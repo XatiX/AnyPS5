@@ -6667,12 +6667,13 @@ bool pendingAfterLeavingWatchTests(const Device& device, Recorder& recorder) {
         ImportWatch decided;
         ~Restore() { SetImportWatch(context, decided); }
     } restore{base, decided};
-    enum class Write { None, AfterPending, BeforePending, UnwatchedFullClear, UnwatchedPartialWrite, BeforeUnwatch, UnwatchedWithoutHook, PendingWithoutHook, UnprovenUnwatch, LateUnwatchedWrite, LateBeforeUnwatch, LateWithoutHook, LateUnproven };
+    enum class Write { None, AfterPending, BeforePending, UnwatchedFullClear, UnwatchedPartialWrite, BeforeUnwatch, UnwatchedWithoutHook, GpuHeldElsewhere, PendingWithoutHook, UnprovenUnwatch, LateUnwatchedWrite, LateBeforeUnwatch, LateWithoutHook, LateUnproven };
     for (const std::uint32_t side : {256u, 1024u})
-    for (const auto write : {Write::None, Write::AfterPending, Write::BeforePending, Write::UnwatchedFullClear, Write::UnwatchedPartialWrite, Write::BeforeUnwatch, Write::UnwatchedWithoutHook, Write::PendingWithoutHook, Write::UnprovenUnwatch, Write::LateUnwatchedWrite, Write::LateBeforeUnwatch, Write::LateWithoutHook, Write::LateUnproven}) {
+    for (const auto write : {Write::None, Write::AfterPending, Write::BeforePending, Write::UnwatchedFullClear, Write::UnwatchedPartialWrite, Write::BeforeUnwatch, Write::UnwatchedWithoutHook, Write::GpuHeldElsewhere, Write::PendingWithoutHook, Write::UnprovenUnwatch, Write::LateUnwatchedWrite, Write::LateBeforeUnwatch, Write::LateWithoutHook, Write::LateUnproven}) {
 #ifndef _WIN32
         if (write == Write::UnprovenUnwatch || write == Write::LateUnproven) continue;
 #endif
+        if (write == Write::GpuHeldElsewhere && side <= 256) continue;
         const std::size_t surfaceBytes = static_cast<std::size_t>(side) * side * 4;
         const std::size_t units = surfaceBytes / unit;
         const std::size_t lastUnit = units - 1;
@@ -6682,10 +6683,10 @@ bool pendingAfterLeavingWatchTests(const Device& device, Recorder& recorder) {
         const bool lateUnwatch = write == Write::LateBeforeUnwatch || write == Write::LateUnproven;
         const bool partial = write == Write::UnwatchedPartialWrite || late;
         const bool unitWritten = unwatchedWrite || write == Write::BeforeUnwatch || late;
-        const bool unhashed = write == Write::UnwatchedWithoutHook || write == Write::PendingWithoutHook || write == Write::UnprovenUnwatch;
+        const bool unhashed = write == Write::UnwatchedWithoutHook || write == Write::GpuHeldElsewhere || write == Write::PendingWithoutHook || write == Write::UnprovenUnwatch;
         const bool pageWritten = write == Write::AfterPending || write == Write::BeforePending;
-        const std::string what = std::string(large ? "1024x1024, " : "") + (write == Write::None ? "no CPU write" : write == Write::AfterPending ? "a CPU write after the results were pending again" : write == Write::BeforePending ? "a CPU write before the results were pending again" : write == Write::UnwatchedFullClear ? "a CPU write into the unwatched block before results that cover it" : write == Write::UnwatchedPartialWrite ? "a CPU write into the unwatched block before results that cover part of it" : write == Write::BeforeUnwatch ? "a CPU write into the last block while it was still watched, before it left the watch" : write == Write::UnwatchedWithoutHook ? "the last block left the watch without the unwatch hook" : write == Write::PendingWithoutHook ? "the last block left the watch without the unwatch hook while the results were pending" : write == Write::LateUnwatchedWrite ? "a CPU write into the unwatched block after results that cover part of it were written" : write == Write::LateBeforeUnwatch ? "a CPU write into the last block after results that cover part of it were written, before it left the watch" : write == Write::LateWithoutHook ? "a CPU write into the last block after it left the watch without the unwatch hook and results that cover part of it were written" : write == Write::LateUnproven ? "a CPU write into the last block after results that cover part of it were written, before it left the watch through a failed collect" : "the last block left the watch through a failed collect");
-        const std::string cause = !large && late ? "its bytes differ from the copy taken at its upload" : write == Write::LateUnwatchedWrite || (large && unwatchedWrite) ? "its bytes no longer match the hash taken when its range left the watch" : unwatchedWrite ? "its bytes differ from the copy taken at its upload" : write == Write::BeforeUnwatch || write == Write::LateBeforeUnwatch ? (large ? "the write watch saw CPU writes to it after its generation, before its range left the watch" : "its bytes differ from the copy taken at its upload") : write == Write::UnwatchedWithoutHook || write == Write::LateWithoutHook ? "no hash of its bytes was taken for its current generation" : write == Write::PendingWithoutHook ? "its results became pending while its range was watched, and its bytes were not saved when the range left the watch" : "its range left the watch through the unwatch hook without its CPU writes proven";
+        const std::string what = std::string(large ? "1024x1024, " : "") + (write == Write::None ? "no CPU write" : write == Write::AfterPending ? "a CPU write after the results were pending again" : write == Write::BeforePending ? "a CPU write before the results were pending again" : write == Write::UnwatchedFullClear ? "a CPU write into the unwatched block before results that cover it" : write == Write::UnwatchedPartialWrite ? "a CPU write into the unwatched block before results that cover part of it" : write == Write::BeforeUnwatch ? "a CPU write into the last block while it was still watched, before it left the watch" : write == Write::UnwatchedWithoutHook ? "the last block left the watch without the unwatch hook" : write == Write::GpuHeldElsewhere ? "the last block left the watch on a thread that does not hold the GPU mutex while another thread holds it" : write == Write::PendingWithoutHook ? "the last block left the watch without the unwatch hook while the results were pending" : write == Write::LateUnwatchedWrite ? "a CPU write into the unwatched block after results that cover part of it were written" : write == Write::LateBeforeUnwatch ? "a CPU write into the last block after results that cover part of it were written, before it left the watch" : write == Write::LateWithoutHook ? "a CPU write into the last block after it left the watch without the unwatch hook and results that cover part of it were written" : write == Write::LateUnproven ? "a CPU write into the last block after results that cover part of it were written, before it left the watch through a failed collect" : "the last block left the watch through a failed collect");
+        const std::string cause = !large && late ? "its bytes differ from the copy taken at its upload" : write == Write::LateUnwatchedWrite || (large && unwatchedWrite) ? "its bytes no longer match the hash taken when its range left the watch" : unwatchedWrite ? "its bytes differ from the copy taken at its upload" : write == Write::BeforeUnwatch || write == Write::LateBeforeUnwatch ? (large ? "the write watch saw CPU writes to it after its generation, before its range left the watch" : "its bytes differ from the copy taken at its upload") : write == Write::UnwatchedWithoutHook || write == Write::GpuHeldElsewhere || write == Write::LateWithoutHook ? "no hash of its bytes was taken for its current generation" : write == Write::PendingWithoutHook ? "its results became pending while its range was watched, and its bytes were not saved when the range left the watch" : "its range left the watch through the unwatch hook without its CPU writes proven";
         void* block = AllocateWatched(surfaceBytes, unit);
         if (block == nullptr) {
             std::cout << "no write watching: results pending after a block left the watch not tested\n";
@@ -6778,6 +6779,18 @@ bool pendingAfterLeavingWatchTests(const Device& device, Recorder& recorder) {
                     } rehook;
                     AgcDriver::GuestMemory::SetUnwatchHook(nullptr);
                     AgcDriver::GuestMemory::Unwatch(address + lastUnit * unit, unit);
+                } else if (write == Write::GpuHeldElsewhere) {
+                    Require(AgcDriver::GuestMemory::GpuMutex().HeldByThisThread(), "(p) " + what + ": the test does not hold the GPU mutex");
+                    std::promise<void> done;
+                    auto finished = done.get_future();
+                    std::thread unwatching([&] {
+                        AgcDriver::GuestMemory::Unwatch(address + lastUnit * unit, unit);
+                        done.set_value();
+                    });
+                    const bool returned = finished.wait_for(std::chrono::seconds(10)) == std::future_status::ready;
+                    if (returned) unwatching.join();
+                    else unwatching.detach();
+                    Require(returned, "(p) " + what + ": the unwatch hook waited for the GPU mutex");
                 } else {
                     AgcDriver::GuestMemory::Unwatch(address + lastUnit * unit, unit);
                 }
