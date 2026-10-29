@@ -4503,9 +4503,14 @@ void StorageTexture::SaveBeforeUnwatch(std::uint64_t address, std::size_t bytes)
             if (auto alive = texture->weak_from_this().lock()) live.push_back(std::move(alive));
         }
     }
-    if (overlapping.empty() && live.empty()) return;
+    if (!live.empty()) {
+        std::unique_lock gpu(GuestMemory::GpuMutex(), std::try_to_lock);
+        if (gpu.owns_lock()) {
+            for (const auto& texture : live) texture->hashBeforeUnwatch(address, bytes, proven);
+        }
+    }
+    if (overlapping.empty()) return;
     std::lock_guard gpu(GuestMemory::GpuMutex());
-    for (const auto& texture : live) texture->hashBeforeUnwatch(address, bytes, proven);
     for (const auto& texture : overlapping) texture->saveBeforeUnwatch();
 }
 
