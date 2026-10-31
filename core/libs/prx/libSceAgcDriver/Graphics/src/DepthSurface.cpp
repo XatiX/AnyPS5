@@ -1287,7 +1287,33 @@ private:
     }
 
     static std::uint64_t PublishedPageHash(const std::byte* page, std::size_t bytes) {
-        return std::hash<std::string_view>{}(std::string_view(reinterpret_cast<const char*>(page), bytes));
+        constexpr std::uint64_t prime1 = 0x9E3779B185EBCA87ull;
+        constexpr std::uint64_t prime2 = 0xC2B2AE3D27D4EB4Full;
+        const auto round = [](std::uint64_t accumulator, std::uint64_t word) { return std::rotl(accumulator + word * prime2, 31) * prime1; };
+        const auto finish = [](std::uint64_t hash) {
+            hash ^= hash >> 33u;
+            hash *= prime2;
+            return hash ^ (hash >> 29u);
+        };
+        if (bytes > 4u && std::memcmp(page, page + 4u, bytes - 4u) == 0) {
+            std::uint32_t word = 0u;
+            std::memcpy(&word, page, sizeof(word));
+            return finish(round(bytes, word));
+        }
+        std::array<std::uint64_t, 4> lanes{prime1 + prime2, prime2, 0u, 0u - prime1};
+        std::size_t offset = 0u;
+        for (; offset + sizeof(lanes) <= bytes; offset += sizeof(lanes)) {
+            std::array<std::uint64_t, 4> words;
+            std::memcpy(words.data(), page + offset, sizeof(words));
+            for (std::size_t lane = 0u; lane < lanes.size(); ++lane) lanes[lane] = round(lanes[lane], words[lane]);
+        }
+        std::uint64_t hash = std::rotl(lanes[0], 1) + std::rotl(lanes[1], 7) + std::rotl(lanes[2], 12) + std::rotl(lanes[3], 18) + bytes;
+        for (; offset < bytes; offset += sizeof(std::uint64_t)) {
+            std::uint64_t word = 0u;
+            std::memcpy(&word, page + offset, std::min(sizeof(word), bytes - offset));
+            hash = round(hash, word);
+        }
+        return finish(hash);
     }
 
     void NotePublishedBytes(std::size_t index, std::span<const std::byte> bytes) {
