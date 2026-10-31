@@ -443,8 +443,8 @@ public:
         if (recorder != nullptr && stencilClearGeneration != 0u && stencilFillNote == 0u) stencilFillNote = fillNoteAfter(*recorder, sampling.initial[2], stencilFillFloor, *stencilClearValue * 0x01010101u);
         if (!publication.empty()) {
             if (auto* pending = RecorderFor(context)) {
-                if (clearFillNote != 0u) pending->SyncThrough(sampling.initial[1].address, sampling.initial[1].bytes);
-                if (stencilFillNote != 0u) pending->SyncThrough(sampling.initial[2].address, sampling.initial[2].bytes);
+                if (clearFillNote != 0u && pending->NewestWriteNote(sampling.initial[1].address, sampling.initial[1].bytes) != clearFillNote) pending->SyncThrough(sampling.initial[1].address, sampling.initial[1].bytes);
+                if (stencilFillNote != 0u && pending->NewestWriteNote(sampling.initial[2].address, sampling.initial[2].bytes) != stencilFillNote) pending->SyncThrough(sampling.initial[2].address, sampling.initial[2].bytes);
             }
         }
         const auto newestHtileNote = recorder != nullptr ? recorder->NewestWriteNote(sampling.initial[1].address, sampling.initial[1].bytes) : 0u;
@@ -481,7 +481,7 @@ public:
             stencilFill = *stencilClearValue;
             RecordClear(VK_IMAGE_ASPECT_STENCIL_BIT);
             plane.generation = generation;
-            RebasePublication(2u);
+            RebasePublication(2u, queuedStencilFill ? std::optional<std::uint32_t>(*stencilClearValue * 0x01010101u) : std::nullopt);
             stencilClearGeneration = 0u;
             sampling.unprovenStencil.reset();
         }
@@ -508,7 +508,7 @@ public:
             Require(GuestMemory::UnchangedSinceCollected(metadata.address, metadata.bytes, clearGeneration), "CPU writes raced native multisample depth clear");
             RecordClear(clearAspects);
             sampling.initial = current;
-            RebasePublication(1u);
+            RebasePublication(1u, queuedFill ? clearPattern : std::nullopt);
             clearGeneration = 0u;
             clearAspects = 0u;
             pendingClear = 0u;
@@ -1366,8 +1366,23 @@ private:
         return true;
     }
 
-    void RebasePublication(std::size_t index) {
+    void RebasePublication(std::size_t index, std::optional<std::uint32_t> fill = std::nullopt) {
         if (publication.empty()) return;
+        if (fill.has_value()) {
+            const auto& range = sampling.initial[index];
+            const auto pages = (range.bytes + PublicationPlane::PageBytes - 1u) / PublicationPlane::PageBytes;
+            PublicationPlane plane;
+            plane.range = range;
+            plane.words.assign(pages, *fill);
+            plane.starts.assign(pages, PublicationPlane::Repeated);
+            std::array<std::uint32_t, PublicationPlane::PageBytes / sizeof(std::uint32_t)> words;
+            words.fill(*fill);
+            auto& hashes = publishedPages[index];
+            hashes.assign(pages, PublishedPageHash(reinterpret_cast<const std::byte*>(words.data()), PublicationPlane::PageBytes));
+            if (const auto tail = range.bytes % PublicationPlane::PageBytes; tail != 0u) hashes.back() = PublishedPageHash(reinterpret_cast<const std::byte*>(words.data()), tail);
+            publication[index] = std::move(plane);
+            return;
+        }
         try {
             publication[index] = CapturePublication(sampling.initial[index]);
         } catch (...) {
