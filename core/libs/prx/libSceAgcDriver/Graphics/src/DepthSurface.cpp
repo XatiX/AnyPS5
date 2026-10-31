@@ -451,7 +451,7 @@ public:
             const auto& range = sampling.initial[index];
             Require(GuestMemory::Accessible(reinterpret_cast<const void*>(range.address), range.bytes) && GuestMemory::Watched(range.address, range.bytes), "native multisample depth requires watched accessible guest memory");
             if (recorder != nullptr && !(index == 1u && queuedFill) && !(index == 2u && queuedStencilFill)) Require(!recorder->PendingWriteOverlaps(range.address, range.bytes), "external GPU writes over native multisample depth are not implemented");
-            GuestMemory::CollectWritesUncached(range.address, range.bytes);
+            GuestMemory::CollectWrites(range.address, range.bytes);
             const auto alias = MultisampleColorTargetOver(range.address, range.bytes);
             if (!alias || (index == 2u && sampling.unprovenStencil && stencilClearGeneration == 0u)) continue;
             const auto value = index == 2u && separatePlane ? aliasedStencil(*alias, range, target.samples) : std::nullopt;
