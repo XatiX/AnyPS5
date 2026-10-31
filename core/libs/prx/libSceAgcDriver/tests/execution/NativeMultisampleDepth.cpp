@@ -709,7 +709,7 @@ struct StencilUse {
 
 class DepthRaster {
 public:
-    DepthRaster(const Context& context, const DepthTarget& target, VkImageView view, std::optional<StencilUse> stencil = std::nullopt, bool perPixel = false) : context(context), extent(target.extent), samples(target.samples) {
+    DepthRaster(const Context& context, const DepthTarget& target, VkImageView view, std::optional<StencilUse> stencil = std::nullopt, bool perPixel = false, bool perSampleStencil = false) : context(context), extent(target.extent), samples(target.samples) {
         try {
             const auto stencilLoad = target.stencilAddress != 0u ? VK_ATTACHMENT_LOAD_OP_LOAD : VK_ATTACHMENT_LOAD_OP_DONT_CARE;
             const auto stencilStore = target.stencilAddress != 0u ? VK_ATTACHMENT_STORE_OP_STORE : VK_ATTACHMENT_STORE_OP_DONT_CARE;
@@ -965,7 +965,7 @@ void CheckDepthPublication(Context context, std::uint32_t samples, PublicationWr
     }
     if (write == PublicationWrite::DrawPending) QueueTargetByteWrite(context, recorder, target.address + depthBytes - 1u, std::byte{0x7e});
     NoteDepthSurfaceWrite(context, target);
-    raster = std::make_unique<DepthRaster>(context, target, view, StencilUse{VK_COMPARE_OP_ALWAYS, VK_STENCIL_OP_REPLACE, 0x20u}, true);
+    raster = std::make_unique<DepthRaster>(context, target, view, StencilUse{VK_COMPARE_OP_ALWAYS, VK_STENCIL_OP_REPLACE, 0x20u}, false, true);
     raster->Run(recorder.Commands(), 0.25f);
     const bool stencilFill = clear >= PublicationClear::Stencil;
     const bool redraw = clear == PublicationClear::Redraw || clear == PublicationClear::Different || clear >= PublicationClear::StencilRedraw;
