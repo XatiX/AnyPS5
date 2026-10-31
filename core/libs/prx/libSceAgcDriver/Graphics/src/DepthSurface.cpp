@@ -507,7 +507,7 @@ public:
             clearAspects = 0u;
             pendingClear = 0u;
         }
-        Require(GuestMemory::UnchangedSinceAll(sampling.initial), "guest writes over native multisample depth are not implemented");
+        Require(GuestMemory::UnchangedSinceAll(sampling.initial) || AcceptHeldPublication(), "guest writes over native multisample depth are not implemented");
     }
 
     void CheckResource(const GuestTextureResource& resource) const {
@@ -687,16 +687,20 @@ public:
         if (samplingActive && target.format == VK_FORMAT_D32_SFLOAT_S8_UINT && context.detiler != nullptr && !hostWritten->load(std::memory_order_acquire)) {
             try {
                 const auto lease = GuestAllocations::GuestAllocationsAcquireAll_nid_postfix();
-                CheckCurrent();
-                std::vector<PublicationPlane> captured;
-                for (const auto& range : sampling.initial) captured.push_back(CapturePublication(range));
-                for (const auto& plane : captured) {
-                    Require(GuestMemory::UnchangedSinceCollected(plane.range.address, plane.range.bytes, plane.range.generation), "guest writes raced native multisample depth publication capture");
-                    Require(GuestMemory::UnchangedSince(plane.range.address, plane.range.bytes, plane.range.generation), "guest writes raced native multisample depth publication capture");
+                constexpr int captureAttempts = 8;
+                for (int attempt = 1;; ++attempt) {
+                    try {
+                        CheckCurrent();
+                        std::vector<PublicationPlane> captured;
+                        for (const auto& range : sampling.initial) captured.push_back(CapturePublication(range));
+                        for (std::size_t index = 0u; index < captured.size(); ++index) publishedPages[index] = captured[index].pageHashes;
+                        Require(AcceptHeldPublication(), "guest writes raced native multisample depth publication capture");
+                        publication = std::move(captured);
+                        break;
+                    } catch (...) {
+                        if (attempt == captureAttempts) throw;
+                    }
                 }
-                for (const auto& range : sampling.initial) Require(GuestMemory::UnchangedSinceCollected(range.address, range.bytes, range.generation), "guest writes raced native multisample depth publication capture");
-                Require(GuestMemory::UnchangedSinceAll(sampling.initial), "guest writes raced native multisample depth publication capture");
-                publication = std::move(captured);
             } catch (...) {
                 publicationFailure = std::current_exception();
                 publication.clear();
@@ -1233,6 +1237,7 @@ public:
 private:
     struct PublicationPlane {
         static constexpr std::size_t PageBytes = 4096u;
+        std::vector<std::uint64_t> pageHashes;
         static constexpr std::size_t Repeated = std::numeric_limits<std::size_t>::max();
         GuestMemory::UnchangedQuery range;
         std::vector<std::uint32_t> words;
@@ -1252,6 +1257,7 @@ private:
         }
     };
     std::vector<PublicationPlane> publication;
+    std::array<std::vector<std::uint64_t>, 3> publishedPages;
     bool publicationInProgress = false;
     bool publicationFailed = false;
     std::exception_ptr publicationFailure;
@@ -1268,6 +1274,7 @@ private:
             const auto first = index * PublicationPlane::PageBytes;
             const auto length = std::min(PublicationPlane::PageBytes, range.bytes - first);
             GuestMemory::CopyGuestBytes(page.data(), reinterpret_cast<const void*>(range.address + first), length);
+            plane.pageHashes.push_back(PublishedPageHash(page.data(), length));
             if (length <= 4u || std::equal(page.begin() + 4u, page.begin() + length, page.begin())) {
                 std::memcpy(&plane.words[index], page.data(), std::min<std::size_t>(length, 4u));
             } else {
@@ -1275,8 +1282,51 @@ private:
                 plane.stored.insert(plane.stored.end(), page.begin(), page.begin() + length);
             }
         }
-        Require(GuestMemory::UnchangedSinceCollected(range.address, range.bytes, plane.range.generation) && GuestMemory::UnchangedSince(range.address, range.bytes, plane.range.generation), "guest writes raced native multisample depth publication capture");
         return plane;
+    }
+
+    static std::uint64_t PublishedPageHash(const std::byte* page, std::size_t bytes) {
+        return std::hash<std::string_view>{}(std::string_view(reinterpret_cast<const char*>(page), bytes));
+    }
+
+    void NotePublishedBytes(std::size_t index, std::span<const std::byte> bytes) {
+        auto& hashes = publishedPages[index];
+        hashes.clear();
+        for (std::size_t offset = 0u; offset < bytes.size(); offset += PublicationPlane::PageBytes) {
+            const auto length = std::min(PublicationPlane::PageBytes, bytes.size() - offset);
+            hashes.push_back(PublishedPageHash(bytes.data() + offset, length));
+        }
+    }
+
+public:
+    void NoteImportedBytes() {
+        for (std::size_t index = 0u; index < sampling.initial.size(); ++index) {
+            const auto& plane = sampling.initial[index];
+            std::vector<std::byte> bytes(plane.bytes);
+            GuestMemory::CopyGuestBytes(bytes.data(), reinterpret_cast<const void*>(plane.address), plane.bytes);
+            NotePublishedBytes(index, bytes);
+        }
+    }
+
+private:
+    bool AcceptHeldPublication() {
+        std::array<std::byte, PublicationPlane::PageBytes> page;
+        for (std::size_t index = 0u; index < sampling.initial.size(); ++index) {
+            auto& plane = sampling.initial[index];
+            if (GuestMemory::UnchangedSince(plane.address, plane.bytes, plane.generation)) continue;
+            const auto& hashes = publishedPages[index];
+            if (hashes.size() != (plane.bytes + PublicationPlane::PageBytes - 1u) / PublicationPlane::PageBytes) return false;
+            const auto generation = GuestMemory::CollectWritesUncached(plane.address, plane.bytes);
+            for (std::size_t pageIndex = 0u; pageIndex < hashes.size(); ++pageIndex) {
+                const auto offset = pageIndex * PublicationPlane::PageBytes;
+                const auto length = std::min(PublicationPlane::PageBytes, plane.bytes - offset);
+                if (GuestMemory::UnchangedSince(plane.address + offset, length, plane.generation)) continue;
+                GuestMemory::CopyGuestBytes(page.data(), reinterpret_cast<const void*>(plane.address + offset), length);
+                if (PublishedPageHash(page.data(), length) != hashes[pageIndex]) return false;
+            }
+            if (generation != 0u) plane.generation = generation;
+        }
+        return true;
     }
 
     void RebasePublication(std::size_t index) {
@@ -2143,18 +2193,20 @@ void DepthSurface::PublishToGuest() {
             for (auto first = begin; first < end;) {
                 const auto address = plane.range.address + first;
                 const auto bytes = std::min<std::size_t>(4096u - (address & 4095u), end - first);
-                if (!GuestMemory::UnchangedSinceLastCollect(address, bytes, plane.range.generation)) {
+                if (!GuestMemory::NoStoreSinceLastCollect(address, bytes, plane.range.generation)) {
                     if (GuestMemory::StoredAllSince_nid_no_patch(address, bytes, plane.range.generation)) {
                         if (!std::equal(current[index].begin() + first, current[index].begin() + first + bytes, result[index].begin() + first)) tookGuest[index] = true;
                         std::copy_n(current[index].begin() + first, bytes, result[index].begin() + first);
-                    } else for (std::size_t offset = first; offset < first + bytes; ++offset) {
+                    } else if (const auto held = [&] {
+                                   for (std::size_t offset = first; offset < first + bytes; ++offset) {
+                                       if (current[index][offset] != plane.Byte(offset)) return false;
+                                   }
+                                   return true;
+                               }(); !held) for (std::size_t offset = first; offset < first + bytes; ++offset) {
                         if (current[index][offset] != plane.Byte(offset) || current[index][offset] == result[index][offset] || GuestMemory::StoredAllSince_nid_no_patch(plane.range.address + offset, 1u, plane.range.generation)) {
                             if (current[index][offset] != result[index][offset]) tookGuest[index] = true;
                             result[index][offset] = current[index][offset];
-                        } else {
-                            static std::atomic<std::uint64_t> kept{0u};
-                            if (kept.fetch_add(1u, std::memory_order_relaxed) % 0x100000u == 0u) std::fprintf(stderr, "[EXPERIMENT] publication kept the host byte plane=%zu offset=0x%zx current=%02x snapshot=%02x host=%02x\n", index, offset, static_cast<unsigned>(current[index][offset]), static_cast<unsigned>(plane.Byte(offset)), static_cast<unsigned>(result[index][offset]));
-                        }
+                        } else Require(GuestMemory::NoStoreSinceLastCollect(plane.range.address + offset, 1u, plane.range.generation), "native multisample depth publication cannot distinguish an unwritten byte from a same-value guest store");
                     }
                 }
                 first += bytes;
@@ -2185,7 +2237,10 @@ void DepthSurface::PublishToGuest() {
         const auto generation = GuestMemory::CollectWritesUncached(range.address, range.bytes);
         std::vector<std::byte> committed(range.bytes);
         GuestMemory::CopyGuestBytes(committed.data(), reinterpret_cast<const void*>(range.address), range.bytes);
-        if (committed == result[index]) sampling.initial[index].generation = generation;
+        if (committed == result[index]) {
+            sampling.initial[index].generation = generation;
+            NotePublishedBytes(index, committed);
+        }
     }
     hostWritten->store(false, std::memory_order_release);
     publication.clear();
@@ -2717,6 +2772,7 @@ VkImageView DepthSurfaceView(const Context& context, const DepthTarget& target, 
             anyDepthGuard().store(true, std::memory_order_release);
             InstallResidentImageReadGuard_nid_no_patch();
             fresh.samplingActive = true;
+            fresh.NoteImportedBytes();
         }
         surface = surfaces().back().get();
     }
