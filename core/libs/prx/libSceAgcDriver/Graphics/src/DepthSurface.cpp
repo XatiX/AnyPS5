@@ -433,6 +433,12 @@ public:
         Require(sampling.refusal.empty(), sampling.refusal);
         Require(!clearPending, "native multisample depth clear has not been recorded");
         const auto* recorder = RecorderFor(context);
+        const auto checkEpoch = GuestMemory::ThreadCollectEpoch();
+        const auto checkMapping = GuestAllocations::GuestAllocationsGeneration_nid_postfix();
+        if (checkEpoch != 0u && checkEpoch == checkedEpoch && checkMapping == checkedMapping && clearGeneration == 0u && stencilClearGeneration == 0u && pendingClear == 0u && !publicationFailure) {
+            const bool pendingWrite = recorder != nullptr && std::ranges::any_of(sampling.initial, [&](const auto& range) { return recorder->PendingWriteOverlaps(range.address, range.bytes); });
+            if (!pendingWrite && GuestMemory::UnchangedSinceAll(sampling.initial)) return;
+        }
         if (recorder != nullptr && clearGeneration != 0u && clearPattern.has_value() && clearFillNote == 0u) clearFillNote = fillNoteAfter(*recorder, sampling.initial[1], clearFillFloor, *clearPattern);
         if (recorder != nullptr && stencilClearGeneration != 0u && stencilFillNote == 0u) stencilFillNote = fillNoteAfter(*recorder, sampling.initial[2], stencilFillFloor, *stencilClearValue * 0x01010101u);
         if (!publication.empty()) {
@@ -508,6 +514,8 @@ public:
             pendingClear = 0u;
         }
         Require(GuestMemory::UnchangedSinceAll(sampling.initial) || AcceptHeldPublication(), "guest writes over native multisample depth are not implemented");
+        checkedEpoch = checkEpoch;
+        checkedMapping = checkMapping;
     }
 
     void CheckResource(const GuestTextureResource& resource) const {
@@ -1259,6 +1267,8 @@ private:
     };
     std::vector<PublicationPlane> publication;
     std::array<std::vector<std::uint64_t>, 3> publishedPages;
+    std::uint64_t checkedEpoch = 0u;
+    std::uint64_t checkedMapping = 0u;
     bool publicationInProgress = false;
     bool publicationFailed = false;
     std::exception_ptr publicationFailure;
