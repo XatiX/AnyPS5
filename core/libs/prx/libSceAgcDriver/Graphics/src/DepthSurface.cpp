@@ -711,6 +711,7 @@ public:
     }
 
     void PublishToGuest();
+    bool PublishHtileToGuest(std::uint64_t address, std::size_t bytes);
 
     std::uint64_t written = ++depthWrites;
     std::shared_ptr<std::atomic<bool>> hostWritten = std::make_shared<std::atomic<bool>>(false);
@@ -2095,6 +2096,34 @@ std::uint32_t expandedHtileWord(std::uint32_t word, bool stencilInHtile, VkImage
     return word;
 }
 
+bool DepthSurface::PublishHtileToGuest(std::uint64_t address, std::size_t bytes) {
+    if (publication.size() != 3u || publicationInProgress || publicationFailed || publicationFailure || Recorder::InCompletion()) return false;
+    const auto& plane = publication[1];
+    if (address < plane.range.address || address + bytes > plane.range.address + plane.range.bytes) return false;
+    if (!sampling.refusal.empty() || clearPending || clearGeneration != 0u || stencilClearGeneration != 0u || pendingClear != 0u) return false;
+    if (!GuestMemory::Accessible(reinterpret_cast<const void*>(plane.range.address), plane.range.bytes, true) || !GuestMemory::Watched(plane.range.address, plane.range.bytes)) return false;
+    const std::pair<std::uint64_t, std::uint64_t> range{plane.range.address, plane.range.address + plane.range.bytes};
+    if (MultisampleColorTargetOver(plane.range.address, plane.range.bytes) || StorageTexture::AnyPendingOverlaps(std::span(&range, 1u))) return false;
+    if (auto* recorder = RecorderFor(context); recorder != nullptr && recorder->PendingWriteOverlaps(plane.range.address, plane.range.bytes)) return false;
+    auto expanded = plane.Expand();
+    std::vector<std::byte> current(plane.range.bytes);
+    const auto generation = GuestMemory::CollectWritesUncached(plane.range.address, plane.range.bytes);
+    GuestMemory::CopyGuestBytes(current.data(), reinterpret_cast<const void*>(plane.range.address), plane.range.bytes);
+    if (current != expanded) return false;
+    for (std::size_t offset = 0u; offset + 4u <= expanded.size(); offset += 4u) {
+        std::uint32_t word;
+        std::memcpy(&word, expanded.data() + offset, 4u);
+        word = expandedHtileWord(word, !target.htileDepthOnly, VK_IMAGE_ASPECT_DEPTH_BIT | VK_IMAGE_ASPECT_STENCIL_BIT);
+        std::memcpy(expanded.data() + offset, &word, 4u);
+    }
+    if (expanded == current) return true;
+    if (GuestMemory::WriteChangedIfHeld(plane.range.address, expanded, current, 0u) != 0u) return false;
+    sampling.initial[1].generation = GuestMemory::CollectWritesUncached(plane.range.address, plane.range.bytes);
+    RebasePublication(1u);
+    NotePublishedBytes(1u, expanded);
+    return generation != 0u;
+}
+
 void DepthSurface::PublishToGuest() {
     Require(!Recorder::InCompletion(), "native multisample depth publication inside a GPU completion is not implemented");
     Require(!publicationInProgress, "recursive native multisample depth publication is not implemented");
@@ -2246,15 +2275,19 @@ void DepthSurface::PublishToGuest() {
     publication.clear();
 }
 
-void publishWrittenDepth(std::span<const std::shared_ptr<std::atomic<bool>>> written) {
+bool publishWrittenDepth(std::span<const std::shared_ptr<std::atomic<bool>>> written, std::uint64_t address, std::size_t bytes) {
     std::lock_guard gpu(GuestMemory::GpuMutex());
     std::lock_guard lock(surfacesMutex());
+    bool htileOnly = !written.empty();
     for (const auto& flag : written) {
         if (!flag->load(std::memory_order_acquire)) continue;
         const auto found = std::ranges::find_if(surfaces(), [&](const auto& surface) { return surface->hostWritten == flag && surface->active->load(std::memory_order_acquire); });
         if (found == surfaces().end()) continue;
+        if ((*found)->PublishHtileToGuest(address, bytes)) continue;
+        htileOnly = false;
         (*found)->PublishToGuest();
     }
+    return htileOnly;
 }
 
 std::mutex& htileReadsMutex() {
@@ -2617,7 +2650,7 @@ void RequireNoResidentDepthRead_nid_no_patch(std::uint64_t address, std::size_t 
     if (!written.empty()) {
         Require(allowPublication && !HoldsMultisampleTargetsLock(), "sample-preserving guest publication of native multisample depth is not implemented while a multisampled colour target is being acquired");
         if (const auto hook = depthPublicationHook.load(std::memory_order_acquire)) hook(DepthPublicationStage::ReadCaptured);
-        publishWrittenDepth(written);
+        if (publishWrittenDepth(written, address, bytes)) return;
     }
     std::unique_lock lock(depthGuardMutex());
     for (const auto& range : depthGuards()) {
