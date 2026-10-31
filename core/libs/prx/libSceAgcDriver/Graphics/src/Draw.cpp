@@ -3048,7 +3048,6 @@ bool prepareDraw(const Context& context, const State& state, const Pm4::DrawPara
     }
     if (state.depth) {
         targetViews.push_back(DepthSurfaceView(context, *state.depth, state.depthWrite, state.stencilTest));
-        if (writesDepthTarget(state)) NoteDepthSurfaceWrite(context, *state.depth);
     }
     timer.phase(PhasePrepare);
     const bool recordDraws = RecordDraws();
@@ -3056,6 +3055,7 @@ bool prepareDraw(const Context& context, const State& state, const Pm4::DrawPara
     bool recordable = recordDraws && recorder != nullptr && dumpLimit == 0 && std::all_of(targets.begin(), targets.end(), [](const TargetBinding& binding) { return binding.resident != nullptr || binding.multisampled; });
     auto& resolved = prepared.resolved;
     resolved = resolveDrawResources(context, state, draw, shaders, snapshots, indexBytes, recordable, outcome, timer);
+    if (state.depth && writesDepthTarget(state)) NoteDepthSurfaceWrite(context, *state.depth);
     auto& resources = resolved.resources;
     if (!stencilReferences.empty() && resources->ChecksFaults()) recordable = false;
     if (!stencilReferences.empty()) {
@@ -3795,7 +3795,6 @@ DrawRecipeOutcome DrawWithRecipe(const Context& context, const State& state, con
     if (recipe.hasDepth) {
         timer.phase(PhaseSetup);
         const auto depthView = DepthSurfaceView(context, *state.depth, state.depthWrite, state.stencilTest);
-        if (writesDepthTarget(state)) NoteDepthSurfaceWrite(context, *state.depth);
         timer.phase(PhaseReadTarget);
         if (recipe.targetViews.back() != depthView) return miss(DrawRecipeMiss::TargetGone);
     }
@@ -3818,6 +3817,7 @@ DrawRecipeOutcome DrawWithRecipe(const Context& context, const State& state, con
         return miss(DrawRecipeMiss::Proof);
     }
     CheckBufferAliases(shaders, state.color, draw.indexAddress, inputs.indexBytes);
+    if (recipe.hasDepth && writesDepthTarget(state)) NoteDepthSurfaceWrite(context, *state.depth);
     SharedResourceCache().Touch(recipe.key);
     countCache(&DrawProfile::cacheHits);
     timer.phase(PhaseLookup);
