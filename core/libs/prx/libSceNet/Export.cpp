@@ -3501,4 +3501,20 @@ int APS5_VABI sceNetEmulationGet(NetEmulationParameter*, std::uint32_t) {
     return fail(NET_EOPNOTSUPP);
 }
 
+namespace {
+
+std::int64_t ForwardResult(std::int64_t result) {
+    return result < 0 ? -1 : result;
+}
+
+const KernelSocketForwards g_socketForwards{
+    [](int descriptor, const void* address, std::uint32_t length) { return static_cast<int>(ForwardResult(sceNetBind_nid_postfix(descriptor, address, length))); },
+    [](int descriptor, void* address, std::uint32_t* length) { return static_cast<int>(ForwardResult(sceNetGetsockname(descriptor, address, length))); },
+    [](int descriptor, const void* buffer, std::uint64_t length, int flags, const void* address, std::uint32_t addressLength) { return ForwardResult(sceNetSendto(descriptor, buffer, length, flags, address, addressLength)); },
+    [](int descriptor, void* buffer, std::uint64_t length, int flags, void* address, std::uint32_t* addressLength) { return ForwardResult(sceNetRecvfrom(descriptor, buffer, length, flags, address, addressLength)); },
+};
+const bool g_socketForwardsRegistered = (KernelSetSocketForwards_nid_no_patch(&g_socketForwards), true);
+
+}
+
 }
