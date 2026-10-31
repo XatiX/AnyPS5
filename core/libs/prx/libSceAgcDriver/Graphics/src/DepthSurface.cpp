@@ -1358,6 +1358,7 @@ private:
                 const auto offset = pageIndex * PublicationPlane::PageBytes;
                 const auto length = std::min(PublicationPlane::PageBytes, plane.bytes - offset);
                 if (GuestMemory::UnchangedSince(plane.address + offset, length, plane.generation)) continue;
+                if (!GuestMemory::NoStoreSinceLastCollect(plane.address + offset, length, plane.generation)) return false;
                 GuestMemory::CopyGuestBytes(page.data(), reinterpret_cast<const void*>(plane.address + offset), length);
                 if (PublishedPageHash(page.data(), length) != hashes[pageIndex]) return false;
             }
@@ -2277,12 +2278,7 @@ void DepthSurface::PublishToGuest() {
                     if (GuestMemory::StoredAllSince_nid_no_patch(address, bytes, plane.range.generation)) {
                         if (!std::equal(current[index].begin() + first, current[index].begin() + first + bytes, result[index].begin() + first)) tookGuest[index] = true;
                         std::copy_n(current[index].begin() + first, bytes, result[index].begin() + first);
-                    } else if (const auto held = [&] {
-                                   for (std::size_t offset = first; offset < first + bytes; ++offset) {
-                                       if (current[index][offset] != plane.Byte(offset)) return false;
-                                   }
-                                   return true;
-                               }(); !held) for (std::size_t offset = first; offset < first + bytes; ++offset) {
+                    } else for (std::size_t offset = first; offset < first + bytes; ++offset) {
                         if (current[index][offset] != plane.Byte(offset) || current[index][offset] == result[index][offset] || GuestMemory::StoredAllSince_nid_no_patch(plane.range.address + offset, 1u, plane.range.generation)) {
                             if (current[index][offset] != result[index][offset]) tookGuest[index] = true;
                             result[index][offset] = current[index][offset];
