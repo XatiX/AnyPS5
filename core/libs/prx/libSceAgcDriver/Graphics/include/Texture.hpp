@@ -222,9 +222,12 @@ public:
     static bool WaitForFlushing(std::uint64_t address, std::size_t bytes, const StorageTexture* except = nullptr);
     static void SaveBeforeUnwatch(std::uint64_t address, std::size_t bytes);
     static constexpr std::uint64_t SmallStoreBytes = 64 * 1024;
+    static constexpr std::uint64_t OccasionalStoreBytes = 1024 * 1024;
+    static constexpr std::uint64_t OccasionalWriteFlips = 8;
     static std::size_t StoreSmallPending(const char* reason);
     static void StoreReadbackBeforeLabel(const char* reason);
     static std::size_t StoreDrawnLinear(const char* reason);
+    static void NoteFlip();
     static std::size_t StoreDrawnLinearTouching(const char* reason, const std::function<bool(std::uint64_t, std::uint64_t)>& touches, bool all);
     static bool AnyPending();
     static void FlushDumpSelected(const char* reason);
@@ -684,6 +687,8 @@ private:
     std::vector<std::uint64_t> storeNotes;
     std::uint64_t version = 0;
     std::uint64_t writes = 0;
+    std::uint64_t writtenFlip = 0;
+    bool writtenOccasionally = false;
     // `original` holds the guest bytes; false after a GPU-side clear, which never read them.
     std::vector<bool> layerOriginal;
     std::map<std::uint64_t, std::uint64_t> keptAtUnwatch;
