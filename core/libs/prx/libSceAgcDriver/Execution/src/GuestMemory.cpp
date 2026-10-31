@@ -839,6 +839,17 @@ std::uint64_t ForgetSerial() {
     return forgetSerial.load(std::memory_order_acquire);
 }
 
+std::uint64_t PageStateSerial(std::uint64_t address, std::size_t bytes) {
+    auto& pages = Pages();
+    pages.initialize();
+    if (bytes == 0 || bytes > std::numeric_limits<std::uintptr_t>::max() - address) return 0;
+    const auto* span = pages.spanOf(address);
+    if (span == nullptr || !span->covers(address + bytes - 1)) return 0;
+    const auto forgets = forgetSerial.load(std::memory_order_acquire);
+    if ((forgets & 1u) != 0) return 0;
+    return forgets + pages.accessSerial.load(std::memory_order_acquire) + 1;
+}
+
 Commitment DescribeCommitted(std::uint64_t address, std::size_t bytes, bool writable) {
     require(bytes <= std::numeric_limits<std::uint64_t>::max() - address, "address range overflow");
     const TimedAccess timed(CounterVerify, bytes);

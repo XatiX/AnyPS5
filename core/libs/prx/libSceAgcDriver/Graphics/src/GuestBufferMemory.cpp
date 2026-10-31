@@ -124,6 +124,7 @@ struct GuestBufferMemory::AddressSpace {
     std::vector<HeapRun> heapRuns;
     std::vector<ImageMirror*> sparseMirrors;
     std::unique_ptr<std::atomic<std::uint64_t>[]> verified;
+    std::unique_ptr<std::atomic<std::uint64_t>[]> accessible;
     std::vector<CopiedRange> copied;
     // The BDA table entries of `base`, in its order.
     std::vector<ShaderRecompiler::BdaAbi::Range> ranges;
@@ -3096,6 +3097,7 @@ void planSpaceMirrors(GuestBufferMemory::AddressSpace& space) {
         run.last = space.heapMirrors.size();
     }
     space.verified = std::make_unique<std::atomic<std::uint64_t>[]>(space.heapRuns.size());
+    space.accessible = std::make_unique<std::atomic<std::uint64_t>[]>(space.heapRuns.size());
 }
 
 std::vector<std::pair<std::size_t, std::uint64_t>> refreshHeapRuns(const GuestBufferMemory::AddressSpace& space, std::vector<RefreshBlock>& blocks) {
@@ -3103,7 +3105,12 @@ std::vector<std::pair<std::size_t, std::uint64_t>> refreshHeapRuns(const GuestBu
     checked.reserve(space.heapRuns.size());
     for (std::size_t index = 0; index < space.heapRuns.size(); ++index) {
         const auto& run = space.heapRuns[index];
-        prepareRange(run.begin, run.bytes);
+        const auto pageStates = GuestMemory::PageStateSerial(run.begin, static_cast<std::size_t>(run.bytes));
+        if (pageStates == 0 || space.accessible[index].load(std::memory_order_acquire) != pageStates) {
+            Require(GuestMemory::Accessible(reinterpret_cast<const void*>(run.begin), static_cast<std::size_t>(run.bytes)), "image mirror range became inaccessible");
+            space.accessible[index].store(pageStates, std::memory_order_release);
+        }
+        syncRange(run.begin, run.bytes);
         const auto generation = GuestMemory::CollectWrites(run.begin, static_cast<std::size_t>(run.bytes));
         const auto since = space.verified[index].load(std::memory_order_relaxed);
         if (since == 0 || !GuestMemory::UnchangedSince(run.begin, static_cast<std::size_t>(run.bytes), since)) appendHeapRun(std::span<ImageMirror* const>(space.heapMirrors).subspan(run.first, run.last - run.first), generation, blocks);
