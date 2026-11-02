@@ -1002,6 +1002,14 @@ std::mutex& targetsMutex() {
     return mutex;
 }
 
+thread_local bool targetsMutexHeld = false;
+
+struct TargetsLock {
+    std::lock_guard<std::mutex> lock{targetsMutex()};
+    TargetsLock() { targetsMutexHeld = true; }
+    ~TargetsLock() { targetsMutexHeld = false; }
+};
+
 std::vector<std::shared_ptr<MultisampleTarget>>& targets() {
     static std::vector<std::shared_ptr<MultisampleTarget>> list;
     return list;
@@ -1097,7 +1105,8 @@ MultisampleTarget& createFilled(const Context& context, const GuestTextureResour
     use.bytes = ColorTargetLayout(use.extent.width, use.extent.height, use.tileMode, use.elementBytes).Bytes();
     char range[64];
     std::snprintf(range, sizeof(range), "0x%llx+0x%llx", static_cast<unsigned long long>(use.address), static_cast<unsigned long long>(bytes));
-    RequireNoMultisampleTarget(use.address, static_cast<std::size_t>(bytes), "sampling a multisampled texture no draw rendered to");
+    RequireNoResidentDepthRead_nid_no_patch(use.address, static_cast<std::size_t>(bytes), std::nullopt, false);
+    RequireNoMultisampleColorTarget(use.address, static_cast<std::size_t>(bytes), "sampling a multisampled texture no draw rendered to");
     GuestMemory::FlushGpuWrites(use.address, static_cast<std::size_t>(bytes));
     if (!GuestMemory::Accessible(reinterpret_cast<const void*>(use.address), static_cast<std::size_t>(bytes))) refuse(std::string("whose color memory ") + range + " is not mapped");
     std::uint64_t htileBytes = 0;
@@ -1369,14 +1378,14 @@ bool TakeMultisampledClear(MultisampledCmask& cmask, MultisampledColorFill& colo
 }
 
 SampleOrderTarget MultisampleTargetOrderTarget(const Context& context, const ColorTarget& target) {
-    std::lock_guard lock(targetsMutex());
+    TargetsLock lock;
     auto& found = acquire(context, target);
     found.drawn = true;
     return {found.image, found.OrderView(), found.orderFormat, target.extent, target.samples, SampleOrderMethod::Storage, found.shared_from_this()};
 }
 
 VkImageView MultisampleTargetView(const Context& context, const ColorTarget& target, VkImage* image) {
-    std::lock_guard lock(targetsMutex());
+    TargetsLock lock;
     auto& acquired = acquire(context, target);
     acquired.drawn = true;
     if (image != nullptr) *image = acquired.image;
@@ -1384,7 +1393,7 @@ VkImageView MultisampleTargetView(const Context& context, const ColorTarget& tar
 }
 
 VkImageView MultisampleTargetView(const Context& context, const ColorTarget& target, std::shared_ptr<void>& owner, VkImage* image) {
-    std::lock_guard lock(targetsMutex());
+    TargetsLock lock;
     auto& acquired = acquire(context, target);
     acquired.drawn = true;
     owner = acquired.shared_from_this();
@@ -1426,7 +1435,7 @@ VkFormat sampledFormat(const Context& context, std::uint32_t guestFormat) {
 }
 
 std::shared_ptr<Texture> MultisampleTargetTexture(const Context& context, const GuestTextureResource& resource, VkComponentMapping components, VkImageViewType viewType) {
-    std::lock_guard lock(targetsMutex());
+    TargetsLock lock;
     discardRetiredTargets();
     const auto format = sampledFormat(context, resource.format);
     const MultisampleTarget* other = nullptr;
@@ -1449,7 +1458,7 @@ std::shared_ptr<Texture> MultisampleTargetTexture(const Context& context, const 
 }
 
 std::shared_ptr<Texture> MultisampleTargetFirstSample(const Context& context, const GuestTextureResource& resource, VkComponentMapping components) {
-    std::lock_guard lock(targetsMutex());
+    TargetsLock lock;
     discardRetiredTargets();
     const auto format = sampledFormat(context, resource.format);
     const MultisampleTarget* other = nullptr;
@@ -1472,12 +1481,12 @@ std::shared_ptr<Texture> MultisampleTargetFirstSample(const Context& context, co
 }
 
 void MaterializeMultisampleTargetClear(const Context& context, const ColorTarget& target) {
-    std::lock_guard lock(targetsMutex());
+    TargetsLock lock;
     acquire(context, target);
 }
 
 VkImageView MultisampleTargetStorageView(const Context& context, const GuestTextureResource& resource, bool uintStorage) {
-    std::lock_guard lock(targetsMutex());
+    TargetsLock lock;
     discardRetiredTargets();
     const auto format = ResolveTextureFormat(resource.format);
     const MultisampleTarget* other = nullptr;
@@ -1501,14 +1510,14 @@ VkImageView MultisampleTargetStorageView(const Context& context, const GuestText
 }
 
 bool MultisampleTargetStorable(const Context& context, const ColorTarget& target) {
-    std::lock_guard lock(targetsMutex());
+    TargetsLock lock;
     return std::any_of(targets().begin(), targets().end(), [&](const auto& candidate) {
         return candidate->active->load(std::memory_order_acquire) && candidate->context.device == context.device && sameTarget(candidate->target, target) && candidate->Storable();
     });
 }
 
 void ResolveMultisampleTarget(const Context& context, const ColorTarget& source, StorageTexture& destination, VkImageView destinationView) {
-    std::lock_guard lock(targetsMutex());
+    TargetsLock lock;
     auto& target = acquire(context, source);
     target.Keep();
     const std::array<VkImageView, 2> views{target.View(source.format), destinationView};
@@ -1532,7 +1541,7 @@ void ResolveMultisampleTarget(const Context& context, const ColorTarget& source,
 
 bool MultisampledColorFillAbsorbs(std::uint64_t address, std::size_t bytes, std::uint32_t pattern) {
     if (bytes == 0) return false;
-    std::lock_guard lock(targetsMutex());
+    TargetsLock lock;
     bool absorbed = false;
     for (const auto& target : targets()) {
         VkClearColorValue clear{};
@@ -1543,7 +1552,7 @@ bool MultisampledColorFillAbsorbs(std::uint64_t address, std::size_t bytes, std:
 }
 
 void NoteColorMetadataFill(std::uint64_t address, std::size_t bytes, std::uint32_t pattern) {
-    std::lock_guard lock(targetsMutex());
+    TargetsLock lock;
     for (const auto& target : targets()) {
         if (!target->active->load(std::memory_order_acquire)) continue;
         target->colorFill.NoteFill(address, bytes, pattern);
@@ -1570,7 +1579,7 @@ void NoteColorMetadataFill(std::uint64_t address, std::size_t bytes, std::uint32
 }
 
 std::shared_ptr<Texture> MultisampleTargetFmaskTexture_nid_no_patch(const Context& context, const GuestTextureResource& resource, VkComponentMapping components) {
-    std::lock_guard lock(targetsMutex());
+    TargetsLock lock;
     discardRetiredTargets();
     std::shared_ptr<MultisampleTarget> owner;
     for (const auto& candidate : targets()) {
@@ -1584,7 +1593,7 @@ std::shared_ptr<Texture> MultisampleTargetFmaskTexture_nid_no_patch(const Contex
 }
 
 void ClearMultisampleTargets(VkDevice device) {
-    std::lock_guard lock(targetsMutex());
+    TargetsLock lock;
     std::erase_if(targets(), [&](const auto& target) { return target->context.device == device; });
     std::unique_lock guardLock(guardedMutex());
     const auto removed = std::erase_if(guarded(), [&](const auto& range) { return range.device == device; });
@@ -1608,6 +1617,10 @@ void GuardOneFragmentFmask(const Context& context, const ColorTarget& target) {
     anyGuarded().store(true, std::memory_order_release);
     lock.unlock();
     InstallResidentImageReadGuard_nid_no_patch();
+}
+
+bool HoldsMultisampleTargetsLock() {
+    return targetsMutexHeld;
 }
 
 std::uint64_t MultisampleTargetRangeGeneration() {
@@ -1737,7 +1750,7 @@ std::vector<std::pair<std::uint64_t, std::uint64_t>> HostOnlySampleRanges(std::u
 
 std::optional<MultisampleColorAlias> MultisampleColorTargetOver(std::uint64_t address, std::size_t bytes) {
     if (bytes == 0 || !anyGuarded().load(std::memory_order_acquire)) return std::nullopt;
-    std::lock_guard lock(targetsMutex());
+    TargetsLock lock;
     std::shared_lock guardLock(guardedMutex());
     for (const auto& range : guarded()) {
         if (address >= range.address + range.bytes || range.address >= address + bytes) continue;
@@ -1747,6 +1760,11 @@ std::optional<MultisampleColorAlias> MultisampleColorTargetOver(std::uint64_t ad
         return MultisampleColorAlias{range.address, range.bytes, VK_FORMAT_UNDEFINED, range.samples};
     }
     return std::nullopt;
+}
+
+void WithMultisampleTargetsLockForTest(const std::function<void()>& inside) {
+    TargetsLock lock;
+    inside();
 }
 
 }
