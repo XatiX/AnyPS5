@@ -1,0 +1,38 @@
+name: Linux run for 14310
+on:
+  pull_request:
+    branches: [main]
+  push:
+    branches: [ci/linux-14310]
+jobs:
+  linux:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+          persist-credentials: false
+      - name: Show the tested head
+        run: |
+          git log --oneline -3
+          git diff --stat HEAD~1 HEAD
+          gcc --version | head -1
+          uname -a
+      - run: sudo apt-get update && sudo apt-get install -y --no-install-recommends ninja-build libvulkan1 mesa-vulkan-drivers libpipewire-0.3-dev libpulse-dev libasound2-dev libxrandr-dev libwayland-dev libxkbcommon-dev libegl-dev libdecor-0-dev
+      - run: cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Release -DBUILD_TESTING=ON -DCMAKE_C_COMPILER=gcc -DCMAKE_CXX_COMPILER=g++
+      - name: Build the network test executables
+        run: |
+          pattern='guest_sce_net|guest_net|net_epoll|guest_udp|guest_socket|guest_tcp|guest_datagram'
+          targets=$(grep -rhoE 'add_test_executable\(([a-z0-9_]+)' core/libs --include=CMakeLists.txt --include='*.cmake' | sed 's/.*(//' | grep -E 'net|udp|socket|tcp|datagram' | sort -u)
+          echo "$targets"
+          cmake --build build --parallel --target $targets
+      - name: Run the network tests
+        run: ctest --test-dir build -R 'guest_sce_net|guest_net|net_epoll|guest_udp|guest_socket|guest_tcp|guest_datagram' --output-on-failure --timeout 120 -V 2>&1 | tee ctest.log | grep -E 'Test +#|tests passed|tests failed|Not Run'
+      - name: Run guest_sce_net_kernel_forwards alone
+        run: ctest --test-dir build -R '^guest_sce_net_kernel_forwards$' -V --output-on-failure --timeout 120
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: ctest-log
+          path: ctest.log
