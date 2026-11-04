@@ -2027,9 +2027,18 @@ std::shared_ptr<const RecompileResult> materializePreparedMemoized(SourceEntry& 
         counters.heldEntries.fetch_add(1, std::memory_order_relaxed);
         return shared;
     };
+    // Experiment (local): a large patched result is not kept under its exact hash. Its donor stays
+    // in the masked memo and serves the next one by another patch; keeping every patched copy
+    // (~0.5 MB with a large image table) churns the memo through evictions and trims.
+    // APS5_RESULT_MEMO_KEEP_PATCHED_KB: the size from which patched results are not kept (default 256, 0 keeps all).
+    static const std::uint64_t keepPatchedBytes = [] {
+        const char* value = std::getenv("APS5_RESULT_MEMO_KEEP_PATCHED_KB");
+        return (value != nullptr ? std::strtoull(value, nullptr, 10) : 256ull) << 10u;
+    }();
+    const bool keepExact = donor == nullptr || keepPatchedBytes == 0 || bytes < keepPatchedBytes;
     {
         std::lock_guard lock(source.mutex);
-        shared = insert(source.memo, index, hash, nullptr, true);
+        if (keepExact) shared = insert(source.memo, index, hash, nullptr, true);
         if (patch != nullptr && patch->valid) static_cast<void>(insert(source.maskedMemo, maskedIndex, maskedHash, patch, false));
     }
     if (const auto budget = resultMemoBudget(); budget != 0 && counters.heldBytes.load(std::memory_order_relaxed) > budget) trimResultMemo(budget);
