@@ -6,6 +6,7 @@
 #include "prx/libSceAgcDriver/Execution/include/Driver/Memory/WriteEvidence.hpp"
 #include "prx/libSceAgcDriver/Execution/include/GuestMemory.hpp"
 #include <cstdlib>
+#include <mutex>
 
 namespace AgcDriver::DriverDetail {
 
@@ -110,6 +111,55 @@ bool DrawKeySightings::SeenBefore(std::uint64_t key) {
     next[bucket] = static_cast<std::uint8_t>((next[bucket] + 1u) % Ways);
     if (filled[bucket] < Ways) ++filled[bucket];
     return false;
+}
+
+std::atomic<std::uint64_t>& Driver::drawCacheUseful() {
+    static std::atomic<std::uint64_t> useful{0};
+    return useful;
+}
+
+namespace {
+
+// Experiment (local): a title whose draw entries never pay off (AoM: ~1.5 MB entries evicted before
+// their draw repeats) pays the draw cache's key, lookup and insert (~0.4 ms) on every draw for
+// nothing. Counted per draw: after a window in which fewer than one draw in UsefulShare was served
+// by an entry, only every ProbeEvery-th draw uses entries; the probes keep measuring, scaled by
+// their share, and a window that pays off again ends the back-off. APS5_NO_DRAW_CACHE_BACKOFF=1
+// uses entries on every draw as before.
+struct EntryBackoff {
+    static constexpr std::uint64_t Window = 4096;
+    static constexpr std::uint64_t ProbeEvery = 16;
+    static constexpr std::uint64_t UsefulShare = 32;
+    std::uint64_t draws = 0;
+    std::uint64_t windowStart = 0;
+    std::uint64_t probes = 0;
+    std::uint64_t usefulAtWindow = 0;
+    bool backingOff = false;
+
+    bool use(std::uint64_t useful) {
+        ++draws;
+        if (draws - windowStart >= Window) {
+            const auto measured = backingOff ? probes : draws - windowStart;
+            backingOff = (useful - usefulAtWindow) * UsefulShare < measured;
+            usefulAtWindow = useful;
+            windowStart = draws;
+            probes = 0;
+        }
+        if (backingOff && draws % ProbeEvery != 0) return false;
+        ++probes;
+        return true;
+    }
+};
+
+}
+
+bool Driver::drawEntriesThisDraw() {
+    static const bool disabled = std::getenv("APS5_NO_DRAW_CACHE_BACKOFF") != nullptr;
+    if (disabled) return true;
+    static std::mutex mutex;
+    static EntryBackoff backoff;
+    std::lock_guard lock(mutex);
+    return backoff.use(drawCacheUseful().load(std::memory_order_relaxed));
 }
 
 bool Driver::admitDrawKey(std::uint64_t key, std::uint64_t shape) {
