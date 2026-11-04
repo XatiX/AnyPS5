@@ -351,6 +351,16 @@ public:
         bool audited = false;
     };
     bool Revalidate(std::span<const CompiledShader> shaders, ProofReport* report = nullptr);
+    // APS5_NO_PER_USE_REUSE=1: an object binding a per-use copy is never reused (as before).
+    static bool PerUseReuse();
+    // The lookup that made a per-use copy (Texture::RefreshedPerUse), repeated on every reuse.
+    struct PerUseLookup {
+        std::uint8_t kind = 0; // 0 none, 1 DepthSurfaceTexture, 2 MultisampleTargetTexture
+        std::array<std::uint32_t, 8> words{};
+        std::uint32_t wordCount = 0;
+        VkComponentMapping components{};
+        VkImageViewType viewType = VK_IMAGE_VIEW_TYPE_2D;
+    };
     static bool EpochProofs();
     bool Revalidate(const CompiledShader& shader, ProofReport* report = nullptr) { return Revalidate(std::span<const CompiledShader>(&shader, 1), report); }
     // The proof a recipe hit runs on its template (design_cpu_final M4): Revalidate by that name.
@@ -714,6 +724,21 @@ private:
     bool reusable = false;
     std::vector<DirectRegion> directRegions;
     std::vector<ValidatedSurface> validatedTextures;
+    std::vector<PerUseLookup> perUseLookups;
+    // Textures a remembered image table bound (local experiment): while that table (by serial) is
+    // still current by the build path's own test, a revalidation takes them as proved together.
+    struct TableCover {
+        ShaderRecompiler::ShaderStage stage = ShaderRecompiler::ShaderStage::Compute;
+        std::uint64_t serial = 0;
+        // Texture index and table element, in element order.
+        std::vector<std::pair<std::size_t, std::uint32_t>> entries;
+    };
+    std::vector<TableCover> tableCovers;
+    std::vector<bool> tableCovered;
+    bool coversProved = false;
+    bool coversCurrent(std::span<const CompiledShader> shaders);
+    bool refreshPerUse();
+    bool revalidateChecks(std::span<const CompiledShader> shaders, ProofReport* report);
     std::vector<ShaderRecompiler::RegisteredImageView> registeredImageViews;
     // The pending registry's serial at the last Revalidate that proved this object, taken before
     // its checks and kept only when unchanged after them (0: none): while it is still the serial,

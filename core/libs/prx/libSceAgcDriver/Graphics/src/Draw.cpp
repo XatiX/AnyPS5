@@ -2036,10 +2036,10 @@ ResolvedResources resolveDrawResources(const Context& context, const State& stat
     static const bool trimKey = std::getenv("APS5_NO_DRAW_KEY_TRIM") == nullptr;
     // Experiment (local): an image table's words go into the key whole, so a draw binding a large
     // table pays for building, hashing and comparing a key of that size on every draw.
-    // APS5_DRAW_CACHE_TABLE_WORDS (default 8192, 0 = no limit) leaves such draws out of the cache.
+    // APS5_DRAW_CACHE_TABLE_WORDS (default 0 = no limit; large tables now key compactly) leaves such draws out.
     static const std::size_t tableWordLimit = [] {
         const char* value = std::getenv("APS5_DRAW_CACHE_TABLE_WORDS");
-        return value != nullptr ? static_cast<std::size_t>(std::strtoull(value, nullptr, 10)) : std::size_t{8192};
+        return value != nullptr ? static_cast<std::size_t>(std::strtoull(value, nullptr, 10)) : std::size_t{0};
     }();
     const auto tableWords = [&] {
         std::size_t words = 0;

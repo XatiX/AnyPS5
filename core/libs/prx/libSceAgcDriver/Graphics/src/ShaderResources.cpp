@@ -515,6 +515,15 @@ void reportTextureCounters() {
 // then repeats the proof from write stamps on its next Revalidate. The lookups run inside one build
 // on one thread; records nobody takes (a build that threw, a resident target looked up outside a
 // build, a thread that never captures) are dropped by the next capture or by the bound below.
+using PerUseLookup = ShaderResources::PerUseLookup;
+
+PerUseLookup perUseLookup(std::uint8_t kind, const std::shared_ptr<Texture>& texture, std::span<const std::uint32_t> words, VkComponentMapping components, VkImageViewType viewType) {
+    if (texture == nullptr) return {};
+    PerUseLookup lookup{kind, {}, static_cast<std::uint32_t>(std::min<std::size_t>(words.size(), 8u)), components, viewType};
+    std::copy_n(words.begin(), lookup.wordCount, lookup.words.begin());
+    return lookup;
+}
+
 struct LookupRecord {
     const void* object;
     GuestTextureResource resource;
@@ -523,6 +532,9 @@ struct LookupRecord {
     std::uint64_t generation;
     const StorageTexture* source;
     bool depth = false;
+    // A copy the depth surface or multisample target remakes on every use (Texture::RefreshedPerUse):
+    // the lookup's arguments, so a reused object can repeat it (local experiment).
+    PerUseLookup perUse{};
 };
 
 thread_local std::vector<LookupRecord>* lookupLogSlot = nullptr;
@@ -851,11 +863,11 @@ std::shared_ptr<Texture> cachedTexture(const Context& context, std::span<const s
     if (resource.dimension == TextureDimension::k2DMsaa) {
         Require(!depthCompare, "native multisampled depth comparison sampling is not implemented");
         if (auto depth = DepthSurfaceTexture(context, words, resource, components, multisampleViewType)) {
-            logLookup({depth.get(), resource, 0, DccKeys::Uncompressed, 0, nullptr, true});
+            logLookup({depth.get(), resource, 0, DccKeys::Uncompressed, 0, nullptr, true, perUseLookup(1, depth, words, components, multisampleViewType)});
             return depth;
         }
         auto target = MultisampleTargetTexture(context, resource, components, multisampleViewType);
-        logLookup({target.get(), resource, 0, DccKeys::Uncompressed, 0, nullptr, true});
+        logLookup({target.get(), resource, 0, DccKeys::Uncompressed, 0, nullptr, true, perUseLookup(2, target, words, components, multisampleViewType)});
         return target;
     }
     if (resource.fmaskCmaskAddress != 0u) {
@@ -871,7 +883,7 @@ std::shared_ptr<Texture> cachedTexture(const Context& context, std::span<const s
     if (auto* recorder = Recorder::Active(); recorder != nullptr) recorder->BoundKeptBytes();
     Require(!layerRows || !DepthSurfaceAt(resource.baseAddress), "sampling a native depth surface as a 1D array past maxImageArrayLayers is not implemented");
     if (auto depth = layerRows ? nullptr : DepthSurfaceTexture(context, words, resource, components)) {
-        logLookup({depth.get(), resource, 0, DccKeys::Uncompressed, 0, nullptr, true});
+        logLookup({depth.get(), resource, 0, DccKeys::Uncompressed, 0, nullptr, true, perUseLookup(1, depth, words, components, VK_IMAGE_VIEW_TYPE_2D)});
         return depth;
     }
     const auto depthBitsWidth = words.size() >= 4 ? ShaderRecompiler::DepthBitsTextureWidth(words[1], words[3]) : 0u;
@@ -2053,6 +2065,7 @@ struct ReusedTable {
     std::vector<std::list<CachedTexture>::iterator> entries;
     std::uint64_t erasures = 0;
     bool entriesKnown = false;
+    std::uint64_t serial = 0;
 };
 
 constexpr std::size_t ReusedTableCount = 4;
@@ -2111,7 +2124,10 @@ bool CachedTableTextures(ReusedTable& table, std::vector<std::shared_ptr<Texture
     return true;
 }
 
-void RememberTable(ReusedTable&& table, const ShaderRecompiler::DescriptorBinding& binding) {
+std::uint64_t RememberTable(ReusedTable&& table, const ShaderRecompiler::DescriptorBinding& binding) {
+    static std::atomic<std::uint64_t> serials{0};
+    table.serial = serials.fetch_add(1, std::memory_order_relaxed) + 1;
+    const auto serial = table.serial;
     auto& tables = ReusedTables();
     std::erase_if(tables, [&](const ReusedTable& entry) { return SameTable(entry, table.device, binding); });
     table.words = binding.guestDescriptor;
@@ -2119,6 +2135,7 @@ void RememberTable(ReusedTable&& table, const ShaderRecompiler::DescriptorBindin
     table.depthCompare = binding.imageDepthCompare;
     tables.insert(tables.begin(), std::move(table));
     if (tables.size() > ReusedTableCount) tables.resize(ReusedTableCount);
+    return serial;
 }
 
 std::string HexText(std::uint64_t value) {
@@ -2839,7 +2856,12 @@ void ShaderResources::noteReusable() {
     directRegions.clear();
     const bool spaceReusable = !htileClear.has_value() && drawBuild && usesBda && bdaReadOnly && !SpaceReuseDisabled() && guestMemory.SpaceOnly() && !guestMemory.HasCopiedWrites() && multisampleSources.empty() && !(bda != nullptr && LoopGuardEnabled());
     if (!spaceReusable && (htileClear.has_value() || guestMemory.HasCopiedWrites() || HoldsLease() || usesBda || !multisampleSources.empty() || (bda != nullptr && LoopGuardEnabled()))) return;
-    if (std::any_of(textures.begin(), textures.end(), [](const std::shared_ptr<Texture>& texture) { return texture != nullptr && texture->RefreshedPerUse(); })) return;
+    // A per-use copy is remade by repeating its lookup on every reuse (refreshPerUse); one without
+    // a recorded lookup keeps the object from being reused, as before.
+    for (std::size_t i = 0; i < textures.size(); ++i) {
+        if (textures[i] == nullptr || !textures[i]->RefreshedPerUse()) continue;
+        if (!PerUseReuse() || i >= perUseLookups.size() || perUseLookups[i].kind == 0) return;
+    }
     if (TemplateDataRefresh() && std::any_of(allocations.begin(), allocations.end(), [](const Allocation& allocation) { return allocation.buffer != nullptr && !allocation.guest && allocation.role != ShaderRecompiler::DescriptorRole::ImageTableMap && allocation.size > MaxRefreshBytes; })) return;
     if (spaceReusable) {
         spaceReuse = true;
@@ -2904,6 +2926,57 @@ void ShaderResources::reportDescriptorCaches() const {
     AgcDriver::ProfilePrint_nid_no_patch("[descriptors] layouts %llu hits / %llu created, sets %llu from %llu pools and %llu dedicated pools, samplers %llu hits / %llu created\n", static_cast<unsigned long long>(descriptors.layoutHits), static_cast<unsigned long long>(descriptors.layoutMisses), static_cast<unsigned long long>(descriptors.sets), static_cast<unsigned long long>(descriptors.pools), static_cast<unsigned long long>(descriptors.dedicatedPools), static_cast<unsigned long long>(samplerHits), static_cast<unsigned long long>(samplerMisses));
 }
 
+// A large image table enters a content key as two 64-bit hashes of its per-element content (words,
+// samplers, shapes and flags) instead of that content (~12 words per element): the key of a draw
+// binding a 14k-entry table is built, hashed and compared on every draw (local experiment).
+// APS5_NO_COMPACT_TABLE_KEY=1 keys the content itself.
+constexpr std::size_t CompactTableKeyWords = 8192;
+
+bool CompactTableKeys() {
+    static const bool enabled = std::getenv("APS5_NO_COMPACT_TABLE_KEY") == nullptr;
+    return enabled;
+}
+
+// Four independent lanes (xxHash64's round) over raw memory, so the work is not one dependency chain.
+struct TableKeyHash {
+    static constexpr std::uint64_t P1 = 0x9e3779b185ebca87ull;
+    static constexpr std::uint64_t P2 = 0xc2b2ae3d27d4eb4full;
+    std::uint64_t lanes[4] = {P1 + P2, P2, 0, 0 - P1};
+    std::uint64_t total = 0;
+    static std::uint64_t round(std::uint64_t lane, std::uint64_t value) {
+        lane += value * P2;
+        lane = (lane << 31u) | (lane >> 33u);
+        return lane * P1;
+    }
+    void bytes(const void* data, std::size_t size) {
+        const auto* at = static_cast<const unsigned char*>(data);
+        std::size_t i = 0;
+        for (; i + 32 <= size; i += 32) {
+            std::uint64_t v[4];
+            std::memcpy(v, at + i, sizeof(v));
+            lanes[0] = round(lanes[0], v[0]);
+            lanes[1] = round(lanes[1], v[1]);
+            lanes[2] = round(lanes[2], v[2]);
+            lanes[3] = round(lanes[3], v[3]);
+        }
+        for (; i < size; ++i) lanes[i % 4] = round(lanes[i % 4], at[i] | (static_cast<std::uint64_t>(i) << 8u));
+        total += size;
+        add(size);
+    }
+    void add(std::uint64_t value) {
+        const auto lane = total++ % 4;
+        lanes[lane] = round(lanes[lane], value);
+    }
+    // The positions of the set bits (vector<bool> finds go a word at a time).
+    void bits(const std::vector<bool>& set) {
+        add(set.size());
+        for (auto it = std::find(set.begin(), set.end(), true); it != set.end(); it = std::find(it + 1, set.end(), true)) add(static_cast<std::uint64_t>(it - set.begin()));
+        add(~0ull);
+    }
+    std::uint64_t a() const { return round(lanes[0], lanes[1]) ^ round(lanes[2], lanes[3]); }
+    std::uint64_t b() const { return round(lanes[3] ^ total, lanes[0]) + round(lanes[1], lanes[2] ^ P1); }
+};
+
 template<typename TVisitor>
 void VisitContentKey(const CompiledShader& shader, bool dataWords, bool movableBuffers, const TVisitor& visit) {
     Require(shader.program != nullptr, "missing compiled shader");
@@ -2926,6 +2999,17 @@ void VisitContentKey(const CompiledShader& shader, bool dataWords, bool movableB
     };
     for (const auto& binding : program.bindings) {
         for (const auto word : {static_cast<std::uint32_t>(binding.kind), static_cast<std::uint32_t>(binding.role), binding.descriptorSet, binding.binding, binding.count, binding.readOnly ? 1u : 0u, binding.imageShape.has_value() ? static_cast<std::uint32_t>(*binding.imageShape) + 1u : 0u, static_cast<std::uint32_t>(binding.guestDescriptor.size())}) visit(word);
+        if (binding.role == ShaderRecompiler::DescriptorRole::ImageTable && binding.guestDescriptor.size() > CompactTableKeyWords && CompactTableKeys()) {
+            TableKeyHash hash;
+            hash.bytes(binding.guestDescriptor.data(), binding.guestDescriptor.size() * sizeof(std::uint32_t));
+            hash.bytes(binding.imageSamplers.data(), binding.imageSamplers.size() * sizeof(binding.imageSamplers[0]));
+            hash.bytes(binding.imageShapes.data(), binding.imageShapes.size() * sizeof(binding.imageShapes[0]));
+            for (const auto* set : {&binding.imageWritten, &binding.samplerDepthCompare, &binding.imageDepthCompare, &binding.imageAtomic, &binding.samplerUnnormalized, &binding.samplerIntegerBorder, &binding.samplerCoordinatesIgnored, &binding.imageUnnormalized, &binding.imageUnnormalizedBaseLevel, &binding.bufferWritten}) hash.bits(*set);
+            const auto first = hash.a();
+            const auto second = hash.b();
+            for (const auto word : {0xc0de7ab1u, static_cast<std::uint32_t>(first), static_cast<std::uint32_t>(first >> 32u), static_cast<std::uint32_t>(second), static_cast<std::uint32_t>(second >> 32u)}) visit(word);
+            continue;
+        }
         if (movableBuffers && binding.role == ShaderRecompiler::DescriptorRole::GuestBuffers && binding.guestDescriptor.size() == static_cast<std::size_t>(binding.count) * 4u) {
             for (std::uint32_t element = 0; element < binding.count; ++element) {
                 const auto* words = binding.guestDescriptor.data() + static_cast<std::size_t>(element) * 4u;
@@ -2974,6 +3058,7 @@ void ShaderResources::AppendContentKey(const CompiledShader& shader, bool dataWo
     };
     for (const auto& binding : shader.program->bindings) {
         addWords(20);
+        if (binding.role == ShaderRecompiler::DescriptorRole::ImageTable && binding.guestDescriptor.size() > CompactTableKeyWords && CompactTableKeys()) continue;
         addWords(binding.imageSamplers.size() * 2u);
         addWords(binding.imageShapes.size());
         if ((dataWords && !movableBuffers) || !DataRole(binding.role)) addWords(binding.guestDescriptor.size());
@@ -3369,6 +3454,10 @@ namespace {
 thread_local bool skipValidationCapture = false;
 }
 
+bool CapturingValidation() {
+    return !skipValidationCapture;
+}
+
 ShaderResources::ValidationCaptureSkip::ValidationCaptureSkip(bool skip) : previous(skipValidationCapture) {
     skipValidationCapture = skip;
 }
@@ -3380,6 +3469,9 @@ ShaderResources::ValidationCaptureSkip::~ValidationCaptureSkip() {
 void ShaderResources::captureValidation() {
     if (!keepsTemplateRecords() || skipValidationCapture) {
         validatedTextures.clear();
+        perUseLookups.clear();
+        tableCovers.clear();
+        tableCovered.clear();
         lookupLog().clear();
         return;
     }
@@ -3395,11 +3487,53 @@ void ShaderResources::captureValidation() {
     objects.clear();
     for (const auto& texture : textures) objects.push_back(texture.get());
     LastRecordIndices(logged, objects, indices);
+    // A later capture (the full walk's) keeps an earlier record or per-use lookup for a texture its
+    // lookups did not log again: an older generation can only fail a proof, never pass a stale one.
+    auto previous = std::move(validatedTextures);
+    auto previousPerUse = std::move(perUseLookups);
+    if (previous.size() != textures.size()) previous.clear();
+    if (previousPerUse.size() != textures.size()) previousPerUse.clear();
     validatedTextures.assign(textures.size(), {});
+    perUseLookups.assign(textures.size(), {});
     for (std::size_t i = 0; i < textures.size(); ++i) {
-        if (indices[i] == log.size()) continue;
+        if (indices[i] == log.size()) {
+            if (!previous.empty() && previous[i].valid) validatedTextures[i] = previous[i];
+            if (!previousPerUse.empty() && previousPerUse[i].kind != 0) perUseLookups[i] = previousPerUse[i];
+            continue;
+        }
         const auto& found = log[indices[i]];
         validatedTextures[i] = {found.resource, found.bytes, found.keys, found.generation, 0, found.source, found.depth, true};
+        perUseLookups[i] = found.perUse;
+    }
+    tableCovered.assign(textures.size(), false);
+    for (const auto& cover : tableCovers) {
+        // The record a lookup of each covered entry would have logged, from the table that bound it:
+        // its resource and the generation its query proves (queries follow the kept elements).
+        const ReusedTable* source = nullptr;
+        for (const auto& candidate : ReusedTables()) {
+            if (candidate.serial == cover.serial) source = &candidate;
+        }
+        std::vector<std::uint64_t> generations;
+        if (source != nullptr) {
+            generations.assign(source->elements.size(), 0);
+            std::size_t query = 0;
+            for (std::size_t element = 0; element < source->elements.size() && query < source->queries.size(); ++element) {
+                if (source->elements[element].rejected || source->elements[element].live) continue;
+                generations[element] = source->queries[query++].generation;
+            }
+        }
+        for (const auto& [index, element] : cover.entries) {
+            if (index >= textures.size()) continue;
+            if (!validatedTextures[index].valid) {
+                if (source != nullptr && element < source->elements.size() && generations[element] != 0) {
+                    const auto& entry = source->elements[element];
+                    validatedTextures[index] = {entry.resource, entry.guestBytes, DccKeys::Uncompressed, generations[element], 0, nullptr, false, true};
+                } else if (!previous.empty() && previous[index].valid) {
+                    validatedTextures[index] = previous[index];
+                }
+            }
+            tableCovered[index] = true;
+        }
     }
     lookupLog().clear();
     const auto trim = [](auto& scratch) {
@@ -3488,7 +3622,14 @@ bool ShaderResources::fastRevalidate(std::uint64_t serialBefore, std::span<const
     for (std::size_t i = 0; i < textures.size(); ++i) {
         auto& surface = validatedTextures[i];
         if (!surface.valid) return fail(FastFail::NoRecord);
+        if (coversProved && i < tableCovered.size() && tableCovered[i]) {
+            scannedKeys[i] = surface.keys;
+            surface.collected = surface.generation;
+            continue;
+        }
         if (surface.depth) {
+            // A per-use copy is proved by repeating its lookup after the checks (refreshPerUse).
+            if (i < perUseLookups.size() && perUseLookups[i].kind != 0) continue;
             if (!DepthSurfaceHolds(context, surface.resource, textures[i].get())) return fail(FastFail::Depth);
             continue;
         }
@@ -3830,7 +3971,77 @@ void noteEpochProof(bool reused, bool verified, bool failed) {
 }
 }
 
+bool TableCoverProofs() {
+    static const bool enabled = std::getenv("APS5_NO_TABLE_COVER_PROOFS") == nullptr;
+    return enabled;
+}
+
+bool ShaderResources::PerUseReuse() {
+    static const bool enabled = std::getenv("APS5_NO_PER_USE_REUSE") == nullptr;
+    return enabled;
+}
+
+// Repeats the lookup of every per-use copy the object binds, which remakes the copy from the
+// surface's current content (as the build's lookup did); the hit stands only while each lookup
+// still returns the object's texture.
+bool ShaderResources::refreshPerUse() {
+    for (std::size_t i = 0; i < perUseLookups.size() && i < textures.size(); ++i) {
+        const auto& lookup = perUseLookups[i];
+        if (lookup.kind == 0) continue;
+        const auto& surface = validatedTextures.at(i);
+        const auto words = std::span<const std::uint32_t>(lookup.words.data(), lookup.wordCount);
+        std::shared_ptr<Texture> again;
+        try {
+            again = lookup.kind == 1 ? DepthSurfaceTexture(context, words, surface.resource, lookup.components, lookup.viewType) : MultisampleTargetTexture(context, surface.resource, lookup.components, lookup.viewType);
+        } catch (const std::runtime_error&) {
+            return false;
+        }
+        if (again.get() != textures[i].get()) return false;
+    }
+    return true;
+}
+
+bool ShaderResources::coversCurrent(std::span<const CompiledShader> shaders) {
+    if (tableCovers.empty()) return false;
+    const auto state = CurrentTableState();
+    thread_local std::vector<std::shared_ptr<Texture>>* scratchSlot = nullptr;
+    auto& scratch = ShaderRecompiler::ThreadOwned(scratchSlot);
+    for (const auto& cover : tableCovers) {
+        const auto* binding = tableImages(shaders, cover.stage);
+        if (binding == nullptr) return false;
+        auto* table = FindReusedTable(context.device, *binding, state);
+        if (table == nullptr || table->serial != cover.serial || !TableCurrent(*table)) return false;
+        // The table's cache entries, as CachedTableTextures proves them: known and nothing erased
+        // since. Its touches run on every 16th proof only, to keep the entries recent.
+        bool known = false;
+        {
+            auto& cache = Textures();
+            std::lock_guard lock(cache.mutex);
+            known = table->entriesKnown && table->erasures == cache.erasures;
+        }
+        thread_local std::uint64_t proofs = 0;
+        if (!known || ++proofs % 16 == 0) {
+            scratch.clear();
+            const bool cached = CachedTableTextures(*table, scratch);
+            scratch.clear();
+            if (!cached) return false;
+        }
+    }
+    return true;
+}
+
 bool ShaderResources::Revalidate(std::span<const CompiledShader> shaders, ProofReport* report) {
+    coversProved = TableCoverProofs() && coversCurrent(shaders);
+    const bool ok = revalidateChecks(shaders, report);
+    coversProved = false;
+    if (!ok || perUseLookups.empty()) return ok;
+    if (refreshPerUse()) return true;
+    provedEpoch = 0;
+    if (report != nullptr) *report = {ProofPath::Full, ProofFailure::Other};
+    return false;
+}
+
+bool ShaderResources::revalidateChecks(std::span<const CompiledShader> shaders, ProofReport* report) {
     if (!registeredImageViewsCurrent(registeredImageViews)) {
         if (report != nullptr) *report = {ProofPath::Full, ProofFailure::Other};
         provedEpoch = 0;
@@ -3875,8 +4086,12 @@ bool ShaderResources::revalidateFull(std::span<const CompiledShader> shaders, Pr
         static_cast<void>(FlushDepthPlanes(region.begin, static_cast<std::size_t>(region.end - region.begin)));
         CompletePendingCpuWrites(context, region.begin, static_cast<std::size_t>(region.end - region.begin));
     }
+    // With no CPU writes pending at the start none appears for any range (nothing here records):
+    // one check instead of one per range (thousands for a large image table).
+    const bool pendingCpuWrites = AnyPendingCpuWrites(context);
     for (const auto& range : describedRanges) {
         if (!range.imageTable) RequireNoMultisampleColorTarget(range.address, static_cast<std::size_t>(range.bytes), "a cached image access");
+        if (!pendingCpuWrites) continue;
         CompletePendingCpuWrites(context, range.address, static_cast<std::size_t>(range.bytes));
         if (range.dccAddress != 0) CompletePendingCpuWrites(context, range.dccAddress, DccKeyBytes(range.bytes));
     }
@@ -5804,6 +6019,16 @@ void ShaderResources::resolveImageTables() {
                     }
                 }
             }
+            if (CapturingValidation()) {
+                TableCover cover{table.stage, reused->serial, {}};
+                cover.entries.reserve(binding.count);
+                for (std::uint32_t element = 0; element < binding.count; ++element) {
+                    const auto& entry = reused->elements[element];
+                    if (entry.rejected || entry.live || table.elementTextures[element] == std::numeric_limits<std::size_t>::max()) continue;
+                    cover.entries.emplace_back(table.elementTextures[element], element);
+                }
+                if (!cover.entries.empty()) tableCovers.push_back(std::move(cover));
+            }
             if (!replay) {
                 reused->imageSamplers = binding.imageSamplers;
                 reused->samplers = samplerKey;
@@ -5932,7 +6157,17 @@ void ShaderResources::resolveImageTables() {
                 fresh.imageSamplers = binding.imageSamplers;
                 fresh.samplers = std::move(samplerKey);
                 fresh.replayable = static_cast<std::uint64_t>(table.elementBase) + binding.count <= context.imageTableCapacity;
-                RememberTable(std::move(fresh), binding);
+                TableCover cover{table.stage, 0, {}};
+                if (CapturingValidation()) {
+                    cover.entries.reserve(binding.count);
+                    for (std::uint32_t element = 0; element < binding.count && element < fresh.elements.size(); ++element) {
+                        const auto& entry = fresh.elements[element];
+                        if (entry.rejected || entry.live || table.elementTextures[element] == std::numeric_limits<std::size_t>::max()) continue;
+                        cover.entries.emplace_back(table.elementTextures[element], element);
+                    }
+                }
+                cover.serial = RememberTable(std::move(fresh), binding);
+                if (!cover.entries.empty()) tableCovers.push_back(std::move(cover));
             }
         }
     }
