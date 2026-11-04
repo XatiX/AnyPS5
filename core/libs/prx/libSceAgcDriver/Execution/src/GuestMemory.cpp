@@ -2165,6 +2165,24 @@ bool UnchangedSinceAll(std::span<const UnchangedQuery> queries) {
     const auto lock = lockTracker(tracker);
     tracker.initialize();
     if (!tracker.watched) return false;
+#ifdef _WIN32
+    // One host-region check over the queries' bounding span stands for all of them when no host
+    // region meets that span (each per-query check is a call into the arena's region list).
+    std::uint64_t low = std::numeric_limits<std::uint64_t>::max();
+    std::uint64_t high = 0;
+    for (const auto& [address, bytes, generation] : queries) {
+        if (generation == 0 || bytes == 0 || bytes > std::numeric_limits<std::uint64_t>::max() - address) return false;
+        low = std::min(low, address);
+        high = std::max(high, address + bytes);
+    }
+    if (!queries.empty() && !GuestArena::GuestArenaHostRegionOverlaps_nid_postfix(static_cast<std::uintptr_t>(low), static_cast<std::size_t>(high - low))) {
+        for (const auto& [address, bytes, generation] : queries) {
+            if (!tracker.coverage.Covers(address, bytes)) return false;
+            if (!tracker.rangeUnchanged(address, bytes, generation)) return false;
+        }
+        return true;
+    }
+#endif
     for (const auto& [address, bytes, generation] : queries) {
         if (generation == 0 || bytes == 0 || !tracker.covers(address, bytes)) return false;
         if (!tracker.rangeUnchanged(address, bytes, generation)) return false;

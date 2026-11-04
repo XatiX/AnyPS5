@@ -3316,6 +3316,29 @@ bool ImportAuditAdmitted() {
 
 void LastRecordIndices(std::span<const void* const> logged, std::span<const void* const> objects, std::vector<std::size_t>& indices) {
     indices.assign(objects.size(), logged.size());
+    if (logged.empty() || objects.empty()) return;
+    if (logged.size() < objects.size()) {
+        // A draw reusing a large table looks up only a few textures: sort the log's last record per
+        // object instead of every object (same answer, the log's latest index per object).
+        thread_local std::vector<std::pair<const void*, std::size_t>>* lastSlot = nullptr;
+        auto& last = ShaderRecompiler::ThreadOwned(lastSlot);
+        last.clear();
+        for (std::size_t at = 0; at < logged.size(); ++at) last.emplace_back(logged[at], at);
+        std::sort(last.begin(), last.end(), [](const auto& left, const auto& right) { return std::less<const void*>{}(left.first, right.first) || (left.first == right.first && left.second < right.second); });
+        const auto byObject = [](const std::pair<const void*, std::size_t>& left, const void* right) { return std::less<const void*>{}(left.first, right); };
+        for (std::size_t i = 0; i < objects.size(); ++i) {
+            auto it = std::lower_bound(last.begin(), last.end(), objects[i], byObject);
+            if (it == last.end() || it->first != objects[i]) continue;
+            auto end = it;
+            while (end != last.end() && end->first == objects[i]) ++end;
+            indices[i] = std::prev(end)->second;
+        }
+        if (last.capacity() > LookupLogBound + LookupLogBound / 2) {
+            last.clear();
+            last.shrink_to_fit();
+        }
+        return;
+    }
     thread_local std::vector<std::pair<const void*, std::size_t>>* wantedSlot = nullptr;
     auto& wanted = ShaderRecompiler::ThreadOwned(wantedSlot);
     wanted.clear();
@@ -5738,6 +5761,10 @@ void ShaderResources::resolveImageTables() {
             const bool replay = TableReplay() && reused->replayable && reused->imageSamplers == binding.imageSamplers && reused->samplers == samplerKey;
             if (!replay) reused->bound.assign(binding.count, {});
             auto next = cached.begin();
+            // Nothing in the table's loop records work, so a table with no pending CPU writes at
+            // its start has none for any entry: one check instead of one per entry (each reads the
+            // recorder's thread state and copies the draw writers' list).
+            const bool pendingCpuWrites = AnyPendingCpuWrites(context);
             for (std::uint32_t element = 0; element < binding.count; ++element) {
                 const auto words = std::span<const std::uint32_t>(binding.guestDescriptor).subspan(static_cast<std::size_t>(element) * 8u, 8u);
                 const auto& entry = reused->elements[element];
@@ -5750,7 +5777,7 @@ void ShaderResources::resolveImageTables() {
                     auto message = resolveLive(element, words);
                     if (!replay) reused->bound[element] = std::move(message);
                 } else {
-                    CompletePendingCpuWrites(context, entry.resource.baseAddress, static_cast<std::size_t>(entry.guestBytes));
+                    if (pendingCpuWrites) CompletePendingCpuWrites(context, entry.resource.baseAddress, static_cast<std::size_t>(entry.guestBytes));
                     if (!replay) {
                         reused->bound[element] = bind(element, words, std::move(*next++), entry.resource, entry.guestBytes, entry.firstLayer);
                     } else if (!reused->bound[element].empty()) {
