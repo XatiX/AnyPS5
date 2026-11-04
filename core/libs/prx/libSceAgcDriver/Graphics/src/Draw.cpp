@@ -2121,6 +2121,7 @@ ResolvedResources resolveDrawResources(const Context& context, const State& stat
     }
     timer.phase(PhaseLookup);
     if (resolved.resources == nullptr) {
+        const ShaderResources::ValidationCaptureSkip skipValidation(!candidate);
         resolved.resources = std::make_shared<ShaderResources>(context, shaders, state.color, static_cast<std::uint32_t>(state.colors.size()), draw.indexAddress, static_cast<std::size_t>(indexBytes), snapshots, recordable && drawStagingEnabled());
         resolved.built = &resolved.resources->Timing();
         outcome.addressBased = resolved.resources->HoldsLease();

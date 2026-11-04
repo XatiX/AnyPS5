@@ -3365,8 +3365,20 @@ bool ShaderResources::keepsTemplateRecords() const {
 
 // Turns the lookups' records into this object's per-texture validation records (see
 // ValidatedSurface); the last record of an object is the freshest.
+namespace {
+thread_local bool skipValidationCapture = false;
+}
+
+ShaderResources::ValidationCaptureSkip::ValidationCaptureSkip(bool skip) : previous(skipValidationCapture) {
+    skipValidationCapture = skip;
+}
+
+ShaderResources::ValidationCaptureSkip::~ValidationCaptureSkip() {
+    skipValidationCapture = previous;
+}
+
 void ShaderResources::captureValidation() {
-    if (!keepsTemplateRecords()) {
+    if (!keepsTemplateRecords() || skipValidationCapture) {
         validatedTextures.clear();
         lookupLog().clear();
         return;
@@ -5651,6 +5663,10 @@ void ShaderResources::resolveImageTables() {
         const auto faults = table.map[ShaderRecompiler::ImageTableAbi::HeaderElementFaults];
         const auto stageSamplers = std::span<const std::shared_ptr<Sampler>>(samplers).subspan(table.firstSampler, table.samplerCount);
         table.elementTextures.assign(binding.count, std::numeric_limits<std::size_t>::max());
+        // place() appends one texture and range per bound entry: room for the whole table up front.
+        textures.reserve(textures.size() + binding.count);
+        textureFirstLayer.reserve(textureFirstLayer.size() + binding.count);
+        describedRanges.reserve(describedRanges.size() + binding.count);
         const auto capacityMessage = [&] { return "the image table exceeds the device's capacity of " + std::to_string(context.imageTableCapacity) + " images"; };
         std::vector<std::uint32_t> samplerKey;
         for (std::uint32_t sampler = 0; sampler < table.samplerCount; ++sampler) {

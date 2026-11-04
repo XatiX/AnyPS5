@@ -325,6 +325,15 @@ public:
     void KeepStorageImageBytes(Recorder& recorder) const;
     const std::vector<std::uint64_t>& MultisampleSources() const { return multisampleSources; }
     static bool NeverReusable(std::span<const CompiledShader> shaders);
+    // While one is alive on this thread, builds keep no per-texture validation records: for an
+    // object that never enters the resource cache, so is never revalidated (local experiment).
+    struct ValidationCaptureSkip {
+        explicit ValidationCaptureSkip(bool skip);
+        ~ValidationCaptureSkip();
+        ValidationCaptureSkip(const ValidationCaptureSkip&) = delete;
+        ValidationCaptureSkip& operator=(const ValidationCaptureSkip&) = delete;
+        bool previous;
+    };
     static std::uint64_t DepthGuardRefusals();
     const std::vector<std::shared_ptr<Texture>>& SampledTextures() const { return textures; }
     static std::size_t LookupLogCapacity();
