@@ -4635,6 +4635,7 @@ void Recorder::finish(std::unique_ptr<Batch> batch, bool wait, int source, bool 
         Recorder& recorder;
         const Batch* batch;
         ~Finishing() {
+            if (GuestMemory::WorkerHoldsKeepProofs()) GuestMemory::BreakProofs();
             auto& list = recorder.finishing;
             list.erase(std::remove(list.begin(), list.end(), batch), list.end());
             // The batch's completion labels have landed, or never will (fence failure below).
@@ -4727,6 +4728,9 @@ void Recorder::finish(std::unique_ptr<Batch> batch, bool wait, int source, bool 
     // Completions store GPU results to guest memory; a failing one is reported, the rest still run.
     // Timed (APS5_PROFILE_DRAW) with the release of the kept objects: both run under whichever hold
     // reaped or synced the batch. Inside them the flush hook makes no pending-write wait (SyncThrough).
+    // The batch's GPU writes have landed: with worker holds keeping proofs, one made before this
+    // point may no longer hold.
+    if (GuestMemory::WorkerHoldsKeepProofs()) GuestMemory::BreakProofs();
     const bool profile = DrawProfiled();
     const auto completionStart = profile ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
     {

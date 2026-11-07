@@ -118,6 +118,10 @@ void AdoptLatestCollectEpoch();
 std::uint64_t ProofSerial();
 void BreakProofs();
 void MarkProofThread();
+// APS5_WORKER_HOLDS_KEEP_PROOFS (with APS5_DRAW_PIPELINE): a queue worker's GpuMutex holds keep
+// proofs. Its own stores break them where they are made (Write, StoreOwnBytes, WriteChanged), and a
+// retired recorder batch breaks them once its GPU writes have landed (Recorder::finish).
+bool WorkerHoldsKeepProofs();
 std::uint64_t CollectEpoch();
 std::uint64_t CollectEpochBumps();
 std::uint64_t ThreadCollectEpoch();

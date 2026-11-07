@@ -1935,6 +1935,11 @@ void BreakProofs() {
     proofSerial.fetch_add(1, std::memory_order_acq_rel);
 }
 
+bool WorkerHoldsKeepProofs() {
+    static const bool enabled = std::getenv("APS5_WORKER_HOLDS_KEEP_PROOFS") != nullptr;
+    return enabled;
+}
+
 void MarkProofThread() {
     proofThread = true;
 }
@@ -2651,7 +2656,9 @@ void GpuMutexType::acquired() {
     owner.store(CurrentThreadToken(), std::memory_order_relaxed);
     if (++depth == 1) {
         gpuHoldSerial.fetch_add(1, std::memory_order_relaxed);
-        if (!proofThread) BreakProofs();
+        // A queue worker holds a collect epoch; a thread that never bumps one (a title thread in a
+        // hook, the presenter) breaks proofs on every hold.
+        if (!proofThread && !(WorkerHoldsKeepProofs() && HostThreadSlot<std::uint64_t, CollectEpochSlot>::Get() != 0)) BreakProofs();
     }
 }
 

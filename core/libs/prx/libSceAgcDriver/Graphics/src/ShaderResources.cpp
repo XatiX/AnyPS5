@@ -2066,6 +2066,10 @@ struct ReusedTable {
     std::uint64_t erasures = 0;
     bool entriesKnown = false;
     std::uint64_t serial = 0;
+    // The collect epoch and proof serial under which `queries` last held (epoch proofs, see
+    // revalidateChecks: within one epoch the block stamps move only when proofs are broken).
+    std::uint64_t provedEpoch = 0;
+    std::uint64_t provedProof = 0;
 };
 
 constexpr std::size_t ReusedTableCount = 4;
@@ -4089,6 +4093,15 @@ bool PartialCovers() {
     return enabled;
 }
 
+namespace {
+void noteTableEpochProof(bool failed) {
+    static std::atomic<std::uint64_t> checks{0}, failures{0};
+    const auto count = checks.fetch_add(1, std::memory_order_relaxed) + 1u;
+    if (failed) failures.fetch_add(1, std::memory_order_relaxed);
+    if ((count & (count - 1u)) == 0u || failed) std::fprintf(stderr, "[epoch-proofs] image table proofs: %llu reused ones checked, %llu failed\n", static_cast<unsigned long long>(count), static_cast<unsigned long long>(failures.load(std::memory_order_relaxed)));
+}
+}
+
 bool ShaderResources::coversCurrent(std::span<const CompiledShader> shaders) {
     coverExcluded.clear();
     if (tableCovers.empty()) return false;
@@ -4116,7 +4129,20 @@ bool ShaderResources::coversCurrent(std::span<const CompiledShader> shaders) {
                 table->pendingSerial = serial;
             }
         }
-        if (!GuestMemory::UnchangedSinceAll(table->queries)) return false;
+        const auto proof = GuestMemory::ProofSerial();
+        const bool reuse = EpochProofs() && state.epoch != 0 && table->provedEpoch == state.epoch && table->provedProof == proof;
+        static const bool verify = std::getenv("APS5_VERIFY_DRAW_PIPELINE") != nullptr;
+        thread_local std::uint64_t reuses = 0;
+        if (!reuse || (verify && ++reuses % 64u == 0u)) {
+            table->provedEpoch = 0;
+            const bool unchanged = GuestMemory::UnchangedSinceAll(table->queries);
+            if (reuse) noteTableEpochProof(!unchanged);
+            if (!unchanged) return false;
+            if (EpochProofs() && GuestMemory::ProofSerial() == proof) {
+                table->provedEpoch = state.epoch;
+                table->provedProof = proof;
+            }
+        }
         // The table's cache entries, as CachedTableTextures proves them: known and nothing erased
         // since. Its touches run on every 16th proof only, to keep the entries recent.
         bool known = false;
