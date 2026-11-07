@@ -114,6 +114,178 @@ public:
         m_info.bdaWrites = false;
     }
 
+    // A waterfall loop over a per-lane table key: v_readfirstlane picks one lane's key k, EXEC is
+    // narrowed to the lanes whose key equals k, the T# is loaded from the table at k and the image
+    // operation runs, until no lane is left. Where every use of the first-lane value is that
+    // compare or the address of descriptor loads feeding image operations that run only in lanes
+    // where it equals the lane's own key, each lane's key replaces it: every lane loads its own T#
+    // (a per-lane table key) and the loop ends after one pass.
+    static bool IsU32Constant(const IrValue* value, std::uint32_t expected) {
+        return value != nullptr && value->HasImmediate() && value->Type() == IrType::U32 && value->ImmediateU32() == expected;
+    }
+
+    static IrValue* BallotWordCondition(IrValue* word, std::uint32_t index, std::uint32_t depth = 0) {
+        if (word == nullptr || depth > 8u) return nullptr;
+        if (word->Opcode() == IrOpcode::CompositeExtractU32x4 && word->ArgumentCount() == 2u && IsU32Constant(word->Argument(1), index)) {
+            IrValue* ballot = word->Argument(0);
+            if (ballot->Opcode() == IrOpcode::Ballot && ballot->ArgumentCount() == 1u) return ballot->Argument(0);
+            return nullptr;
+        }
+        if (word->Opcode() == IrOpcode::BitwiseAnd32 && word->ArgumentCount() == 2u) {
+            if (IrValue* condition = BallotWordCondition(word->Argument(0), index, depth + 1u)) return condition;
+            return BallotWordCondition(word->Argument(1), index, depth + 1u);
+        }
+        return nullptr;
+    }
+
+    // The condition C of a value that is this lane's bit of Ballot(C), ANDed with other masks:
+    // INotEqual32(BitwiseAnd32(ShiftRightLogical32(word, shift), 1), 0), where the word is the low
+    // ballot word for lanes below 32 and the high one above, and the shift is LaneId & 31 (or the
+    // low word shifted by LaneId).
+    static IrValue* LaneBallotCondition(IrValue* predicate) {
+        if (predicate == nullptr || predicate->Opcode() != IrOpcode::INotEqual32 || predicate->ArgumentCount() != 2u || !IsU32Constant(predicate->Argument(1), 0u)) return nullptr;
+        IrValue* bit = predicate->Argument(0);
+        if (bit->Opcode() != IrOpcode::BitwiseAnd32 || bit->ArgumentCount() != 2u) return nullptr;
+        IrValue* shifted = IsU32Constant(bit->Argument(1), 1u) ? bit->Argument(0) : IsU32Constant(bit->Argument(0), 1u) ? bit->Argument(1) : nullptr;
+        if (shifted == nullptr || shifted->Opcode() != IrOpcode::ShiftRightLogical32 || shifted->ArgumentCount() != 2u) return nullptr;
+        IrValue* word = shifted->Argument(0);
+        IrValue* shift = shifted->Argument(1);
+        const auto isLaneId = [](const IrValue* value) { return value->Opcode() == IrOpcode::LaneId; };
+        if (isLaneId(shift)) return BallotWordCondition(word, 0u);
+        if (shift->Opcode() != IrOpcode::BitwiseAnd32 || shift->ArgumentCount() != 2u) return nullptr;
+        const bool masked = (isLaneId(shift->Argument(0)) && IsU32Constant(shift->Argument(1), 31u)) || (isLaneId(shift->Argument(1)) && IsU32Constant(shift->Argument(0), 31u));
+        if (!masked || word->Opcode() != IrOpcode::SelectU32 || word->ArgumentCount() != 3u) return nullptr;
+        IrValue* low = word->Argument(0);
+        if (low->Opcode() != IrOpcode::ULessThan32 || low->ArgumentCount() != 2u || !isLaneId(low->Argument(0)) || !IsU32Constant(low->Argument(1), 32u)) return nullptr;
+        IrValue* lowCondition = BallotWordCondition(word->Argument(1), 0u);
+        IrValue* highCondition = BallotWordCondition(word->Argument(2), 1u);
+        return lowCondition != nullptr && lowCondition == highCondition ? lowCondition : nullptr;
+    }
+
+    static bool ImpliesFirstLaneEqual(IrValue* condition, const IrValue* first, const IrValue* lane, std::uint32_t depth = 0) {
+        if (condition == nullptr || depth > 8u) return false;
+        if (condition->Opcode() == IrOpcode::IEqual32 && condition->ArgumentCount() == 2u) {
+            return (condition->Argument(0) == first && condition->Argument(1) == lane) || (condition->Argument(0) == lane && condition->Argument(1) == first);
+        }
+        if (condition->Opcode() == IrOpcode::LogicalAnd && condition->ArgumentCount() == 2u) {
+            return ImpliesFirstLaneEqual(condition->Argument(0), first, lane, depth + 1u) || ImpliesFirstLaneEqual(condition->Argument(1), first, lane, depth + 1u);
+        }
+        if (IrValue* ballot = LaneBallotCondition(condition)) return ImpliesFirstLaneEqual(ballot, first, lane, depth + 1u);
+        return false;
+    }
+
+    static bool CrossLaneOpcode(IrOpcode opcode) {
+        switch (opcode) {
+            case IrOpcode::ReadLane:
+            case IrOpcode::WriteLane:
+            case IrOpcode::DppMoveU32:
+            case IrOpcode::DppUpdateU32:
+            case IrOpcode::Permlane16U32:
+            case IrOpcode::SwizzleU32:
+                return true;
+            default:
+                return false;
+        }
+    }
+
+    static bool FirstLaneKeyFold() {
+        static const bool enabled = std::getenv("APS5_NO_FIRST_LANE_KEY_FOLD") == nullptr;
+        return enabled;
+    }
+
+    // Whether `value` is built from `first` by shifts, multiplications and additions of constants
+    // only, every step used once (by the next step or a descriptor load).
+    static bool KeyChainOf(IrValue* value, const IrValue* first, std::vector<IrValue*>& chain, std::uint32_t depth = 0) {
+        if (value == first) return true;
+        if (depth > 6u || value->IsPhi() || value->ArgumentCount() != 2u) return false;
+        const auto op = value->Opcode();
+        if (op != IrOpcode::ShiftLeftLogical32 && op != IrOpcode::IAdd32 && op != IrOpcode::IMul32) return false;
+        const bool constantRight = value->Argument(1)->HasImmediate();
+        const bool constantLeft = value->Argument(0)->HasImmediate() && op != IrOpcode::ShiftLeftLogical32;
+        if (!constantRight && !constantLeft) return false;
+        chain.push_back(value);
+        return KeyChainOf(constantRight ? value->Argument(0) : value->Argument(1), first, chain, depth + 1u);
+    }
+
+    void FoldFirstLaneTableKeys() {
+        if (!FirstLaneKeyFold()) return;
+        std::vector<IrValue*> firsts;
+        for (auto& block : m_program.Blocks()) {
+            for (IrValue* inst : block->Instructions()) {
+                if (inst->Opcode() == IrOpcode::ReadFirstLane && inst->ArgumentCount() == 2u && inst->Type() == IrType::U32) firsts.push_back(inst);
+            }
+        }
+        for (IrValue* first : firsts) {
+            IrValue* lane = first->Argument(0);
+            std::vector<IrValue*> compares;
+            std::vector<IrValue*> loads;
+            std::vector<IrValue*> images;
+            bool foldable = true;
+            // Every use of the first-lane value: the loop's compare, or a key chain whose only
+            // users are LoadAddressU32 offsets of a GetImageResource used by one image operation.
+            std::vector<IrValue*> pending{first};
+            std::vector<IrValue*> chainNodes;
+            while (!pending.empty() && foldable) {
+                IrValue* node = pending.back();
+                pending.pop_back();
+                for (const auto& use : node->OperandUses()) {
+                    IrValue* user = use.user;
+                    if (node == first && user->Opcode() == IrOpcode::IEqual32 && user->ArgumentCount() == 2u && (user->Argument(0) == lane || user->Argument(1) == lane)) {
+                        compares.push_back(user);
+                        continue;
+                    }
+                    if (user->Opcode() == IrOpcode::LoadAddressU32 && use.operand == 1u) {
+                        loads.push_back(user);
+                        continue;
+                    }
+                    std::vector<IrValue*> chain;
+                    if (KeyChainOf(user, first, chain) && !chain.empty() && chain.front() == user) {
+                        chainNodes.push_back(user);
+                        pending.push_back(user);
+                        continue;
+                    }
+                    foldable = false;
+                    break;
+                }
+            }
+            if (!foldable || loads.empty() || compares.empty()) continue;
+            for (IrValue* load : loads) {
+                if (load->UseCount() != 1u) { foldable = false; break; }
+                IrValue* descriptor = nullptr;
+                for (const auto& use : load->OperandUses()) descriptor = use.user;
+                if (descriptor == nullptr || descriptor->Opcode() != IrOpcode::GetImageResource || descriptor->UseCount() != 1u) { foldable = false; break; }
+                IrValue* image = nullptr;
+                for (const auto& use : descriptor->OperandUses()) image = use.user;
+                if (image == nullptr || ImageOpcodeInfoOf(image->Opcode()).access == ImageAccess::None || image->ArgumentCount() == 0u) { foldable = false; break; }
+                IrValue* exec = image->Argument(image->ArgumentCount() - 1u);
+                if (exec->Type() != IrType::Bool || !ImpliesFirstLaneEqual(exec, first, lane)) { foldable = false; break; }
+                if (std::find(images.begin(), images.end(), image) == images.end()) images.push_back(image);
+            }
+            if (!foldable) continue;
+            for (IrValue* image : images) {
+                for (IrValue* inst : image->Parent()->Instructions()) {
+                    if (CrossLaneOpcode(inst->Opcode()) || (inst->Opcode() == IrOpcode::ReadFirstLane && inst != first)) { foldable = false; break; }
+                }
+                if (!foldable) break;
+            }
+            if (!foldable) continue;
+            for (IrValue* compare : compares) {
+                for (std::size_t argument = 0; argument < compare->ArgumentCount(); ++argument) {
+                    if (compare->Argument(argument) == first) compare->ReplaceArgument(argument, lane);
+                }
+            }
+            for (IrValue* node : chainNodes) {
+                for (std::size_t argument = 0; argument < node->ArgumentCount(); ++argument) {
+                    if (node->Argument(argument) == first) node->ReplaceArgument(argument, lane);
+                }
+            }
+            for (IrValue* load : loads) {
+                if (load->Argument(1) == first) load->ReplaceArgument(1, lane);
+            }
+            ++m_firstLaneKeysFolded;
+        }
+    }
+
     void Run() {
         if (m_program.Resources().resourceTrackingComplete) {
             fail("resources already tracked");
@@ -121,6 +293,7 @@ public:
         if (!m_program.Resources().srtPlanComplete) {
             fail("SRT plan is not ready");
         }
+        FoldFirstLaneTableKeys();
         SplitDescriptorPhis();
         if (m_foldedWeb) {
             DeadCodeEliminator{}.Eliminate(m_program);
@@ -2558,6 +2731,7 @@ private:
     std::vector<EdgeSelectorEntry> m_edgeSelectors;
     std::unordered_map<const IrValue*, std::string> m_splitFailures;
     bool m_foldedWeb = false;
+    std::uint32_t m_firstLaneKeysFolded = 0;
 };
 
 }
