@@ -2854,7 +2854,7 @@ void ShaderResources::noteReusable() {
     importsReconcilable = false;
     spaceReuse = false;
     directRegions.clear();
-    const bool spaceReusable = !htileClear.has_value() && drawBuild && usesBda && bdaReadOnly && !SpaceReuseDisabled() && guestMemory.SpaceOnly() && !guestMemory.HasCopiedWrites() && multisampleSources.empty() && !(bda != nullptr && LoopGuardEnabled());
+    const bool spaceReusable = spaceReuseCandidate();
     if (!spaceReusable && (htileClear.has_value() || guestMemory.HasCopiedWrites() || HoldsLease() || usesBda || !multisampleSources.empty() || (bda != nullptr && LoopGuardEnabled()))) return;
     // A per-use copy is remade by repeating its lookup on every reuse (refreshPerUse); one without
     // a recorded lookup keeps the object from being reused, as before.
@@ -3443,9 +3443,13 @@ void LastRecordIndices(std::span<const void* const> logged, std::span<const void
     }
 }
 
+bool ShaderResources::spaceReuseCandidate() const {
+    return !htileClear.has_value() && drawBuild && usesBda && bdaReadOnly && !SpaceReuseDisabled() && guestMemory.SpaceOnly() && !guestMemory.HasCopiedWrites() && multisampleSources.empty() && !(bda != nullptr && LoopGuardEnabled());
+}
+
 bool ShaderResources::keepsTemplateRecords() const {
     static const bool always = std::getenv("APS5_KEEP_TEMPLATE_RECORDS") != nullptr;
-    return always || !(usesBda || (usesFaultBuffer && LoopGuardEnabled()));
+    return always || spaceReuseCandidate() || !(usesBda || (usesFaultBuffer && LoopGuardEnabled()));
 }
 
 // Turns the lookups' records into this object's per-texture validation records (see
