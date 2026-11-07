@@ -750,6 +750,13 @@ void ShaderMemory::spillTouching(std::uint64_t begin, std::uint64_t end) {
     }
 }
 
+namespace {
+bool SupplyOverFetchedPages() {
+    static const bool enabled = std::getenv("APS5_NO_SUPPLY_OVER_FETCHED_PAGES") == nullptr;
+    return enabled;
+}
+}
+
 bool ShaderMemory::supplyWords(void* context, const std::shared_ptr<const ShaderRecompiler::SrtGuestWords>& words) {
     auto& self = *static_cast<ShaderMemory*>(context);
     if (words == nullptr || words->runs.empty()) return false;
@@ -778,7 +785,33 @@ bool ShaderMemory::supplyWords(void* context, const std::shared_ptr<const Shader
     const auto fetched = self.pageAtOrAfter(begin & ~static_cast<std::uint64_t>(PageBytes - 1));
     const bool paged = fetched != self.pages.size() && self.pages[fetched].first < end;
     const bool overlapping = std::any_of(self.supplied.begin(), self.supplied.end(), [&](const Supplied& entry) { return entry.begin < end && begin < entry.end && RunsOverlap(entry.words->runs, words->runs); });
-    if (paged || overlapping) {
+    // Pages this capture fetched inside the block (a large image table read in part before its
+    // remembered words are supplied) hold the same guest words when no word there was read over a
+    // pending GPU write and every word known there equals the block's. Their marks inside the block
+    // then move to the block, which stays shared instead of being copied page by page.
+    const auto forEachFetched = [&](auto&& visit) {
+        std::size_t at = 0;
+        for (const auto& [address, count] : words->runs) {
+            const auto runEnd = address + static_cast<std::uint64_t>(count) * sizeof(std::uint32_t);
+            for (auto index = self.pageAtOrAfter(address & ~static_cast<std::uint64_t>(PageBytes - 1)); index < self.pages.size() && self.pages[index].first < runEnd; ++index) {
+                const auto base = self.pages[index].first;
+                const auto first = static_cast<std::size_t>((std::max(base, address) - base) / sizeof(std::uint32_t));
+                const auto past = static_cast<std::size_t>((std::min<std::uint64_t>(base + PageBytes, runEnd) - base) / sizeof(std::uint32_t));
+                const auto offset = at + static_cast<std::size_t>((base + first * sizeof(std::uint32_t) - address) / sizeof(std::uint32_t));
+                if (!visit(*self.pages[index].second, first, past, words->words.data() + offset)) return false;
+            }
+            at += count;
+        }
+        return true;
+    };
+    const bool adopt = paged && !overlapping && SupplyOverFetchedPages() && forEachFetched([](const Page& page, std::size_t first, std::size_t past, const std::uint32_t* values) {
+        if (page.wordwise) return false;
+        for (std::size_t word = first; word < past; ++word) {
+            if (page.valid.Test(word) && page.words[word] != values[word - first]) return false;
+        }
+        return true;
+    });
+    if ((paged && !adopt) || overlapping) {
         for (std::size_t index = self.supplied.size(); index-- > 0;) {
             const auto& entry = self.supplied[index];
             if (entry.begin < end && begin < entry.end && RunsOverlap(entry.words->runs, words->runs)) self.spill(index);
@@ -806,6 +839,15 @@ bool ShaderMemory::supplyWords(void* context, const std::shared_ptr<const Shader
             past = std::max(past, to);
         }
         if (!GuestMemory::Accessible(reinterpret_cast<const void*>(first), static_cast<std::size_t>(past - first))) return false;
+    }
+    if (adopt) {
+        static_cast<void>(forEachFetched([](Page& page, std::size_t first, std::size_t past, const std::uint32_t*) {
+            for (std::size_t word = first; word < past; ++word) {
+                page.read.Clear(word);
+                page.recent.Clear(word);
+            }
+            return true;
+        }));
     }
     self.supplied.push_back({words, begin, end, true});
     totals.suppliedShared += total;
