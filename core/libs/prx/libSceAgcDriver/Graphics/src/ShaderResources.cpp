@@ -3875,6 +3875,11 @@ bool ShaderResources::fastRevalidateEach() {
     return true;
 }
 
+bool SnapshotOwnRefresh() {
+    static const bool enabled = std::getenv("APS5_NO_SNAPSHOT_T1") == nullptr;
+    return enabled;
+}
+
 ShaderResources::OwnRefreshFallback ShaderResources::refreshOwnObjects(std::span<const CompiledShader> shaders, std::span<PendingOverlap> overlapping) {
     const auto listed = [&](std::size_t element, bool storage) {
         return std::find_if(overlapping.begin(), overlapping.end(), [&](const PendingOverlap& overlap) { return overlap.element == element && overlap.storage == storage; });
@@ -3884,9 +3889,21 @@ ShaderResources::OwnRefreshFallback ShaderResources::refreshOwnObjects(std::span
     // view stays the lookup's answer only when that image is its own source. `sourceEligible` is
     // recorded whichever branch answers: a later refresh of this call may flush the source, and
     // the re-run then judges the surface by the other branch.
-    const auto refreshView = [&](std::size_t i, PendingOverlap& overlap, bool depthCompare) {
+    const auto refreshView = [&](std::size_t i, PendingOverlap& overlap, bool depthCompare, const std::function<std::shared_ptr<Texture>()>& lookup) {
         const auto& surface = validatedTextures[i];
         const auto& source = textures[i]->SharedStorageSource();
+        if (source == nullptr && surface.source == nullptr && SnapshotOwnRefresh()) {
+            const auto again = lookup();
+            if (again.get() != textures[i].get()) return OwnRefreshFallback::Snapshot;
+            const auto& log = lookupLog();
+            for (auto it = log.rbegin(); it != log.rend(); ++it) {
+                if (it->object != textures[i].get()) continue;
+                validatedTextures[i] = {it->resource, it->bytes, it->keys, it->generation, 0, it->source, it->depth, true};
+                break;
+            }
+            countOwnRefresh(false);
+            return OwnRefreshFallback::Count;
+        }
         if (source == nullptr || source.get() != surface.source) return OwnRefreshFallback::Snapshot;
         if (!source->Cached()) return OwnRefreshFallback::Uncached;
         if (!StorageImageServesKeys(*source, surface.resource.dccAddress)) return OwnRefreshFallback::Keys;
@@ -3938,7 +3955,18 @@ ShaderResources::OwnRefreshFallback ShaderResources::refreshOwnObjects(std::span
                     const auto index = textureIndex++;
                     const auto overlap = listed(index, false);
                     if (overlap == overlapping.end()) continue;
-                    if (const auto fallback = refreshView(index, *overlap, !binding.imageDepthCompare.empty() && binding.imageDepthCompare.at(element)); fallback != OwnRefreshFallback::Count) return fallback;
+                    const bool depthCompare = !binding.imageDepthCompare.empty() && binding.imageDepthCompare.at(element);
+                    const auto lookup = [&] {
+                        const auto elementWords = binding.count != 0 ? binding.guestDescriptor.size() / binding.count : 0;
+                        const auto raw = std::span<const std::uint32_t>(binding.guestDescriptor).subspan(static_cast<std::size_t>(element) * elementWords, elementWords);
+                        std::array<std::uint32_t, 8> narrowed{};
+                        const auto narrowedWords = firstLayerWords(raw, binding.imageShape, narrowed, false);
+                        const auto resource = DecodeTextureResource(narrowedWords);
+                        const VkImageViewType multisampleViewType = binding.imageShape == ShaderRecompiler::DescriptorImageShape::Image2DMultisampleArray ? VK_IMAGE_VIEW_TYPE_2D_ARRAY : VK_IMAGE_VIEW_TYPE_2D;
+                        BuildLookups lookups;
+                        return cachedTexture(context, narrowedWords, resource, ViewComponents(resource), 0, depthCompare, multisampleViewType, layerRowsBinding(binding.imageShape, resource, depthCompare));
+                    };
+                    if (const auto fallback = refreshView(index, *overlap, depthCompare, lookup); fallback != OwnRefreshFallback::Count) return fallback;
                 }
             } else if (binding.kind == ShaderRecompiler::DescriptorKind::StorageImage) {
                 for (std::uint32_t element = 0; element < binding.count; ++element) {
@@ -3961,7 +3989,16 @@ ShaderResources::OwnRefreshFallback ShaderResources::refreshOwnObjects(std::span
             const auto overlap = listed(index, false);
             if (overlap == overlapping.end()) continue;
             if (images == nullptr || images->count != table.elementTextures.size()) return OwnRefreshFallback::Uncached;
-            if (const auto fallback = refreshView(index, *overlap, images->imageDepthCompare.at(element)); fallback != OwnRefreshFallback::Count) return fallback;
+            const auto lookup = [&] {
+                const auto raw = std::span<const std::uint32_t>(images->guestDescriptor).subspan(element * 8u, 8u);
+                std::array<std::uint32_t, 8> narrowed{};
+                const auto narrowedWords = firstLayerWords(raw, images->imageShapes.at(element), narrowed, false);
+                const auto resource = DecodeTextureResource(narrowedWords);
+                const VkImageViewType multisampleViewType = images->imageShapes.at(element) == ShaderRecompiler::DescriptorImageShape::Image2DMultisampleArray ? VK_IMAGE_VIEW_TYPE_2D_ARRAY : VK_IMAGE_VIEW_TYPE_2D;
+                BuildLookups lookups;
+                return cachedTexture(context, narrowedWords, resource, ViewComponents(resource), 0, images->imageDepthCompare.at(element), multisampleViewType);
+            };
+            if (const auto fallback = refreshView(index, *overlap, images->imageDepthCompare.at(element), lookup); fallback != OwnRefreshFallback::Count) return fallback;
         }
     }
     return OwnRefreshFallback::Count;
@@ -4047,7 +4084,13 @@ bool ShaderResources::refreshPerUse() {
     return true;
 }
 
+bool PartialCovers() {
+    static const bool enabled = std::getenv("APS5_NO_PARTIAL_COVERS") == nullptr;
+    return enabled;
+}
+
 bool ShaderResources::coversCurrent(std::span<const CompiledShader> shaders) {
+    coverExcluded.clear();
     if (tableCovers.empty()) return false;
     const auto state = CurrentTableState();
     thread_local std::vector<std::shared_ptr<Texture>>* scratchSlot = nullptr;
@@ -4056,7 +4099,24 @@ bool ShaderResources::coversCurrent(std::span<const CompiledShader> shaders) {
         const auto* binding = tableImages(shaders, cover.stage);
         if (binding == nullptr) return false;
         auto* table = FindReusedTable(context.device, *binding, state);
-        if (table == nullptr || table->serial != cover.serial || !TableCurrent(*table)) return false;
+        if (table == nullptr || table->serial != cover.serial) return false;
+        const auto serial = StorageTexture::PendingSerial();
+        if (serial != table->pendingSerial) {
+            if (StorageTexture::AnyPendingOverlaps(table->ranges)) {
+                if (!PartialCovers()) return false;
+                for (const auto& [texture, element] : cover.entries) {
+                    if (element >= table->elements.size()) return false;
+                    const auto& entry = table->elements[element];
+                    const std::array<std::pair<std::uint64_t, std::uint64_t>, 1> range{{{entry.resource.baseAddress, entry.resource.baseAddress + entry.guestBytes}}};
+                    if (StorageTexture::AnyPendingOverlaps(range)) coverExcluded.push_back(texture);
+                }
+                if (StorageTexture::PendingSerial() != serial) return false;
+            } else {
+                if (StorageTexture::PendingSerial() != serial) return false;
+                table->pendingSerial = serial;
+            }
+        }
+        if (!GuestMemory::UnchangedSinceAll(table->queries)) return false;
         // The table's cache entries, as CachedTableTextures proves them: known and nothing erased
         // since. Its touches run on every 16th proof only, to keep the entries recent.
         bool known = false;
@@ -4078,8 +4138,19 @@ bool ShaderResources::coversCurrent(std::span<const CompiledShader> shaders) {
 
 bool ShaderResources::Revalidate(std::span<const CompiledShader> shaders, ProofReport* report) {
     coversProved = TableCoverProofs() && coversCurrent(shaders);
+    std::vector<std::size_t> uncovered;
+    if (coversProved) {
+        for (const auto index : coverExcluded) {
+            if (index >= tableCovered.size() || !tableCovered[index]) continue;
+            tableCovered[index] = false;
+            uncovered.push_back(index);
+        }
+    }
     const bool ok = revalidateChecks(shaders, report);
     coversProved = false;
+    for (const auto index : uncovered) {
+        if (index < tableCovered.size()) tableCovered[index] = true;
+    }
     if (!ok || perUseLookups.empty()) return ok;
     if (refreshPerUse()) return true;
     provedEpoch = 0;
@@ -6193,6 +6264,30 @@ void ShaderResources::resolveImageTables() {
             else counters.variantRejected.fetch_add(1, std::memory_order_relaxed);
         }
         counters.tablesResolved.fetch_add(1, std::memory_order_relaxed);
+        if (reusable && PartialCovers() && StorageTexture::AnyPendingOverlaps(fresh.ranges)) {
+            std::vector<GuestMemory::UnchangedQuery> queries;
+            std::vector<std::pair<std::uint64_t, std::uint64_t>> ranges;
+            queries.reserve(fresh.queries.size());
+            ranges.reserve(fresh.ranges.size());
+            std::size_t kept = 0;
+            for (auto& element : fresh.elements) {
+                if (element.rejected || element.live) continue;
+                if (kept >= fresh.ranges.size() || kept >= fresh.queries.size()) break;
+                const auto range = fresh.ranges[kept];
+                const auto query = fresh.queries[kept];
+                ++kept;
+                const std::array<std::pair<std::uint64_t, std::uint64_t>, 1> one{{range}};
+                if (StorageTexture::AnyPendingOverlaps(one)) {
+                    element.live = true;
+                    element.texture.reset();
+                    continue;
+                }
+                queries.push_back(query);
+                ranges.push_back(range);
+            }
+            fresh.queries = std::move(queries);
+            fresh.ranges = std::move(ranges);
+        }
         const bool anyKept = std::any_of(fresh.elements.begin(), fresh.elements.end(), [](const ReusedTableElement& element) { return !element.live; });
         if (reusable && anyKept && CurrentTableState() == state) {
             const auto serial = StorageTexture::PendingSerial();

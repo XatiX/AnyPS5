@@ -736,6 +736,7 @@ private:
     };
     std::vector<TableCover> tableCovers;
     std::vector<bool> tableCovered;
+    std::vector<std::size_t> coverExcluded;
     bool coversProved = false;
     bool coversCurrent(std::span<const CompiledShader> shaders);
     bool refreshPerUse();
