@@ -174,17 +174,34 @@ void Driver::tagVariantRuns(DispatchVariant& variant, std::span<const ShaderReco
             variant.runs.emplace_back(region.guestAddress, region.guestAddress + region.bytes.size());
             continue;
         }
+        if (count == 0) continue;
         std::size_t start = 0;
-        auto current = count != 0 ? origin(region.guestAddress) : std::int8_t {-1};
-        for (std::size_t word = 1; word <= count; ++word) {
-            const auto next = word < count ? origin(region.guestAddress + word * sizeof(std::uint32_t)) : std::int8_t {-2};
-            if (next == current) continue;
+        std::int8_t current = -1;
+        const auto emit = [&](std::size_t word) {
             AppendSharedWords(variant.shared, variant.runs.size(), offset + start, region.bytes.subspan(start * sizeof(std::uint32_t), (word - start) * sizeof(std::uint32_t)), supplied);
             variant.runs.emplace_back(region.guestAddress + start * sizeof(std::uint32_t), region.guestAddress + word * sizeof(std::uint32_t));
             variant.runBases.push_back(current);
             start = word;
-            current = next;
+        };
+        const auto change = [&](std::size_t word, std::int8_t value) {
+            if (value == current) return;
+            if (word != 0) emit(word);
+            current = value;
+        };
+        const auto end = region.guestAddress + count * sizeof(std::uint32_t);
+        std::size_t next = 0;
+        for (auto read = std::lower_bound(reads.begin(), reads.end(), std::make_pair(region.guestAddress, std::numeric_limits<std::int32_t>::min())); read != reads.end() && read->first < end; ++read) {
+            if (read != reads.begin() && std::prev(read)->first == read->first) continue;
+            if (((read->first - region.guestAddress) & 3u) != 0) continue;
+            const auto value = origin(read->first);
+            if (value < 0) continue;
+            const auto word = static_cast<std::size_t>((read->first - region.guestAddress) / sizeof(std::uint32_t));
+            if (word > next) change(next, -1);
+            change(word, value);
+            next = word + 1;
         }
+        if (next < count) change(next, -1);
+        emit(count);
     }
 }
 
