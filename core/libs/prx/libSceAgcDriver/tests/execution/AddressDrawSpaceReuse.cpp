@@ -6,6 +6,7 @@
 #include "prx/libSceAgcDriver/Graphics/include/Draw.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/GuestBufferMemory.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/MultisampleTarget.hpp"
+#include "prx/libSceAgcDriver/Graphics/include/ShaderResources.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/Texture.hpp"
 #include "prx/libc/include/GuestAllocations.hpp"
 #include "prx/libc/include/GuestArena.hpp"
@@ -100,6 +101,20 @@ constexpr std::array<std::uint32_t, 12> StoringPixelCode{
 };
 
 constexpr std::size_t StoringCodeOffset = 768;
+
+constexpr std::array<std::uint32_t, 14> SampledPixelCode{
+    0x7e000280u,
+    0xdc308000u, 0x01000000u,
+    0x7e3c02ffu, 0x3f000000u,
+    0x7e3e02ffu, 0x3f000000u,
+    0xf09c0108u, 0x00610a1eu,
+    0xbf8c3f70u,
+    0x38021501u,
+    0xf800180fu, 0x01010101u,
+    0xbf810000u,
+};
+
+constexpr std::size_t SampledCodeOffset = 1024;
 constexpr std::size_t MultisampleTargetOffset = 32768;
 
 alignas(16) constexpr std::array<std::uint32_t, 4> OutsideWords{0x11111111u, 0x22222222u, 0x33333333u, 0x44444444u};
@@ -312,6 +327,7 @@ struct Scene {
     Pages constants{BlockBytes};
     Pages spare{BlockBytes};
     Pages ring{BlockBytes};
+    Pages texels{BlockBytes};
     bool cachedVertex = false;
     std::deque<ShaderRecompiler::RecompileResult> vertexResults;
     std::uint32_t vertexPush = 0;
@@ -329,10 +345,13 @@ struct Scene {
         std::memcpy(code.Data() + PixelCodeOffset, PixelCode.data(), sizeof(PixelCode));
         std::memcpy(code.Data() + IndirectCodeOffset, IndirectPixelCode.data(), sizeof(IndirectPixelCode));
         std::memcpy(code.Data() + StoringCodeOffset, StoringPixelCode.data(), sizeof(StoringPixelCode));
+        std::memcpy(code.Data() + SampledCodeOffset, SampledPixelCode.data(), sizeof(SampledPixelCode));
         code.Register(false);
         constants.Register(true);
         spare.Register(true);
         ring.Register(true);
+        std::memset(texels.Data(), 0, BlockBytes);
+        texels.Register(false);
         Fetch(0);
         state.stages = {AgcDriver::Graphics::ShaderPath::Vertex, 0u, 64u, 64u, std::nullopt, std::nullopt};
         state.color = {pixels.Address(), {Width, Height}, VK_FORMAT_R8G8B8A8_UNORM, TargetLayout.Bytes(), 0xe4u, ColorTileMode::RenderTarget};
@@ -372,7 +391,7 @@ struct Scene {
         shaders[0] = {ShaderStage::Vertex, &vertexResults.back(), 0};
     }
 
-    void Point(std::uint64_t slot, std::span<const std::uint32_t> program = PixelCode, std::size_t offset = PixelCodeOffset) {
+    void Point(std::uint64_t slot, std::span<const std::uint32_t> program = PixelCode, std::size_t offset = PixelCodeOffset, std::span<const std::uint32_t> resources = {}) {
         const auto target = device.Target();
         ShaderRecompiler::ShaderPixelStageInfo pixel{};
         pixel.inputAddr = ShaderRecompiler::PixelInputBit(ShaderRecompiler::PixelInput::PositionX) | ShaderRecompiler::PixelInputBit(ShaderRecompiler::PixelInput::PositionY);
@@ -380,7 +399,8 @@ struct Scene {
         pixel.posY = true;
         pixel.targetOutputMode[0] = 9;
         pixel.targetExportMapping.fill(0xe4u);
-        const std::vector<std::uint32_t> userData{static_cast<std::uint32_t>(slot), static_cast<std::uint32_t>(slot >> 32u), 0u, 0u};
+        std::vector<std::uint32_t> userData{static_cast<std::uint32_t>(slot), static_cast<std::uint32_t>(slot >> 32u), 0u, 0u};
+        userData.insert(userData.end(), resources.begin(), resources.end());
         const std::array<ShaderRecompiler::MemoryRegion, 1> pixelMemory{{{code.Address(offset), std::as_bytes(program)}}};
         ShaderRecompiler::RecompileRequest fragment{
             {ShaderStage::Fragment, code.Address(offset), program, 0, {}},
@@ -398,6 +418,12 @@ struct Scene {
             {code.Address(VertexCodeOffset), std::as_bytes(std::span(reinterpret_cast<const std::uint32_t*>(code.Data() + VertexCodeOffset), VertexCode.size()))},
             {code.Address(offset), std::as_bytes(std::span(reinterpret_cast<const std::uint32_t*>(code.Data() + offset), program.size()))},
         };
+    }
+
+    void PointSampling() {
+        const auto image = texels.Address();
+        const std::array<std::uint32_t, 12> resources{static_cast<std::uint32_t>(image >> 8u), static_cast<std::uint32_t>(image >> 40u) | (22u << 20u) | (3u << 30u), 7u, 0x90000facu, 0u, 0u, 0u, 0u, 0u, 0u, 0u, 0u};
+        Point(constants.Address(), SampledPixelCode, SampledCodeOffset, resources);
     }
 
     void PointThrough(std::size_t slot, std::uint64_t address) {
@@ -457,6 +483,33 @@ void UnchangedInputs(Scene& scene) {
     const auto color = scene.DrawnColor();
     Require(color == 200, "address draw space reuse: the repeated draw read " + std::to_string(color) + " instead of the guest constant 200");
     Require(Builds() == before, "address draw space reuse: a read-only address-based draw repeated with unchanged inputs over an imported allocation built its resources again (" + std::to_string(Builds() - before) + " builds)");
+}
+
+void SampledTexture(Scene& scene) {
+    scene.Store(scene.constants, 0, 230);
+    scene.PointSampling();
+    const auto& bindings = scene.pixelResults.back().bindings;
+    Require(std::any_of(bindings.begin(), bindings.end(), [](const auto& binding) { return binding.role == ShaderRecompiler::DescriptorRole::GuestImages; }), "address draw space reuse: the sampling pixel shader binds no guest image");
+    Require(scene.DrawnColor() == 230, "address draw space reuse: the draw that also samples a texture did not read the guest constant");
+    const auto before = Builds();
+    const Outcomes outcomes;
+    const auto color = scene.DrawnColor();
+    scene.Point(scene.constants.Address());
+    Require(color == 230, "address draw space reuse: the repeated draw that also samples a texture read " + std::to_string(color) + " instead of the guest constant 230");
+    Require(outcomes[AgcDriver::Graphics::AddressDrawReuse::Reused] == 1 && Builds() == before, "address draw space reuse: a read-only address-based draw that also samples a texture, repeated with unchanged inputs, counted " + outcomes.Text() + " and " + std::to_string(Builds() - before) + " builds, expected one reuse");
+    {
+        std::lock_guard gpu(AgcDriver::GuestMemory::GpuMutex());
+        scene.PointSampling();
+        const auto context = AgcDriver::VulkanDeviceTestAccess::ContextOf(scene.device);
+        auto resources = std::make_shared<AgcDriver::Graphics::ShaderResources>(context, std::span<const AgcDriver::Graphics::CompiledShader>(scene.shaders), scene.state.color, 1u, 0u, 0u, scene.snapshots);
+        const bool spaceReuse = resources->SpaceReuse() && resources->Reusable();
+        AgcDriver::Graphics::ShaderResources::ProofReport report;
+        const bool current = spaceReuse && resources->Revalidate(std::span<const AgcDriver::Graphics::CompiledShader>(scene.shaders), &report);
+        if (resources->SpaceReuse()) static_cast<void>(resources->ReleaseSpace());
+        scene.Point(scene.constants.Address());
+        Require(spaceReuse, "address draw space reuse: the build of a read-only address-based draw that also samples a texture is not space-reusable");
+        Require(current && report.path == AgcDriver::Graphics::ShaderResources::ProofPath::Fast, "address draw space reuse: a space-reusable build that also samples a texture, with its memory unchanged, did not prove current on the fast path: the build kept no record of its texture");
+    }
 }
 
 void CpuWrite(Scene& scene) {
@@ -974,8 +1027,9 @@ struct NamedCase {
     Case run;
 };
 
-constexpr std::array<NamedCase, 14> DefaultCases{{
+constexpr std::array<NamedCase, 15> DefaultCases{{
     {"unchanged", UnchangedInputs},
+    {"sampled-texture", SampledTexture},
     {"cpu-write", CpuWrite},
     {"idle-free", IdleFree},
     {"no-recipe", NoRecipe},
