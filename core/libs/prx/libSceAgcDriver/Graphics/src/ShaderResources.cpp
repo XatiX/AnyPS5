@@ -2034,7 +2034,9 @@ struct TableState {
 
 TableState CurrentTableState() {
     if (!TableReuseEnabled()) return {};
-    return {GuestMemory::ThreadCollectEpoch(), GuestMemory::UnwatchSerial(), GuestAllocations::GuestAllocationsGeneration_nid_postfix(), DepthSurfacesSerial()};
+    static const bool keepEpoch = std::getenv("APS5_TABLE_STATE_EPOCH") != nullptr;
+    const auto epoch = GuestMemory::ThreadCollectEpoch();
+    return {keepEpoch ? epoch : (epoch != 0 ? 1u : 0u), GuestMemory::UnwatchSerial(), GuestAllocations::GuestAllocationsGeneration_nid_postfix(), DepthSurfacesSerial()};
 }
 
 struct ReusedTableElement {
@@ -2932,6 +2934,11 @@ void ShaderResources::reportDescriptorCaches() const {
 // APS5_NO_COMPACT_TABLE_KEY=1 keys the content itself.
 constexpr std::size_t CompactTableKeyWords = 8192;
 
+bool EmptyBufferKeys() {
+    static const bool enabled = std::getenv("APS5_NO_EMPTY_BUFFER_KEY") == nullptr;
+    return enabled;
+}
+
 bool CompactTableKeys() {
     static const bool enabled = std::getenv("APS5_NO_COMPACT_TABLE_KEY") == nullptr;
     return enabled;
@@ -3015,7 +3022,8 @@ void VisitContentKey(const CompiledShader& shader, bool dataWords, bool movableB
                 const auto* words = binding.guestDescriptor.data() + static_cast<std::size_t>(element) * 4u;
                 const bool written = element >= binding.bufferWritten.size() || binding.bufferWritten[element];
                 const bool empty = words[2] == 0 || (words[0] == 0 && (words[1] & 0xffffu) == 0);
-                if (written || empty) { for (std::uint32_t index = 0; index < 4u; ++index) visit(words[index]); }
+                if (empty && EmptyBufferKeys()) { for (const auto word : {0xe3e3e3e3u, words[1] & 0xffff0000u, words[2], words[3]}) visit(word); }
+                else if (written || empty) { for (std::uint32_t index = 0; index < 4u; ++index) visit(words[index]); }
                 else { for (const auto word : {0u, words[1] & 0xffff0000u, 0u, words[3]}) visit(word); }
             }
         } else if (binding.role == ShaderRecompiler::DescriptorRole::ImageTableMap && binding.guestDescriptor.size() > CompactTableKeyWords && CompactTableKeys()) {
@@ -4791,7 +4799,7 @@ std::size_t ResourceCache::Capacity() const {
 std::uint64_t ResourceCache::TableElementBudget() {
     static const std::uint64_t elements = [] {
         const char* value = std::getenv("APS5_RESOURCE_CACHE_TABLE_ELEMENTS");
-        const auto parsed = value ? std::strtoull(value, nullptr, 10) : 65536ull;
+        const auto parsed = value ? std::strtoull(value, nullptr, 10) : 4194304ull;
         return static_cast<std::uint64_t>(parsed != 0 ? parsed : 65536ull);
     }();
     return elements;
