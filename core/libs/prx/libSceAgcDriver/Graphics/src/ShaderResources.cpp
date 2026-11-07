@@ -2034,9 +2034,7 @@ struct TableState {
 
 TableState CurrentTableState() {
     if (!TableReuseEnabled()) return {};
-    static const bool keepEpoch = std::getenv("APS5_TABLE_STATE_EPOCH") != nullptr;
-    const auto epoch = GuestMemory::ThreadCollectEpoch();
-    return {keepEpoch ? epoch : (epoch != 0 ? 1u : 0u), GuestMemory::UnwatchSerial(), GuestAllocations::GuestAllocationsGeneration_nid_postfix(), DepthSurfacesSerial()};
+    return {GuestMemory::ThreadCollectEpoch(), GuestMemory::UnwatchSerial(), GuestAllocations::GuestAllocationsGeneration_nid_postfix(), DepthSurfacesSerial()};
 }
 
 struct ReusedTableElement {
@@ -2081,10 +2079,39 @@ bool SameTable(const ReusedTable& table, VkDevice device, const ShaderRecompiler
     return table.device == device && table.words == binding.guestDescriptor && table.shapes == binding.imageShapes && table.depthCompare == binding.imageDepthCompare;
 }
 
+constexpr std::uint64_t EpochRefreshGap = 65536;
+
+bool EpochTableRefresh() {
+    static const bool enabled = std::getenv("APS5_NO_EPOCH_TABLE_REFRESH") == nullptr;
+    return enabled;
+}
+
 ReusedTable* FindReusedTable(VkDevice device, const ShaderRecompiler::DescriptorBinding& binding, const TableState& state) {
     if (state.epoch == 0) return nullptr;
     auto& tables = ReusedTables();
-    std::erase_if(tables, [&](const ReusedTable& table) { return table.state != state; });
+    std::erase_if(tables, [&](ReusedTable& table) {
+        if (table.state == state) return false;
+        // Only the collect epoch moved: collect the table's ranges again (merged into spans), so the
+        // block stamps its queries compare carry any CPU store made before this epoch, and keep it.
+        if (!EpochTableRefresh() || table.state.unwatched != state.unwatched || table.state.allocations != state.allocations || table.state.depthSurfaces != state.depthSurfaces) return true;
+        auto spans = table.ranges;
+        std::sort(spans.begin(), spans.end());
+        std::uint64_t begin = 0;
+        std::uint64_t end = 0;
+        const auto collect = [&] { return end <= begin || GuestMemory::CollectWrites(begin, static_cast<std::size_t>(end - begin)) != 0; };
+        for (const auto& [first, last] : spans) {
+            if (end > begin && first <= end + EpochRefreshGap) {
+                end = std::max(end, last);
+                continue;
+            }
+            if (!collect()) return true;
+            begin = first;
+            end = last;
+        }
+        if (!collect()) return true;
+        table.state = state;
+        return false;
+    });
     for (auto& table : tables) {
         if (SameTable(table, device, binding)) return &table;
     }
