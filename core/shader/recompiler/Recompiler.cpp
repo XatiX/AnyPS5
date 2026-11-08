@@ -368,6 +368,7 @@ IrProgram PrepareResourceProgram(const RecompileRequest& request, ShaderPreparat
 
     deadCodeEliminator.EliminateUnobservedPhis(program);
     deadCodeEliminator.Eliminate(program);
+    program.Metadata().directResources = request.target.directResources;
     constexpr SrtWalker srtWalker;
     srtWalker.BuildPlan(program);
     deadCodeEliminator.Eliminate(program);
