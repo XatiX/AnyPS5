@@ -1,3 +1,4 @@
+#include "prx/libSceAgcDriver/Graphics/include/DirectHeap.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/Draw.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/MemoryAccounting.hpp"
 #include "prx/libc/include/RunReport.hpp"
@@ -2750,6 +2751,12 @@ bool WriteOnlyPasses() {
     return enabled;
 }
 
+void BindDirectHeap(const Context& context, VkCommandBuffer commands, VkPipelineLayout layout, std::span<const CompiledShader> shaders) {
+    if (std::ranges::none_of(shaders, [](const CompiledShader& shader) { return shader.program != nullptr && shader.program->directSlotCount != 0u; })) return;
+    const auto set = DirectHeapFor(context).Set();
+    context.Resolved(&DeviceFunctions::cmdBindDescriptorSets, "vkCmdBindDescriptorSets")(commands, VK_PIPELINE_BIND_POINT_GRAPHICS, layout, ShaderRecompiler::RuntimeAbi::DirectHeapSet, 1, &set, 0, nullptr);
+}
+
 void recordDraw(const Context& context, const State& state, const Pm4::DrawParameters& draw, std::span<const CompiledShader> shaders, DrawInputs& inputs, RecordedDraw& record, DrawOutcome& outcome, DrawTimer& timer, double& ownWaitedMs, const DrawTraceContext* trace = nullptr) {
     std::uint32_t subdraw = 0;
     auto* recorder = record.recorder;
@@ -2925,6 +2932,7 @@ void recordDraw(const Context& context, const State& state, const Pm4::DrawParam
     }
     if (std::ranges::any_of(shaders, [](const CompiledShader& shader) { return shader.program != nullptr && shader.program->functionLdsBuffer; })) BindPixelFunctionLds(context, commands, record.pipeline->Layout());
     if (UsesMeshWindow(shaders)) BindMeshWindow(context, commands, record.pipeline->Layout());
+    BindDirectHeap(context, commands, record.pipeline->Layout(), shaders);
     APS5_LOG_CHARS_OUT_DEBUG("Resources bound");
     pushDrawConstants(*record.pipeline, commands, state, draw, shaders, resources, record.pushBytes, record.pushStages, meshArguments != nullptr ? meshArguments->DeviceAddress() : 0, !inputs.restartTable.empty(), inputs.meshLayerStride);
     APS5_LOG_CHARS_OUT_DEBUG("Push constants recorded");
@@ -3923,6 +3931,7 @@ void recordPreparedDraw(const Context& context, const State& state, const Pm4::D
     resources->BindDrawUse(commands, pipeline->Layout(), drawUse.get());
     if (pixelLdsSubgroup != 0u) BindPixelFunctionLds(context, commands, pipeline->Layout());
     if (UsesMeshWindow(shaders)) BindMeshWindow(context, commands, pipeline->Layout());
+    BindDirectHeap(context, commands, pipeline->Layout(), shaders);
     APS5_LOG_CHARS_OUT_DEBUG("Resources bound");
     pushDrawConstants(*pipeline, commands, state, draw, shaders, *resources, nullptr, 0, meshArguments != nullptr ? meshArguments->DeviceAddress() : 0, !inputs.restartTable.empty(), inputs.meshLayerStride);
     APS5_LOG_CHARS_OUT_DEBUG("Push constants recorded");
