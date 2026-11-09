@@ -577,6 +577,8 @@ void encodeArtifact(Writer& writer, const CompiledShaderArtifact& result) {
     writer.Value(result.bdaWrites);
     writer.Value(result.layerReplaySafe);
     writer.Value(result.stencilReferenceDword);
+    writer.Value(result.directSlotCount);
+    writer.Value(result.directSlotDword);
 }
 
 void decodeArtifact(Reader& reader, CompiledShaderArtifact& result) {
@@ -648,6 +650,8 @@ void decodeArtifact(Reader& reader, CompiledShaderArtifact& result) {
     reader.Value(result.bdaWrites);
     reader.Value(result.layerReplaySafe);
     reader.Value(result.stencilReferenceDword);
+    reader.Value(result.directSlotCount);
+    reader.Value(result.directSlotDword);
     result.variantId = 0;
 }
 
