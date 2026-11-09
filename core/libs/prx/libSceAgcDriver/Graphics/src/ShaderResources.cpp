@@ -2956,8 +2956,13 @@ void VisitContentKey(const CompiledShader& shader, bool dataWords, bool movableB
         }
     };
     for (const auto& binding : program.bindings) {
-        for (const auto word : {static_cast<std::uint32_t>(binding.kind), static_cast<std::uint32_t>(binding.role), binding.descriptorSet, binding.binding, binding.count, binding.readOnly ? 1u : 0u, binding.imageShape.has_value() ? static_cast<std::uint32_t>(*binding.imageShape) + 1u : 0u, static_cast<std::uint32_t>(binding.guestDescriptor.size())}) visit(word);
-        if (movableBuffers && binding.role == ShaderRecompiler::DescriptorRole::GuestBuffers && binding.guestDescriptor.size() == static_cast<std::size_t>(binding.count) * 4u) {
+        // A direct stage's table mirror map is keyed by its hash, not its (large) words.
+        const bool hashedMap = binding.role == ShaderRecompiler::DescriptorRole::ImageTableMap && program.directTableMapHash != 0u;
+        for (const auto word : {static_cast<std::uint32_t>(binding.kind), static_cast<std::uint32_t>(binding.role), binding.descriptorSet, binding.binding, binding.count, binding.readOnly ? 1u : 0u, binding.imageShape.has_value() ? static_cast<std::uint32_t>(*binding.imageShape) + 1u : 0u, hashedMap ? 2u : static_cast<std::uint32_t>(binding.guestDescriptor.size())}) visit(word);
+        if (hashedMap) {
+            visit(static_cast<std::uint32_t>(program.directTableMapHash));
+            visit(static_cast<std::uint32_t>(program.directTableMapHash >> 32u));
+        } else if (movableBuffers && binding.role == ShaderRecompiler::DescriptorRole::GuestBuffers && binding.guestDescriptor.size() == static_cast<std::size_t>(binding.count) * 4u) {
             for (std::uint32_t element = 0; element < binding.count; ++element) {
                 const auto* words = binding.guestDescriptor.data() + static_cast<std::size_t>(element) * 4u;
                 const bool written = element >= binding.bufferWritten.size() || binding.bufferWritten[element];
