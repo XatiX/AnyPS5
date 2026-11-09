@@ -136,10 +136,25 @@ void Driver::waitMemory(std::span<const std::uint32_t> packet, std::uint32_t que
     } waitTrace{traceGpu, queue, awaited, std::chrono::steady_clock::now()};
     bool warned = false;
 
+    // Debug aid: APS5_TRACE_WAIT_WRITERS=1 also counts the epoch bumps of waits by exit path.
+    enum WaitExit : int { ExitLanded, ExitAtEntry, ExitHeldAtSubmit, ExitLabelOther, ExitLabelLate, ExitSettled, ExitCount };
     struct EpochPoint {
         bool bump = true;
+        int exit = ExitLanded;
         ~EpochPoint() {
             if (bump) bumpEpoch(&EpochBumps::waits);
+            static const bool trace = std::getenv("APS5_TRACE_WAIT_WRITERS") != nullptr;
+            if (!trace) return;
+            static std::array<std::atomic<std::uint64_t>, ExitCount * 2> counts{};
+            static std::atomic<std::int64_t> last{0};
+            ++counts[exit * 2 + (bump ? 1 : 0)];
+            const auto now = std::chrono::duration_cast<std::chrono::seconds>(std::chrono::steady_clock::now().time_since_epoch()).count();
+            if (auto seen = last.load(); now - seen >= 10 && last.compare_exchange_strong(seen, now)) {
+                static constexpr const char* names[ExitCount] = {"landed", "at entry", "held at submit", "another queue's label", "late label", "settled"};
+                std::string line = "[waitexits] (cumulative, bumped/kept):";
+                for (int at = 0; at < ExitCount; ++at) line += std::string(" ") + names[at] + " " + std::to_string(counts[at * 2 + 1].load()) + "/" + std::to_string(counts[at * 2].load());
+                std::fprintf(stderr, "%s\n", line.c_str());
+            }
         }
     } epochPoint;
     bool ownStoreUnlanded = false;
@@ -156,11 +171,26 @@ void Driver::waitMemory(std::span<const std::uint32_t> packet, std::uint32_t que
     };
     GuestMemory::CheckRange(reinterpret_cast<const void*>(awaited), awaitedBytes, awaitedBytes);
     if (memorySatisfied()) {
+        epochPoint.exit = ExitAtEntry;
         ++outcomes.atEntry;
         if (storedByOwnLabel()) epochPoint.bump = false;
+        // Debug aid: APS5_TRACE_WAIT_WRITERS=1 counts who stored the value of waits satisfied at entry.
+        static const bool traceWriters = std::getenv("APS5_TRACE_WAIT_WRITERS") != nullptr;
+        if (traceWriters) {
+            static std::atomic<std::uint64_t> own{0}, other{0}, unknown{0};
+            static std::atomic<std::int64_t> last{0};
+            std::uint32_t writer = queue;
+            const bool stored = !requireMemory && storedSince(packet, awaited, awaitedBytes, received, queue, &writer);
+            ++(!stored ? unknown : writer == queue ? own : other);
+            const auto now = std::chrono::duration_cast<std::chrono::seconds>(std::chrono::steady_clock::now().time_since_epoch()).count();
+            if (auto seen = last.load(); now - seen >= 10 && last.compare_exchange_strong(seen, now)) std::fprintf(stderr, "[waitwriters] satisfied at entry (cumulative): own queue label %llu, another queue's label %llu, no driver store (CPU or older) %llu\n", static_cast<unsigned long long>(own.load()), static_cast<unsigned long long>(other.load()), static_cast<unsigned long long>(unknown.load()));
+        }
         return;
     }
-    if (heldAtSubmit) return;
+    if (heldAtSubmit) {
+        epochPoint.exit = ExitHeldAtSubmit;
+        return;
+    }
     if (std::uint32_t writer = queue; !requireMemory && storedSince(packet, awaited, awaitedBytes, received, queue, &writer)) {
         if (writer != queue) notePendingWait(packet, queue, received);
         else epochPoint.bump = false;
@@ -200,6 +230,7 @@ void Driver::waitMemory(std::span<const std::uint32_t> packet, std::uint32_t que
             ++outcomes.fromRecorderLate;
             if (trace) traceLate("trusted", hit, refusal);
         }
+        epochPoint.exit = hit->late ? ExitLabelLate : ExitLabelOther;
         ++(polling ? outcomes.fromRecorderPolling : outcomes.fromRecorder);
         if (unlockedHit) ++outcomes.fromRecorderUnlocked;
         if (hit->queue == queue) {
@@ -381,7 +412,10 @@ void Driver::waitMemory(std::span<const std::uint32_t> packet, std::uint32_t que
         if (requireMemory && (polls & 15u) == 0) {
             std::unique_lock settleLock(GuestMemory::GpuMutex(), std::try_to_lock);
             if (settleLock.owns_lock()) {
-                if (const auto localDevice = device.Load(); localDevice != nullptr && localDevice->RecordedWritesSettled(awaited, awaitedBytes)) return;
+                if (const auto localDevice = device.Load(); localDevice != nullptr && localDevice->RecordedWritesSettled(awaited, awaitedBytes)) {
+                    epochPoint.exit = ExitSettled;
+                    return;
+                }
             }
         }
         if (const auto done = packetsDone.load(); done != lastDone || (!requireMemory && packetsInFlight.load() != 0)) {
