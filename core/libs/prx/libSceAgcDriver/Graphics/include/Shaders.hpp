@@ -80,6 +80,12 @@ inline VkShaderStageFlags PushConstantStages(std::span<const CompiledShader> sha
     return result;
 }
 
+// A compute program's push constant block: 128 bytes, or the whole 256-byte block when its data
+// does not fit (direct compute keeps its heap slot words in push constants).
+inline std::uint32_t ComputePushBytesFor(const ShaderRecompiler::RecompileResult& program) {
+    return program.pushConstants.size() > ComputePushConstantBytes ? PipelinePushConstantBytes : ComputePushConstantBytes;
+}
+
 inline std::array<std::byte, PipelinePushConstantBytes> AssemblePushConstants(std::span<const CompiledShader> shaders) {
     std::array<std::byte, PipelinePushConstantBytes> result{};
     std::array<bool, PipelinePushConstantBytes> occupied{};
@@ -89,7 +95,7 @@ inline std::array<std::byte, PipelinePushConstantBytes> AssemblePushConstants(st
         if (bytes.empty()) continue;
         Require(bytes.size() % 4 == 0 && shader.pushConstantOffset % 4 == 0, "shader push constant range is not DWORD aligned");
         Require(shader.pushConstantOffset < PipelinePushConstantBytes && bytes.size() <= PipelinePushConstantBytes - shader.pushConstantOffset, "shader push constant range lies outside the pipeline push constant block");
-        Require(bytes.size() <= PipelinePushSlotBytes - shader.pushConstantOffset % PipelinePushSlotBytes, "shader push constant range crosses a push constant slot");
+        Require(shader.stage == ShaderRecompiler::ShaderStage::Compute || bytes.size() <= PipelinePushSlotBytes - shader.pushConstantOffset % PipelinePushSlotBytes, "shader push constant range crosses a push constant slot");
         for (std::size_t i = 0; i < bytes.size(); ++i) {
             const auto position = shader.pushConstantOffset + i;
             Require(!occupied[position], "shader push constant ranges of different stages overlap");
