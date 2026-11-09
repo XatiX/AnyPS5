@@ -2309,4 +2309,10 @@ std::uint64_t ResultMemoBytes() {
     return resultMemoCounters().heldBytes.load(std::memory_order_relaxed);
 }
 
+std::vector<PipelineSpecializationConstant> DirectStageSpecialization(const RecompileRequest& request, const ResourceCapture& capture, const SourceHandle& handle) {
+    const auto exports = request.context.pixel ? std::span<const std::uint8_t>(request.context.pixel->targetExportMapping) : std::span<const std::uint8_t>{};
+    const auto plan = preparedBindingPlan(*handle.artifact, capture.snapshot, exports, request.target.registrationModules, {}, request.target.shaderImageMinLod);
+    return plan->bindings.specialization;
+}
+
 }
