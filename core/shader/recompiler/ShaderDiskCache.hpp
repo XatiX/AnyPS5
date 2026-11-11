@@ -13,7 +13,8 @@
 
 namespace ShaderRecompiler::ShaderDiskCache {
 
-inline constexpr std::uint32_t FormatVersion = 65;
+// rewrite/direct: upstream format 68 plus the direct-path fields; kept apart from upstream numbers.
+inline constexpr std::uint32_t FormatVersion = 1068;
 
 enum class LoadStatus {
     Loaded,

@@ -38,6 +38,7 @@
 #include "Optimization/include/Optimization/HostInterpolationChecker.hpp"
 #include "Optimization/include/Optimization/MaskedSelectEliminator.hpp"
 #include "Optimization/include/Optimization/ReadLaneEliminator.hpp"
+#include "Optimization/include/Optimization/GotoPhiRefiner.hpp"
 #include "Optimization/include/Optimization/RedundantValueEliminator.hpp"
 #include "Optimization/include/Optimization/RequestMemoryView.hpp"
 #include "Optimization/include/Optimization/ResourceMaterializer.hpp"
@@ -370,6 +371,10 @@ IrProgram PrepareResourceProgram(const RecompileRequest& request, ShaderPreparat
     deadCodeEliminator.Eliminate(program);
     program.Metadata().directResources = request.target.directResources;
     program.Metadata().directFoldSrt = request.target.directResources && request.target.directFoldSrt;
+    constexpr GotoPhiRefiner gotoPhiRefiner;
+    if (gotoPhiRefiner.Refine(program).replacedOperands != 0u) {
+        deadCodeEliminator.Eliminate(program);
+    }
     constexpr SrtWalker srtWalker;
     srtWalker.BuildPlan(program);
     deadCodeEliminator.Eliminate(program);
