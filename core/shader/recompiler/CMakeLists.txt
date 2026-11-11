@@ -283,6 +283,8 @@ function(add_shader_recompiler target runtimeTarget)
             GetPreparedArtifact
             MaterializeShader
             DirectStageSpecialization
+            DirectPath::Draws
+            DirectPath::Tables
             ResourceMaterializer::RuntimeImageMode
             ResourceMaterializer::ResolveImageTablesShared
             DescriptorBindingForImage
