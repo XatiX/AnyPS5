@@ -47,6 +47,7 @@
 #else
 #include <windows.h>
 #include "prx/libc/include/WindowsDescriptor.hpp"
+#include "prx/libkernel/DirectMemory/GuestView.hpp"
 
 static constexpr int PROT_NONE = 0;
 static constexpr int PROT_READ = 1;
@@ -79,7 +80,51 @@ struct KernelArena {
     void Release(const void* pointer, size_t len) { GuestArena::GuestArenaRelease_nid_postfix(pointer, len); }
 };
 
+static GuestMemoryView::GuestView* SharedView() {
+    static GuestMemoryView::GuestView* const view = []() -> GuestMemoryView::GuestView* {
+        if (std::getenv("APS5_GUEST_VIEW") == nullptr || !GuestArena::GuestArenaAvailable_nid_postfix()) return nullptr;
+        std::uintptr_t base = 0;
+        std::size_t bytes = 0;
+        GuestArena::GuestArenaRange_nid_postfix(&base, &bytes);
+        auto* created = new GuestMemoryView::GuestView;
+        created->Reserve(base, bytes, DIRECT_MEMORY_SIZE);
+        return created;
+    }();
+    return view;
+}
+
+static bool CommitThroughView(void* addr, size_t len, DWORD winProt) {
+    auto* view = SharedView();
+    const auto start = reinterpret_cast<std::uintptr_t>(addr);
+    if (view == nullptr || !view->Covers(start, len) || ((start | len) & (PS5_PAGE_SIZE - 1)) != 0) return false;
+    const auto end = start + len;
+    for (auto cursor = start; cursor < end;) {
+        MEMORY_BASIC_INFORMATION memory{};
+        if (VirtualQuery(reinterpret_cast<const void*>(cursor), &memory, sizeof(memory)) != sizeof(memory)) throw std::system_error(static_cast<int>(GetLastError()), std::system_category(), "query guest memory to commit");
+        auto stop = std::min<std::uintptr_t>(end, reinterpret_cast<std::uintptr_t>(memory.BaseAddress) + memory.RegionSize);
+        if (memory.State == MEM_RESERVE) {
+            stop = std::min<std::uintptr_t>(end, (stop + PS5_PAGE_SIZE - 1) & ~static_cast<std::uintptr_t>(PS5_PAGE_SIZE - 1));
+            stop = std::min(stop, view->ChunkEnd(cursor));
+            const auto bytes = static_cast<std::size_t>(stop - cursor);
+            std::uint64_t offset = 0;
+            const HANDLE section = view->Chunk(cursor, &offset);
+            view->Discard(cursor, bytes);
+            GuestArena::GuestArenaMap_nid_postfix(reinterpret_cast<void*>(cursor), bytes, section, offset, winProt);
+            view->MarkUsed(cursor, bytes);
+        } else {
+            GuestArena::GuestArenaCommit_nid_postfix(reinterpret_cast<void*>(cursor), stop - cursor, winProt, PS5_PAGE_SIZE);
+        }
+        cursor = stop;
+    }
+    return true;
+}
+
+static void DiscardView(void* addr, size_t len) {
+    if (auto* view = SharedView()) view->Discard(reinterpret_cast<std::uintptr_t>(addr), len);
+}
+
 static void CommitArenaRange(void* addr, size_t len, DWORD winProt) {
+    if (CommitThroughView(addr, len, winProt)) return;
     GuestArena::GuestArenaCommit_nid_postfix(addr, len, winProt, PS5_PAGE_SIZE);
 }
 
@@ -122,8 +167,10 @@ static void* mmap(void* addr, size_t len, int prot, int flags, int, int) {
 
 static int munmap(void* addr, size_t len) {
     auto& arena = KernelArena::Get();
-    if (arena.Contains(addr, len)) GuestArena::GuestArenaReset_nid_postfix(addr, len);
-    else if (!VirtualFree(addr, len, MEM_DECOMMIT)) throw std::system_error(static_cast<int>(GetLastError()), std::system_category(), "VirtualFree decommit failed");
+    if (arena.Contains(addr, len)) {
+        GuestArena::GuestArenaReset_nid_postfix(addr, len);
+        DiscardView(addr, len);
+    } else if (!VirtualFree(addr, len, MEM_DECOMMIT)) throw std::system_error(static_cast<int>(GetLastError()), std::system_category(), "VirtualFree decommit failed");
     if (arena.Contains(addr, len)) arena.Release(addr, len);
     return 0;
 }
@@ -421,7 +468,7 @@ public:
 #if defined(__EMSCRIPTEN__)
         static_cast<void>(start);
 #elif defined(_WIN32)
-        static_cast<void>(start);
+        physicalStart = start;
         const auto size = static_cast<std::uint64_t>(bytes);
         if (SectionPoolEnabled()) section = SectionPool::Get().Take(bytes);
         if (!section) section = CreateFileMappingW(INVALID_HANDLE_VALUE, nullptr, PAGE_EXECUTE_READWRITE | SEC_RESERVE, static_cast<DWORD>(size >> 32), static_cast<DWORD>(size), nullptr);
@@ -431,6 +478,7 @@ public:
             std::snprintf(message, sizeof(message), "create direct memory backing of 0x%llx bytes (%llu MiB)", static_cast<unsigned long long>(size), static_cast<unsigned long long>((size + 0xFFFFF) >> 20));
             throw std::system_error(error, std::system_category(), message);
         }
+        if (auto* view = SharedView()) view->MapDirect(section, start, bytes);
 #elif defined(__APPLE__)
         static_cast<void>(start);
         memory_object_size_t size = bytes;
@@ -460,6 +508,7 @@ public:
     ~PhysicalBacking() {
 #if defined(__EMSCRIPTEN__)
 #elif defined(_WIN32)
+        if (auto* view = SharedView()) view->UnmapDirect(section, physicalStart, bytes);
         if (!SectionPoolEnabled()) {
             GuestArena::GuestArenaForgetSection_nid_postfix(section);
             CloseHandle(section);
@@ -482,7 +531,8 @@ public:
         static_cast<void>(protection);
         GuestArena::GuestArenaCommit_nid_postfix(reinterpret_cast<void*>(address), bytes, 0x04, PS5_PAGE_SIZE);
 #elif defined(_WIN32)
-        GuestArena::GuestArenaMapDirect_nid_postfix(reinterpret_cast<void*>(address), bytes, section, offset, WinProtFromPosix(protection));
+        if (SharedView() != nullptr) GuestArena::GuestArenaMap_nid_postfix(reinterpret_cast<void*>(address), bytes, section, offset, WinProtFromPosix(protection));
+        else GuestArena::GuestArenaMapDirect_nid_postfix(reinterpret_cast<void*>(address), bytes, section, offset, WinProtFromPosix(protection));
 #elif defined(__APPLE__)
         auto target = static_cast<mach_vm_address_t>(address);
         const auto result = mach_vm_map(mach_task_self(), &target, bytes, 0, VM_FLAGS_FIXED | VM_FLAGS_OVERWRITE, entry, offset, FALSE, protection, VM_PROT_ALL, VM_INHERIT_SHARE);
@@ -497,6 +547,7 @@ private:
 #if defined(__EMSCRIPTEN__)
 #elif defined(_WIN32)
     HANDLE section = nullptr;
+    std::uint64_t physicalStart = 0;
 #elif defined(__APPLE__)
     mach_port_t entry = MACH_PORT_NULL;
 #else
@@ -934,6 +985,7 @@ bool RemapFixedIntoRegistered(GuestAllocations::Mutation& mutation, void* addr, 
         } else {
             EraseMappings(address, address + len);
 #ifdef _WIN32
+            DiscardView(addr, len);
             if (zero) GuestArena::GuestArenaMapZero_nid_postfix(addr, len);
             else {
                 GuestArena::GuestArenaReset_nid_postfix(addr, len);
@@ -1345,6 +1397,27 @@ int DoMapZero(void** addr, size_t len, int prot, int flags) {
     return MapAnonymous(addr, len, prot, flags, PS5_PAGE_SIZE, false, true);
 #else
     return DoMapAnon(addr, len, prot, flags);
+#endif
+}
+
+std::uint8_t* GuestViewAddress_nid_no_patch(std::uintptr_t address, std::size_t bytes) {
+#ifdef _WIN32
+    auto* view = SharedView();
+    return view != nullptr && view->Covers(address, bytes) ? view->Address(address) : nullptr;
+#else
+    static_cast<void>(address);
+    static_cast<void>(bytes);
+    return nullptr;
+#endif
+}
+
+std::uint8_t* GuestViewDirectAddress_nid_no_patch(std::uint64_t physical) {
+#ifdef _WIN32
+    auto* view = SharedView();
+    return view != nullptr && physical < DIRECT_MEMORY_SIZE ? view->DirectAddress(physical) : nullptr;
+#else
+    static_cast<void>(physical);
+    return nullptr;
 #endif
 }
 

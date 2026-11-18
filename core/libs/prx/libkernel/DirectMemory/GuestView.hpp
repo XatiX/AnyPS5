@@ -12,7 +12,7 @@
 #include <mutex>
 #include <vector>
 
-namespace DirectMemoryView {
+namespace GuestMemoryView {
 
 class GuestView {
 public:
@@ -28,6 +28,7 @@ public:
     bool Reserved() const { return view != nullptr; }
     bool Covers(std::uintptr_t guest, std::size_t bytes) const;
     std::uint8_t* Address(std::uintptr_t guest) const { return view + (guest - guestBase); }
+    std::uintptr_t ChunkEnd(std::uintptr_t guest) const { return guestBase + ((guest - guestBase) / chunkBytes + 1) * chunkBytes; }
     std::uint8_t* DirectAddress(std::uint64_t physical) const { return view + guestBytes + physical; }
     HANDLE Chunk(std::uintptr_t guest, std::uint64_t* offset);
     void MarkUsed(std::uintptr_t guest, std::size_t bytes);

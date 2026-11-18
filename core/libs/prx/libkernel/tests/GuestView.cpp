@@ -21,14 +21,14 @@ using UnmapFunction = BOOL(WINAPI*)(HANDLE, PVOID, ULONG);
 constexpr std::size_t ChunkBytes = 16u << 20;
 constexpr std::size_t GuestBytes = 2 * ChunkBytes;
 constexpr std::size_t DirectBytes = 8u << 20;
-constexpr std::size_t Page = DirectMemoryView::GuestView::PageBytes;
+constexpr std::size_t Page = GuestMemoryView::GuestView::PageBytes;
 
 const auto kernelBase = GetModuleHandleW(L"kernelbase.dll");
 const auto allocate = reinterpret_cast<AllocateFunction>(GetProcAddress(kernelBase, "VirtualAlloc2"));
 const auto mapView = reinterpret_cast<MapFunction>(GetProcAddress(kernelBase, "MapViewOfFile3"));
 const auto unmapView = reinterpret_cast<UnmapFunction>(GetProcAddress(kernelBase, "UnmapViewOfFile2"));
 
-std::uint8_t* mapGuest(DirectMemoryView::GuestView& view, std::uint8_t* guest, std::size_t at, std::size_t bytes) {
+std::uint8_t* mapGuest(GuestMemoryView::GuestView& view, std::uint8_t* guest, std::size_t at, std::size_t bytes) {
     std::uint64_t offset = 0;
     const auto section = view.Chunk(reinterpret_cast<std::uintptr_t>(guest + at), &offset);
     Expect(offset == at % ChunkBytes, "the chunk offset is the guest offset within its chunk");
@@ -45,7 +45,7 @@ void testGuestPagesReachableThroughTheView() {
     Expect(guest != nullptr, "a guest placeholder is reserved");
     if (guest == nullptr) return;
     {
-        DirectMemoryView::GuestView view;
+        GuestMemoryView::GuestView view;
         view.Reserve(reinterpret_cast<std::uintptr_t>(guest), GuestBytes, DirectBytes, ChunkBytes);
         Expect(view.Reserved() && view.Covers(reinterpret_cast<std::uintptr_t>(guest), GuestBytes), "the view covers the guest range");
         const std::size_t at = ChunkBytes + 4 * Page;
@@ -75,7 +75,7 @@ void testGuestPagesReachableThroughTheView() {
 }
 
 void testDirectBackingsReplaceEachOther() {
-    DirectMemoryView::GuestView view;
+    GuestMemoryView::GuestView view;
     view.Reserve(0x10000000, GuestBytes, DirectBytes, ChunkBytes);
     const auto make = [](std::size_t bytes) { return CreateFileMappingW(INVALID_HANDLE_VALUE, nullptr, PAGE_READWRITE, 0, static_cast<DWORD>(bytes), nullptr); };
     const auto wide = make(4u << 20);

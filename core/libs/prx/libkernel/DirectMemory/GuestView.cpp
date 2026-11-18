@@ -6,7 +6,7 @@
 #include <stdexcept>
 #include <system_error>
 
-namespace DirectMemoryView {
+namespace GuestMemoryView {
 
 namespace {
 
