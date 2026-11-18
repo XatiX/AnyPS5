@@ -1,6 +1,7 @@
 #include "prx/libSceAgcDriver/Unified/include/Shadow.hpp"
 #include "prx/libSceAgcDriver/Unified/include/Front.hpp"
 #include "prx/libSceAgcDriver/Unified/include/MemoryCore.hpp"
+#include "prx/libSceAgcDriver/Unified/include/ResidencyService.hpp"
 #include "prx/libSceAgcDriver/Unified/include/Events.hpp"
 #include "prx/libSceAgcDriver/Unified/include/ProofVerdict.hpp"
 #include "prx/libc/include/GuestArena.hpp"
@@ -99,6 +100,7 @@ bool registerRange(std::uint64_t begin, std::uint64_t end) {
         return false;
     }
     MemoryCore::Get().Register(first, last - first);
+    ResidencyService::Get().Add(first, last - first);
     auto& totals = memoryTotals();
     totals.registrations.fetch_add(1, std::memory_order_relaxed);
     totals.registeredBytes.fetch_add(last - first, std::memory_order_relaxed);
@@ -114,6 +116,7 @@ void consumeMemory() {
     if (!memoryInstalled()) return;
     const auto start = std::chrono::steady_clock::now();
     const auto ranges = MemoryCore::Get().ConsumeDirty();
+    ResidencyService::Get().NoteDirty(ranges);
     const auto nanoseconds = static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - start).count());
     auto& totals = memoryTotals();
     std::uint64_t bytes = 0;
@@ -147,7 +150,7 @@ std::string memoryLine() {
     const auto events = Events::Shared().Counts();
     char eventLine[384];
     std::snprintf(eventLine, sizeof(eventLine), "[recode-events] notes %llu serial %llu; queries %llu, region skips %llu, changed %llu, owner exempt %llu; proof objects %llu, with ranges outside the arena %llu\n", static_cast<unsigned long long>(events.notes), static_cast<unsigned long long>(Events::Shared().Serial()), static_cast<unsigned long long>(events.queries), static_cast<unsigned long long>(events.regionSkips), static_cast<unsigned long long>(events.changed), static_cast<unsigned long long>(events.ownerExempt), static_cast<unsigned long long>(totals.proofObjects.load(std::memory_order_relaxed)), static_cast<unsigned long long>(totals.proofObjectsOutside.load(std::memory_order_relaxed)));
-    return std::string(line) + eventLine;
+    return std::string(line) + eventLine + ResidencyService::Get().Line();
 }
 
 void report() {
@@ -249,6 +252,7 @@ void NoteGpuMapping(const GuestAllocations::Mapped& ranges) {
         const auto first = range->address & ~(PageBytes - 1);
         const auto last = (range->address + range->bytes + PageBytes - 1) & ~(PageBytes - 1);
         MemoryCore::Get().Register(first, last - first);
+        ResidencyService::Get().Add(first, last - first);
         totals.registrations.fetch_add(1, std::memory_order_relaxed);
         totals.registeredBytes.fetch_add(last - first, std::memory_order_relaxed);
     }
@@ -272,7 +276,10 @@ void Tee(const DriverDetail::Submission& submission) {
     if (submission.suspend || submission.commands.empty()) return;
     if (MemoryActive()) {
         consumeMemory();
-        if (!submission.flips.empty() && memoryInstalled()) MemoryCore::Get().AdvanceFrame();
+        if (!submission.flips.empty() && memoryInstalled()) {
+            MemoryCore::Get().AdvanceFrame();
+            ResidencyService::Get().AdvanceFrame();
+        }
     }
     if (decoding) front().Push(Copy(submission));
     report();

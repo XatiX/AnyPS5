@@ -1,5 +1,8 @@
 #include "prx/libSceAgcDriver/Unified/include/Residency.hpp"
+#include "prx/libSceAgcDriver/Unified/include/ResidentUploads.hpp"
 #include <cstdio>
+#include <cstring>
+#include <vector>
 #include <map>
 #include <set>
 #include <utility>
@@ -116,9 +119,60 @@ void testFailedBindKeepsChunksFree() {
     Expect(residency.MakeResident(0x50000000, ChunkBytes, 1).size() == 1 && residency.Counts().boundBytes == ChunkBytes, "the chunks of a failed bind are bound later");
 }
 
+struct GuestBlock {
+    std::vector<std::byte> storage = std::vector<std::byte>(5 * ChunkBytes);
+    std::uint64_t base = (reinterpret_cast<std::uint64_t>(storage.data()) + ChunkBytes - 1) & ~(ChunkBytes - 1);
+    std::byte* At(std::uint64_t offset) { return reinterpret_cast<std::byte*>(base + offset); }
+};
+
+void testUploadsFollowResidency() {
+    FakeDevice device;
+    Residency residency(device, 0);
+    ResidentUploads uploads(residency);
+    GuestBlock guest;
+    for (std::uint64_t at = 0; at < 3 * ChunkBytes; ++at) *guest.At(at) = static_cast<std::byte>(at * 7);
+    residency.Add(guest.base, 3 * ChunkBytes);
+    const std::vector<DirtyRange> early{{guest.base, 0x1000}};
+    uploads.NoteDirty(early);
+    Expect(uploads.Take().empty() && uploads.Counts().skippedBytes == 0x1000, "a dirty page that is not resident is not uploaded");
+    Expect(uploads.Prepare(guest.base + 0x1000, 0x100, 1), "preparing a span makes it resident");
+    auto taken = uploads.Take();
+    Expect(taken.size() == 1 && taken[0].offset == 0 && taken[0].bytes.size() == ChunkBytes && std::memcmp(taken[0].bytes.data(), guest.At(0), ChunkBytes) == 0, "a newly resident chunk is uploaded in full");
+    std::memset(guest.At(0x2000), 0x5a, 0x1000);
+    const std::vector<DirtyRange> dirty{{guest.base + 0x2000, 0x1000}, {guest.base + ChunkBytes, 0x1000}};
+    uploads.NoteDirty(dirty);
+    taken = uploads.Take();
+    Expect(taken.size() == 1 && taken[0].offset == 0x2000 && taken[0].bytes.size() == 0x1000 && taken[0].bytes[0] == std::byte{0x5a}, "a dirty resident page is uploaded alone");
+    Expect(uploads.Prepare(guest.base, 3 * ChunkBytes, 2), "the rest of the range is made resident");
+    taken = uploads.Take();
+    Expect(taken.size() == 1 && taken[0].offset == ChunkBytes && taken[0].bytes.size() == 2 * ChunkBytes, "only the newly bound chunks are uploaded, as one span");
+    Expect(!uploads.Prepare(guest.base + 2 * ChunkBytes, 2 * ChunkBytes, 2), "a span past the range is refused");
+}
+
+void testEvictionDropsPendingUploads() {
+    FakeDevice device;
+    Residency residency(device, ChunkBytes);
+    ResidentUploads uploads(residency);
+    GuestBlock guest;
+    residency.Add(guest.base, ChunkBytes);
+    residency.Add(guest.base + 2 * ChunkBytes, ChunkBytes);
+    uploads.Prepare(guest.base, ChunkBytes, 1);
+    uploads.Take();
+    const std::vector<DirtyRange> dirty{{guest.base, 0x1000}};
+    uploads.NoteDirty(dirty);
+    uploads.Prepare(guest.base + 2 * ChunkBytes, ChunkBytes, 2);
+    const auto evicted = uploads.Evict(2);
+    Expect(evicted.size() == 1 && evicted[0].address == guest.base, "the older range is evicted");
+    const auto taken = uploads.Take();
+    Expect(taken.size() == 1 && taken[0].guest == guest.base + 2 * ChunkBytes, "uploads into an evicted range are dropped");
+    Expect(uploads.Counts().evictedRanges == 1, "evicted ranges are counted");
+}
+
 }
 
 int main() {
+    testUploadsFollowResidency();
+    testEvictionDropsPendingUploads();
     testAddBindsNothing();
     testMakeResidentBindsCoveringChunks();
     testEvictionTakesTheOldestRange();
