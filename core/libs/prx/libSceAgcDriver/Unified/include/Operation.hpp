@@ -22,6 +22,7 @@ struct SnapshotIds {
     std::uint64_t context = 0;
     std::uint64_t userConfig = 0;
     std::uint64_t shader = 0;
+    std::uint64_t scalars = 0;
 
     bool operator==(const SnapshotIds&) const = default;
 };
