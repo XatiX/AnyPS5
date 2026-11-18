@@ -82,7 +82,8 @@ struct KernelArena {
 
 static GuestMemoryView::GuestView* SharedView() {
     static GuestMemoryView::GuestView* const view = []() -> GuestMemoryView::GuestView* {
-        if (std::getenv("APS5_GUEST_VIEW") == nullptr || !GuestArena::GuestArenaAvailable_nid_postfix()) return nullptr;
+        const bool wanted = std::getenv("APS5_GUEST_VIEW") != nullptr || (std::getenv("APS5_RECODE_MEMORY") != nullptr && std::getenv("APS5_NO_GUEST_VIEW") == nullptr);
+        if (!wanted || !GuestArena::GuestArenaAvailable_nid_postfix()) return nullptr;
         std::uintptr_t base = 0;
         std::size_t bytes = 0;
         GuestArena::GuestArenaRange_nid_postfix(&base, &bytes);
