@@ -338,6 +338,8 @@ BdaResources::BdaResources(const Context& context, const GuestBufferMemory& memo
         Require(tableBytes <= context.limits.maxStorageBufferRange && ShaderRecompiler::BdaAbi::FaultBufferBytes <= context.limits.maxStorageBufferRange, "BDA descriptors exceed storage buffer range limit");
         tableGuardSerial = MultisampleTargetRangeGeneration();
         pageTable = true;
+        std::uint64_t spaceSerial = 0;
+        if (auto spaceRanges = memory.SpaceRanges(spaceSerial)) service.MapImports(spaceSerial, std::move(spaceRanges));
         return;
     }
 #endif

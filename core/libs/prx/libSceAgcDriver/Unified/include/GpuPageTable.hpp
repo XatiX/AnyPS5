@@ -2,6 +2,7 @@
 #define CORE_LIBS_PRX_LIBSCEAGCDRIVER_UNIFIED_INCLUDE_GPUPAGETABLE_HPP
 
 #include <cstdint>
+#include <map>
 #include <memory>
 #include <span>
 #include <vector>
@@ -23,6 +24,14 @@ struct GpuPageTableDirty {
     bool root = false;
     std::vector<std::uint32_t> leaves;
 };
+
+struct LinearSpan {
+    std::uint64_t begin = 0;
+    std::uint64_t end = 0;
+    std::uint64_t deviceAddress = 0;
+};
+
+std::map<std::uint64_t, std::uint64_t> WholePages(std::span<const LinearSpan> spans);
 
 class GpuPageTable {
 public:

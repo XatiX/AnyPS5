@@ -70,6 +70,30 @@ std::span<const std::uint64_t> GpuPageTable::Leaf(std::uint32_t index) const {
     return *leaves[index];
 }
 
+std::map<std::uint64_t, std::uint64_t> WholePages(std::span<const LinearSpan> spans) {
+    std::map<std::uint64_t, std::uint64_t> pages;
+    const auto addRun = [&](const LinearSpan& run) {
+        const auto first = (run.begin + GpuPageBytes - 1) & ~(GpuPageBytes - 1);
+        const auto last = run.end & ~(GpuPageBytes - 1);
+        for (auto page = first; page < last; page += GpuPageBytes) {
+            const auto target = run.deviceAddress + (page - run.begin);
+            if ((target & GpuPagePermissions) == 0) pages.emplace(page, target);
+        }
+    };
+    LinearSpan run;
+    for (const auto& span : spans) {
+        if (span.end <= span.begin || span.deviceAddress == 0) continue;
+        if (run.end != 0 && span.begin == run.end && span.deviceAddress == run.deviceAddress + (run.end - run.begin)) {
+            run.end = span.end;
+            continue;
+        }
+        if (run.end != 0) addRun(run);
+        run = span;
+    }
+    if (run.end != 0) addRun(run);
+    return pages;
+}
+
 GpuPageTableDirty GpuPageTable::TakeDirty() {
     for (const auto index : dirty.leaves) leafDirty[index] = false;
     return std::exchange(dirty, {});

@@ -65,6 +65,27 @@ void testAddressSpaceBounds() {
     Expect(table.Lookup(GpuAddressSpace + 5) == 0, "lookups past the table miss");
 }
 
+void testWholePagesOfImports() {
+    const std::vector<LinearSpan> spans{
+        {Guest, Guest + GpuPageBytes / 2, Device},
+        {Guest + GpuPageBytes / 2, Guest + 2 * GpuPageBytes, Device + GpuPageBytes / 2},
+        {Guest + 3 * GpuPageBytes + 0x1000, Guest + 5 * GpuPageBytes, Device + 8 * GpuPageBytes + 0x1000},
+        {Guest + 6 * GpuPageBytes, Guest + 7 * GpuPageBytes, Device + 0x10001},
+        {Guest + 8 * GpuPageBytes, Guest + 9 * GpuPageBytes, 0},
+    };
+    const auto pages = WholePages(spans);
+    Expect(pages.size() == 3, "only whole pages of linear runs are mapped");
+    Expect(pages.contains(Guest) && pages.at(Guest) == Device && pages.contains(Guest + GpuPageBytes) && pages.at(Guest + GpuPageBytes) == Device + GpuPageBytes, "device-contiguous spans join into one run");
+    Expect(!pages.contains(Guest + 3 * GpuPageBytes) && pages.contains(Guest + 4 * GpuPageBytes) && pages.at(Guest + 4 * GpuPageBytes) == Device + 9 * GpuPageBytes, "a partly covered page is left out and the next keeps its offset");
+    Expect(!pages.contains(Guest + 6 * GpuPageBytes), "a target that would overlap the permission bits is left out");
+    Expect(!pages.contains(Guest + 8 * GpuPageBytes), "a span with no device address is left out");
+    const std::vector<LinearSpan> split{
+        {Guest, Guest + GpuPageBytes / 2, Device},
+        {Guest + GpuPageBytes / 2, Guest + GpuPageBytes, Device + 4 * GpuPageBytes},
+    };
+    Expect(WholePages(split).empty(), "a page whose halves live in different buffers is left out");
+}
+
 }
 
 int main() {
@@ -73,6 +94,7 @@ int main() {
     testPermissions();
     testUnmapAndDirtyLeaves();
     testAddressSpaceBounds();
+    testWholePagesOfImports();
     if (failures != 0) {
         std::fprintf(stderr, "%d failure(s)\n", failures);
         return 1;
