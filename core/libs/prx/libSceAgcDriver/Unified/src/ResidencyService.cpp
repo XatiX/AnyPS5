@@ -38,7 +38,7 @@ bool ResidencyService::Enabled() {
 }
 
 bool ResidencyService::PageTableEnabled() {
-    static const bool enabled = Enabled() && std::getenv("APS5_RECODE_PAGE_TABLE") != nullptr && std::getenv("APS5_RECODE_NO_OWNED_REGIONS") == nullptr;
+    static const bool enabled = Enabled() && std::getenv("APS5_RECODE_NO_PAGE_TABLE") == nullptr && std::getenv("APS5_RECODE_NO_OWNED_REGIONS") == nullptr;
     return enabled;
 }
 
