@@ -168,9 +168,50 @@ void testEvictionDropsPendingUploads() {
     Expect(uploads.Counts().evictedRanges == 1, "evicted ranges are counted");
 }
 
+void testServedRangeReplacesUnboundRanges() {
+    FakeDevice device;
+    Residency residency(device, 0);
+    residency.Add(0x70010000, 0x1000);
+    residency.Add(0x70030000, 0x2000);
+    residency.Add(0x6fff0000, 0x20000);
+    Expect(residency.RemoveUnboundInside(0x70000000, 0x100000) == 2, "unbound ranges inside are removed");
+    Expect(residency.Owns(0x6fff0000, 0x20000), "a range reaching outside is kept");
+    residency.Remove(0x6fff0000);
+    Expect(residency.Add(0x70000000, 0x100000), "the whole range is added once the ranges inside are gone");
+    residency.MakeResident(0x70000000, ChunkBytes, 1);
+    residency.Add(0x80000000, ChunkBytes);
+    residency.MakeResident(0x80000000, ChunkBytes, 1);
+    Expect(residency.RemoveUnboundInside(0x70000000, 0x20000000) == 0, "bound ranges are kept");
+    const auto base = residency.Base(0x70008000);
+    Expect(base && base->offset == 0x8000 && base->bytes == 0xf8000 && base->address == (std::uint64_t{4} << 40u) + 0x8000, "the base of an address does not need its chunk bound");
+    Expect(residency.Base(0x70020000).has_value() && !residency.Translate(0x70020000, 4).has_value(), "an unbound page has a base but no translation");
+    residency.SetBudget(ChunkBytes);
+    residency.Touch(0x70000000, 5);
+    const auto evicted = residency.Evict(5);
+    Expect(evicted.size() == 1 && evicted[0].address == 0x80000000, "a touched range is kept over an older one");
+}
+
+std::vector<std::pair<std::uint64_t, std::uint64_t>> committedHalf(std::uint64_t address, std::size_t bytes, bool) {
+    return {{address, address + bytes / 2}};
+}
+
+void testFullUploadsReadCommittedPagesOnly() {
+    FakeDevice device;
+    Residency residency(device, 0);
+    ResidentUploads uploads(residency, committedHalf);
+    GuestBlock guest;
+    std::memset(guest.At(0), 0x33, ChunkBytes);
+    residency.Add(guest.base, ChunkBytes);
+    uploads.Prepare(guest.base, ChunkBytes, 1);
+    const auto taken = uploads.Take();
+    Expect(taken.size() == 1 && taken[0].bytes[0] == std::byte{0x33} && taken[0].bytes[ChunkBytes / 2] == std::byte{0}, "uncommitted pages of a full upload read as zeros");
+}
+
 }
 
 int main() {
+    testServedRangeReplacesUnboundRanges();
+    testFullUploadsReadCommittedPagesOnly();
     testUploadsFollowResidency();
     testEvictionDropsPendingUploads();
     testAddBindsNothing();

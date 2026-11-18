@@ -75,6 +75,9 @@ public:
     [[nodiscard]] bool Owns(std::uint64_t address, std::uint64_t size) const;
     std::vector<GuestSpan> MakeResident(std::uint64_t address, std::uint64_t size, std::uint64_t frame);
     [[nodiscard]] std::optional<DeviceSpan> Translate(std::uint64_t address, std::uint64_t size) const;
+    [[nodiscard]] std::optional<DeviceSpan> Base(std::uint64_t address) const;
+    void Touch(std::uint64_t address, std::uint64_t frame);
+    std::size_t RemoveUnboundInside(std::uint64_t address, std::uint64_t size);
     std::vector<GuestSpan> Evict(std::uint64_t frame);
     void SetBudget(std::uint64_t bytes);
     [[nodiscard]] ResidencyCounts Counts() const;

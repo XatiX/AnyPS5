@@ -5,7 +5,7 @@
 
 namespace AgcDriver::Unified {
 
-ResidentUploads::ResidentUploads(Residency& residency) : residency(residency) {}
+ResidentUploads::ResidentUploads(Residency& residency, Committed committed) : residency(residency), committed(committed) {}
 
 void ResidentUploads::snapshot(std::uint64_t address, std::uint64_t size, bool full) {
     const auto end = address + size;
@@ -25,7 +25,13 @@ void ResidentUploads::snapshot(std::uint64_t address, std::uint64_t size, bool f
             stop = next;
         }
         PendingUpload upload{first->handle, first->offset, cursor, std::vector<std::byte>(static_cast<std::size_t>(stop - cursor))};
-        std::memcpy(upload.bytes.data(), reinterpret_cast<const void*>(cursor), upload.bytes.size());
+        if (full && committed != nullptr) {
+            for (const auto& [from, to] : committed(cursor, upload.bytes.size(), false)) {
+                std::memcpy(upload.bytes.data() + (from - cursor), reinterpret_cast<const void*>(from), static_cast<std::size_t>(to - from));
+            }
+        } else {
+            std::memcpy(upload.bytes.data(), reinterpret_cast<const void*>(cursor), upload.bytes.size());
+        }
         if (full) {
             ++counts.fullUploads;
             counts.fullBytes += stop - cursor;
@@ -58,6 +64,11 @@ std::vector<PendingUpload> ResidentUploads::Take() {
     std::vector<PendingUpload> taken;
     taken.swap(pending);
     return taken;
+}
+
+bool ResidentUploads::Pending() const {
+    std::lock_guard lock(mutex);
+    return !pending.empty();
 }
 
 std::vector<GuestSpan> ResidentUploads::Evict(std::uint64_t frame) {

@@ -159,6 +159,36 @@ std::optional<DeviceSpan> Residency::Translate(std::uint64_t address, std::uint6
     return DeviceSpan{range.buffer.handle, offset, range.buffer.address + offset, size};
 }
 
+std::optional<DeviceSpan> Residency::Base(std::uint64_t address) const {
+    std::lock_guard lock(mutex);
+    const auto it = rangeOf(address);
+    if (it == ranges.end()) return std::nullopt;
+    const auto offset = address - it->second.origin;
+    return DeviceSpan{it->second.buffer.handle, offset, it->second.buffer.address + offset, it->second.end - address};
+}
+
+void Residency::Touch(std::uint64_t address, std::uint64_t frame) {
+    std::lock_guard lock(mutex);
+    const auto it = rangeOf(address);
+    if (it != ranges.end()) it->second.lastUse = std::max(it->second.lastUse, frame);
+}
+
+std::size_t Residency::RemoveUnboundInside(std::uint64_t address, std::uint64_t size) {
+    std::lock_guard lock(mutex);
+    const auto end = size > std::numeric_limits<std::uint64_t>::max() - address ? std::numeric_limits<std::uint64_t>::max() : address + size;
+    std::size_t removed = 0;
+    for (auto it = ranges.lower_bound(address); it != ranges.end() && it->first < end;) {
+        if (it->second.end > end || it->second.boundChunks != 0) {
+            ++it;
+            continue;
+        }
+        device.DestroyBuffer(it->second.buffer.handle);
+        it = ranges.erase(it);
+        ++removed;
+    }
+    return removed;
+}
+
 std::vector<GuestSpan> Residency::Evict(std::uint64_t frame) {
     std::vector<GuestSpan> evicted;
     std::lock_guard lock(mutex);

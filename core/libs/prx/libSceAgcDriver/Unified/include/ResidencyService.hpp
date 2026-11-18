@@ -5,6 +5,8 @@
 #include "prx/libSceAgcDriver/Unified/include/ResidentUploads.hpp"
 #include "prx/libSceAgcDriver/Unified/include/VulkanResidency.hpp"
 #include <atomic>
+#include <map>
+#include <span>
 #include <memory>
 #include <mutex>
 #include <optional>
@@ -25,8 +27,11 @@ public:
     void NoteDirty(std::span<const DirtyRange> ranges);
     bool Prepare(std::uint64_t address, std::uint64_t size);
     [[nodiscard]] std::optional<DeviceSpan> Translate(std::uint64_t address, std::uint64_t size) const;
+    std::optional<DeviceSpan> Serve(std::uint64_t address, std::uint64_t size, std::span<const std::pair<std::uint64_t, std::uint64_t>> committed);
+    [[nodiscard]] bool Pending() const;
     std::size_t Record(VkCommandBuffer commands, std::vector<std::shared_ptr<void>>& kept);
     void AdvanceFrame();
+    [[nodiscard]] std::uint64_t Frame() const { return frame.load(std::memory_order_relaxed); }
     [[nodiscard]] std::string Line() const;
 
 private:
@@ -38,6 +43,8 @@ private:
     std::unique_ptr<Residency> ledger;
     std::unique_ptr<ResidentUploads> uploads;
     std::vector<std::pair<std::uint64_t, std::uint64_t>> queued;
+    std::map<std::uint64_t, std::uint64_t> served;
+    std::uint64_t serveRefusals = 0;
     std::atomic<std::uint64_t> frame{1};
     std::atomic<bool> attached{false};
     std::atomic<bool> refused{false};

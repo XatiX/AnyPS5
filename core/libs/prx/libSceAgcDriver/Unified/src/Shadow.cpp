@@ -5,6 +5,7 @@
 #include "prx/libSceAgcDriver/Unified/include/Events.hpp"
 #include "prx/libSceAgcDriver/Unified/include/ProofVerdict.hpp"
 #include "prx/libc/include/GuestArena.hpp"
+#include "prx/libSceAgcDriver/Execution/include/GuestMemory.hpp"
 #include "prx/libSceAgcDriver/Unified/include/RecordVerify.hpp"
 #include "prx/libSceAgcDriver/Unified/include/RecordDraw.hpp"
 #include <atomic>
@@ -60,7 +61,16 @@ struct MemoryTotals {
     std::atomic<std::uint64_t> dirtyBytes{0};
     std::atomic<std::uint64_t> consumeNanoseconds{0};
     std::atomic<std::uint64_t> maxConsumeNanoseconds{0};
+    std::atomic<std::uint64_t> ownedServes{0};
+    std::atomic<std::uint64_t> ownedWalks{0};
+    std::atomic<std::uint64_t> ownedWalkNanoseconds{0};
+    std::atomic<std::uint64_t> ownedRecords{0};
+    std::atomic<std::uint64_t> ownedRecordNanoseconds{0};
 };
+
+std::uint64_t nanosecondsSince(std::chrono::steady_clock::time_point start) {
+    return static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - start).count());
+}
 
 MemoryTotals& memoryTotals() {
     static MemoryTotals& totals = *new MemoryTotals();
@@ -150,7 +160,13 @@ std::string memoryLine() {
     const auto events = Events::Shared().Counts();
     char eventLine[384];
     std::snprintf(eventLine, sizeof(eventLine), "[recode-events] notes %llu serial %llu; queries %llu, region skips %llu, changed %llu, owner exempt %llu; proof objects %llu, with ranges outside the arena %llu\n", static_cast<unsigned long long>(events.notes), static_cast<unsigned long long>(Events::Shared().Serial()), static_cast<unsigned long long>(events.queries), static_cast<unsigned long long>(events.regionSkips), static_cast<unsigned long long>(events.changed), static_cast<unsigned long long>(events.ownerExempt), static_cast<unsigned long long>(totals.proofObjects.load(std::memory_order_relaxed)), static_cast<unsigned long long>(totals.proofObjectsOutside.load(std::memory_order_relaxed)));
-    return std::string(line) + eventLine + ResidencyService::Get().Line();
+    std::string owned;
+    if (const auto serves = totals.ownedServes.load(std::memory_order_relaxed); serves != 0) {
+        char ownedLine[256];
+        std::snprintf(ownedLine, sizeof(ownedLine), "[recode-owned] serves %llu, walks %llu (%.1f ms), upload records %llu (%.1f ms)\n", static_cast<unsigned long long>(serves), static_cast<unsigned long long>(totals.ownedWalks.load(std::memory_order_relaxed)), static_cast<double>(totals.ownedWalkNanoseconds.load(std::memory_order_relaxed)) / 1e6, static_cast<unsigned long long>(totals.ownedRecords.load(std::memory_order_relaxed)), static_cast<double>(totals.ownedRecordNanoseconds.load(std::memory_order_relaxed)) / 1e6);
+        owned = ownedLine;
+    }
+    return std::string(line) + eventLine + ResidencyService::Get().Line() + owned;
 }
 
 void report() {
@@ -256,6 +272,69 @@ void NoteGpuMapping(const GuestAllocations::Mapped& ranges) {
         totals.registrations.fetch_add(1, std::memory_order_relaxed);
         totals.registeredBytes.fetch_add(last - first, std::memory_order_relaxed);
     }
+}
+
+bool ServesOwned() {
+    static const bool serves = ResidencyService::Enabled() && std::getenv("APS5_RECODE_NO_OWNED_REGIONS") == nullptr;
+    return serves && memoryInstalled();
+}
+
+bool ServeOwned(const Graphics::Context& context, std::uint64_t address, std::uint64_t size, OwnedSpan* span) {
+    if (size == 0 || !ServesOwned()) return false;
+    auto& service = ResidencyService::Get();
+    if (!service.Attach(context)) return false;
+    const auto first = address & ~(PageBytes - 1);
+    const auto last = (address + size + PageBytes - 1) & ~(PageBytes - 1);
+    auto& totals = memoryTotals();
+    totals.ownedServes.fetch_add(1, std::memory_order_relaxed);
+    struct Served {
+        std::uint64_t last = 0;
+        std::uint64_t frame = 0;
+        OwnedSpan span;
+    };
+    static std::mutex servedMutex;
+    static auto& served = *new std::map<std::uint64_t, Served>();
+    const auto frame = service.Frame();
+    std::lock_guard lock(servedMutex);
+    if (const auto found = served.find(first); found != served.end() && found->second.last == last && found->second.frame == frame) {
+        *span = found->second.span;
+        span->address += address - first;
+        return true;
+    }
+    if (!GuestArena::GuestArenaContains_nid_postfix(reinterpret_cast<const void*>(first), static_cast<std::size_t>(last - first))) return false;
+    const auto start = std::chrono::steady_clock::now();
+    const auto committed = GuestMemory::CommittedRanges(first, static_cast<std::size_t>(last - first));
+    auto& core = MemoryCore::Get();
+    core.Reserve(first, last - first);
+    for (const auto& [from, to] : committed) core.MakeResident(from, to - from);
+    const auto base = service.Serve(first, last - first, committed);
+    totals.ownedWalks.fetch_add(1, std::memory_order_relaxed);
+    totals.ownedWalkNanoseconds.fetch_add(nanosecondsSince(start), std::memory_order_relaxed);
+    if (!base) {
+        served.erase(first);
+        return false;
+    }
+    const OwnedSpan whole{base->handle, base->address, first - base->offset};
+    served[first] = {last, frame, whole};
+    *span = whole;
+    span->address += address - first;
+    return true;
+}
+
+bool OwnedUploadsPending() {
+    return ServesOwned() && ResidencyService::Get().Pending();
+}
+
+std::size_t RecordOwnedUploads(VkCommandBuffer commands, std::vector<std::shared_ptr<void>>& kept) {
+    if (!ServesOwned()) return 0;
+    const auto start = std::chrono::steady_clock::now();
+    const auto recorded = ResidencyService::Get().Record(commands, kept);
+    if (recorded != 0) {
+        auto& totals = memoryTotals();
+        totals.ownedRecords.fetch_add(1, std::memory_order_relaxed);
+        totals.ownedRecordNanoseconds.fetch_add(nanosecondsSince(start), std::memory_order_relaxed);
+    }
+    return recorded;
 }
 
 std::shared_ptr<DriverDetail::Submission> Copy(const DriverDetail::Submission& submission) {

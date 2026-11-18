@@ -1,5 +1,7 @@
 #include "prx/libSceAgcDriver/Unified/include/ResidencyService.hpp"
+#include "prx/libSceAgcDriver/Execution/include/GuestMemory.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/Resources.hpp"
+#include <algorithm>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -39,7 +41,7 @@ bool ResidencyService::Attach(const Graphics::Context& graphics) {
     context.emplace(graphics);
     device = std::make_unique<VulkanResidency>(*context);
     ledger = std::make_unique<Residency>(*device, 0);
-    uploads = std::make_unique<ResidentUploads>(*ledger);
+    uploads = std::make_unique<ResidentUploads>(*ledger, GuestMemory::CommittedRanges);
     for (const auto& [address, size] : queued) ledger->Add(address, size);
     queued.clear();
     queued.shrink_to_fit();
@@ -62,6 +64,44 @@ void ResidencyService::NoteDirty(std::span<const DirtyRange> ranges) {
     if (!Attached() || ranges.empty()) return;
     std::lock_guard lock(mutex);
     uploads->NoteDirty(ranges);
+    if (served.empty()) return;
+    const auto now = frame.load(std::memory_order_relaxed);
+    for (const auto& range : ranges) {
+        auto it = served.upper_bound(range.address);
+        if (it == served.begin()) continue;
+        --it;
+        if (range.address < it->second) uploads->Prepare(range.address, std::min(range.size, it->second - range.address), now);
+    }
+}
+
+std::optional<DeviceSpan> ResidencyService::Serve(std::uint64_t address, std::uint64_t size, std::span<const std::pair<std::uint64_t, std::uint64_t>> committed) {
+    if (!Attached() || size == 0) return std::nullopt;
+    std::lock_guard lock(mutex);
+    const auto end = address + size;
+    if (!served.contains(address)) {
+        if (!ledger->Owns(address, size)) {
+            ledger->RemoveUnboundInside(address, size);
+            if (!ledger->Add(address, size)) {
+                ++serveRefusals;
+                return std::nullopt;
+            }
+        }
+        served.emplace(address, end);
+    }
+    const auto now = frame.load(std::memory_order_relaxed);
+    for (const auto& [from, to] : committed) {
+        const auto first = std::max(from, address);
+        const auto last = std::min(to, end);
+        if (first < last && !uploads->Prepare(first, last - first, now)) {
+            served.erase(address);
+            ledger->Remove(address);
+            ++serveRefusals;
+            return std::nullopt;
+        }
+    }
+    auto base = ledger->Base(address);
+    if (base) base->bytes = std::min(base->bytes, size);
+    return base;
 }
 
 bool ResidencyService::Prepare(std::uint64_t address, std::uint64_t size) {
@@ -76,9 +116,17 @@ std::optional<DeviceSpan> ResidencyService::Translate(std::uint64_t address, std
     return ledger->Translate(address, size);
 }
 
+bool ResidencyService::Pending() const {
+    if (!Attached()) return false;
+    std::lock_guard lock(mutex);
+    return uploads->Pending();
+}
+
 std::size_t ResidencyService::Record(VkCommandBuffer commands, std::vector<std::shared_ptr<void>>& kept) {
     if (!Attached()) return 0;
     std::lock_guard lock(mutex);
+    const auto now = frame.load(std::memory_order_relaxed);
+    for (const auto& [address, end] : served) ledger->Touch(address, now);
     auto taken = uploads->Take();
     if (taken.empty()) return 0;
     std::size_t total = 0;
@@ -119,11 +167,11 @@ std::string ResidencyService::Line() const {
     const auto ledgerCounts = ledger->Counts();
     const auto uploadCounts = uploads->Counts();
     char line[512];
-    std::snprintf(line, sizeof(line), "[recode-residency] ranges %llu, pools %llu, bound %llu MiB of %llu MiB budget, chunks bound %llu, evicted %llu, refused %llu; uploads dirty %llu (%llu MiB) full %llu (%llu MiB) not resident %llu MiB; recorded %llu (%llu MiB)\n",
+    std::snprintf(line, sizeof(line), "[recode-residency] ranges %llu, pools %llu, bound %llu MiB of %llu MiB budget, chunks bound %llu, evicted %llu, refused %llu; uploads dirty %llu (%llu MiB) full %llu (%llu MiB) not resident %llu MiB; recorded %llu (%llu MiB); served %llu, serves refused %llu\n",
         static_cast<unsigned long long>(ledgerCounts.ranges), static_cast<unsigned long long>(ledgerCounts.pools), static_cast<unsigned long long>(ledgerCounts.boundBytes >> 20), static_cast<unsigned long long>(ledgerCounts.budget >> 20),
         static_cast<unsigned long long>(ledgerCounts.bound), static_cast<unsigned long long>(ledgerCounts.evicted), static_cast<unsigned long long>(ledgerCounts.refused),
         static_cast<unsigned long long>(uploadCounts.dirtyUploads), static_cast<unsigned long long>(uploadCounts.dirtyBytes >> 20), static_cast<unsigned long long>(uploadCounts.fullUploads), static_cast<unsigned long long>(uploadCounts.fullBytes >> 20), static_cast<unsigned long long>(uploadCounts.skippedBytes >> 20),
-        static_cast<unsigned long long>(recordedUploads), static_cast<unsigned long long>(recordedBytes >> 20));
+        static_cast<unsigned long long>(recordedUploads), static_cast<unsigned long long>(recordedBytes >> 20), static_cast<unsigned long long>(served.size()), static_cast<unsigned long long>(serveRefusals));
     return line;
 }
 
