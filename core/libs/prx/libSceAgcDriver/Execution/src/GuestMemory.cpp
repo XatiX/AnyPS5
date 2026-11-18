@@ -2062,7 +2062,7 @@ bool collectWindowsWrites(StampRuns& runs, std::uint64_t first, std::uint64_t st
     const bool fresh = runs.kind == StampKind::Fresh;
     if (fresh) {
         if (const auto hook = freshCollectHook.load(std::memory_order_acquire)) return hook(static_cast<std::uintptr_t>(first), static_cast<std::size_t>(stop - first), &stampWrittenRun, &runs);
-    } else if (const auto* hooks = coreWriteHooks.load(std::memory_order_acquire); hooks != nullptr && !tracker.coverage.Covers(first, static_cast<std::size_t>(stop - first)) && hooks->covers(static_cast<std::uintptr_t>(first), static_cast<std::size_t>(stop - first))) {
+    } else if (const auto* hooks = coreWriteHooks.load(std::memory_order_acquire); hooks != nullptr && hooks->covers(static_cast<std::uintptr_t>(first), static_cast<std::size_t>(stop - first))) {
         const bool complete = hooks->collect(static_cast<std::uintptr_t>(first), static_cast<std::size_t>(stop - first), &stampWrittenRun, &runs);
         if (complete && runs.stamped != 0) collectDirty.fetch_add(1, std::memory_order_relaxed);
         return complete;
