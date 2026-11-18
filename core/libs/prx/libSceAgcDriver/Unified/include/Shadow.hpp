@@ -16,6 +16,7 @@ bool Active();
 bool MemoryActive();
 bool DrawScope();
 bool Teeing();
+std::shared_ptr<QueueState> RecordedState(const DriverDetail::Submission& submission, std::size_t packetOffset);
 void NoteDriverDraw(const QueueState& queue, const DriverDetail::Submission& submission, std::size_t packetOffset);
 void NoteGpuMapping(const GuestAllocations::Mapped& ranges);
 void NoteGuestAccess(GuestRanges reads, GuestRanges writes, bool unknown);

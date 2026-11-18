@@ -3,6 +3,7 @@
 #include "prx/libSceAgcDriver/Unified/include/MemoryCore.hpp"
 #include "prx/libc/include/GuestArena.hpp"
 #include "prx/libSceAgcDriver/Unified/include/RecordVerify.hpp"
+#include "prx/libSceAgcDriver/Unified/include/RecordDraw.hpp"
 #include <atomic>
 #include "prx/libSceAgcDriver/Execution/include/PerformanceOverlay.hpp"
 #include <chrono>
@@ -29,12 +30,17 @@ bool drawScope() {
 
 void registerUses(std::span<const GuestUse> uses);
 
-void verifyDecoded(const Operation& operation, const DecodeState& state) {
-    Record::SharedVerifier().NoteDecoded(operation, state);
+void consumeDecoded(const Operation& operation, const DecodeState& state) {
+    if (Record::VerifyActive()) Record::SharedVerifier().NoteDecoded(operation, state);
+    if (Record::DrawActive()) Record::SharedHandoff().Offer(operation, state);
+}
+
+bool recording() {
+    return Record::VerifyActive() || Record::DrawActive();
 }
 
 Front& front() {
-    static Front& shared = *new Front(Record::VerifyActive() ? Front::Consumer(verifyDecoded) : Front::Consumer(), std::getenv("APS5_RECODE_RESOLVE") != nullptr || drawScope() || Record::VerifyActive(), drawScope() ? UseSink(registerUses) : UseSink());
+    static Front& shared = *new Front(recording() ? Front::Consumer(consumeDecoded) : Front::Consumer(), std::getenv("APS5_RECODE_RESOLVE") != nullptr || drawScope() || recording(), drawScope() ? UseSink(registerUses) : UseSink());
     return shared;
 }
 
@@ -145,7 +151,7 @@ void report() {
         last = now;
     }
     if (!Active()) {
-        const auto memory = memoryLine() + Record::VerifyLine();
+        const auto memory = memoryLine() + Record::VerifyLine() + Record::HandoffLine();
         if (!memory.empty()) std::fputs(memory.c_str(), stderr);
         return;
     }
@@ -170,6 +176,7 @@ void report() {
     line += compare;
     line += memoryLine();
     line += Record::VerifyLine();
+    line += Record::HandoffLine();
     std::fputs(line.c_str(), stderr);
 }
 
@@ -190,8 +197,13 @@ bool DrawScope() {
 }
 
 bool Teeing() {
-    static const bool teeing = Active() || MemoryActive() || Record::VerifyActive();
+    static const bool teeing = Active() || MemoryActive() || recording();
     return teeing;
+}
+
+std::shared_ptr<QueueState> RecordedState(const DriverDetail::Submission& submission, std::size_t packetOffset) {
+    if (!Record::DrawActive()) return nullptr;
+    return Record::SharedHandoff().Take(submission.queue, submission.serial, packetOffset, std::chrono::milliseconds(100));
 }
 
 void NoteDriverDraw(const QueueState& queue, const DriverDetail::Submission& submission, std::size_t packetOffset) {
@@ -235,7 +247,7 @@ std::shared_ptr<DriverDetail::Submission> Copy(const DriverDetail::Submission& s
 }
 
 void Tee(const DriverDetail::Submission& submission) {
-    const bool decoding = Active() || drawScope() || Record::VerifyActive();
+    const bool decoding = Active() || drawScope() || recording();
     if (submission.suspend && decoding) front().NoteSuspend();
     if (submission.suspend || submission.commands.empty()) return;
     if (MemoryActive()) {

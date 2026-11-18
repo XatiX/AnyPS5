@@ -5,6 +5,7 @@
 #include "prx/libSceAgcDriver/Unified/include/Replay.hpp"
 #include "prx/libSceAgcDriver/Unified/include/RecordState.hpp"
 #include "prx/libSceAgcDriver/Unified/include/RecordVerify.hpp"
+#include "prx/libSceAgcDriver/Unified/include/RecordDraw.hpp"
 #include "prx/libSceAgcDriver/Execution/include/SubmissionCapture.hpp"
 #include "prx/libSceAgcDriver/Execution/include/VideoOutput.hpp"
 #include "../tools/Pm4Analysis.hpp"
@@ -429,6 +430,31 @@ void testSuspendResetsTheGraphicsState() {
     Expect(reset.size() == 2 && reset[0] && !reset[1], "after a suspend the next queue 0 submission starts from a fresh state, as the driver's does");
 }
 
+void testHandoffGivesEachDrawItsDecodedState() {
+    Stream stream;
+    stream.SetContext(0x8e, 0x3);
+    stream.Draw(3);
+    stream.SetContext(0x8e, 0x9);
+    stream.Draw(6);
+    DecodeState state(0);
+    Recorded sink(state);
+    sink.retire = false;
+    DecodeSubmission(stream.submission, state, sink);
+    if (sink.operations.size() != 2) {
+        Expect(false, "two draws to hand off");
+        return;
+    }
+    Record::Handoff handoff;
+    for (const auto& operation : sink.operations) handoff.Offer(operation, state);
+    const auto second = handoff.Take(0, sink.operations[1].submission, sink.operations[1].packetOffset, std::chrono::milliseconds(0));
+    const auto first = handoff.Take(0, sink.operations[0].submission, sink.operations[0].packetOffset, std::chrono::milliseconds(0));
+    Expect(first != nullptr && first->context.at(0x8e) == 0x3, "the first draw gets the state decoded at it");
+    Expect(second != nullptr && second->context.at(0x8e) == 0x9, "the second draw gets its own state, taken in any order");
+    Expect(handoff.Take(0, sink.operations[0].submission, sink.operations[0].packetOffset, std::chrono::milliseconds(1)) == nullptr, "a state is taken once");
+    const auto counts = handoff.Counts();
+    Expect(counts.offered == 2 && counts.taken == 2 && counts.missed == 1 && counts.pending == 0, "handoff counts");
+}
+
 void testConditionalRangesArePredicated() {
     Stream stream;
     const auto condition = stream.Add({type3(0x22, 5), 0x1000, 0x2, 0x0, 3});
@@ -506,6 +532,7 @@ int main() {
     testRebuiltStateResolvesLikeTheDecoder();
     testVerifierPairsDecodedAndDriverDraws();
     testSuspendResetsTheGraphicsState();
+    testHandoffGivesEachDrawItsDecodedState();
     if (failures != 0) {
         std::fprintf(stderr, "%d failure(s)\n", failures);
         return 1;

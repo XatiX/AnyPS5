@@ -23,6 +23,9 @@
 #include <stdexcept>
 #include <string>
 #include <utility>
+#if ANYPS5_UNIFIED
+#include "prx/libSceAgcDriver/Unified/include/Shadow.hpp"
+#endif
 
 namespace AgcDriver::DriverDetail {
 
@@ -547,7 +550,13 @@ void Driver::execute(Submission& submission) {
 
                 try {
                     std::string rejected;
-                    const auto verdict = draw(queue, packet, submission, cursor, rejected);
+#if ANYPS5_UNIFIED
+                    const auto recorded = Unified::Shadow::RecordedState(submission, cursor);
+                    auto& drawState = recorded != nullptr ? *recorded : queue;
+#else
+                    auto& drawState = queue;
+#endif
+                    const auto verdict = draw(drawState, packet, submission, cursor, rejected);
                     drawn = verdict == DrawVerdict::Drawn;
                     CaptureTrace::Log("draw submission=%llu queue=%x offset=%zu target=%llx mask=%x verdict=%d reason=%.256s", static_cast<unsigned long long>(submission.serial), submission.queue, cursor, static_cast<unsigned long long>(color), readRegister(queue.context, 0x8e), static_cast<int>(verdict), rejected.c_str());
                     if (verdict == DrawVerdict::Rejected) {
