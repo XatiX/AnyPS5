@@ -4,6 +4,7 @@
 #include "prx/libSceAgcDriver/Unified/include/Shadow.hpp"
 #include "prx/libSceAgcDriver/Unified/include/Replay.hpp"
 #include "prx/libSceAgcDriver/Unified/include/RecordState.hpp"
+#include "prx/libSceAgcDriver/Unified/include/RecordVerify.hpp"
 #include "prx/libSceAgcDriver/Execution/include/SubmissionCapture.hpp"
 #include "prx/libSceAgcDriver/Execution/include/VideoOutput.hpp"
 #include "../tools/Pm4Analysis.hpp"
@@ -193,7 +194,7 @@ void testFrontDecodesQueuesOnTheirOwnThreads() {
     std::mutex seenMutex;
     std::map<std::uint32_t, std::uint64_t> seen;
     {
-        Front front([&](const Operation& operation) {
+        Front front([&](const Operation& operation, const DecodeState&) {
             std::lock_guard lock(seenMutex);
             ++seen[operation.queue];
         });
@@ -367,6 +368,67 @@ void testRebuiltStateResolvesLikeTheDecoder() {
     Expect(rebuilt && context != nullptr && rebuilt->context.at(0x8e) == 0x7, "the rebuilt state carries the context snapshot");
 }
 
+void testVerifierPairsDecodedAndDriverDraws() {
+    Stream stream;
+    stream.Draw(3);
+    stream.SetContext(0x8e, 0x5);
+    stream.Draw(6);
+    stream.Draw(9);
+    DecodeState state(0);
+    state.SetResolve(true);
+    Recorded sink(state);
+    sink.retire = false;
+    DecodeSubmission(stream.submission, state, sink);
+    Expect(sink.operations.size() == 3 && state.Counts().resolved == 3, "three resolved draws to verify");
+    if (sink.operations.size() != 3) return;
+    Record::Verifier verifier;
+    const auto& first = sink.operations[0];
+    const auto& second = sink.operations[1];
+    const auto& third = sink.operations[2];
+    verifier.NoteDecoded(first, state);
+    verifier.NoteDriverKey(first.key, 0, first.submission, first.packetOffset);
+    verifier.NoteDriverKey(second.key, 0, second.submission, second.packetOffset);
+    verifier.NoteDecoded(second, state);
+    verifier.NoteDecoded(third, state);
+    verifier.NoteDriverKey(third.key ^ 1u, 0, third.submission, third.packetOffset);
+    const auto counts = verifier.Counts();
+    Expect(counts.matched == 2, "equal keys match whichever side arrives first");
+    Expect(counts.mismatched == 1, "a different driver key is a mismatch");
+    Expect(counts.bridgeMismatched == 0 && counts.bridgeMissing == 0, "the rebuilt state gives the decoder's key at every draw");
+    Expect(counts.pending == 0, "every pair met");
+}
+
+void testSuspendResetsTheGraphicsState() {
+    const auto run = [](bool suspend) {
+        std::mutex seenMutex;
+        std::vector<bool> written;
+        {
+            Front front([&](const Operation& operation, const DecodeState& state) {
+                if (operation.kind != OpKind::Draw) return;
+                const auto rebuilt = Record::QueueStateAt(state, operation.snapshots);
+                std::lock_guard lock(seenMutex);
+                written.push_back(rebuilt && rebuilt->shader.contains(0x212));
+            });
+            auto first = std::make_shared<DriverDetail::Submission>();
+            first->serial = 1;
+            first->commands = {type3(0x76, 3), 0x212, 0x55, type3(0x2d, 3), 3, 2};
+            front.Push(first);
+            if (suspend) front.NoteSuspend();
+            auto second = std::make_shared<DriverDetail::Submission>();
+            second->serial = 2;
+            second->commands = {type3(0x2d, 3), 3, 2};
+            front.Push(second);
+            const auto totals = front.Totals();
+            Expect(totals.size() == 1 && totals[0].counts.resets == (suspend ? 1u : 0u), "a suspend resets the queue 0 lane once");
+        }
+        return written;
+    };
+    const auto kept = run(false);
+    const auto reset = run(true);
+    Expect(kept.size() == 2 && kept[0] && kept[1], "without a suspend the shader write carries into the next submission");
+    Expect(reset.size() == 2 && reset[0] && !reset[1], "after a suspend the next queue 0 submission starts from a fresh state, as the driver's does");
+}
+
 void testConditionalRangesArePredicated() {
     Stream stream;
     const auto condition = stream.Add({type3(0x22, 5), 0x1000, 0x2, 0x0, 3});
@@ -442,6 +504,8 @@ int main() {
     testResolveFillsDrawParametersAndKeys();
     testUsesReportIndexAndIndirectRanges();
     testRebuiltStateResolvesLikeTheDecoder();
+    testVerifierPairsDecodedAndDriverDraws();
+    testSuspendResetsTheGraphicsState();
     if (failures != 0) {
         std::fprintf(stderr, "%d failure(s)\n", failures);
         return 1;

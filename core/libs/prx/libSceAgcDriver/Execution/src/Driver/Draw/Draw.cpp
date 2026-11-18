@@ -35,6 +35,9 @@
 #include <string>
 #include <string_view>
 #include <typeinfo>
+#if ANYPS5_UNIFIED
+#include "prx/libSceAgcDriver/Unified/include/Shadow.hpp"
+#endif
 
 namespace AgcDriver::DriverDetail {
 
@@ -332,6 +335,9 @@ std::unordered_map<std::uint64_t, bool>& CpuIndirectPrograms() {
 }
 
 DrawVerdict Driver::draw(QueueState& queue, std::span<const std::uint32_t> packet, const Submission& submission, std::size_t packetOffset, std::string& rejected) {
+#if ANYPS5_UNIFIED
+    Unified::Shadow::NoteDriverDraw(queue, submission, packetOffset);
+#endif
     PerformanceTimer timing("Driver.Draw");
     static const bool profile = std::getenv("APS5_PROFILE_DRAW") != nullptr;
     auto tailHolder = std::make_shared<DrawTail>();

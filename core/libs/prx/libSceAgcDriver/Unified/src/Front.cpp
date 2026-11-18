@@ -24,14 +24,14 @@ struct Front::Lane {
 
     private:
         void deliver(const Operation& operation) {
-            if (front.consumer) front.consumer(operation);
+            if (front.consumer) front.consumer(operation, lane.state);
         }
         Front& front;
         Lane& lane;
     };
 
     DecodeState state;
-    SpscRing<std::shared_ptr<const DriverDetail::Submission>, LaneDepth> input;
+    SpscRing<Input, LaneDepth> input;
     std::atomic<std::uint32_t> wake{0};
     std::atomic<std::uint64_t> pushed{0};
     std::atomic<std::uint64_t> decoded{0};
@@ -71,7 +71,9 @@ Front::Lane& Front::laneFor(std::uint32_t queue) {
 
 void Front::Push(std::shared_ptr<const DriverDetail::Submission> submission) {
     Lane& lane = laneFor(submission->queue);
-    while (!lane.input.TryPush(submission)) std::this_thread::yield();
+    const bool reset = submission->queue == 0 && graphicsReset.exchange(false, std::memory_order_relaxed);
+    Input item{std::move(submission), reset};
+    while (!lane.input.TryPush(item)) std::this_thread::yield();
     lane.pushed.fetch_add(1, std::memory_order_release);
     lane.wake.fetch_add(1, std::memory_order_release);
     lane.wake.notify_one();
@@ -88,10 +90,11 @@ void Front::run(Lane& lane) {
             continue;
         }
         const auto start = std::chrono::steady_clock::now();
-        DecodeSubmission(**next, lane.state, sink);
+        if (next->reset) lane.state.ResetQueueState();
+        DecodeSubmission(*next->submission, lane.state, sink);
         const auto spent = std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - start).count();
         lane.decodeNanoseconds.fetch_add(static_cast<std::uint64_t>(spent), std::memory_order_relaxed);
-        next->reset();
+        next->submission.reset();
         {
             std::lock_guard lock(lane.publishedMutex);
             lane.published.queue = lane.state.Queue();

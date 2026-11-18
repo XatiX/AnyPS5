@@ -2,6 +2,7 @@
 #include "prx/libSceAgcDriver/Unified/include/Front.hpp"
 #include "prx/libSceAgcDriver/Unified/include/MemoryCore.hpp"
 #include "prx/libc/include/GuestArena.hpp"
+#include "prx/libSceAgcDriver/Unified/include/RecordVerify.hpp"
 #include <atomic>
 #include "prx/libSceAgcDriver/Execution/include/PerformanceOverlay.hpp"
 #include <chrono>
@@ -28,8 +29,12 @@ bool drawScope() {
 
 void registerUses(std::span<const GuestUse> uses);
 
+void verifyDecoded(const Operation& operation, const DecodeState& state) {
+    Record::SharedVerifier().NoteDecoded(operation, state);
+}
+
 Front& front() {
-    static Front& shared = *new Front({}, std::getenv("APS5_RECODE_RESOLVE") != nullptr || drawScope(), drawScope() ? UseSink(registerUses) : UseSink());
+    static Front& shared = *new Front(Record::VerifyActive() ? Front::Consumer(verifyDecoded) : Front::Consumer(), std::getenv("APS5_RECODE_RESOLVE") != nullptr || drawScope() || Record::VerifyActive(), drawScope() ? UseSink(registerUses) : UseSink());
     return shared;
 }
 
@@ -140,7 +145,7 @@ void report() {
         last = now;
     }
     if (!Active()) {
-        const auto memory = memoryLine();
+        const auto memory = memoryLine() + Record::VerifyLine();
         if (!memory.empty()) std::fputs(memory.c_str(), stderr);
         return;
     }
@@ -164,6 +169,7 @@ void report() {
     std::snprintf(compare, sizeof(compare), "[recode-shadow] compare: draws shadow %llu (conditional %llu) driver %llu; dispatches shadow %llu (conditional %llu) driver %llu\n", static_cast<unsigned long long>(draws), static_cast<unsigned long long>(conditionalDraws), static_cast<unsigned long long>(driver.draws), static_cast<unsigned long long>(dispatches), static_cast<unsigned long long>(conditionalDispatches), static_cast<unsigned long long>(driver.dispatches));
     line += compare;
     line += memoryLine();
+    line += Record::VerifyLine();
     std::fputs(line.c_str(), stderr);
 }
 
@@ -181,6 +187,16 @@ bool MemoryActive() {
 
 bool DrawScope() {
     return drawScope();
+}
+
+bool Teeing() {
+    static const bool teeing = Active() || MemoryActive() || Record::VerifyActive();
+    return teeing;
+}
+
+void NoteDriverDraw(const QueueState& queue, const DriverDetail::Submission& submission, std::size_t packetOffset) {
+    if (!Record::VerifyActive()) return;
+    Record::SharedVerifier().NoteDriverDraw(queue, submission.queue, submission.serial, packetOffset);
 }
 
 void NoteGuestAccess(GuestRanges reads, GuestRanges writes, bool unknown) {
@@ -219,12 +235,14 @@ std::shared_ptr<DriverDetail::Submission> Copy(const DriverDetail::Submission& s
 }
 
 void Tee(const DriverDetail::Submission& submission) {
+    const bool decoding = Active() || drawScope() || Record::VerifyActive();
+    if (submission.suspend && decoding) front().NoteSuspend();
     if (submission.suspend || submission.commands.empty()) return;
     if (MemoryActive()) {
         consumeMemory();
         if (!submission.flips.empty() && memoryInstalled()) MemoryCore::Get().AdvanceFrame();
     }
-    if (Active() || drawScope()) front().Push(Copy(submission));
+    if (decoding) front().Push(Copy(submission));
     report();
 }
 

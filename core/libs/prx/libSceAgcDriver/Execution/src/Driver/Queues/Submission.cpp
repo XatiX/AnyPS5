@@ -1035,7 +1035,7 @@ void Driver::noteWaitBlocked(std::uint32_t queue, std::uint64_t awaited, bool bl
 
 void Driver::enqueue(Submission submission) {
 #if ANYPS5_UNIFIED
-    if (Unified::Shadow::Active() || Unified::Shadow::MemoryActive()) Unified::Shadow::Tee(submission);
+    if (Unified::Shadow::Teeing()) Unified::Shadow::Tee(submission);
 #endif
     const auto queue = submission.queue;
     submission.waitFree = waitFree(submission);

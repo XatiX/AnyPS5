@@ -26,7 +26,7 @@ struct LaneTotals {
 
 class Front {
 public:
-    using Consumer = std::function<void(const Operation&)>;
+    using Consumer = std::function<void(const Operation& operation, const DecodeState& state)>;
 
     explicit Front(Consumer consumer = {}, bool resolve = false, UseSink uses = {});
     ~Front();
@@ -34,6 +34,7 @@ public:
     Front& operator=(const Front&) = delete;
 
     void Push(std::shared_ptr<const DriverDetail::Submission> submission);
+    void NoteSuspend() { graphicsReset.store(true, std::memory_order_relaxed); }
     void Flush();
     [[nodiscard]] std::vector<LaneTotals> Totals(bool flush = true);
     [[nodiscard]] Order& Ordering() { return order; }
@@ -45,7 +46,13 @@ private:
     Lane& laneFor(std::uint32_t queue);
     void run(Lane& lane);
 
+    struct Input {
+        std::shared_ptr<const DriverDetail::Submission> submission;
+        bool reset = false;
+    };
+
     Consumer consumer;
+    std::atomic<bool> graphicsReset{false};
     bool resolve;
     UseSink uses;
     Order order;

@@ -15,6 +15,8 @@ using GuestRanges = std::span<const std::pair<std::uint64_t, std::uint64_t>>;
 bool Active();
 bool MemoryActive();
 bool DrawScope();
+bool Teeing();
+void NoteDriverDraw(const QueueState& queue, const DriverDetail::Submission& submission, std::size_t packetOffset);
 void NoteGpuMapping(const GuestAllocations::Mapped& ranges);
 void NoteGuestAccess(GuestRanges reads, GuestRanges writes, bool unknown);
 std::shared_ptr<DriverDetail::Submission> Copy(const DriverDetail::Submission& submission);
