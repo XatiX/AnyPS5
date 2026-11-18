@@ -179,7 +179,7 @@ private:
         return ids;
     }
 
-    void emit(OpKind kind, std::uint64_t address, std::uint64_t size, std::uint64_t value, const SnapshotIds& snapshots = {}) {
+    void emit(OpKind kind, std::uint64_t address, std::uint64_t size, std::uint64_t value, const SnapshotIds& snapshots = {}, std::uint64_t mask = ~std::uint64_t{0}, std::uint8_t function = 0) {
         Operation operation;
         operation.kind = kind;
         operation.opcode = static_cast<std::uint8_t>(current.opcode);
@@ -192,6 +192,8 @@ private:
         operation.address = address;
         operation.size = size;
         operation.value = value;
+        operation.mask = mask;
+        operation.function = function;
         ++state.counts.operations;
         if (current.conditional) ++state.counts.conditional;
         sink.Emit(operation);
@@ -239,7 +241,7 @@ private:
         try {
             const auto fields = Pm4::DecodeWait(packet);
             ++state.counts.waits;
-            emit(OpKind::Wait, fields.address, fields.bytes, fields.reference);
+            emit(OpKind::Wait, fields.address, fields.bytes, fields.reference, {}, fields.mask, static_cast<std::uint8_t>(fields.function));
         } catch (const std::exception&) {
             ++state.counts.stateErrors;
         }

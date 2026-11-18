@@ -1,4 +1,5 @@
 #include "prx/libSceAgcDriver/Unified/include/Decoder.hpp"
+#include "prx/libSceAgcDriver/Unified/include/Order.hpp"
 #include "prx/libSceAgcDriver/Execution/include/VideoOutput.hpp"
 #include <cstdint>
 #include <cstdio>
@@ -118,6 +119,57 @@ void testWaitsLabelsAndStores() {
     Expect(operations[2].kind == OpKind::LabelStore && operations[2].address == 0x400003000ull && operations[2].value == 0xabcd, "a WRITE_DATA to memory is a label store");
     Expect(operations[3].kind == OpKind::Fill && operations[3].address == 0x500004000ull && operations[3].size == 64 && operations[3].value == 0xdeadbeefu, "a DMA_DATA from data is a fill");
     Expect(operations[0].snapshots.context == 0, "operations other than draws and dispatches take no snapshot");
+    Expect(operations[0].function == 3 && operations[0].mask == 0xffffffffu, "a wait carries its compare function and mask");
+}
+
+Operation labelAt(std::uint32_t queue, std::uint64_t sequence, std::uint64_t address, std::uint64_t value) {
+    Operation store;
+    store.kind = OpKind::LabelStore;
+    store.queue = queue;
+    store.sequence = sequence;
+    store.address = address;
+    store.size = 4;
+    store.value = value;
+    return store;
+}
+
+Operation waitFor(std::uint32_t queue, std::uint64_t sequence, std::uint64_t address, std::uint64_t reference) {
+    Operation wait;
+    wait.kind = OpKind::Wait;
+    wait.queue = queue;
+    wait.sequence = sequence;
+    wait.address = address;
+    wait.size = 4;
+    wait.value = reference;
+    wait.mask = 0xffffffffu;
+    wait.function = 3;
+    return wait;
+}
+
+void testWaitEdgesFollowLabelStores() {
+    Order order;
+    static_cast<void>(order.Note(labelAt(0x20, 5, 0x1000, 7)));
+    auto met = waitFor(0, 1, 0x1000, 7);
+    Expect(order.Resolve(met) == Order::Verdict::Edge && met.after.queue == 0x20 && met.after.sequence == 5, "a wait already met by a decoded store depends on that store");
+    auto later = waitFor(0, 2, 0x1000, 8);
+    Expect(order.Resolve(later) == Order::Verdict::Pending && order.PendingWaits() == 1, "a wait no decoded store meets is pending");
+    Expect(order.Note(labelAt(0, 3, 0x1000, 8)).empty(), "a store from the waiting queue itself does not release the wait");
+    const auto released = order.Note(labelAt(0x20, 6, 0x1000, 8));
+    Expect(released.size() == 1 && released[0].sequence == 2 && released[0].after.queue == 0x20 && released[0].after.sequence == 6, "a store from another queue releases the pending wait with an edge");
+    Operation fill;
+    fill.kind = OpKind::Fill;
+    fill.queue = 0x20;
+    fill.sequence = 7;
+    fill.address = 0xff0;
+    fill.size = 0x20;
+    static_cast<void>(order.Note(fill));
+    auto afterFill = waitFor(0, 4, 0x1000, 8);
+    Expect(order.Resolve(afterFill) == Order::Verdict::Pending, "a fill over a label forgets its value");
+    order.Settled(afterFill);
+    Expect(order.PendingWaits() == 0, "a wait settled by polling leaves the pending list");
+    auto always = waitFor(0, 5, 0x2000, 0);
+    always.function = 0;
+    Expect(order.Resolve(always) == Order::Verdict::Passes, "an always-true wait needs no edge");
 }
 
 void testConditionalRangesArePredicated() {
@@ -188,6 +240,7 @@ int main() {
     testConditionalRangesArePredicated();
     testFlipsAndIndirectRegisters();
     testFullRingAsksForRoom();
+    testWaitEdgesFollowLabelStores();
     if (failures != 0) {
         std::fprintf(stderr, "%d failure(s)\n", failures);
         return 1;
