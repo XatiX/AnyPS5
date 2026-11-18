@@ -1,4 +1,6 @@
 #include "prx/libSceAgcDriver/Unified/include/Protector.hpp"
+#include "prx/libSceAgcDriver/Unified/include/MemoryCore.hpp"
+#include <atomic>
 #include <cstdint>
 #include <cstdio>
 #include <vector>
@@ -7,6 +9,7 @@
 #define NOMINMAX
 #endif
 #include <windows.h>
+#include "prx/libc/include/GuestArena.hpp"
 #endif
 
 using namespace AgcDriver::Unified;
@@ -74,6 +77,39 @@ void testDeferredChangesFlushAsRuns() {
     Expect(protector.Counts().failures == 0, "no protection call failed");
     release(base);
 }
+
+std::atomic<int> routed{0};
+
+LONG WINAPI routeToGuestArena(EXCEPTION_POINTERS* info) {
+    if (!GuestArena::GuestArenaHandleGpuFault_nid_no_patch(info)) return EXCEPTION_CONTINUE_SEARCH;
+    routed.fetch_add(1);
+    return EXCEPTION_CONTINUE_EXECUTION;
+}
+
+void testWriteFaultOpensACleanPage() {
+    const auto base = reserve();
+    if (base == 0) return;
+    auto& core = MemoryCore::Get();
+    core.Register(base, 4 * PageBytes);
+    const auto first = core.ConsumeDirty();
+    Expect(first.size() == 1 && first[0].size == 4 * PageBytes, "the registered range uploads once");
+    Expect(protectionAt(base + PageBytes) == PAGE_READONLY, "consumed pages are armed");
+    core.Install();
+    void* handler = AddVectoredExceptionHandler(1, routeToGuestArena);
+    auto* bytes = reinterpret_cast<volatile std::uint8_t*>(base + PageBytes + 8);
+    *bytes = 0x5a;
+    RemoveVectoredExceptionHandler(handler);
+    core.Uninstall();
+    Expect(*bytes == 0x5a, "the faulting write completes after the page opens");
+    Expect(routed.load() >= 1 && core.Counts().writesOpened == 1, "the write fault goes through the guest arena to the memory core");
+    Expect(protectionAt(base + PageBytes) == PAGE_READWRITE && protectionAt(base) == PAGE_READONLY, "only the written page opens");
+    Expect(core.Pages().StateOf(base + PageBytes) == PageState::CpuDirty, "the written page is dirty");
+    const auto second = core.ConsumeDirty();
+    Expect(second.size() == 1 && second[0].address == base + PageBytes && second[0].size == PageBytes, "the next consume uploads only the written page");
+    core.Unregister(base, 4 * PageBytes);
+    Expect(protectionAt(base) == PAGE_READWRITE, "unregistering opens the pages");
+    release(base);
+}
 #endif
 
 }
@@ -82,6 +118,7 @@ int main() {
 #ifdef _WIN32
     testApplySkipsNeverArmedPages();
     testDeferredChangesFlushAsRuns();
+    testWriteFaultOpensACleanPage();
 #endif
     if (failures != 0) {
         std::fprintf(stderr, "%d failure(s)\n", failures);

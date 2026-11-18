@@ -724,6 +724,29 @@ bool GuestArenaHandleRead_nid_postfix(std::uintptr_t address) {
     return WindowsMappings::Get().HandleRead(address);
 }
 
+namespace {
+
+std::atomic<bool (*)(std::uintptr_t, bool)>& gpuFaultHandler() {
+    static std::atomic<bool (*)(std::uintptr_t, bool)> handler{nullptr};
+    return handler;
+}
+
+}
+
+void GuestArenaSetGpuFaultHandler_nid_no_patch(bool (*handler)(std::uintptr_t address, bool write)) {
+    gpuFaultHandler().store(handler, std::memory_order_release);
+}
+
+bool GuestArenaHandleGpuFault_nid_no_patch(EXCEPTION_POINTERS* exception) {
+    const auto handler = gpuFaultHandler().load(std::memory_order_acquire);
+    if (handler == nullptr) return false;
+    const auto* record = exception->ExceptionRecord;
+    if (record->ExceptionCode != EXCEPTION_ACCESS_VIOLATION || record->NumberParameters < 2) return false;
+    const auto kind = record->ExceptionInformation[0];
+    if (kind != 0 && kind != 1) return false;
+    return handler(static_cast<std::uintptr_t>(record->ExceptionInformation[1]), kind == 1);
+}
+
 void GuestArenaPinWritable_nid_postfix(const void* pointer, std::size_t bytes) {
     if (!Arena::Get().Contains(pointer, bytes)) return;
     WindowsMappings::Get().Pin(reinterpret_cast<std::uintptr_t>(pointer), bytes);
