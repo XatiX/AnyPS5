@@ -5,7 +5,9 @@
 #include "prx/libSceAgcDriver/Unified/include/GpuPageTable.hpp"
 #include "prx/libSceAgcDriver/Unified/include/ResidentUploads.hpp"
 #include "prx/libSceAgcDriver/Unified/include/VulkanResidency.hpp"
+#include "BdaAbi.hpp"
 #include <atomic>
+#include <deque>
 #include <map>
 #include <span>
 #include <memory>
@@ -37,6 +39,7 @@ public:
     [[nodiscard]] std::optional<DeviceSpan> Translate(std::uint64_t address, std::uint64_t size) const;
     std::optional<DeviceSpan> Serve(std::uint64_t address, std::uint64_t size, std::span<const std::pair<std::uint64_t, std::uint64_t>> committed);
     bool ServeFaultPage(std::uint64_t page, std::uint64_t allocation, std::uint64_t allocationBytes, std::span<const std::pair<std::uint64_t, std::uint64_t>> committed);
+    void MapImports(std::uint64_t serial, std::shared_ptr<const std::vector<ShaderRecompiler::BdaAbi::Range>> ranges);
     [[nodiscard]] std::shared_ptr<Graphics::Buffer> PageTableBuffer() const;
     std::vector<PendingUpload> ReadBack(std::span<const std::pair<std::uint64_t, std::uint64_t>> ranges);
     [[nodiscard]] bool Pending() const;
@@ -65,6 +68,11 @@ private:
     std::uint64_t readBackMissedBytes = 0;
     std::vector<std::pair<std::uint64_t, std::uint64_t>> queued;
     std::map<std::uint64_t, std::uint64_t> served;
+    std::map<std::uint64_t, std::uint64_t> importPages;
+    std::deque<std::shared_ptr<const std::vector<ShaderRecompiler::BdaAbi::Range>>> importSpaces;
+    std::uint64_t importSerial = 0;
+    std::uint64_t importMaps = 0;
+    std::uint64_t faultPagesMapped = 0;
     std::uint64_t serveRefusals = 0;
     std::atomic<std::uint64_t> frame{1};
     std::atomic<bool> attached{false};

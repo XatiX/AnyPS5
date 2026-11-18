@@ -7750,6 +7750,12 @@ std::optional<std::pair<std::uint64_t, std::shared_ptr<const std::vector<ShaderR
     }
 }
 
+std::shared_ptr<const std::vector<ShaderRecompiler::BdaAbi::Range>> GuestBufferMemory::SpaceRanges(std::uint64_t& serial) const {
+    if (space == nullptr) return nullptr;
+    serial = space->serial;
+    return std::shared_ptr<const std::vector<ShaderRecompiler::BdaAbi::Range>>(space, &space->ranges);
+}
+
 std::optional<GuestBufferMemory::CachedTable> GuestBufferMemory::CachedAddressTable() const {
     if (space == nullptr) return std::nullopt;
     Require(uploaded && !committed, "guest GPU address ranges are not available");
