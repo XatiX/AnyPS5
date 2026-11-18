@@ -16,7 +16,7 @@ inline constexpr std::uint64_t PageBytes = 0x1000;
 inline constexpr std::uint64_t RegionBytes = 0x400000;
 inline constexpr std::size_t RegionPages = RegionBytes / PageBytes;
 
-enum class PageState : std::uint8_t { Untracked, CpuClean, CpuDirty, GpuOwned };
+enum class PageState : std::uint8_t { Untracked, CpuClean, CpuDirty, GpuOwned, Reserved };
 
 enum class Protection : std::uint8_t { ReadWrite, ReadOnly, NoAccess };
 
@@ -54,7 +54,11 @@ public:
     static constexpr std::uint32_t QuietEpochs = 2;
 
     std::vector<ProtectionChange> Register(std::uint64_t address, std::uint64_t size);
+    void Reserve(std::uint64_t address, std::uint64_t size);
+    std::vector<ProtectionChange> MakeResident(std::uint64_t address, std::uint64_t size);
     std::vector<ProtectionChange> Unregister(std::uint64_t address, std::uint64_t size);
+    [[nodiscard]] bool OwnedBy(std::uint64_t address, std::uint64_t size) const;
+    [[nodiscard]] std::vector<std::uint64_t> BusyPages() const;
     bool HandleWrite(std::uint64_t address, std::vector<ProtectionChange>& changes);
     using WriteCheck = std::function<bool(std::uint64_t page, bool proven)>;
     std::vector<DirtyRange> ConsumeDirty(std::vector<ProtectionChange>& changes, const WriteCheck& written = {});
@@ -63,6 +67,9 @@ public:
     std::vector<DirtyRange> GpuOwnedIn(std::uint64_t address, std::uint64_t size) const;
     std::vector<ProtectionChange> Reclaim(std::uint64_t address, std::uint64_t size, bool forWrite);
     [[nodiscard]] PageState StateOf(std::uint64_t address) const;
+    [[nodiscard]] bool Covers(std::uint64_t address, std::uint64_t size) const;
+    using WrittenRun = void (*)(void* context, std::uintptr_t begin, std::uintptr_t end);
+    void Collect(std::uint64_t address, std::uint64_t size, WrittenRun written, void* context, const WriteCheck& changed = {});
     [[nodiscard]] bool RegionDirty(std::uint64_t address) const;
     [[nodiscard]] std::size_t DirtyPages() const;
     [[nodiscard]] PageTableCounts Counts() const;
@@ -74,7 +81,11 @@ private:
         std::array<std::uint32_t, RegionPages> busyUntil{};
         std::array<std::uint32_t, RegionPages> lastConsume{};
         std::array<std::uint64_t, RegionPages / 64> listed{};
+        std::array<std::uint64_t, RegionPages / 64> unreported{};
         std::uint32_t dirtyPages = 0;
+        std::uint32_t trackedPages = 0;
+        std::uint32_t writablePages = 0;
+        std::uint32_t unreportedPages = 0;
     };
 
     Region* regionOf(std::uint64_t page, bool create);

@@ -27,6 +27,9 @@ namespace GuestArena {
 class WindowsMappings {
 public:
     enum class Collection { All, Armed, Fresh };
+    static constexpr std::uint8_t CapNone = 0;
+    static constexpr std::uint8_t CapReadOnly = 1;
+    static constexpr std::uint8_t CapNoAccess = 2;
 
     static WindowsMappings& Get() {
         static auto* mappings = new WindowsMappings;
@@ -98,8 +101,7 @@ public:
                     mapped->second.armed = 0;
                     invalidate(mapped->first, mapped->second);
                 }
-                DWORD previous;
-                if (!VirtualProtect(reinterpret_cast<void*>(cursor), stop - cursor, protection, &previous)) fail("protect guest memory");
+                protectCapped(cursor, stop - cursor, protection, "protect guest memory");
                 cursor = stop;
             }
         }
@@ -186,8 +188,7 @@ public:
                 }
                 forgetClean(base, base + runBytes);
                 remember(freshRanges, base, base + runBytes);
-                DWORD previous;
-                if (protection != PAGE_READWRITE && !VirtualProtect(reinterpret_cast<void*>(base), runBytes, protection, &previous)) fail("protect resident guest pages");
+                if (protection != PAGE_READWRITE || coreCaps.lower_bound(base) != coreCaps.lower_bound(base + runBytes)) protectCapped(base, runBytes, protection, "protect resident guest pages");
                 done += runBytes;
                 continue;
             }
@@ -222,8 +223,7 @@ public:
             if (!perPage) commitSection(section, offset + done, runBytes);
             split(base, runBytes);
             mapRun(base, runBytes, section, offset + done);
-            DWORD previous;
-            if (!VirtualProtect(reinterpret_cast<void*>(base), runBytes, protection, &previous)) fail("protect shared guest pages");
+            protectCapped(base, runBytes, protection, "protect shared guest pages");
             collectableRanges.clear();
             for (std::size_t at = 0; at < runBytes; at += pageBytes) {
                 auto& [slot, shared] = pages[at / pageBytes];
@@ -347,6 +347,50 @@ public:
         if (!views.contains(address & ~(pageBytes - 1))) return false;
         const auto memory = query(address);
         return memory.State == MEM_COMMIT && (memory.Protect & (PAGE_NOACCESS | PAGE_GUARD)) == 0;
+    }
+
+    bool TrackProtect(std::uintptr_t address, std::size_t bytes, std::uint8_t cap, bool* held) {
+        std::lock_guard lock(mutex);
+        const auto start = address & ~(subpageBytes - 1);
+        const auto end = (address + bytes + subpageBytes - 1) & ~(subpageBytes - 1);
+        if (cap == CapNone) {
+            coreCaps.erase(coreCaps.lower_bound(start), coreCaps.lower_bound(end));
+        } else {
+            auto hint = coreCaps.lower_bound(start);
+            for (auto page = start; page < end; page += subpageBytes) hint = std::next(coreCaps.insert_or_assign(hint, page, cap));
+        }
+        bool done = true;
+        bool kept = false;
+        for (auto cursor = start; cursor < end;) {
+            const auto base = cursor & ~(pageBytes - 1);
+            const auto found = views.find(base);
+            if (found == views.end()) {
+                const auto next = views.lower_bound(base + pageBytes);
+                const auto stop = next == views.end() ? end : std::min(end, next->first);
+                done = protectCommitted(cursor, stop - cursor, capped(PAGE_READWRITE, cap)) && done;
+                cursor = stop;
+                continue;
+            }
+            const auto& view = found->second;
+            const auto stop = std::min(end, base + pageBytes);
+            for (auto from = cursor; from < stop;) {
+                const auto applied = capped(intended(base, view, from), cap);
+                auto to = from + subpageBytes;
+                while (to < stop && capped(intended(base, view, to), cap) == applied) to += subpageBytes;
+                if (cap == CapNone && !writable(applied)) kept = true;
+                DWORD previous;
+                done = VirtualProtect(reinterpret_cast<void*>(from), to - from, applied, &previous) != 0 && done;
+                from = to;
+            }
+            cursor = stop;
+        }
+        if (held != nullptr) *held = kept;
+        return done;
+    }
+
+    std::size_t CoreCapped(std::uintptr_t address, std::size_t bytes) {
+        std::lock_guard lock(mutex);
+        return static_cast<std::size_t>(std::distance(coreCaps.lower_bound(address & ~(subpageBytes - 1)), coreCaps.lower_bound(address + bytes)));
     }
 
     bool ResidentSpan(std::uintptr_t address, std::size_t bytes, std::uintptr_t* start, std::uintptr_t* end) {
@@ -1251,12 +1295,11 @@ private:
         if (viewBytes != pageBytes) split(base, viewBytes);
         if (!map(section, GetCurrentProcess(), page, offset, sectionBytes, MEM_REPLACE_PLACEHOLDER, viewProtection, nullptr, 0)) fail("map shared guest page");
         if (!committed && query(base).State == MEM_RESERVE && !VirtualAlloc(page, viewBytes, MEM_COMMIT, PAGE_EXECUTE_READWRITE)) fail("commit shared guest page");
-        DWORD previous;
-        if (!VirtualProtect(page, viewBytes, protection, &previous)) fail("protect shared guest page");
+        protectCapped(base, viewBytes, protection, "protect shared guest page");
         if (viewBytes == pageBytes) return;
         void* zeros = reinterpret_cast<void*>(base + viewBytes);
         if (!allocate(GetCurrentProcess(), zeros, pageBytes - viewBytes, MEM_RESERVE | MEM_COMMIT | MEM_REPLACE_PLACEHOLDER, PAGE_READWRITE, nullptr, 0)) fail("replace guest placeholder past the end of a file with zero pages");
-        if (!VirtualProtect(zeros, pageBytes - viewBytes, protection, &previous)) fail("protect guest pages past the end of a file");
+        protectCapped(base + viewBytes, pageBytes - viewBytes, protection, "protect guest pages past the end of a file");
     }
 
     void mapRun(std::uintptr_t base, std::size_t bytes, HANDLE section, std::uint64_t offset) {
@@ -1301,8 +1344,7 @@ private:
         for (const auto& part : parts) {
             if (!part.committed) continue;
             for (const auto [from, to] : {std::pair{part.base, std::min(part.end, at)}, std::pair{std::max(part.base, at), part.end}}) {
-                DWORD previous;
-                if (from < to && !VirtualProtect(reinterpret_cast<void*>(from), to - from, part.protection, &previous)) fail("protect a split run of shared guest pages");
+                if (from < to) protectCapped(from, to - from, part.protection, "protect a split run of shared guest pages");
             }
         }
         const auto* before = saved.data();
@@ -1361,8 +1403,7 @@ private:
             if (indexed) staged.emplace(std::make_pair(run->second.key, view.offset), slot);
             created.emplace_back(std::move(shared), std::move(slot));
         }
-        DWORD previous;
-        if (!VirtualProtect(reinterpret_cast<void*>(start), stop - start, PAGE_READONLY, &previous)) fail("fence resident guest pages");
+        protectCapped(start, stop - start, PAGE_READONLY, "fence resident guest pages");
         const auto section = views.at(start).section;
         auto window = open(section->handle, views.at(start).offset, stop - start);
         if (query(reinterpret_cast<std::uintptr_t>(window.bytes)).State == MEM_RESERVE && !VirtualAlloc(window.bytes, stop - start, MEM_COMMIT, PAGE_READWRITE)) fail("commit direct memory pages");
@@ -1407,8 +1448,7 @@ private:
         disown(start, stop);
         forgetOwnedPending(start, stop);
         forgetZero(start, stop);
-        DWORD previous;
-        if (!VirtualProtect(reinterpret_cast<void*>(start), stop - start, PAGE_READONLY, &previous)) fail("open resident guest pages");
+        protectCapped(start, stop - start, PAGE_READONLY, "open resident guest pages");
         const auto entry = indexEntry(run);
         const bool indexed = entry != residentIndex.end();
         std::vector<void*> dirty;
@@ -1527,7 +1567,7 @@ private:
         return static_cast<std::uint8_t>(((1u << (last + 1)) - 1) & ~((1u << first) - 1));
     }
 
-    static void protectSubpages(std::uintptr_t base, std::uint8_t mask, DWORD protection, const char* operation, std::size_t viewBytes = pageBytes) {
+    void protectSubpages(std::uintptr_t base, std::uint8_t mask, DWORD protection, const char* operation, std::size_t viewBytes = pageBytes) {
         for (std::size_t sub = 0; sub < subpages;) {
             if ((mask & (1u << sub)) == 0) {
                 ++sub;
@@ -1535,10 +1575,66 @@ private:
             }
             auto stop = sub + 1;
             while (stop < subpages && (mask & (1u << stop)) != 0 && stop * subpageBytes != viewBytes) ++stop;
-            DWORD previous;
-            if (!VirtualProtect(reinterpret_cast<void*>(base + sub * subpageBytes), (stop - sub) * subpageBytes, protection, &previous)) fail(operation);
+            protectCapped(base + sub * subpageBytes, (stop - sub) * subpageBytes, protection, operation);
             sub = stop;
         }
+    }
+
+    static DWORD capped(DWORD protection, std::uint8_t cap) {
+        if (cap == CapNoAccess) return PAGE_NOACCESS;
+        if (cap != CapReadOnly) return protection;
+        if (protection == PAGE_EXECUTE_READWRITE || protection == PAGE_EXECUTE_WRITECOPY) return PAGE_EXECUTE_READ;
+        if (protection == PAGE_READWRITE || protection == PAGE_WRITECOPY) return PAGE_READONLY;
+        return protection;
+    }
+
+    static DWORD intended(std::uintptr_t base, const View& view, std::uintptr_t subpage) {
+        const auto bit = static_cast<std::uint8_t>(1u << ((subpage - base) / subpageBytes));
+        return (view.armed & bit) != 0 ? capped(view.protection, CapReadOnly) : view.protection;
+    }
+
+    void protectCapped(std::uintptr_t start, std::size_t bytes, DWORD protection, const char* operation) {
+        const auto end = start + bytes;
+        auto cap = coreCaps.lower_bound(start & ~(subpageBytes - 1));
+        DWORD previous;
+        if (cap == coreCaps.end() || cap->first >= end) {
+            if (!VirtualProtect(reinterpret_cast<void*>(start), bytes, protection, &previous)) fail(operation);
+            return;
+        }
+        for (auto cursor = start; cursor < end;) {
+            auto stop = end;
+            auto applied = protection;
+            if (cap != coreCaps.end() && cap->first <= cursor) {
+                const auto value = cap->second;
+                stop = cap->first + subpageBytes;
+                for (++cap; cap != coreCaps.end() && cap->first == stop && cap->second == value && stop < end; ++cap) stop += subpageBytes;
+                stop = std::min(end, stop);
+                applied = capped(protection, value);
+            } else if (cap != coreCaps.end()) {
+                stop = std::min(end, cap->first);
+            }
+            if (!VirtualProtect(reinterpret_cast<void*>(cursor), stop - cursor, applied, &previous)) fail(operation);
+            cursor = stop;
+        }
+    }
+
+    static bool protectCommitted(std::uintptr_t start, std::size_t bytes, DWORD protection) {
+        DWORD previous;
+        if (VirtualProtect(reinterpret_cast<void*>(start), bytes, protection, &previous)) return true;
+        bool any = false;
+        bool done = true;
+        const auto end = start + bytes;
+        for (auto cursor = start; cursor < end;) {
+            MEMORY_BASIC_INFORMATION memory{};
+            if (VirtualQuery(reinterpret_cast<const void*>(cursor), &memory, sizeof(memory)) != sizeof(memory)) return false;
+            const auto stop = std::min(end, reinterpret_cast<std::uintptr_t>(memory.BaseAddress) + memory.RegionSize);
+            if (memory.State == MEM_COMMIT) {
+                any = true;
+                done = VirtualProtect(reinterpret_cast<void*>(cursor), stop - cursor, protection, &previous) != 0 && done;
+            }
+            cursor = stop;
+        }
+        return any && done;
     }
 
     bool sameSection(HANDLE first, HANDLE second) const {
@@ -1708,6 +1804,7 @@ private:
     Ranges freshRanges;
     std::unordered_map<std::uintptr_t, std::array<std::uint64_t, chunkBytes / 4096 / 64>> zeroPages;
     std::map<std::uintptr_t, View> views;
+    std::map<std::uintptr_t, std::uint8_t> coreCaps;
 
     using Views = std::map<std::uintptr_t, View>;
 

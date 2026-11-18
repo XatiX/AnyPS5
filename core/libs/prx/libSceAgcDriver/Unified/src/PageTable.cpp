@@ -79,20 +79,70 @@ void PageTable::setState(std::uint64_t page, PageState next) {
     auto& state = region->states[slotOf(page)];
     if (state == PageState::GpuOwned && next != PageState::GpuOwned) --counts.gpuOwnedPages;
     if (state != PageState::GpuOwned && next == PageState::GpuOwned) ++counts.gpuOwnedPages;
+    const auto tracked = [](PageState value) { return value == PageState::CpuClean || value == PageState::CpuDirty; };
+    if (tracked(state) != tracked(next)) tracked(next) ? ++region->trackedPages : --region->trackedPages;
+    const bool dirtyChanged = (state == PageState::CpuDirty) != (next == PageState::CpuDirty);
+    if (dirtyChanged) next == PageState::CpuDirty ? ++region->writablePages : --region->writablePages;
+    if (dirtyChanged || (!tracked(state) && tracked(next))) {
+        const auto slot = slotOf(page);
+        auto& word = region->unreported[slot / 64];
+        const auto bit = std::uint64_t{1} << (slot % 64);
+        if ((word & bit) == 0) {
+            word |= bit;
+            ++region->unreportedPages;
+        }
+    }
     state = next;
 }
 
 std::vector<ProtectionChange> PageTable::Register(std::uint64_t address, std::uint64_t size) {
+    Reserve(address, size);
+    return MakeResident(address, size);
+}
+
+void PageTable::Reserve(std::uint64_t address, std::uint64_t size) {
     std::lock_guard lock(mutex);
     for (auto page = firstPage(address); page < endPage(address, size); ++page) {
         auto* region = regionOf(page, true);
-        if (region->states[slotOf(page)] != PageState::Untracked) continue;
+        if (region->states[slotOf(page)] == PageState::Untracked) setState(page, PageState::Reserved);
+    }
+}
+
+std::vector<ProtectionChange> PageTable::MakeResident(std::uint64_t address, std::uint64_t size) {
+    std::lock_guard lock(mutex);
+    for (auto page = firstPage(address); page < endPage(address, size); ++page) {
+        auto* region = regionOf(page, false);
+        if (region == nullptr || region->states[slotOf(page)] != PageState::Reserved) continue;
         setState(page, PageState::CpuDirty);
         region->busyUntil[slotOf(page)] = 0;
         region->streak[slotOf(page)] = 0;
         list(page);
     }
     return {};
+}
+
+bool PageTable::OwnedBy(std::uint64_t address, std::uint64_t size) const {
+    std::lock_guard lock(mutex);
+    if (size == 0) return false;
+    for (auto page = firstPage(address); page < endPage(address, size); ++page) {
+        const auto* region = regionOf(page);
+        if (region == nullptr || region->states[slotOf(page)] == PageState::Untracked) return false;
+    }
+    return true;
+}
+
+std::vector<std::uint64_t> PageTable::BusyPages() const {
+    std::lock_guard lock(mutex);
+    std::vector<std::uint64_t> busy;
+    for (const auto page : dirty) {
+        const auto* region = regionOf(page);
+        if (region == nullptr) continue;
+        const auto slot = slotOf(page);
+        if (region->busyUntil[slot] != 0 && region->states[slot] == PageState::CpuDirty) busy.push_back(page);
+    }
+    std::sort(busy.begin(), busy.end());
+    busy.erase(std::unique(busy.begin(), busy.end()), busy.end());
+    return busy;
 }
 
 std::vector<ProtectionChange> PageTable::Unregister(std::uint64_t address, std::uint64_t size) {
@@ -214,7 +264,7 @@ std::vector<ProtectionChange> PageTable::MarkGpuOwned(std::uint64_t address, std
         if (region == nullptr) continue;
         const auto slot = slotOf(page);
         const auto state = region->states[slot];
-        if (state == PageState::Untracked || state == PageState::GpuOwned) continue;
+        if (state == PageState::Untracked || state == PageState::GpuOwned || state == PageState::Reserved) continue;
         unlist(page);
         region->busyUntil[slot] = 0;
         region->streak[slot] = 0;
@@ -261,6 +311,64 @@ PageState PageTable::StateOf(std::uint64_t address) const {
     const auto page = firstPage(address);
     const auto* region = regionOf(page);
     return region == nullptr ? PageState::Untracked : region->states[slotOf(page)];
+}
+
+bool PageTable::Covers(std::uint64_t address, std::uint64_t size) const {
+    if (size == 0) return false;
+    std::lock_guard lock(mutex);
+    const auto end = endPage(address, size);
+    for (auto page = firstPage(address); page < end;) {
+        const auto* region = regionOf(page);
+        if (region == nullptr) return false;
+        const auto regionEnd = (page / RegionPages + 1) * RegionPages;
+        if (region->trackedPages == RegionPages) {
+            page = regionEnd;
+            continue;
+        }
+        for (; page < std::min(end, regionEnd); ++page) {
+            const auto state = region->states[slotOf(page)];
+            if (state != PageState::CpuClean && state != PageState::CpuDirty) return false;
+        }
+    }
+    return true;
+}
+
+void PageTable::Collect(std::uint64_t address, std::uint64_t size, WrittenRun written, void* context, const WriteCheck& changed) {
+    if (size == 0) return;
+    std::lock_guard lock(mutex);
+    const auto end = endPage(address, size);
+    std::uint64_t runBegin = 0;
+    std::uint64_t runEnd = 0;
+    const auto flush = [&] {
+        if (runEnd > runBegin) written(context, static_cast<std::uintptr_t>(runBegin * PageBytes), static_cast<std::uintptr_t>(runEnd * PageBytes));
+        runBegin = runEnd = 0;
+    };
+    for (auto page = firstPage(address); page < end;) {
+        auto* region = regionOf(page, false);
+        const auto regionEnd = (page / RegionPages + 1) * RegionPages;
+        if (region == nullptr || (region->writablePages == 0 && region->unreportedPages == 0)) {
+            page = regionEnd;
+            continue;
+        }
+        for (; page < std::min(end, regionEnd); ++page) {
+            const auto slot = slotOf(page);
+            auto& word = region->unreported[slot / 64];
+            const auto bit = std::uint64_t{1} << (slot % 64);
+            const bool unreported = (word & bit) != 0;
+            if (unreported) {
+                word &= ~bit;
+                --region->unreportedPages;
+            }
+            if (!unreported && region->states[slot] != PageState::CpuDirty) continue;
+            if (changed && !changed(page, unreported)) continue;
+            if (runEnd != page) {
+                flush();
+                runBegin = page;
+            }
+            runEnd = page + 1;
+        }
+    }
+    flush();
 }
 
 bool PageTable::RegionDirty(std::uint64_t address) const {

@@ -255,7 +255,9 @@ function(add_shader_recompiler target runtimeTarget)
         string(APPEND shaderCacheExtra " system-deps=${ANYPS5_SYSTEM_DEPS_STAMP}")
     endif()
     set(shaderCacheReviewedNames
+            BdaAbi::Known
             BdaAbi::OtherFaults
+            BdaAbi::PageTableBytes
             BdaAbi::RangesOrdered
             BuildBarycentricGeometryShader
             BuildBarycentricTessellationShaders

@@ -1,9 +1,11 @@
 #include "prx/libSceAgcDriver/Unified/include/Shadow.hpp"
 #include "prx/libSceAgcDriver/Unified/include/Front.hpp"
 #include "prx/libSceAgcDriver/Unified/include/MemoryCore.hpp"
+#include "prx/libSceAgcDriver/Unified/include/ResidencyService.hpp"
 #include "prx/libSceAgcDriver/Unified/include/Events.hpp"
 #include "prx/libSceAgcDriver/Unified/include/ProofVerdict.hpp"
 #include "prx/libc/include/GuestArena.hpp"
+#include "prx/libSceAgcDriver/Execution/include/GuestMemory.hpp"
 #include "prx/libSceAgcDriver/Unified/include/RecordVerify.hpp"
 #include "prx/libSceAgcDriver/Unified/include/RecordDraw.hpp"
 #include <atomic>
@@ -14,11 +16,16 @@
 #include <cstring>
 #include <mutex>
 #include <map>
+#include <algorithm>
+#include <unordered_map>
+#include <vector>
 #include <span>
 #include <utility>
 #include <string>
 
 namespace AgcDriver::Unified::Shadow {
+
+std::string writeAuditLine();
 
 namespace {
 
@@ -59,7 +66,16 @@ struct MemoryTotals {
     std::atomic<std::uint64_t> dirtyBytes{0};
     std::atomic<std::uint64_t> consumeNanoseconds{0};
     std::atomic<std::uint64_t> maxConsumeNanoseconds{0};
+    std::atomic<std::uint64_t> ownedServes{0};
+    std::atomic<std::uint64_t> ownedWalks{0};
+    std::atomic<std::uint64_t> ownedWalkNanoseconds{0};
+    std::atomic<std::uint64_t> ownedRecords{0};
+    std::atomic<std::uint64_t> ownedRecordNanoseconds{0};
 };
+
+std::uint64_t nanosecondsSince(std::chrono::steady_clock::time_point start) {
+    return static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - start).count());
+}
 
 MemoryTotals& memoryTotals() {
     static MemoryTotals& totals = *new MemoryTotals();
@@ -99,6 +115,7 @@ bool registerRange(std::uint64_t begin, std::uint64_t end) {
         return false;
     }
     MemoryCore::Get().Register(first, last - first);
+    ResidencyService::Get().Add(first, last - first);
     auto& totals = memoryTotals();
     totals.registrations.fetch_add(1, std::memory_order_relaxed);
     totals.registeredBytes.fetch_add(last - first, std::memory_order_relaxed);
@@ -114,6 +131,7 @@ void consumeMemory() {
     if (!memoryInstalled()) return;
     const auto start = std::chrono::steady_clock::now();
     const auto ranges = MemoryCore::Get().ConsumeDirty();
+    ResidencyService::Get().NoteDirty(ranges);
     const auto nanoseconds = static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - start).count());
     auto& totals = memoryTotals();
     std::uint64_t bytes = 0;
@@ -147,7 +165,14 @@ std::string memoryLine() {
     const auto events = Events::Shared().Counts();
     char eventLine[384];
     std::snprintf(eventLine, sizeof(eventLine), "[recode-events] notes %llu serial %llu; queries %llu, region skips %llu, changed %llu, owner exempt %llu; proof objects %llu, with ranges outside the arena %llu\n", static_cast<unsigned long long>(events.notes), static_cast<unsigned long long>(Events::Shared().Serial()), static_cast<unsigned long long>(events.queries), static_cast<unsigned long long>(events.regionSkips), static_cast<unsigned long long>(events.changed), static_cast<unsigned long long>(events.ownerExempt), static_cast<unsigned long long>(totals.proofObjects.load(std::memory_order_relaxed)), static_cast<unsigned long long>(totals.proofObjectsOutside.load(std::memory_order_relaxed)));
-    return std::string(line) + eventLine;
+    std::string owned;
+    if (const auto serves = totals.ownedServes.load(std::memory_order_relaxed); serves != 0) {
+        char ownedLine[256];
+        std::snprintf(ownedLine, sizeof(ownedLine), "[recode-owned] serves %llu, walks %llu (%.1f ms), upload records %llu (%.1f ms)\n", static_cast<unsigned long long>(serves), static_cast<unsigned long long>(totals.ownedWalks.load(std::memory_order_relaxed)), static_cast<double>(totals.ownedWalkNanoseconds.load(std::memory_order_relaxed)) / 1e6, static_cast<unsigned long long>(totals.ownedRecords.load(std::memory_order_relaxed)), static_cast<double>(totals.ownedRecordNanoseconds.load(std::memory_order_relaxed)) / 1e6);
+        owned = ownedLine;
+    }
+    owned += writeAuditLine();
+    return std::string(line) + eventLine + ResidencyService::Get().Line() + owned;
 }
 
 void report() {
@@ -249,9 +274,167 @@ void NoteGpuMapping(const GuestAllocations::Mapped& ranges) {
         const auto first = range->address & ~(PageBytes - 1);
         const auto last = (range->address + range->bytes + PageBytes - 1) & ~(PageBytes - 1);
         MemoryCore::Get().Register(first, last - first);
+        ResidencyService::Get().Add(first, last - first);
         totals.registrations.fetch_add(1, std::memory_order_relaxed);
         totals.registeredBytes.fetch_add(last - first, std::memory_order_relaxed);
     }
+}
+
+namespace {
+
+bool coreCoversWrites(std::uintptr_t address, std::size_t bytes) {
+    return MemoryCore::Get().Pages().Covers(address, bytes);
+}
+
+struct WriteAudit {
+    std::mutex mutex;
+    std::unordered_map<std::uint64_t, std::uint64_t> hashes;
+    std::vector<std::pair<std::uintptr_t, std::uintptr_t>> reported;
+    std::atomic<std::uint64_t> pages{0};
+    std::atomic<std::uint64_t> misses{0};
+    std::vector<std::uintptr_t> listed;
+};
+
+WriteAudit& writeAudit() {
+    static auto* audit = new WriteAudit;
+    return *audit;
+}
+
+struct AuditForward {
+    void (*written)(void*, std::uintptr_t, std::uintptr_t);
+    void* context;
+    std::vector<std::pair<std::uintptr_t, std::uintptr_t>>* runs;
+};
+
+void auditWritten(void* context, std::uintptr_t begin, std::uintptr_t end) {
+    auto* forward = static_cast<AuditForward*>(context);
+    forward->runs->emplace_back(begin, end);
+    forward->written(forward->context, begin, end);
+}
+
+bool coreCollectWrites(std::uintptr_t address, std::size_t bytes, void (*written)(void*, std::uintptr_t, std::uintptr_t), void* context) {
+    static const bool audit = std::getenv("APS5_RECODE_AUDIT_CORE_WRITES") != nullptr;
+    if (!audit) {
+        MemoryCore::Get().CollectWrites(address, bytes, written, context);
+        return true;
+    }
+    auto& state = writeAudit();
+    std::lock_guard lock(state.mutex);
+    state.reported.clear();
+    AuditForward forward{written, context, &state.reported};
+    auto& pages = MemoryCore::Get().Pages();
+    MemoryCore::Get().CollectWrites(address, bytes, auditWritten, &forward);
+    const auto end = address + bytes;
+    for (auto page = address & ~(PageBytes - 1); page < end; page += PageBytes) {
+        const auto kind = pages.StateOf(page);
+        if (kind != PageState::CpuClean && kind != PageState::CpuDirty) continue;
+        std::uint64_t hash = 0xcbf29ce484222325ull;
+        const auto* words = reinterpret_cast<const std::uint64_t*>(page);
+        for (std::size_t i = 0; i < PageBytes / sizeof(std::uint64_t); ++i) hash = (hash ^ words[i]) * 0x100000001b3ull;
+        state.pages.fetch_add(1, std::memory_order_relaxed);
+        auto [entry, inserted] = state.hashes.try_emplace(page, hash);
+        if (inserted || entry->second == hash) continue;
+        entry->second = hash;
+        bool seen = false;
+        for (const auto& [from, to] : state.reported) seen = seen || (page >= from && page < to);
+        if (seen) continue;
+        if (state.listed.size() < 8 && std::find(state.listed.begin(), state.listed.end(), page) == state.listed.end()) state.listed.push_back(page);
+        state.misses.fetch_add(1, std::memory_order_relaxed);
+    }
+    return true;
+}
+
+}
+
+std::string writeAuditLine() {
+    auto& state = writeAudit();
+    if (state.pages.load(std::memory_order_relaxed) == 0) return {};
+    std::string pages;
+    {
+        std::lock_guard lock(state.mutex);
+        for (const auto page : state.listed) {
+            char one[32];
+            std::snprintf(one, sizeof(one), " 0x%llx", static_cast<unsigned long long>(page));
+            pages += one;
+        }
+    }
+    char text[160];
+    std::snprintf(text, sizeof(text), "[recode-audit] pages hashed %llu, missed writes %llu, first missed pages", static_cast<unsigned long long>(state.pages.load(std::memory_order_relaxed)), static_cast<unsigned long long>(state.misses.load(std::memory_order_relaxed)));
+    return std::string(text) + pages + "\n";
+}
+
+namespace {
+
+const GuestMemory::CoreWriteHooks coreWriteHooks{coreCoversWrites, coreCollectWrites};
+
+}
+
+bool ServesOwned() {
+    static const bool serves = ResidencyService::Enabled() && std::getenv("APS5_RECODE_NO_OWNED_REGIONS") == nullptr;
+    if (!serves || !memoryInstalled()) return false;
+    static const bool hooked = [] {
+        if (std::getenv("APS5_RECODE_CORE_WRITES") != nullptr) GuestMemory::SetCoreWriteHooks(&coreWriteHooks);
+        return true;
+    }();
+    return hooked;
+}
+
+bool ServeOwned(const Graphics::Context& context, std::uint64_t address, std::uint64_t size, OwnedSpan* span) {
+    if (size == 0 || !ServesOwned()) return false;
+    auto& service = ResidencyService::Get();
+    if (!service.Attach(context)) return false;
+    const auto first = address & ~(PageBytes - 1);
+    const auto last = (address + size + PageBytes - 1) & ~(PageBytes - 1);
+    auto& totals = memoryTotals();
+    totals.ownedServes.fetch_add(1, std::memory_order_relaxed);
+    struct Served {
+        std::uint64_t last = 0;
+        std::uint64_t frame = 0;
+        OwnedSpan span;
+    };
+    static std::mutex servedMutex;
+    static auto& served = *new std::map<std::uint64_t, Served>();
+    const auto frame = service.Frame();
+    std::lock_guard lock(servedMutex);
+    if (const auto found = served.find(first); found != served.end() && found->second.last == last && found->second.frame == frame) {
+        *span = found->second.span;
+        span->address += address - first;
+        return true;
+    }
+    if (!GuestArena::GuestArenaContains_nid_postfix(reinterpret_cast<const void*>(first), static_cast<std::size_t>(last - first))) return false;
+    const auto start = std::chrono::steady_clock::now();
+    const auto committed = GuestMemory::CommittedRanges(first, static_cast<std::size_t>(last - first));
+    auto& core = MemoryCore::Get();
+    core.Reserve(first, last - first);
+    for (const auto& [from, to] : committed) core.MakeResident(from, to - from);
+    const auto base = service.Serve(first, last - first, committed);
+    totals.ownedWalks.fetch_add(1, std::memory_order_relaxed);
+    totals.ownedWalkNanoseconds.fetch_add(nanosecondsSince(start), std::memory_order_relaxed);
+    if (!base) {
+        served.erase(first);
+        return false;
+    }
+    const OwnedSpan whole{base->handle, base->address, first - base->offset};
+    served[first] = {last, frame, whole};
+    *span = whole;
+    span->address += address - first;
+    return true;
+}
+
+bool OwnedUploadsPending() {
+    return ServesOwned() && ResidencyService::Get().Pending();
+}
+
+std::size_t RecordOwnedUploads(VkCommandBuffer commands, std::vector<std::shared_ptr<void>>& kept) {
+    if (!ServesOwned()) return 0;
+    const auto start = std::chrono::steady_clock::now();
+    const auto recorded = ResidencyService::Get().Record(commands, kept);
+    if (recorded != 0) {
+        auto& totals = memoryTotals();
+        totals.ownedRecords.fetch_add(1, std::memory_order_relaxed);
+        totals.ownedRecordNanoseconds.fetch_add(nanosecondsSince(start), std::memory_order_relaxed);
+    }
+    return recorded;
 }
 
 std::shared_ptr<DriverDetail::Submission> Copy(const DriverDetail::Submission& submission) {
@@ -272,7 +455,10 @@ void Tee(const DriverDetail::Submission& submission) {
     if (submission.suspend || submission.commands.empty()) return;
     if (MemoryActive()) {
         consumeMemory();
-        if (!submission.flips.empty() && memoryInstalled()) MemoryCore::Get().AdvanceFrame();
+        if (!submission.flips.empty() && memoryInstalled()) {
+            MemoryCore::Get().AdvanceFrame();
+            ResidencyService::Get().AdvanceFrame();
+        }
     }
     if (decoding) front().Push(Copy(submission));
     report();

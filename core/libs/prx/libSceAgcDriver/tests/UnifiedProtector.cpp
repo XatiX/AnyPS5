@@ -24,6 +24,35 @@ void Expect(bool condition, const char* what) {
     ++failures;
 }
 
+struct TrackedCall {
+    std::uintptr_t address;
+    std::size_t bytes;
+    std::uint32_t protection;
+};
+
+std::vector<TrackedCall> trackedCalls;
+
+bool fakeTracker(std::uintptr_t address, std::size_t bytes, std::uint32_t protection, bool* held) {
+    trackedCalls.push_back({address, bytes, protection});
+    *held = protection == static_cast<std::uint32_t>(Protection::ReadWrite) && address == 0x20000;
+    return true;
+}
+
+void testTrackerTakesEveryChange() {
+    Protector protector;
+    protector.Track(fakeTracker);
+    protector.NeverArm(0x11000, PageBytes);
+    const std::vector<ProtectionChange> arm{{0x10000, 3 * PageBytes, Protection::ReadOnly}};
+    bool held = false;
+    Expect(protector.Apply(arm, &held) == 2 && !held, "arming around a never-armed page makes two tracked calls");
+    Expect(trackedCalls.size() == 2 && trackedCalls[0].address == 0x10000 && trackedCalls[0].bytes == PageBytes && trackedCalls[1].address == 0x12000 && trackedCalls[1].protection == static_cast<std::uint32_t>(Protection::ReadOnly), "the tracker sees the armed pieces only");
+    const std::vector<ProtectionChange> open{{0x20000, PageBytes, Protection::ReadWrite}};
+    Expect(protector.Apply(open, &held) == 1 && held, "an open the tracker keeps protected is reported as held");
+    Expect(protector.Counts().tracked == 3 && protector.Counts().held == 1, "tracked and held calls are counted");
+    protector.Track(nullptr);
+    trackedCalls.clear();
+}
+
 #ifdef _WIN32
 constexpr std::uint64_t Pages = 16;
 
@@ -127,6 +156,7 @@ void testWriteFaultOpensACleanPage() {
 }
 
 int main() {
+    testTrackerTakesEveryChange();
 #ifdef _WIN32
     testApplySkipsNeverArmedPages();
     testDeferredChangesFlushAsRuns();

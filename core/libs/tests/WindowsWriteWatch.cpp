@@ -18,10 +18,19 @@ void Require(bool condition, const char* message) {
     if (!condition) throw std::runtime_error(message);
 }
 
+std::atomic<unsigned> coreFaults{0};
+
 LONG CALLBACK HandleWrite(EXCEPTION_POINTERS* exception) {
     const auto* record = exception->ExceptionRecord;
     if (record->ExceptionCode != EXCEPTION_ACCESS_VIOLATION || record->NumberParameters < 2 || record->ExceptionInformation[0] != 1) return EXCEPTION_CONTINUE_SEARCH;
-    if (!Mappings::Get().HandleWrite(record->ExceptionInformation[1])) return EXCEPTION_CONTINUE_SEARCH;
+    const auto address = static_cast<std::uintptr_t>(record->ExceptionInformation[1]);
+    if (Mappings::Get().CoreCapped(address, 1) != 0) {
+        bool held = false;
+        Mappings::Get().TrackProtect(address & ~std::uintptr_t{Small - 1}, Small, Mappings::CapNone, &held);
+        ++coreFaults;
+        if (!held) return EXCEPTION_CONTINUE_EXECUTION;
+    }
+    if (!Mappings::Get().HandleWrite(address)) return EXCEPTION_CONTINUE_SEARCH;
     ++faults;
     return EXCEPTION_CONTINUE_EXECUTION;
 }
@@ -1034,6 +1043,49 @@ void CheckKnownZeroShared() {
     Require(KnownZeroPages(region.first, Bytes).empty(), "shared memory is known zero");
 }
 
+void CheckCoreCapsShared() {
+    Region region;
+    const auto page = [&](std::size_t index) { return reinterpret_cast<std::uintptr_t>(region.first) + index * Small; };
+    bool held = true;
+    Require(Mappings::Get().TrackProtect(page(1), Small, Mappings::CapReadOnly, &held) && !held, "the core could not cap a shared page");
+    Require(region.Protection(1) == PAGE_READONLY && region.Protection(0) == PAGE_READWRITE, "the core cap protected the wrong page");
+    Require(region.Collect(Collection::All, 0, 4) == Pages(0, 4), "collect under a core cap lost fresh pages");
+    const auto core = coreFaults.load();
+    region.Write(0, 1);
+    Require(coreFaults == core, "a write outside the core cap reached the core");
+    Require(region.Protection(0) == PAGE_READWRITE && region.Protection(1) == PAGE_READONLY, "a write resume lifted the core cap");
+    region.Write(1, 2);
+    Require(coreFaults == core + 1, "a write on a capped page missed the core");
+    Require(region.Protection(1) == PAGE_READWRITE, "a write on a capped and armed page stayed protected");
+    Require(region.Collect(Collection::Armed, 0, 4) == Pages(0, 2), "collection lost a write the core opened first");
+    Require(Mappings::Get().TrackProtect(page(2), Small, Mappings::CapReadOnly, &held) && !held, "the core could not cap an armed page");
+    Mappings::Get().Pin(page(0), 16384);
+    Require(region.Protection(2) == PAGE_READONLY && region.Protection(3) == PAGE_READWRITE, "a pin lifted the core cap");
+    Mappings::Get().Unpin(page(0), 16384);
+    Require(Mappings::Get().TrackProtect(page(2), Small, Mappings::CapNone, &held) && !held, "the core could not open a pinned page");
+    Require(region.Protection(2) == PAGE_READWRITE, "opening a core cap left the page protected");
+    Require(Mappings::Get().TrackProtect(page(4), Small, Mappings::CapNoAccess, &held), "the core could not fence a page");
+    Require(region.Protection(4) == PAGE_NOACCESS, "a fence was not applied");
+    Require(Mappings::Get().TrackProtect(page(0), Bytes, Mappings::CapNone, &held), "the core could not open the region");
+    Require(Mappings::Get().CoreCapped(page(0), Bytes) == 0, "opened pages kept a core cap");
+}
+
+void CheckCoreCapsPrivate() {
+    auto* memory = static_cast<unsigned char*>(VirtualAlloc(nullptr, Bytes, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE));
+    Require(memory != nullptr, "cannot allocate private core test memory");
+    const auto address = reinterpret_cast<std::uintptr_t>(memory);
+    bool held = true;
+    Require(Mappings::Get().TrackProtect(address, Bytes, Mappings::CapReadOnly, &held) && !held, "the core could not cap private memory");
+    MEMORY_BASIC_INFORMATION info{};
+    Require(VirtualQuery(memory, &info, sizeof(info)) == sizeof(info) && info.Protect == PAGE_READONLY && info.RegionSize == Bytes, "private memory was not capped");
+    const auto core = coreFaults.load();
+    static_cast<volatile unsigned char*>(memory)[Small * 3] = 5;
+    Require(coreFaults == core + 1 && memory[Small * 3] == 5, "a private write missed the core");
+    Require(Mappings::Get().CoreCapped(address, Bytes) == Bytes / Small - 1, "a private write opened more than its page");
+    Require(Mappings::Get().TrackProtect(address, Bytes, Mappings::CapNone, &held) && !held, "the core could not open private memory");
+    VirtualFree(memory, 0, MEM_RELEASE);
+}
+
 int main(int argc, char** argv) {
     auto* handler = AddVectoredExceptionHandler(1, HandleWrite);
     try {
@@ -1073,6 +1125,8 @@ int main(int argc, char** argv) {
         CheckKnownZeroResident();
         CheckKnownZeroShared();
         CheckKnownZeroFirstReads();
+        CheckCoreCapsShared();
+        CheckCoreCapsPrivate();
         std::cout << "Windows deferred write-watch tests passed\n";
     } catch (const std::exception& error) {
         std::cerr << error.what() << '\n';

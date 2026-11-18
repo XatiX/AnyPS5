@@ -227,9 +227,9 @@ void ShaderResources::prepareAddressBindings(std::span<const CompiledShader> sha
                 faultReportOnly = faultReportOnly && faultReportOnlyCached(shader.program->spirv, binding.descriptorSet, binding.binding);
             }
         }
-        const bool faultOnly = tables == 0 && faults == 1 && shader.program->bdaAbiVersion == ShaderRecompiler::BdaAbi::Version;
+        const bool faultOnly = tables == 0 && faults == 1 && ShaderRecompiler::BdaAbi::Known(shader.program->bdaAbiVersion);
         Require((tables == faults || faultOnly) && tables <= 1 && faults <= 1, "invalid BDA table and fault descriptors");
-        Require(shader.program->bdaAbiVersion == (faults == 0 ? 0u : ShaderRecompiler::BdaAbi::Version), "incompatible BDA ABI version");
+        Require((faults == 0 ? shader.program->bdaAbiVersion == 0u : ShaderRecompiler::BdaAbi::Known(shader.program->bdaAbiVersion)), "incompatible BDA ABI version");
         // Rect-list validation needs a fault buffer, but never accesses guest addresses.
         usesBda = usesBda || tables != 0;
         if (tables != 0 && storesThroughAddressesCached(shader.program->spirv)) bdaReadOnly = false;

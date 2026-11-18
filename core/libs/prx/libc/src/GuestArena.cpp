@@ -9,7 +9,11 @@
 #include <exception>
 #ifndef _WIN32
 #include <cerrno>
+#include <csignal>
 #include <fstream>
+#endif
+#ifdef __linux__
+#include <ucontext.h>
 #include <sstream>
 #include <string>
 #include <sys/mman.h>
@@ -760,6 +764,11 @@ bool GuestArenaHandleGpuFault_nid_no_patch(EXCEPTION_POINTERS* exception) {
     return handler(static_cast<std::uintptr_t>(record->ExceptionInformation[1]), kind == 1);
 }
 
+bool GuestArenaTrackProtect_nid_no_patch(std::uintptr_t address, std::size_t bytes, std::uint32_t protection, bool* held) {
+    if (protection > WindowsMappings::CapNoAccess) return false;
+    return WindowsMappings::Get().TrackProtect(address, bytes, static_cast<std::uint8_t>(protection), held);
+}
+
 void GuestArenaPinWritable_nid_postfix(const void* pointer, std::size_t bytes) {
     if (!Arena::Get().Contains(pointer, bytes)) return;
     WindowsMappings::Get().Pin(reinterpret_cast<std::uintptr_t>(pointer), bytes);
@@ -1114,6 +1123,68 @@ bool GuestArenaOverlapsHostRegion_nid_no_patch(std::uintptr_t address, std::size
 void GuestArenaReleaseHostRegion_nid_no_patch(const void* pointer, std::size_t bytes) {
     Arena::Get().ReleaseHostRegion(pointer, bytes);
 }
+
+#if defined(__linux__) || defined(__APPLE__)
+namespace {
+
+std::atomic<bool (*)(std::uintptr_t, bool)> posixGpuFaultHandler{nullptr};
+struct sigaction previousSegv {};
+struct sigaction previousBus {};
+
+bool writeFault(const void* context) {
+#if defined(__linux__) && defined(__x86_64__)
+    constexpr long WriteAccess = 1 << 1;
+    return context != nullptr && (static_cast<const ucontext_t*>(context)->uc_mcontext.gregs[REG_ERR] & WriteAccess) != 0;
+#else
+    static_cast<void>(context);
+    return true;
+#endif
+}
+
+void forwardFault(int signal, siginfo_t* info, void* context) {
+    const auto& previous = signal == SIGBUS ? previousBus : previousSegv;
+    if ((previous.sa_flags & SA_SIGINFO) != 0 && previous.sa_sigaction != nullptr) {
+        previous.sa_sigaction(signal, info, context);
+        return;
+    }
+    if (previous.sa_handler != SIG_DFL && previous.sa_handler != SIG_IGN && previous.sa_handler != nullptr) {
+        previous.sa_handler(signal);
+        return;
+    }
+    ::signal(signal, SIG_DFL);
+    ::raise(signal);
+}
+
+void gpuFault(int signal, siginfo_t* info, void* context) {
+    const auto handler = posixGpuFaultHandler.load(std::memory_order_acquire);
+    if (handler != nullptr && info != nullptr && info->si_code > 0 && handler(reinterpret_cast<std::uintptr_t>(info->si_addr), writeFault(context))) return;
+    forwardFault(signal, info, context);
+}
+
+}
+
+bool GuestArenaSetGpuFaultHandler_nid_no_patch(bool (*handler)(std::uintptr_t address, bool write)) {
+    static const bool installed = [] {
+        struct sigaction action {};
+        action.sa_sigaction = &gpuFault;
+        action.sa_flags = SA_SIGINFO | SA_ONSTACK | SA_RESTART;
+        sigemptyset(&action.sa_mask);
+        if (sigaction(SIGSEGV, &action, &previousSegv) != 0) return false;
+        if (sigaction(SIGBUS, &action, &previousBus) != 0) {
+            sigaction(SIGSEGV, &previousSegv, nullptr);
+            return false;
+        }
+        return true;
+    }();
+    if (handler != nullptr && !installed) return false;
+    posixGpuFaultHandler.store(handler, std::memory_order_release);
+    return true;
+}
+#else
+bool GuestArenaSetGpuFaultHandler_nid_no_patch(bool (*handler)(std::uintptr_t address, bool write)) {
+    return handler == nullptr;
+}
+#endif
 #endif
 
 }

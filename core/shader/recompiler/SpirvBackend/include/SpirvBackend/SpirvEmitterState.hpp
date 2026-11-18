@@ -172,6 +172,7 @@ struct SpirvEmitterState {
     std::vector<BufferLengthCacheEntry> bufferLengths;
     std::uint32_t bufferFormatTable = 0;
     std::uint32_t bdaPagetableVariable = 0;
+    std::uint32_t bdaAbiVersion = 0;
     std::uint32_t faultBufferVariable = 0;
     std::uint32_t bdaPointerFunction = 0;
     // The lookup without fault recording that wide reads try first (see EmitBdaDwordReads); 0 when

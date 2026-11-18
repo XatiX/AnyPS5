@@ -24,6 +24,7 @@
 #include "prx/libc/include/GuestWriteWatch.hpp"
 #include "prx/libc/include/HostThreadLocal.hpp"
 #include "prx/libc/include/general/AtomicSharedPtr.hpp"
+#include "prx/libSceAgcDriver/Unified/include/Shadow.hpp"
 #ifdef _WIN32
 #include <windows.h>
 #else
@@ -121,6 +122,10 @@ struct ImageMirror {
     std::uint64_t serial = 0;
     std::atomic<std::uint64_t> watchedSerial{0};
     std::uint64_t lastDispatch = 0;
+    bool owned = false;
+    VkBuffer ownedBuffer = VK_NULL_HANDLE;
+    VkDeviceAddress ownedAddress = 0;
+    std::uint64_t ownedOrigin = 0;
 };
 
 // The address space. An address-based build maps every readable registered range; building that
@@ -3287,14 +3292,17 @@ void growResident(ImageMirror& mirror, const GuestRuns& runs) {
 }
 
 std::uint64_t mirrorStart(const ImageMirror& mirror) {
+    if (mirror.owned) return mirror.ownedOrigin;
     return mirror.resident != nullptr ? mirror.resident->Origin() : mirror.base;
 }
 
 VkBuffer mirrorHandle(const ImageMirror& mirror) {
+    if (mirror.owned) return mirror.ownedBuffer;
     return mirror.resident != nullptr ? mirror.resident->Handle() : mirror.buffer->Handle();
 }
 
 VkDeviceAddress mirrorAddress(const ImageMirror& mirror) {
+    if (mirror.owned) return mirror.ownedAddress;
     return mirror.resident != nullptr ? mirror.resident->DeviceAddress() : mirror.buffer->DeviceAddress();
 }
 
@@ -3687,7 +3695,7 @@ bool refreshSparseMirror(ImageMirror& mirror, std::vector<RefreshBlock>& blocks)
 void planSpaceMirrors(GuestBufferMemory::AddressSpace& space) {
     for (std::size_t index = 0; index < space.base.size(); ++index) {
         const auto& region = space.base[index];
-        if (region.mirror == nullptr) continue;
+        if (region.mirror == nullptr || region.mirror->owned) continue;
         space.mirrored = true;
         if (!region.mirror->heap) {
             if (region.mirror->writable) space.writableMirrors.push_back(index);
@@ -3905,6 +3913,64 @@ std::shared_ptr<ImageMirror> acquireMirror(const Context& context, const std::sh
     state.entries[selected.address] = mirror;
     ++state.version;
     return mirror;
+}
+
+struct OwnedMirrors {
+    std::mutex mutex;
+    std::map<std::uint64_t, std::shared_ptr<ImageMirror>> served;
+};
+
+OwnedMirrors& ownedMirrors() {
+    static auto& mirrors = *new OwnedMirrors();
+    return mirrors;
+}
+
+std::uint64_t ownedSerial(std::uint64_t address, std::size_t bytes) {
+    if (!Unified::Shadow::ServesOwned()) return 0;
+    auto& owned = ownedMirrors();
+    std::lock_guard lock(owned.mutex);
+    auto found = owned.served.upper_bound(address);
+    if (found == owned.served.begin()) return 0;
+    --found;
+    const auto& mirror = found->second;
+    if (address < mirror->base || address + bytes > mirror->base + mirror->bytes || mirror->range.expired()) return 0;
+    return mirror->serial;
+}
+
+std::shared_ptr<ImageMirror> ownedMirror(const Context& context, const std::shared_ptr<const GuestAllocations::Range>& range) {
+    Unified::Shadow::OwnedSpan span;
+    if (!Unified::Shadow::ServeOwned(context, range->address, range->bytes, &span)) return nullptr;
+    const auto buffer = reinterpret_cast<VkBuffer>(static_cast<std::uintptr_t>(span.handle));
+    auto& owned = ownedMirrors();
+    std::lock_guard lock(owned.mutex);
+    auto& slot = owned.served[range->address];
+    if (slot != nullptr && slot->bytes == range->bytes && slot->writable == range->writable && slot->ownedBuffer == buffer && slot->ownedAddress == span.address && sameRange(slot->range, range)) return slot;
+    auto mirror = std::make_shared<ImageMirror>();
+    mirror->base = range->address;
+    mirror->bytes = range->bytes;
+    mirror->reserved = range->bytes;
+    mirror->writable = range->writable;
+    mirror->range = range;
+    mirror->owned = true;
+    mirror->ownedBuffer = buffer;
+    mirror->ownedAddress = span.address;
+    mirror->ownedOrigin = span.origin;
+    {
+        auto& state = Mirrors();
+        std::lock_guard mirrors(state.mutex);
+        mirror->serial = (1ull << 63u) | ++state.serials;
+    }
+    slot = mirror;
+    return mirror;
+}
+
+void recordOwnedUploads() {
+    if (!Unified::Shadow::OwnedUploadsPending()) return;
+    auto* recorder = Recorder::Active();
+    if (recorder == nullptr) return;
+    std::vector<std::shared_ptr<void>> kept;
+    if (Unified::Shadow::RecordOwnedUploads(recorder->Commands(), kept) == 0) return;
+    for (auto& object : kept) recorder->Keep(std::move(object));
 }
 
 std::shared_ptr<ImageMirror> findMirror(const Context& context, std::uint64_t begin, std::uint64_t end) {
@@ -5522,6 +5588,11 @@ void GuestBufferMemory::AcquireRegistered() {
                     continue;
                 }
             }
+            if (auto owned = ownedMirror(context, range); owned != nullptr) {
+                region.mirror = std::move(owned);
+                regions.push_back(std::move(region));
+                continue;
+            }
             addCopiedRange({range->address, range->address + range->bytes, range->writable});
             const auto& copied = regions.back();
             std::uint64_t committed = copied.end - copied.begin;
@@ -6938,6 +7009,7 @@ void GuestBufferMemory::UploadFinish(bool addressable, std::optional<std::pair<s
     if (!gpuCopies.empty()) recordGpuCopies(gpuCopies, addressable);
     takeHeapReferences();
     ResidentBuffer::FlushChanged(context);
+    recordOwnedUploads();
     if (!profile) return;
     const auto loopUs = microsecondsSince(loopStart);
     readUs.fetch_add(refreshUs, std::memory_order_relaxed);
@@ -7721,7 +7793,7 @@ bool GuestBufferMemory::HasCopiedWrites() const {
         // and nothing could be stored from it by the CPU.
         if (region.gpuCopy && (region.copiedBack || region.deviceLocal)) continue;
         // Writes into a read-only image mirror are never stored (its pages could not take them).
-        if (region.mirror != nullptr && !region.mirror->writable) continue;
+        if (region.mirror != nullptr && (!region.mirror->writable || region.mirror->owned)) continue;
         return true;
     }
     return false;
@@ -7736,7 +7808,7 @@ bool GuestBufferMemory::CopiedWritesOverlap(std::uint64_t address, std::size_t b
         const auto& region = *found;
         if (region.direct != nullptr) continue;
         if (region.gpuCopy && (region.copiedBack || region.deviceLocal)) continue;
-        if (region.mirror != nullptr && !region.mirror->writable) continue;
+        if (region.mirror != nullptr && (!region.mirror->writable || region.mirror->owned)) continue;
         return true;
     }
     return false;
@@ -7867,14 +7939,14 @@ void GuestBufferMemory::WriteBack() {
         Require(found != nullptr, "write-back range has no GPU owner");
         const auto& region = *found;
         // Every branch below but the direct, copied-back and staged ones stores from the CPU.
-        if (region.direct == nullptr && !(region.gpuCopy && (region.copiedBack || region.deviceLocal)) && !(region.mirror != nullptr && !region.mirror->writable)) Recorder::NoteWrittenBack(begin, static_cast<std::size_t>(end - begin));
+        if (region.direct == nullptr && !(region.gpuCopy && (region.copiedBack || region.deviceLocal)) && !(region.mirror != nullptr && (!region.mirror->writable || region.mirror->owned))) Recorder::NoteWrittenBack(begin, static_cast<std::size_t>(end - begin));
         if (region.direct != nullptr) {
             // The GPU wrote imported guest memory directly; page write watching did not see it.
             StorageTexture::StampKeepingNewerResults(begin, static_cast<std::size_t>(end - begin), directWritesGeneration, [&] { return GuestMemory::MarkPossiblyWritten(begin, static_cast<std::size_t>(end - begin)); });
             continue;
         }
         if (region.mirror != nullptr) {
-            if (!region.mirror->writable) continue;
+            if (!region.mirror->writable || region.mirror->owned) continue;
             Require(end <= region.end, "write-back range exceeds its GPU owner");
             // The shadow is what the GPU started from; it then takes the mirror's bytes so the next
             // refresh does not mistake the GPU's results for a guest change.
@@ -7962,7 +8034,7 @@ std::optional<std::vector<std::pair<std::uint64_t, std::uint64_t>>> GuestBufferM
     std::vector<std::pair<std::uint64_t, std::uint64_t>> result;
     if (space != nullptr) {
         for (const auto& region : space->base) {
-            if (region.direct == nullptr && (region.mirror == nullptr || region.mirror->writable || region.mirror->heap)) return std::nullopt;
+            if (region.direct == nullptr && (region.mirror == nullptr || ((region.mirror->writable || region.mirror->heap) && !region.mirror->owned))) return std::nullopt;
             result.emplace_back(region.begin, region.end);
         }
     }
@@ -7973,7 +8045,7 @@ std::optional<std::vector<std::pair<std::uint64_t, std::uint64_t>>> GuestBufferM
         // A read-only mirror is as fixed as an import: its bytes and VkBuffer never change while its
         // A staged region is keyed by its import like one bound in place: the import is the source
         // of its copy-in and the destination of its copy-back, both recorded per use.
-        const bool fixedMirror = region.mirror != nullptr && !region.mirror->writable && !region.mirror->heap;
+        const bool fixedMirror = region.mirror != nullptr && ((!region.mirror->writable && !region.mirror->heap) || region.mirror->owned);
         const bool staged = region.gpuCopy && region.deviceLocal;
         if (region.direct == nullptr && !fixedMirror && !staged) return std::nullopt;
         if (staged) {
@@ -8077,6 +8149,7 @@ void GuestBufferMemory::AddressStores(std::vector<std::pair<std::uint64_t, std::
 
 void GuestBufferMemory::RecordStagingCopies(Recorder& recorder) {
     ResidentBuffer::FlushChanged(context);
+    recordOwnedUploads();
     if (!uploaded || committed) return;
     static const bool profile = std::getenv("APS5_PROFILE_DRAW") != nullptr;
     std::vector<Region*> copies;
@@ -8098,7 +8171,9 @@ void GuestBufferMemory::RecordStagingCopies(Recorder& recorder) {
 }
 
 std::uint64_t ImageMirrorSerial(const Context& context, std::uint64_t address, std::size_t bytes) {
-    if (bytes == 0 || bytes > std::numeric_limits<std::uint64_t>::max() - address || !mirrorsEnabled()) return 0;
+    if (bytes == 0 || bytes > std::numeric_limits<std::uint64_t>::max() - address) return 0;
+    if (const auto serial = ownedSerial(address, bytes); serial != 0) return serial;
+    if (!mirrorsEnabled()) return 0;
     // A replaced Range expires the mirror (findMirror), and a replacement mirror has a new serial.
     const auto mirror = findMirror(context, address, address + bytes);
     return mirror != nullptr && !mirror->writable ? mirror->serial : 0;

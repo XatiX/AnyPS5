@@ -2,9 +2,7 @@
 #include "prx/libSceAgcDriver/Unified/include/Events.hpp"
 #include <array>
 #include <cstdlib>
-#ifdef _WIN32
 #include "prx/libc/include/GuestArena.hpp"
-#endif
 
 namespace AgcDriver::Unified {
 
@@ -29,22 +27,35 @@ bool MemoryCore::Install() {
 #ifdef _WIN32
     if (!GuestArena::GuestArenaSetGpuFaultHandler_nid_no_patch(handleGuestFault)) return false;
     GuestArena::GuestArenaSetGpuHostWriteHook_nid_no_patch(prepareGuestHostWrite);
+    if (std::getenv("APS5_RECODE_NO_PROTECT_OWNER") == nullptr) protector.Track(GuestArena::GuestArenaTrackProtect_nid_no_patch);
     return true;
 #else
-    return false;
+    if (!GuestArena::GuestArenaSetGpuFaultHandler_nid_no_patch(handleGuestFault)) return false;
+    GuestArena::GuestArenaSetGpuHostWriteHook_nid_no_patch(prepareGuestHostWrite);
+    return true;
 #endif
 }
 
 void MemoryCore::Uninstall() {
-#ifdef _WIN32
     GuestArena::GuestArenaSetGpuHostWriteHook_nid_no_patch(nullptr);
     GuestArena::GuestArenaSetGpuFaultHandler_nid_no_patch(nullptr);
+#ifdef _WIN32
+    protector.Track(nullptr);
 #endif
 }
 
 void MemoryCore::Register(std::uint64_t address, std::uint64_t size) {
     std::lock_guard lock(mutex);
     protector.Apply(pages.Register(address, size));
+}
+
+void MemoryCore::Reserve(std::uint64_t address, std::uint64_t size) {
+    pages.Reserve(address, size);
+}
+
+void MemoryCore::MakeResident(std::uint64_t address, std::uint64_t size) {
+    std::lock_guard lock(mutex);
+    protector.Apply(pages.MakeResident(address, size));
 }
 
 void MemoryCore::Unregister(std::uint64_t address, std::uint64_t size) {
@@ -61,18 +72,31 @@ std::uint64_t MemoryCore::PageHash(std::uint64_t page) {
     return lanes[0] ^ (lanes[1] * 31u) ^ (lanes[2] * 131u) ^ (lanes[3] * 1031u);
 }
 
+bool MemoryCore::rehash(std::uint64_t page, bool proven) {
+    const auto hash = PageHash(page);
+    auto [entry, inserted] = busyHashes.try_emplace(page, hash);
+    if (inserted || proven || entry->second != hash) {
+        entry->second = hash;
+        return true;
+    }
+    return false;
+}
+
 std::vector<DirtyRange> MemoryCore::ConsumeDirty() {
     static const bool hashBusy = std::getenv("APS5_RECODE_NO_BUSY_HASH") == nullptr;
+    static const bool unlockedHash = std::getenv("APS5_RECODE_NO_UNLOCKED_HASH") == nullptr;
+    std::lock_guard hashLock(hashMutex);
+    std::unordered_map<std::uint64_t, bool> hashed;
+    if (hashBusy && unlockedHash) {
+        for (const auto page : pages.BusyPages()) hashed.emplace(page, rehash(page, false));
+    }
     std::lock_guard lock(mutex);
     std::vector<ProtectionChange> changes;
-    const PageTable::WriteCheck written = [this](std::uint64_t page, bool proven) {
-        const auto hash = PageHash(page);
-        auto [entry, inserted] = busyHashes.try_emplace(page, hash);
-        if (inserted || proven || entry->second != hash) {
-            entry->second = hash;
-            return true;
+    const PageTable::WriteCheck written = [this, &hashed](std::uint64_t page, bool proven) {
+        if (!proven) {
+            if (const auto found = hashed.find(page); found != hashed.end()) return found->second;
         }
-        return false;
+        return rehash(page, proven);
     };
     auto ranges = hashBusy ? pages.ConsumeDirty(changes, written) : pages.ConsumeDirty(changes);
     protector.Apply(changes);
@@ -88,7 +112,7 @@ void MemoryCore::MarkGpuOwned(std::uint64_t address, std::uint64_t size) {
 bool MemoryCore::HandleFault(std::uint64_t address, bool write) {
     std::lock_guard lock(mutex);
     const auto state = pages.StateOf(address);
-    if (state == PageState::Untracked) {
+    if (state == PageState::Untracked || state == PageState::Reserved) {
         foreignFaults.fetch_add(1, std::memory_order_relaxed);
         return false;
     }
@@ -101,14 +125,16 @@ bool MemoryCore::HandleFault(std::uint64_t address, bool write) {
         staleFaults.fetch_add(1, std::memory_order_relaxed);
         Events::Shared().Note(address & ~(PageBytes - 1), PageBytes);
         const ProtectionChange reopen{address & ~(PageBytes - 1), PageBytes, Protection::ReadWrite};
-        return protector.Apply(std::span(&reopen, 1)) == 1;
+        bool held = false;
+        return protector.Apply(std::span(&reopen, 1), &held) == 1 && !held;
     }
     std::vector<ProtectionChange> changes;
     if (!pages.HandleWrite(address, changes)) return false;
     Events::Shared().Note(address & ~(PageBytes - 1), PageBytes);
-    protector.Apply(changes);
+    bool held = false;
+    protector.Apply(changes, &held);
     writesOpened.fetch_add(1, std::memory_order_relaxed);
-    return true;
+    return !held;
 }
 
 void MemoryCore::PrepareHostWrite(std::uint64_t address, std::uint64_t size) {
@@ -122,6 +148,23 @@ void MemoryCore::PrepareHostWrite(std::uint64_t address, std::uint64_t size) {
         if (pages.HandleWrite(page, changes)) hostWritesOpened.fetch_add(1, std::memory_order_relaxed);
     }
     protector.Apply(changes);
+}
+
+void MemoryCore::CollectWrites(std::uint64_t address, std::uint64_t size, PageTable::WrittenRun written, void* context) {
+    std::lock_guard lock(collectMutex);
+    pages.Collect(address, size, written, context, [this](std::uint64_t page, bool proven) {
+        if (proven) {
+            collectHashes.erase(page);
+            return true;
+        }
+        const auto hash = PageHash(page);
+        auto [entry, inserted] = collectHashes.try_emplace(page, hash);
+        if (inserted || entry->second != hash) {
+            entry->second = hash;
+            return true;
+        }
+        return false;
+    });
 }
 
 MemoryCoreCounts MemoryCore::Counts() const {

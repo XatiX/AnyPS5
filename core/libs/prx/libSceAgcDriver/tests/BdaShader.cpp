@@ -10,7 +10,7 @@
 namespace {
 
 template<typename TEmit>
-std::vector<std::uint32_t> MakeShader(std::uint64_t address, bool coherent, bool stops, const TEmit& emit, std::uint32_t extracted = 0, bool writes = false) {
+std::vector<std::uint32_t> MakeShader(std::uint64_t address, bool coherent, bool stops, const TEmit& emit, std::uint32_t extracted = 0, bool writes = false, std::uint32_t version = ShaderRecompiler::BdaAbi::Version) {
     using namespace ShaderRecompiler;
     IrProgram program;
     program.Resources().stage = IrShaderStage::Compute;
@@ -22,6 +22,7 @@ std::vector<std::uint32_t> MakeShader(std::uint64_t address, bool coherent, bool
         program.Resources().memoryInfo = {memory};
     }
     SpirvEmitterState state(program, {});
+    state.bdaAbiVersion = version;
     EmitBaseHeader(state.module, program);
     const auto define = [&](std::uint32_t binding) {
         const auto variable = state.module.DefineGlobalVariable(TypeStorageBufferPointer(state), spv::StorageClassStorageBuffer);
@@ -71,12 +72,12 @@ std::vector<std::uint32_t> MakeShader(std::uint64_t address, bool coherent, bool
 
 }
 
-std::vector<std::uint32_t> MakeBdaTestShader(std::uint64_t address, std::uint32_t bits, std::int64_t offset) {
+std::vector<std::uint32_t> MakeBdaTestShader(std::uint64_t address, std::uint32_t bits, std::int64_t offset, std::uint32_t version) {
     using namespace ShaderRecompiler;
     return MakeShader(address, false, true, [&](SpirvValueEmitContext& ctx, const IrValue& instruction, std::uint32_t base) {
         if (offset != 0) base = AddBdaAddress(ctx, instruction, base, BdaConstant(ctx.state, offset < 0 ? std::uint64_t{0} - static_cast<std::uint64_t>(offset) : static_cast<std::uint64_t>(offset)), offset < 0);
         return std::vector<std::uint32_t>{EmitBdaRead(ctx, instruction, base, bits)};
-    });
+    }, 0u, false, version);
 }
 
 std::vector<std::uint32_t> MakeBdaSpanReadTestShader(std::uint64_t address, std::uint32_t offset, std::uint32_t extracted, bool coherent, bool stops) {
