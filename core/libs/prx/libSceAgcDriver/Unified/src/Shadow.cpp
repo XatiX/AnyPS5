@@ -154,12 +154,12 @@ std::string memoryLine() {
     const auto consumes = totals.consumes.load(std::memory_order_relaxed);
     const auto nanoseconds = totals.consumeNanoseconds.load(std::memory_order_relaxed);
     char line[896];
-    std::snprintf(line, sizeof(line), "[recode-memory] registered %llu ranges %llu MiB, %llu outside the arena; backend accesses %llu, unknown memory %llu; consumes %llu, dirty ranges %llu, dirty %llu MiB, consume %.1f us avg %.1f us max; write faults opened %llu, host writes opened %llu, stale %llu, gpu-owned %llu, foreign %llu; kept busy %llu, rearmed %llu, busy unchanged %llu; protect calls %llu (%llu MiB), split %llu, skipped %llu MiB, failures %llu\n",
+    std::snprintf(line, sizeof(line), "[recode-memory] registered %llu ranges %llu MiB, %llu outside the arena; backend accesses %llu, unknown memory %llu; consumes %llu, dirty ranges %llu, dirty %llu MiB, consume %.1f us avg %.1f us max; write faults opened %llu, host writes opened %llu, driver pages settled %llu, stale %llu, gpu-owned %llu, foreign %llu; kept busy %llu, rearmed %llu, busy unchanged %llu; protect calls %llu (%llu MiB), split %llu, skipped %llu MiB, failures %llu\n",
         static_cast<unsigned long long>(totals.registrations.load(std::memory_order_relaxed)), static_cast<unsigned long long>(totals.registeredBytes.load(std::memory_order_relaxed) >> 20), static_cast<unsigned long long>(totals.outsideArena.load(std::memory_order_relaxed)),
         static_cast<unsigned long long>(totals.accesses.load(std::memory_order_relaxed)), static_cast<unsigned long long>(totals.unknownAccesses.load(std::memory_order_relaxed)),
         static_cast<unsigned long long>(consumes), static_cast<unsigned long long>(totals.ranges.load(std::memory_order_relaxed)), static_cast<unsigned long long>(totals.dirtyBytes.load(std::memory_order_relaxed) >> 20),
         consumes == 0 ? 0.0 : static_cast<double>(nanoseconds) / static_cast<double>(consumes) / 1000.0, static_cast<double>(totals.maxConsumeNanoseconds.exchange(0, std::memory_order_relaxed)) / 1000.0,
-        static_cast<unsigned long long>(core.writesOpened), static_cast<unsigned long long>(core.hostWritesOpened), static_cast<unsigned long long>(core.staleFaults), static_cast<unsigned long long>(core.gpuOwnedFaults), static_cast<unsigned long long>(core.foreignFaults),
+        static_cast<unsigned long long>(core.writesOpened), static_cast<unsigned long long>(core.hostWritesOpened), static_cast<unsigned long long>(core.driverPagesSettled), static_cast<unsigned long long>(core.staleFaults), static_cast<unsigned long long>(core.gpuOwnedFaults), static_cast<unsigned long long>(core.foreignFaults),
         static_cast<unsigned long long>(table.keptBusy), static_cast<unsigned long long>(table.rearmed), static_cast<unsigned long long>(table.unchangedBusy),
         static_cast<unsigned long long>(protect.calls), static_cast<unsigned long long>(protect.bytes >> 20), static_cast<unsigned long long>(protect.splitCalls), static_cast<unsigned long long>(protect.skippedBytes >> 20), static_cast<unsigned long long>(protect.failures));
     const auto events = Events::Shared().Counts();
@@ -365,7 +365,11 @@ std::string writeAuditLine() {
 
 namespace {
 
-const GuestMemory::CoreWriteHooks coreWriteHooks{coreCoversWrites, coreCollectWrites};
+void coreNoteWritten(std::uintptr_t address, std::size_t bytes) {
+    MemoryCore::Get().NoteDriverWrite(address, bytes);
+}
+
+const GuestMemory::CoreWriteHooks coreWriteHooks{coreCoversWrites, coreCollectWrites, coreNoteWritten};
 
 }
 
@@ -419,6 +423,58 @@ bool ServeOwned(const Graphics::Context& context, std::uint64_t address, std::ui
     *span = whole;
     span->address += address - first;
     return true;
+}
+
+void ServeFaultPages(std::span<const std::uint64_t> pages) {
+    if (pages.empty() || !ServesOwned()) return;
+    auto& service = ResidencyService::Get();
+    if (!service.Attached()) return;
+    struct FaultPage {
+        std::uint64_t page = 0;
+        std::uint64_t first = 0;
+        std::uint64_t last = 0;
+    };
+    std::vector<FaultPage> found;
+    found.reserve(pages.size());
+    {
+        const auto lease = GuestAllocations::GuestAllocationsAcquire_nid_postfix();
+        for (const auto address : pages) {
+            const auto page = address & ~(GpuPageBytes - 1);
+            FaultPage entry{page, page, page + GpuPageBytes};
+            auto range = std::upper_bound(lease.begin(), lease.end(), page, [](std::uint64_t at, const auto& candidate) { return at < candidate->address; });
+            if (range != lease.begin()) {
+                const auto& allocation = *--range;
+                const auto first = allocation->address & ~(PageBytes - 1);
+                const auto last = (allocation->address + allocation->bytes + PageBytes - 1) & ~(PageBytes - 1);
+                if (allocation->bytes != 0 && first <= page && page + GpuPageBytes <= last) {
+                    entry.first = first;
+                    entry.last = last;
+                }
+            }
+            found.push_back(entry);
+        }
+    }
+    auto& core = MemoryCore::Get();
+    for (const auto& [page, first, last] : found) {
+        if (!GuestArena::GuestArenaContains_nid_postfix(reinterpret_cast<const void*>(page), static_cast<std::size_t>(GpuPageBytes))) continue;
+        const bool whole = registerRange(first, last);
+        if (!whole && first != page) registerRange(page, page + GpuPageBytes);
+        const auto committed = GuestMemory::CommittedRanges(page, static_cast<std::size_t>(GpuPageBytes));
+        core.Reserve(page, GpuPageBytes);
+        for (const auto& [from, to] : committed) core.MakeResident(from, to - from);
+        if (whole) service.ServeFaultPage(page, first, last - first, committed);
+        else service.ServeFaultPage(page, 0, 0, committed);
+    }
+}
+
+void LandGpuWrites(GuestRanges ranges) {
+    static const bool ahead = std::getenv("APS5_RECODE_NO_READBACK_AHEAD") == nullptr;
+    if (!ahead || ranges.empty() || !ServesOwned()) return;
+    std::unique_lock<GuestMemory::GpuMutexType> gpu(GuestMemory::GpuMutex(), std::defer_lock);
+    if (!GuestMemory::GpuMutex().HeldByThisThread()) gpu.lock();
+    const auto pieces = ResidencyService::Get().ReadBack(ranges);
+    auto& core = MemoryCore::Get();
+    for (const auto& piece : pieces) core.LandGpuWrite(piece.guest, piece.bytes);
 }
 
 bool OwnedUploadsPending() {

@@ -565,7 +565,8 @@ void RunBdaPageTableExecutionTests(const Context& context) {
     std::memcpy(near.Bytes().data(), head.data(), head.size());
     std::memcpy(near.Bytes().data() + page - 2, seam.data(), seam.size());
     std::memcpy(far.Bytes().data(), seam.data() + 2, 2);
-    Buffer fault(context, sizeof(Abi::Fault), VK_BUFFER_USAGE_STORAGE_BUFFER_BIT);
+    Buffer fault(context, Abi::FaultBufferBytes, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT);
+    std::vector<std::uint64_t> faultPages;
     Buffer output(context, 4, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT);
     const auto run = [&](const Unified::GpuPageTable& pages, std::uint64_t address, std::uint32_t bits, std::uint32_t expected, Abi::FaultReason reason) {
         Buffer table(context, Abi::PageTableBytes(pages.Leaves()), VK_BUFFER_USAGE_STORAGE_BUFFER_BIT);
@@ -586,7 +587,12 @@ void RunBdaPageTableExecutionTests(const Context& context) {
         std::uint32_t result = 0;
         std::memcpy(&report, fault.Bytes().data(), sizeof(report));
         std::memcpy(&result, output.Bytes().data(), sizeof(result));
+        faultPages.clear();
+        const auto* words = reinterpret_cast<const std::uint32_t*>(fault.Bytes().data());
+        Require(words[Abi::FaultPageOverflowWord] == 0 && Abi::ForEachFaultPage(words, [&](std::uint64_t page) { faultPages.push_back(page); }), "page-table BDA fault pages are invalid at " + Hex(address));
+        std::sort(faultPages.begin(), faultPages.end());
         if (static_cast<std::uint32_t>(reason) == 0) {
+            Require(faultPages.empty(), "a mapped page-table BDA read listed fault pages at " + Hex(address));
             Require(report.state == Abi::FaultState::Empty && result == expected, "page-table BDA read produced incorrect data or a fault at " + Hex(address));
         } else {
             Require(report.state == Abi::FaultState::Ready && report.reason == reason && report.instruction == 0x1234, "page-table BDA fault was not published correctly at " + Hex(address));
@@ -600,9 +606,13 @@ void RunBdaPageTableExecutionTests(const Context& context) {
     run(linear, guest, 32, 0x44332211, static_cast<Abi::FaultReason>(0));
     run(linear, guest + page - 2, 32, 0xa4a3a2a1, static_cast<Abi::FaultReason>(0));
     run(linear, guest + 2 * page, 8, 0, Abi::FaultReason::Unmapped);
+    Require(faultPages == std::vector<std::uint64_t>{guest + 2 * page}, "an unmapped page-table BDA read did not list its page");
     run(linear, guest + 2 * page - 2, 32, 0, Abi::FaultReason::Unmapped);
+    Require(faultPages == std::vector<std::uint64_t>{guest + 2 * page}, "a read running into an unmapped page did not list only that page");
     run(linear, guest - 1, 8, 0, Abi::FaultReason::Unmapped);
+    Require(faultPages == std::vector<std::uint64_t>{guest - page}, "an unmapped page before the span was not listed");
     run(linear, Abi::PageTableAddressSpace, 8, 0, Abi::FaultReason::Unmapped);
+    Require(faultPages.empty(), "an address past the page table was listed as a fault page");
     Unified::GpuPageTable split;
     Require(split.Map(guest, page, near.DeviceAddress(), Unified::GpuPageRead) && split.Map(guest + page, page, far.DeviceAddress(), Unified::GpuPageRead), "the split pages map");
     run(split, guest + page, 16, 0xa4a3, static_cast<Abi::FaultReason>(0));

@@ -2,6 +2,7 @@
 #include "prx/libSceAgcDriver/Unified/include/Events.hpp"
 #include <array>
 #include <cstdlib>
+#include <cstring>
 #include "prx/libc/include/GuestArena.hpp"
 
 namespace AgcDriver::Unified {
@@ -150,16 +151,30 @@ void MemoryCore::PrepareHostWrite(std::uint64_t address, std::uint64_t size) {
     protector.Apply(changes);
 }
 
+void MemoryCore::LandGpuWrite(std::uint64_t address, std::span<const std::byte> bytes) {
+    if (bytes.empty()) return;
+    std::lock_guard lock(mutex);
+    std::vector<ProtectionChange> open;
+    std::vector<ProtectionChange> close;
+    const auto end = address + bytes.size();
+    for (auto page = address & ~(PageBytes - 1); page < end; page += PageBytes) {
+        const auto state = pages.StateOf(page);
+        if (state != PageState::CpuClean && state != PageState::GpuOwned) continue;
+        open.push_back({page, PageBytes, Protection::ReadWrite});
+        close.push_back({page, PageBytes, state == PageState::CpuClean ? Protection::ReadOnly : Protection::NoAccess});
+    }
+    protector.Apply(open);
+    std::memcpy(reinterpret_cast<void*>(address), bytes.data(), bytes.size());
+    protector.Apply(close);
+    landedBytes.fetch_add(bytes.size(), std::memory_order_relaxed);
+}
+
 void MemoryCore::CollectWrites(std::uint64_t address, std::uint64_t size, PageTable::WrittenRun written, void* context) {
     std::lock_guard lock(collectMutex);
     pages.Collect(address, size, written, context, [this](std::uint64_t page, bool proven) {
-        if (proven) {
-            collectHashes.erase(page);
-            return true;
-        }
         const auto hash = PageHash(page);
         auto [entry, inserted] = collectHashes.try_emplace(page, hash);
-        if (inserted || entry->second != hash) {
+        if (proven || (!inserted && entry->second != hash)) {
             entry->second = hash;
             return true;
         }
@@ -167,8 +182,15 @@ void MemoryCore::CollectWrites(std::uint64_t address, std::uint64_t size, PageTa
     });
 }
 
+void MemoryCore::NoteDriverWrite(std::uint64_t address, std::uint64_t size) {
+    if (size == 0) return;
+    std::lock_guard lock(mutex);
+    protector.Apply(pages.MarkDeviceWritten(address, size));
+    driverPagesSettled.fetch_add((size + PageBytes - 1) / PageBytes, std::memory_order_relaxed);
+}
+
 MemoryCoreCounts MemoryCore::Counts() const {
-    return {writesOpened.load(std::memory_order_relaxed), hostWritesOpened.load(std::memory_order_relaxed), gpuOwnedFaults.load(std::memory_order_relaxed), foreignFaults.load(std::memory_order_relaxed), staleFaults.load(std::memory_order_relaxed)};
+    return {writesOpened.load(std::memory_order_relaxed), hostWritesOpened.load(std::memory_order_relaxed), gpuOwnedFaults.load(std::memory_order_relaxed), foreignFaults.load(std::memory_order_relaxed), staleFaults.load(std::memory_order_relaxed), landedBytes.load(std::memory_order_relaxed), driverPagesSettled.load(std::memory_order_relaxed)};
 }
 
 }

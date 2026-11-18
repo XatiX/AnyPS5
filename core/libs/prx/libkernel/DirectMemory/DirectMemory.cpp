@@ -82,12 +82,14 @@ struct KernelArena {
 
 static GuestMemoryView::GuestView* SharedView() {
     static GuestMemoryView::GuestView* const view = []() -> GuestMemoryView::GuestView* {
-        if (std::getenv("APS5_GUEST_VIEW") == nullptr || !GuestArena::GuestArenaAvailable_nid_postfix()) return nullptr;
+        const bool wanted = std::getenv("APS5_GUEST_VIEW") != nullptr || (std::getenv("APS5_RECODE_MEMORY") != nullptr && std::getenv("APS5_NO_GUEST_VIEW") == nullptr);
+        if (!wanted || !GuestArena::GuestArenaAvailable_nid_postfix()) return nullptr;
         std::uintptr_t base = 0;
         std::size_t bytes = 0;
         GuestArena::GuestArenaRange_nid_postfix(&base, &bytes);
         auto* created = new GuestMemoryView::GuestView;
         created->Reserve(base, bytes, DIRECT_MEMORY_SIZE);
+        GuestArena::GuestArenaSetViewResolver_nid_no_patch(&GuestViewAddress_nid_no_patch);
         return created;
     }();
     return view;
@@ -1403,7 +1405,7 @@ int DoMapZero(void** addr, size_t len, int prot, int flags) {
 std::uint8_t* GuestViewAddress_nid_no_patch(std::uintptr_t address, std::size_t bytes) {
 #ifdef _WIN32
     auto* view = SharedView();
-    return view != nullptr && view->Covers(address, bytes) ? view->Address(address) : nullptr;
+    return view != nullptr && view->Mapped(address, bytes) ? view->Address(address) : nullptr;
 #else
     static_cast<void>(address);
     static_cast<void>(bytes);

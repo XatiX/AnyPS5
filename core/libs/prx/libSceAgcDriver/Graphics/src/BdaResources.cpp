@@ -3,6 +3,10 @@
 #include "prx/libSceAgcDriver/Graphics/include/MultisampleTarget.hpp"
 #include "ImageTableAbi.hpp"
 #include "prx/libSceAgcDriver/Execution/include/GuestMemory.hpp"
+#if ANYPS5_UNIFIED
+#include "prx/libSceAgcDriver/Unified/include/ResidencyService.hpp"
+#include "prx/libSceAgcDriver/Unified/include/Shadow.hpp"
+#endif
 #include <algorithm>
 #include <array>
 #include <atomic>
@@ -157,9 +161,21 @@ bool faultSlotClean(std::span<const std::byte> bytes) {
     if (bytes.size() < Abi::FaultBufferBytes) return std::all_of(bytes.begin(), bytes.end(), [](std::byte value) { return value == std::byte{0}; });
     std::array<std::uint32_t, Abi::WrittenSlotsWord> head{};
     std::memcpy(head.data(), bytes.data(), sizeof(head));
-    std::uint32_t guard = 0;
-    std::memcpy(&guard, bytes.data() + Abi::SrtGuardWord * sizeof(std::uint32_t), sizeof(guard));
-    return guard == 0 && std::all_of(head.begin(), head.end(), [](std::uint32_t word) { return word == 0; });
+    std::array<std::uint32_t, 3> tail{};
+    std::memcpy(tail.data(), bytes.data() + Abi::SrtGuardWord * sizeof(std::uint32_t), sizeof(tail));
+    return std::all_of(tail.begin(), tail.end(), [](std::uint32_t word) { return word == 0; }) && std::all_of(head.begin(), head.end(), [](std::uint32_t word) { return word == 0; });
+}
+
+void clearFaultPages(std::uint32_t* words) {
+    namespace Abi = ShaderRecompiler::BdaAbi;
+    const auto count = std::min(words[Abi::FaultPageCountWord], Abi::FaultPageSlots);
+    for (std::uint32_t claim = 0; claim < count; ++claim) {
+        const auto slot = words[Abi::FaultPageListWord + claim];
+        if (slot < Abi::FaultPageSlots) words[Abi::FaultPageSlotsWord + slot] = 0;
+    }
+    if (words[Abi::FaultPageOverflowWord] != 0 || words[Abi::FaultPageCountWord] > Abi::FaultPageSlots) std::memset(words + Abi::FaultPageSlotsWord, 0, Abi::FaultPageSlots * sizeof(std::uint32_t));
+    words[Abi::FaultPageOverflowWord] = 0;
+    words[Abi::FaultPageCountWord] = 0;
 }
 
 void clearFaultSlot(std::span<std::byte> bytes) {
@@ -170,6 +186,7 @@ void clearFaultSlot(std::span<std::byte> bytes) {
     }
     std::memset(bytes.data(), 0, Abi::WrittenListWord * sizeof(std::uint32_t));
     std::memset(bytes.data() + Abi::SrtGuardWord * sizeof(std::uint32_t), 0, sizeof(std::uint32_t));
+    clearFaultPages(reinterpret_cast<std::uint32_t*>(bytes.data()));
 }
 
 void dropChunk(FaultArena& arena, const std::shared_ptr<BdaFaultChunk>& chunk, std::vector<std::shared_ptr<BdaFaultChunk>>& dropped) {
@@ -311,6 +328,19 @@ bool BdaResources::TakeFaultSlot(const Context& context) {
 }
 
 BdaResources::BdaResources(const Context& context, const GuestBufferMemory& memory, bool reportOnly) : BdaResources(context, reportOnly) {
+#if ANYPS5_UNIFIED
+    if (Unified::ResidencyService::PageTableEnabled()) {
+        auto& service = Unified::ResidencyService::Get();
+        Require(service.Attach(context), "APS5_RECODE_PAGE_TABLE: the residency service did not attach (no sparse residency buffers or device addresses)");
+        table = service.PageTableBuffer();
+        Require(table != nullptr, "APS5_RECODE_PAGE_TABLE: the residency service has no page table");
+        tableBytes = ShaderRecompiler::BdaAbi::PageTableBytes(Unified::PageTableLeafCapacity);
+        Require(tableBytes <= context.limits.maxStorageBufferRange && ShaderRecompiler::BdaAbi::FaultBufferBytes <= context.limits.maxStorageBufferRange, "BDA descriptors exceed storage buffer range limit");
+        tableGuardSerial = MultisampleTargetRangeGeneration();
+        pageTable = true;
+        return;
+    }
+#endif
     const auto cached = memory.CachedAddressTable();
     std::vector<ShaderRecompiler::BdaAbi::Range> built;
     if (!cached.has_value()) built = memory.AddressRanges();
@@ -433,7 +463,7 @@ std::span<const std::byte> BdaResources::TableBytes() const {
 }
 
 bool BdaResources::TableGuardCurrent(VkDevice device, std::span<const ShaderRecompiler::BdaAbi::Range> ranges) {
-    if (table == nullptr || tableGuardSerial == MultisampleTargetRangeGeneration()) return true;
+    if (table == nullptr || pageTable || tableGuardSerial == MultisampleTargetRangeGeneration()) return true;
     auto generation = tableGuardSerial;
     const auto filtered = ExcludeMultisampleTargetRanges(device, ranges, generation);
     const auto expected = filtered.has_value() ? std::span<const ShaderRecompiler::BdaAbi::Range>(*filtered) : ranges;
@@ -486,6 +516,17 @@ void BdaResources::checkFault(const BdaResources& record) const {
         return;
     }
     Require(report.state == ShaderRecompiler::BdaAbi::FaultState::Ready && (report.claim & ~(ShaderRecompiler::BdaAbi::FaultClaimed | ShaderRecompiler::BdaAbi::FaultClaimOtherFaults)) == 0, "incomplete or invalid BDA fault record");
+#if ANYPS5_UNIFIED
+    if (pageTable) {
+        std::vector<std::uint64_t> pages;
+        Require(ShaderRecompiler::BdaAbi::ForEachFaultPage(reinterpret_cast<const std::uint32_t*>(record.faultBytes().data()), [&](std::uint64_t page) { pages.push_back(page); }), "invalid BDA fault page list");
+        Unified::Shadow::ServeFaultPages(pages);
+        if (report.reason == ShaderRecompiler::BdaAbi::FaultReason::Unmapped && ShaderRecompiler::BdaAbi::OtherFaults(report) == 0) {
+            clearFaultSlot(record.faultBytes());
+            return;
+        }
+    }
+#endif
     Require(report.reason != ShaderRecompiler::BdaAbi::FaultReason::InvalidRectangle, "rect-list requires finite nondegenerate axis-aligned positions with equal positive W");
     if (report.reason == ShaderRecompiler::BdaAbi::FaultReason::LoopLimit) {
         // APS5_LOOP_GUARD: the shader left a loop that ran past the guard; the dispatch result is kept.
@@ -523,7 +564,7 @@ void BdaResources::checkFault(const BdaResources& record) const {
         throw std::runtime_error(message.str());
     }
     message << "BDA access failed: address=0x" << std::hex << report.address << " instruction=0x" << report.instruction << std::dec << " bytes=" << report.bytes << " stage=" << report.stage << " reason=" << static_cast<std::uint32_t>(report.reason);
-    if (report.reason == ShaderRecompiler::BdaAbi::FaultReason::Permission && table != nullptr) {
+    if (report.reason == ShaderRecompiler::BdaAbi::FaultReason::Permission && table != nullptr && !pageTable) {
         const auto bytes = table->Bytes();
         ShaderRecompiler::BdaAbi::Header header{};
         std::memcpy(&header, bytes.data(), sizeof(header));
@@ -578,6 +619,7 @@ void BdaResources::markWrittenPages(const BdaResources& record) const {
     Require(words[Abi::WrittenOverflowWord] == 0, "more than " + std::to_string(Abi::WrittenPageSlots) + " chunks of " + std::to_string(Abi::WrittenChunkPages) + " pages stored to through the BDA table in one use are not implemented");
     const auto count = words[Abi::WrittenCountWord];
     if (count == 0) return;
+    std::vector<std::pair<std::uint64_t, std::uint64_t>> written;
     Require(Abi::ForEachWrittenRange(words, [&](std::uint64_t begin, std::size_t bytes) {
         const auto end = begin + bytes;
         for (const auto& [base, size] : imageTableRanges) {
@@ -587,8 +629,12 @@ void BdaResources::markWrittenPages(const BdaResources& record) const {
                 Require(false, message.str());
             }
         }
-        GuestMemory::MarkPossiblyWritten(begin, bytes);
+        written.emplace_back(begin, bytes);
     }), "invalid BDA written-page record");
+#if ANYPS5_UNIFIED
+    if (pageTable) Unified::Shadow::LandGpuWrites(written);
+#endif
+    for (const auto& [begin, bytes] : written) GuestMemory::MarkPossiblyWritten(begin, static_cast<std::size_t>(bytes));
     for (std::uint32_t claim = 0; claim < count; ++claim) {
         const auto slot = words[Abi::WrittenListWord + claim];
         words[Abi::WrittenSlotsWord + 2 * slot] = 0;

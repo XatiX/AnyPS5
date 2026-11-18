@@ -34,6 +34,7 @@ public:
     [[nodiscard]] std::span<const std::uint32_t> Root() const { return root; }
     [[nodiscard]] std::uint32_t Leaves() const { return static_cast<std::uint32_t>(leaves.size()); }
     [[nodiscard]] std::span<const std::uint64_t> Leaf(std::uint32_t index) const;
+    [[nodiscard]] bool Dirty() const { return dirty.root || !dirty.leaves.empty(); }
     GpuPageTableDirty TakeDirty();
 
 private:

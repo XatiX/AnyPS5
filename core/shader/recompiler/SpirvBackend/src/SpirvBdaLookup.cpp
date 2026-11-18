@@ -96,6 +96,14 @@ std::uint32_t DefineBdaLookup(SpirvEmitterState& state, const char* name, bool r
         const auto last = binary(spv::OpISub, u64, end, BdaConstant(state, 1u));
         const auto head = entryOf(address);
         const auto tail = entryOf(last);
+        if (recordFaults && state.bdaNoteFaultPageFunction != 0) {
+            const auto voidType = state.module.Type(spv::OpTypeVoid);
+            for (const auto& [entry, at] : {std::pair{head, address}, std::pair{tail, last}}) {
+                EmitIfCondition(state, binary(spv::OpIEqual, boolean, entry.value, BdaConstant(state, 0u)), [&] {
+                    state.module.AddFunction(spv::OpFunctionCall, voidType, state.module.AllocateId(), state.bdaNoteFaultPageFunction, at);
+                });
+            }
+        }
         const auto permissionMask = BdaConstant(state, BdaAbi::PageTablePermissions);
         const auto pageMask = BdaConstant(state, (std::uint64_t{1} << BdaAbi::PageTablePageBits) - 1u);
         const auto headBase = binary(spv::OpBitwiseAnd, u64, head.value, Unary(state, spv::OpNot, u64, permissionMask));
@@ -290,6 +298,69 @@ static std::uint32_t DefineBdaNoteWrite(SpirvEmitterState& state) {
     return function;
 }
 
+static std::uint32_t DefineBdaNoteFaultPage(SpirvEmitterState& state) {
+    const auto u32 = TypeU32(state);
+    const auto u64 = TypeScalarU64(state);
+    const auto boolean = TypeBool(state);
+    const auto constant = [&](std::uint32_t value) { return ConstantU32(state, value); };
+    const auto binary = [&](std::uint32_t op, std::uint32_t type, std::uint32_t left, std::uint32_t right) { return Binary(state, op, type, left, right); };
+    const auto voidType = state.module.Type(spv::OpTypeVoid);
+    const auto function = state.module.AllocateId();
+    state.module.AddName(function, "note_bda_fault_page");
+    state.module.AddFunction(spv::OpFunction, voidType, function, spv::FunctionControlMaskNone, state.module.Type(spv::OpTypeFunction, voidType, u64));
+    const auto address = state.module.AllocateId();
+    state.module.AddFunction(spv::OpFunctionParameter, u64, address);
+    EmitLabel(state, state.module.AllocateId());
+    const auto done = state.module.AllocateId();
+    state.module.AddFunction(spv::OpVariable, TypePointer(state, spv::StorageClassFunction, boolean), done, spv::StorageClassFunction);
+    const auto counter = state.module.AllocateId();
+    state.module.AddFunction(spv::OpVariable, TypePointer(state, spv::StorageClassFunction, u32), counter, spv::StorageClassFunction);
+    state.module.AddFunction(spv::OpStore, done, ConstantBool(state, false));
+    state.module.AddFunction(spv::OpStore, counter, constant(0u));
+    const auto key = binary(spv::OpIAdd, u32, Unary(state, spv::OpUConvert, u32, binary(spv::OpShiftRightLogical, u64, address, BdaConstant(state, BdaAbi::PageTablePageBits))), constant(1u));
+    const auto hash = binary(spv::OpShiftRightLogical, u32, binary(spv::OpIMul, u32, key, constant(0x9e3779b1u)), constant(32u - static_cast<std::uint32_t>(std::countr_zero(BdaAbi::FaultPageSlots))));
+    const auto scope = constant(spv::ScopeDevice);
+    const auto relaxed = constant(spv::MemorySemanticsMaskNone);
+    const auto header = state.module.AllocateId();
+    const auto body = state.module.AllocateId();
+    const auto continuation = state.module.AllocateId();
+    const auto merge = state.module.AllocateId();
+    state.module.AddFunction(spv::OpBranch, header);
+    EmitLabel(state, header);
+    const auto probe = state.module.AllocateId();
+    state.module.AddFunction(spv::OpLoad, u32, probe, counter);
+    const auto found = state.module.AllocateId();
+    state.module.AddFunction(spv::OpLoad, boolean, found, done);
+    const auto searching = binary(spv::OpLogicalAnd, boolean, Unary(state, spv::OpLogicalNot, boolean, found), binary(spv::OpULessThan, boolean, probe, constant(BdaAbi::FaultPageProbes)));
+    state.module.AddFunction(spv::OpLoopMerge, merge, continuation, spv::LoopControlMaskNone);
+    state.module.AddFunction(spv::OpBranchConditional, searching, body, merge);
+    EmitLabel(state, body);
+    const auto slot = binary(spv::OpBitwiseAnd, u32, binary(spv::OpIAdd, u32, hash, probe), constant(BdaAbi::FaultPageSlots - 1u));
+    const auto keyWord = binary(spv::OpIAdd, u32, constant(BdaAbi::FaultPageSlotsWord), slot);
+    const auto previous = state.module.AllocateId();
+    state.module.AddFunction(spv::OpAtomicCompareExchange, u32, previous, BdaWord(state, state.faultBufferVariable, keyWord), scope, relaxed, relaxed, key, constant(0u));
+    const auto claimed = binary(spv::OpIEqual, boolean, previous, constant(0u));
+    state.module.AddFunction(spv::OpStore, done, binary(spv::OpLogicalOr, boolean, claimed, binary(spv::OpIEqual, boolean, previous, key)));
+    EmitIfCondition(state, claimed, [&] {
+        const auto index = state.module.AllocateId();
+        state.module.AddFunction(spv::OpAtomicIAdd, u32, index, BdaWord(state, state.faultBufferVariable, constant(BdaAbi::FaultPageCountWord)), scope, relaxed, constant(1u));
+        state.module.AddFunction(spv::OpAtomicStore, BdaWord(state, state.faultBufferVariable, binary(spv::OpIAdd, u32, constant(BdaAbi::FaultPageListWord), index)), scope, relaxed, slot);
+    });
+    state.module.AddFunction(spv::OpBranch, continuation);
+    EmitLabel(state, continuation);
+    state.module.AddFunction(spv::OpStore, counter, binary(spv::OpIAdd, u32, probe, constant(1u)));
+    state.module.AddFunction(spv::OpBranch, header);
+    EmitLabel(state, merge);
+    const auto noted = state.module.AllocateId();
+    state.module.AddFunction(spv::OpLoad, boolean, noted, done);
+    EmitIfCondition(state, Unary(state, spv::OpLogicalNot, boolean, noted), [&] {
+        state.module.AddFunction(spv::OpAtomicStore, BdaWord(state, state.faultBufferVariable, constant(BdaAbi::FaultPageOverflowWord)), scope, relaxed, constant(1u));
+    });
+    state.module.AddFunction(spv::OpReturn);
+    state.module.AddFunction(spv::OpFunctionEnd);
+    return function;
+}
+
 void DefineBdaAnchorFunction(SpirvEmitterState& state) {
     if (state.bdaAnchorFunction == 0) state.bdaAnchorFunction = DefineBdaLookup(state, "bda_anchor_range", false, BdaAbi::Read, true);
 }
@@ -297,6 +368,7 @@ void DefineBdaAnchorFunction(SpirvEmitterState& state) {
 void DefineGetBdaPointer(SpirvEmitterState& state) {
     if (state.faultBufferVariable != 0) DefineBdaFaultFunction(state);
     if (!state.program.Info().usesDma) return;
+    if (state.bdaAbiVersion == BdaAbi::PageTableVersion && state.faultBufferVariable != 0) state.bdaNoteFaultPageFunction = DefineBdaNoteFaultPage(state);
     state.bdaPointerFunction = DefineBdaLookup(state, "get_bda_pointer", true);
     if (!BdaByteReadsForced()) state.bdaProbeFunction = DefineBdaLookup(state, "probe_bda_pointer", false);
     DefineBdaDwordReadFunctions(state);

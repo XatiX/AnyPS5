@@ -114,6 +114,17 @@ void GuestView::MarkUsed(std::uintptr_t guest, std::size_t bytes) {
     for (auto page = first; page < last; ++page) used[page / 64] |= std::uint64_t{1} << (page % 64);
 }
 
+bool GuestView::Mapped(std::uintptr_t guest, std::size_t bytes) const {
+    if (bytes == 0 || !Covers(guest, bytes)) return false;
+    std::lock_guard guard(lock);
+    const auto first = (guest - guestBase) / PageBytes;
+    const auto last = (guest - guestBase + bytes + PageBytes - 1) / PageBytes;
+    for (auto page = first; page < last; ++page) {
+        if ((used[page / 64] & (std::uint64_t{1} << (page % 64))) == 0) return false;
+    }
+    return true;
+}
+
 void GuestView::Discard(std::uintptr_t guest, std::size_t bytes) {
     if (bytes == 0 || !Covers(guest, bytes)) return;
     std::lock_guard guard(lock);

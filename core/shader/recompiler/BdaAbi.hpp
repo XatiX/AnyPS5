@@ -93,12 +93,38 @@ inline constexpr std::uint32_t WrittenSlotsWord = WrittenCountWord + 1;
 inline constexpr std::uint32_t WrittenListWord = WrittenSlotsWord + 2 * WrittenPageSlots;
 inline constexpr std::uint32_t SrtGuardWord = WrittenListWord + WrittenPageSlots;
 inline constexpr std::uint32_t SrtGuardStageShift = 24;
-inline constexpr std::size_t FaultBufferBytes = (SrtGuardWord + 1) * sizeof(std::uint32_t);
+inline constexpr std::uint32_t FaultPageSlots = 1024;
+inline constexpr std::uint32_t FaultPageProbes = 8;
+inline constexpr std::uint32_t FaultPageOverflowWord = SrtGuardWord + 1;
+inline constexpr std::uint32_t FaultPageCountWord = FaultPageOverflowWord + 1;
+inline constexpr std::uint32_t FaultPageSlotsWord = FaultPageCountWord + 1;
+inline constexpr std::uint32_t FaultPageListWord = FaultPageSlotsWord + FaultPageSlots;
+inline constexpr std::size_t FaultBufferBytes = (FaultPageListWord + FaultPageSlots) * sizeof(std::uint32_t);
+static_assert((FaultPageSlots & (FaultPageSlots - 1)) == 0);
 static_assert((WrittenPageSlots & (WrittenPageSlots - 1)) == 0);
 static_assert(WrittenChunkPages == 32);
 
 inline constexpr std::uint32_t WrittenChunkKey(std::uint64_t address) {
     return static_cast<std::uint32_t>(address >> WrittenChunkShift) + 1u;
+}
+
+inline constexpr std::uint32_t FaultPageKey(std::uint64_t address) {
+    return static_cast<std::uint32_t>(address >> PageTablePageBits) + 1u;
+}
+
+template<typename TPage>
+bool ForEachFaultPage(const std::uint32_t* words, TPage&& page) {
+    const auto count = words[FaultPageCountWord];
+    if (count > FaultPageSlots) return false;
+    for (std::uint32_t claim = 0; claim < count; ++claim) {
+        const auto slot = words[FaultPageListWord + claim];
+        if (slot >= FaultPageSlots || words[FaultPageSlotsWord + slot] == 0) return false;
+    }
+    for (std::uint32_t claim = 0; claim < count; ++claim) {
+        const auto key = words[FaultPageSlotsWord + words[FaultPageListWord + claim]];
+        page(static_cast<std::uint64_t>(key - 1u) << PageTablePageBits);
+    }
+    return true;
 }
 
 template<typename TMark>

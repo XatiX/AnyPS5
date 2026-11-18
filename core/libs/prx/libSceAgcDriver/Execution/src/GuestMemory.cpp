@@ -135,6 +135,10 @@ bool coreCovers(std::uint64_t address, std::size_t bytes) {
     const auto* hooks = coreWriteHooks.load(std::memory_order_acquire);
     return hooks != nullptr && hooks->covers(static_cast<std::uintptr_t>(address), bytes);
 }
+bool coreAnswersCovered() {
+    static const bool answers = std::getenv("APS5_RECODE_CORE_COVERED") != nullptr;
+    return answers;
+}
 constexpr std::size_t MaxRecordedBumps = 1024;
 constexpr std::uint64_t SpanGapBytes = std::uint64_t{1} << 20;
 
@@ -2062,7 +2066,7 @@ bool collectWindowsWrites(StampRuns& runs, std::uint64_t first, std::uint64_t st
     const bool fresh = runs.kind == StampKind::Fresh;
     if (fresh) {
         if (const auto hook = freshCollectHook.load(std::memory_order_acquire)) return hook(static_cast<std::uintptr_t>(first), static_cast<std::size_t>(stop - first), &stampWrittenRun, &runs);
-    } else if (const auto* hooks = coreWriteHooks.load(std::memory_order_acquire); hooks != nullptr && !tracker.coverage.Covers(first, static_cast<std::size_t>(stop - first)) && hooks->covers(static_cast<std::uintptr_t>(first), static_cast<std::size_t>(stop - first))) {
+    } else if (const auto* hooks = coreWriteHooks.load(std::memory_order_acquire); hooks != nullptr && (coreAnswersCovered() || !tracker.coverage.Covers(first, static_cast<std::size_t>(stop - first))) && hooks->covers(static_cast<std::uintptr_t>(first), static_cast<std::size_t>(stop - first))) {
         const bool complete = hooks->collect(static_cast<std::uintptr_t>(first), static_cast<std::size_t>(stop - first), &stampWrittenRun, &runs);
         if (complete && runs.stamped != 0) collectDirty.fetch_add(1, std::memory_order_relaxed);
         return complete;
@@ -2991,11 +2995,22 @@ std::uint64_t StoreOwnBytes(std::uint64_t address, std::size_t bytes, const std:
     });
 }
 
-static void copyOwnBytes(std::uint64_t address, std::span<const std::byte> source) {
-#ifndef _WIN32
-    if (GuestWriteWatch::GuestWriteWatchAvailable_nid_postfix() && GuestArena::GuestArenaWriteSharedBacking_nid_no_patch(address, source.data(), source.size())) return;
+void* OwnStoreTarget(std::uint64_t address, std::size_t bytes) {
+#ifdef _WIN32
+    if (auto* view = GuestArena::GuestArenaViewAddress_nid_no_patch(static_cast<std::uintptr_t>(address), bytes); view != nullptr) return view;
+#else
+    static_cast<void>(bytes);
 #endif
+    return reinterpret_cast<void*>(address);
+}
+
+static void copyOwnBytes(std::uint64_t address, std::span<const std::byte> source) {
+#ifdef _WIN32
+    std::memcpy(OwnStoreTarget(address, source.size()), source.data(), source.size());
+#else
+    if (GuestWriteWatch::GuestWriteWatchAvailable_nid_postfix() && GuestArena::GuestArenaWriteSharedBacking_nid_no_patch(address, source.data(), source.size())) return;
     std::memcpy(reinterpret_cast<void*>(address), source.data(), source.size());
+#endif
 }
 
 std::uint64_t StoreOwnBytes(std::uint64_t address, std::span<const std::byte> source) {
@@ -3006,6 +3021,11 @@ std::uint64_t StoreOwnBytes(std::uint64_t address, std::span<const std::byte> so
 }
 
 static std::uint64_t markWritten(std::uint64_t address, std::size_t bytes, bool complete, std::uint64_t* order = nullptr) {
+    if (const auto* hooks = coreWriteHooks.load(std::memory_order_acquire); hooks != nullptr && hooks->written != nullptr && bytes != 0) {
+        const auto blockFirst = address & ~(std::uint64_t{WriteBlockBytes} - 1);
+        const auto blockStop = (address + bytes + WriteBlockBytes - 1) & ~(std::uint64_t{WriteBlockBytes} - 1);
+        hooks->written(static_cast<std::uintptr_t>(blockFirst), static_cast<std::size_t>(blockStop - blockFirst));
+    }
     BreakProofs();
     const BreakWhenStored breakStored;
     const NoteStore noteStore(address, bytes);
@@ -4141,8 +4161,12 @@ void Write(std::uint64_t address, std::span<const std::byte> source, std::size_t
     // Stamped like a GPU write: a collect memoized for this packet would not see the page fault.
     StoreOwnBytes(address, source.size(), [&](std::span<std::byte> image) {
         CheckRange(destination, source.size(), alignment, true);
+#ifdef _WIN32
+        copyOwnBytes(address, source);
+#else
         if (source.size() >= PageBytes) copyOwnBytes(address, source);
         else std::memcpy(destination, source.data(), source.size());
+#endif
         if (!image.empty()) std::memcpy(image.data(), source.data(), source.size());
     });
 }
@@ -4156,7 +4180,8 @@ extern "C" void AgcDriverCheckGuestMemory_nid_postfix(const void* pointer, std::
 extern "C" void AgcDriverStoreGuestLabel_nid_postfix(std::uint64_t* pointer, std::uint64_t value) {
     AgcDriver::GuestMemory::StoreOwnBytes(reinterpret_cast<std::uintptr_t>(pointer), sizeof(*pointer), [&](std::span<std::byte> image) {
         AgcDriver::GuestMemory::CheckRange(pointer, sizeof(*pointer), std::atomic_ref<std::uint64_t>::required_alignment, true);
-        std::atomic_ref(*pointer).store(value, std::memory_order_release);
+        auto* target = static_cast<std::uint64_t*>(AgcDriver::GuestMemory::OwnStoreTarget(reinterpret_cast<std::uintptr_t>(pointer), sizeof(*pointer)));
+        std::atomic_ref(*target).store(value, std::memory_order_release);
         if (!image.empty()) std::memcpy(image.data(), &value, sizeof(value));
     });
 }

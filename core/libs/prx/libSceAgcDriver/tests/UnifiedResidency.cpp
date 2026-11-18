@@ -1,3 +1,4 @@
+#include "prx/libSceAgcDriver/Unified/include/GpuPageTable.hpp"
 #include "prx/libSceAgcDriver/Unified/include/Residency.hpp"
 #include "prx/libSceAgcDriver/Unified/include/ResidentUploads.hpp"
 #include <cstdio>
@@ -209,7 +210,31 @@ void testFullUploadsReadCommittedPagesOnly() {
 
 }
 
+void testPageTableFollowsBoundChunks() {
+    FakeDevice device;
+    Residency residency(device, 0);
+    GpuPageTable pages;
+    residency.Add(0x50000000, 0x18000);
+    residency.MakeResident(0x50000000, ChunkBytes, 1);
+    residency.SetPageTable(&pages);
+    const auto first = std::uint64_t{1} << 40u;
+    Expect(pages.Lookup(0x50000010) == first + 0x10, "a chunk bound before the table is attached is mapped");
+    Expect(pages.Lookup(0x50010000) == 0, "an unbound chunk is not mapped");
+    residency.MakeResident(0x50010000, 0x8000, 2);
+    Expect(pages.Lookup(0x50017ff0, true) == first + 0x17ff0, "a newly bound chunk is mapped for reads and writes");
+    residency.Add(0x50018000, 0x10000);
+    residency.MakeResident(0x50018000, 0x10000, 3);
+    Expect(residency.Counts().sharedPages == 1 && pages.Lookup(0x50018000) == first + 0x18000, "a chunk two ranges share stays mapped to the first");
+    const auto second = std::uint64_t{2} << 40u;
+    Expect(pages.Lookup(0x50020000) == second + 0x10000, "the second range maps its own chunk");
+    residency.Remove(0x50018000);
+    Expect(pages.Lookup(0x50018000) == first + 0x18000 && pages.Lookup(0x50020000) == 0, "removing a range unmaps only its own chunks");
+    residency.Remove(0x50000000);
+    Expect(pages.Lookup(0x50000000) == 0 && pages.Lookup(0x50010000) == 0, "unbinding a range unmaps it");
+}
+
 int main() {
+    testPageTableFollowsBoundChunks();
     testServedRangeReplacesUnboundRanges();
     testFullUploadsReadCommittedPagesOnly();
     testUploadsFollowResidency();

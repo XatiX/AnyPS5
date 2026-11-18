@@ -61,7 +61,10 @@ struct ResidencyCounts {
     std::uint64_t bound = 0;
     std::uint64_t evicted = 0;
     std::uint64_t refused = 0;
+    std::uint64_t sharedPages = 0;
 };
+
+class GpuPageTable;
 
 class Residency {
 public:
@@ -80,6 +83,7 @@ public:
     std::size_t RemoveUnboundInside(std::uint64_t address, std::uint64_t size);
     std::vector<GuestSpan> Evict(std::uint64_t frame);
     void SetBudget(std::uint64_t bytes);
+    void SetPageTable(GpuPageTable* table);
     [[nodiscard]] ResidencyCounts Counts() const;
 
 private:
@@ -98,8 +102,12 @@ private:
     std::optional<Chunk> take();
     void put(Chunk chunk);
     std::uint64_t unbind(Range& range);
+    void mapChunk(const Range& range, std::size_t index);
+    void unmapChunk(const Range& range, std::size_t index);
 
     ResidencyDevice& device;
+    GpuPageTable* pageTable = nullptr;
+    std::uint64_t sharedPages = 0;
     mutable std::mutex mutex;
     Ranges ranges;
     std::vector<Chunk> free;
