@@ -153,7 +153,7 @@ std::vector<DirtyRange> PageTable::ConsumeDirty(std::vector<ProtectionChange>& c
         if (region->busyUntil[slot] != 0 && written && !written(page, false)) {
             ++counts.unchangedBusy;
             const auto epoch = framePaced ? frameEpoch : consumeEpoch;
-            if (region->busyUntil[slot] > epoch) {
+            if (region->busyUntil[slot] > epoch && epoch - region->lastConsume[slot] < QuietEpochs) {
                 keep.push_back(page);
                 continue;
             }

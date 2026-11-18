@@ -51,6 +51,7 @@ public:
     static constexpr std::uint32_t MaxGapPages = 3;
     static constexpr std::uint8_t BusyAfterWrites = 3;
     static constexpr std::uint8_t BusyConsumes = 64;
+    static constexpr std::uint32_t QuietEpochs = 2;
 
     std::vector<ProtectionChange> Register(std::uint64_t address, std::uint64_t size);
     std::vector<ProtectionChange> Unregister(std::uint64_t address, std::uint64_t size);

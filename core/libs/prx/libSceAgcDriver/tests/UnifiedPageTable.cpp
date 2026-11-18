@@ -155,11 +155,12 @@ void testUnchangedBusyPagesAreNotReported() {
     changed = true;
     Expect(table.ConsumeDirty(changes, written).size() == 1, "a changed busy page is reported");
     changed = false;
-    for (std::uint32_t round = 0; round < PageTable::BusyConsumes + 1; ++round) {
-        changes.clear();
-        table.ConsumeDirty(changes, written);
-    }
-    Expect(table.StateOf(Base) == PageState::CpuClean, "an unchanged page is armed again when its busy window ends");
+    changes.clear();
+    table.ConsumeDirty(changes, written);
+    Expect(table.StateOf(Base) == PageState::CpuDirty, "a busy page unchanged for one epoch stays open");
+    changes.clear();
+    table.ConsumeDirty(changes, written);
+    Expect(table.StateOf(Base) == PageState::CpuClean && changes.size() == 1, "a busy page unchanged for two epochs is armed again before its busy window ends");
 }
 
 int main() {
