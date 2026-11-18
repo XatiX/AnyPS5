@@ -1,6 +1,7 @@
 #include "prx/libSceAgcDriver/Unified/include/Shadow.hpp"
 #include "prx/libSceAgcDriver/Unified/include/Front.hpp"
 #include "prx/libSceAgcDriver/Unified/include/MemoryCore.hpp"
+#include "prx/libc/include/GuestArena.hpp"
 #include <atomic>
 #include "prx/libSceAgcDriver/Execution/include/PerformanceOverlay.hpp"
 #include <chrono>
@@ -35,6 +36,7 @@ Front& front() {
 struct MemoryTotals {
     std::atomic<std::uint64_t> registrations{0};
     std::atomic<std::uint64_t> registeredBytes{0};
+    std::atomic<std::uint64_t> outsideArena{0};
     std::atomic<std::uint64_t> consumes{0};
     std::atomic<std::uint64_t> ranges{0};
     std::atomic<std::uint64_t> dirtyBytes{0};
@@ -64,22 +66,29 @@ bool memoryInstalled() {
     return installed;
 }
 
-void registerUses(std::span<const GuestUse> uses) {
-    if (!memoryInstalled()) return;
+void registerRange(std::uint64_t begin, std::uint64_t end) {
+    if (begin == 0 || end <= begin) return;
     static std::mutex seenMutex;
     static std::set<std::pair<std::uint64_t, std::uint64_t>>& seen = *new std::set<std::pair<std::uint64_t, std::uint64_t>>();
-    auto& totals = memoryTotals();
-    for (const auto& use : uses) {
-        const auto first = use.address & ~(PageBytes - 1);
-        const auto last = (use.address + use.size + PageBytes - 1) & ~(PageBytes - 1);
-        {
-            std::lock_guard lock(seenMutex);
-            if (!seen.emplace(first, last).second) continue;
-        }
-        MemoryCore::Get().Register(first, last - first);
-        totals.registrations.fetch_add(1, std::memory_order_relaxed);
-        totals.registeredBytes.fetch_add(last - first, std::memory_order_relaxed);
+    const auto first = begin & ~(PageBytes - 1);
+    const auto last = (end + PageBytes - 1) & ~(PageBytes - 1);
+    {
+        std::lock_guard lock(seenMutex);
+        if (!seen.emplace(first, last).second) return;
     }
+    if (!GuestArena::GuestArenaContains_nid_postfix(reinterpret_cast<const void*>(first), static_cast<std::size_t>(last - first))) {
+        memoryTotals().outsideArena.fetch_add(1, std::memory_order_relaxed);
+        return;
+    }
+    MemoryCore::Get().Register(first, last - first);
+    auto& totals = memoryTotals();
+    totals.registrations.fetch_add(1, std::memory_order_relaxed);
+    totals.registeredBytes.fetch_add(last - first, std::memory_order_relaxed);
+}
+
+void registerUses(std::span<const GuestUse> uses) {
+    if (!memoryInstalled()) return;
+    for (const auto& use : uses) registerRange(use.address, use.address + use.size);
 }
 
 void consumeMemory() {
@@ -108,8 +117,8 @@ std::string memoryLine() {
     const auto consumes = totals.consumes.load(std::memory_order_relaxed);
     const auto nanoseconds = totals.consumeNanoseconds.load(std::memory_order_relaxed);
     char line[640];
-    std::snprintf(line, sizeof(line), "[recode-memory] registered %llu ranges %llu MiB; consumes %llu, dirty ranges %llu, dirty %llu MiB, consume %.1f us avg %.1f us max; write faults opened %llu, host writes opened %llu, stale %llu, gpu-owned %llu, foreign %llu; kept busy %llu, rearmed %llu; protect calls %llu (%llu MiB), split %llu, skipped %llu MiB, failures %llu\n",
-        static_cast<unsigned long long>(totals.registrations.load(std::memory_order_relaxed)), static_cast<unsigned long long>(totals.registeredBytes.load(std::memory_order_relaxed) >> 20),
+    std::snprintf(line, sizeof(line), "[recode-memory] registered %llu ranges %llu MiB, %llu outside the arena; consumes %llu, dirty ranges %llu, dirty %llu MiB, consume %.1f us avg %.1f us max; write faults opened %llu, host writes opened %llu, stale %llu, gpu-owned %llu, foreign %llu; kept busy %llu, rearmed %llu; protect calls %llu (%llu MiB), split %llu, skipped %llu MiB, failures %llu\n",
+        static_cast<unsigned long long>(totals.registrations.load(std::memory_order_relaxed)), static_cast<unsigned long long>(totals.registeredBytes.load(std::memory_order_relaxed) >> 20), static_cast<unsigned long long>(totals.outsideArena.load(std::memory_order_relaxed)),
         static_cast<unsigned long long>(consumes), static_cast<unsigned long long>(totals.ranges.load(std::memory_order_relaxed)), static_cast<unsigned long long>(totals.dirtyBytes.load(std::memory_order_relaxed) >> 20),
         consumes == 0 ? 0.0 : static_cast<double>(nanoseconds) / static_cast<double>(consumes) / 1000.0, static_cast<double>(totals.maxConsumeNanoseconds.exchange(0, std::memory_order_relaxed)) / 1000.0,
         static_cast<unsigned long long>(core.writesOpened), static_cast<unsigned long long>(core.hostWritesOpened), static_cast<unsigned long long>(core.staleFaults), static_cast<unsigned long long>(core.gpuOwnedFaults), static_cast<unsigned long long>(core.foreignFaults),
@@ -165,6 +174,16 @@ bool Active() {
 bool MemoryActive() {
     static const bool active = std::getenv("APS5_RECODE_MEMORY") != nullptr;
     return active;
+}
+
+bool DrawScope() {
+    return drawScope();
+}
+
+void NoteGuestAccess(GuestRanges reads, GuestRanges writes) {
+    if (!drawScope() || !memoryInstalled()) return;
+    for (const auto& [begin, end] : reads) registerRange(begin, end);
+    for (const auto& [begin, end] : writes) registerRange(begin, end);
 }
 
 void NoteGpuMapping(const GuestAllocations::Mapped& ranges) {

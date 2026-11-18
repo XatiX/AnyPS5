@@ -3,13 +3,20 @@
 
 #include "prx/libSceAgcDriver/Execution/include/Driver/Queues/Submission.hpp"
 #include "prx/libc/include/GuestAllocations.hpp"
+#include <cstdint>
 #include <memory>
+#include <span>
+#include <utility>
 
 namespace AgcDriver::Unified::Shadow {
 
+using GuestRanges = std::span<const std::pair<std::uint64_t, std::uint64_t>>;
+
 bool Active();
 bool MemoryActive();
+bool DrawScope();
 void NoteGpuMapping(const GuestAllocations::Mapped& ranges);
+void NoteGuestAccess(GuestRanges reads, GuestRanges writes);
 std::shared_ptr<DriverDetail::Submission> Copy(const DriverDetail::Submission& submission);
 void Tee(const DriverDetail::Submission& submission);
 
