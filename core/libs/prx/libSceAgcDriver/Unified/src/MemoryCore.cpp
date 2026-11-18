@@ -76,7 +76,8 @@ bool MemoryCore::HandleFault(std::uint64_t address, bool write) {
     if (!write) return false;
     if (state != PageState::CpuClean) {
         staleFaults.fetch_add(1, std::memory_order_relaxed);
-        return false;
+        const ProtectionChange reopen{address & ~(PageBytes - 1), PageBytes, Protection::ReadWrite};
+        return protector.Apply(std::span(&reopen, 1)) == 1;
     }
     std::vector<ProtectionChange> changes;
     if (!pages.HandleWrite(address, changes)) return false;

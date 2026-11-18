@@ -27,6 +27,7 @@ public:
     void Register(std::uint64_t address, std::uint64_t size);
     void Unregister(std::uint64_t address, std::uint64_t size);
     std::vector<DirtyRange> ConsumeDirty();
+    void AdvanceFrame() { pages.AdvanceFrame(); }
     void MarkGpuOwned(std::uint64_t address, std::uint64_t size);
     bool HandleFault(std::uint64_t address, bool write);
     void PrepareHostWrite(std::uint64_t address, std::uint64_t size);

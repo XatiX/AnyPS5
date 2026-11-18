@@ -54,6 +54,7 @@ public:
     std::vector<ProtectionChange> Unregister(std::uint64_t address, std::uint64_t size);
     bool HandleWrite(std::uint64_t address, std::vector<ProtectionChange>& changes);
     std::vector<DirtyRange> ConsumeDirty(std::vector<ProtectionChange>& changes);
+    void AdvanceFrame();
     std::vector<ProtectionChange> MarkGpuOwned(std::uint64_t address, std::uint64_t size);
     std::vector<DirtyRange> GpuOwnedIn(std::uint64_t address, std::uint64_t size) const;
     std::vector<ProtectionChange> Reclaim(std::uint64_t address, std::uint64_t size, bool forWrite);
@@ -66,7 +67,7 @@ private:
     struct Region {
         std::array<PageState, RegionPages> states{};
         std::array<std::uint8_t, RegionPages> streak{};
-        std::array<std::uint8_t, RegionPages> busy{};
+        std::array<std::uint32_t, RegionPages> busyUntil{};
         std::array<std::uint32_t, RegionPages> lastConsume{};
         std::array<std::uint64_t, RegionPages / 64> listed{};
         std::uint32_t dirtyPages = 0;
@@ -84,6 +85,8 @@ private:
     std::unordered_map<std::uint64_t, std::unique_ptr<Region>> regions;
     std::vector<std::uint64_t> dirty;
     std::uint32_t consumeEpoch = 0;
+    std::uint32_t frameEpoch = 0;
+    bool framePaced = false;
     PageTableCounts counts;
 };
 

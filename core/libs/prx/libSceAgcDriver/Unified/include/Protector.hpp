@@ -16,6 +16,8 @@ struct ProtectorCounts {
     std::uint64_t neverArmed = 0;
     std::uint64_t failures = 0;
     std::uint64_t deferred = 0;
+    std::uint64_t splitCalls = 0;
+    std::uint64_t skippedBytes = 0;
 };
 
 class Protector {

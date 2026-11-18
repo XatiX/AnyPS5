@@ -74,7 +74,29 @@ bool Protector::protect(std::uint64_t address, std::uint64_t size, Protection pr
 #ifdef _WIN32
     const DWORD flags = protection == Protection::ReadWrite ? PAGE_READWRITE : protection == Protection::ReadOnly ? PAGE_READONLY : PAGE_NOACCESS;
     DWORD previous = 0;
-    const bool done = VirtualProtect(reinterpret_cast<void*>(address), static_cast<SIZE_T>(size), flags, &previous) != 0;
+    bool done = VirtualProtect(reinterpret_cast<void*>(address), static_cast<SIZE_T>(size), flags, &previous) != 0;
+    if (!done) {
+        done = true;
+        bool any = false;
+        const auto end = address + size;
+        for (auto cursor = address; cursor < end;) {
+            MEMORY_BASIC_INFORMATION memory{};
+            if (VirtualQuery(reinterpret_cast<const void*>(cursor), &memory, sizeof(memory)) != sizeof(memory)) {
+                done = false;
+                break;
+            }
+            const auto regionEnd = std::min<std::uint64_t>(end, reinterpret_cast<std::uint64_t>(memory.BaseAddress) + memory.RegionSize);
+            if (memory.State == MEM_COMMIT) {
+                ++counts.splitCalls;
+                any = true;
+                if (VirtualProtect(reinterpret_cast<void*>(cursor), static_cast<SIZE_T>(regionEnd - cursor), flags, &previous) == 0) done = false;
+            } else {
+                counts.skippedBytes += regionEnd - cursor;
+            }
+            cursor = regionEnd;
+        }
+        done = done && any;
+    }
 #else
     const int flags = protection == Protection::ReadWrite ? PROT_READ | PROT_WRITE : protection == Protection::ReadOnly ? PROT_READ : PROT_NONE;
     const bool done = mprotect(reinterpret_cast<void*>(address), static_cast<std::size_t>(size), flags) == 0;

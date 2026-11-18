@@ -110,7 +110,28 @@ void testGpuOwnedPagesReclaim() {
 
 }
 
+void testFramePacedPagesStayOpen() {
+    PageTable table;
+    std::vector<ProtectionChange> changes;
+    table.Register(Base, PageBytes);
+    table.AdvanceFrame();
+    table.ConsumeDirty(changes);
+    std::uint64_t faults = 0;
+    for (int frame = 0; frame < 4; ++frame) {
+        table.AdvanceFrame();
+        for (int submission = 0; submission < 10; ++submission) {
+            changes.clear();
+            if (submission == 3 && table.StateOf(Base) == PageState::CpuClean && table.HandleWrite(Base, changes)) ++faults;
+            changes.clear();
+            table.ConsumeDirty(changes);
+        }
+    }
+    Expect(faults == 2, "a page written once a frame faults in two frames, then counts as busy at its third");
+    Expect(table.StateOf(Base) == PageState::CpuDirty && table.Counts().keptBusy == 1, "a page written in three frames in a row stays open across the submissions of later frames");
+}
+
 int main() {
+    testFramePacedPagesStayOpen();
     testRegisteredPagesUploadOnceThenArm();
     testWriteFaultOpensOnePage();
     testGapsMergeOnlyOverCpuPages();
