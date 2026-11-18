@@ -157,9 +157,21 @@ bool faultSlotClean(std::span<const std::byte> bytes) {
     if (bytes.size() < Abi::FaultBufferBytes) return std::all_of(bytes.begin(), bytes.end(), [](std::byte value) { return value == std::byte{0}; });
     std::array<std::uint32_t, Abi::WrittenSlotsWord> head{};
     std::memcpy(head.data(), bytes.data(), sizeof(head));
-    std::uint32_t guard = 0;
-    std::memcpy(&guard, bytes.data() + Abi::SrtGuardWord * sizeof(std::uint32_t), sizeof(guard));
-    return guard == 0 && std::all_of(head.begin(), head.end(), [](std::uint32_t word) { return word == 0; });
+    std::array<std::uint32_t, 3> tail{};
+    std::memcpy(tail.data(), bytes.data() + Abi::SrtGuardWord * sizeof(std::uint32_t), sizeof(tail));
+    return std::all_of(tail.begin(), tail.end(), [](std::uint32_t word) { return word == 0; }) && std::all_of(head.begin(), head.end(), [](std::uint32_t word) { return word == 0; });
+}
+
+void clearFaultPages(std::uint32_t* words) {
+    namespace Abi = ShaderRecompiler::BdaAbi;
+    const auto count = std::min(words[Abi::FaultPageCountWord], Abi::FaultPageSlots);
+    for (std::uint32_t claim = 0; claim < count; ++claim) {
+        const auto slot = words[Abi::FaultPageListWord + claim];
+        if (slot < Abi::FaultPageSlots) words[Abi::FaultPageSlotsWord + slot] = 0;
+    }
+    if (words[Abi::FaultPageOverflowWord] != 0 || words[Abi::FaultPageCountWord] > Abi::FaultPageSlots) std::memset(words + Abi::FaultPageSlotsWord, 0, Abi::FaultPageSlots * sizeof(std::uint32_t));
+    words[Abi::FaultPageOverflowWord] = 0;
+    words[Abi::FaultPageCountWord] = 0;
 }
 
 void clearFaultSlot(std::span<std::byte> bytes) {
@@ -170,6 +182,7 @@ void clearFaultSlot(std::span<std::byte> bytes) {
     }
     std::memset(bytes.data(), 0, Abi::WrittenListWord * sizeof(std::uint32_t));
     std::memset(bytes.data() + Abi::SrtGuardWord * sizeof(std::uint32_t), 0, sizeof(std::uint32_t));
+    clearFaultPages(reinterpret_cast<std::uint32_t*>(bytes.data()));
 }
 
 void dropChunk(FaultArena& arena, const std::shared_ptr<BdaFaultChunk>& chunk, std::vector<std::shared_ptr<BdaFaultChunk>>& dropped) {
