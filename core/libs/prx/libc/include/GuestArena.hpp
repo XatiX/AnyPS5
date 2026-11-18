@@ -52,6 +52,7 @@ bool GuestArenaHandleRead_nid_postfix(std::uintptr_t address);
 bool GuestArenaWriteFaultsAllowed_nid_no_patch();
 bool GuestArenaSetGpuFaultHandler_nid_no_patch(bool (*handler)(std::uintptr_t address, bool write));
 bool GuestArenaHandleGpuFault_nid_no_patch(_EXCEPTION_POINTERS* exception);
+bool GuestArenaTrackProtect_nid_no_patch(std::uintptr_t address, std::size_t bytes, std::uint32_t protection, bool* held);
 bool GuestArenaCopyOwned_nid_no_patch(std::uintptr_t source, void* destination, std::size_t bytes);
 bool GuestArenaCompareOwned_nid_no_patch(std::uintptr_t source, const void* expected, std::size_t bytes, bool* equal);
 bool GuestArenaRecoverRead_nid_no_patch(_EXCEPTION_POINTERS* exception);

@@ -760,6 +760,11 @@ bool GuestArenaHandleGpuFault_nid_no_patch(EXCEPTION_POINTERS* exception) {
     return handler(static_cast<std::uintptr_t>(record->ExceptionInformation[1]), kind == 1);
 }
 
+bool GuestArenaTrackProtect_nid_no_patch(std::uintptr_t address, std::size_t bytes, std::uint32_t protection, bool* held) {
+    if (protection > WindowsMappings::CapNoAccess) return false;
+    return WindowsMappings::Get().TrackProtect(address, bytes, static_cast<std::uint8_t>(protection), held);
+}
+
 void GuestArenaPinWritable_nid_postfix(const void* pointer, std::size_t bytes) {
     if (!Arena::Get().Contains(pointer, bytes)) return;
     WindowsMappings::Get().Pin(reinterpret_cast<std::uintptr_t>(pointer), bytes);

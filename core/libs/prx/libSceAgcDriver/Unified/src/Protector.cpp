@@ -68,9 +68,25 @@ bool Protector::NeverArmed(std::uint64_t address) const {
     return address < it->second;
 }
 
-bool Protector::protect(std::uint64_t address, std::uint64_t size, Protection protection) {
+void Protector::Track(Tracker next) {
+    std::lock_guard lock(mutex);
+    tracker = next;
+}
+
+bool Protector::protect(std::uint64_t address, std::uint64_t size, Protection protection, bool* held) {
     ++counts.calls;
     counts.bytes += size;
+    if (tracker != nullptr) {
+        ++counts.tracked;
+        bool kept = false;
+        const bool done = tracker(static_cast<std::uintptr_t>(address), static_cast<std::size_t>(size), static_cast<std::uint32_t>(protection), &kept);
+        if (!done) ++counts.failures;
+        if (kept) {
+            ++counts.held;
+            if (held != nullptr) *held = true;
+        }
+        return done;
+    }
 #ifdef _WIN32
     const DWORD flags = protection == Protection::ReadWrite ? PAGE_READWRITE : protection == Protection::ReadOnly ? PAGE_READONLY : PAGE_NOACCESS;
     DWORD previous = 0;
@@ -105,12 +121,12 @@ bool Protector::protect(std::uint64_t address, std::uint64_t size, Protection pr
     return done;
 }
 
-std::size_t Protector::applyLocked(std::span<const ProtectionChange> changes) {
+std::size_t Protector::applyLocked(std::span<const ProtectionChange> changes, bool* held) {
     std::size_t calls = 0;
     for (const auto& change : changes) {
         if (change.size == 0) continue;
         if (change.protection == Protection::ReadWrite) {
-            calls += protect(change.address, change.size, change.protection) ? 1 : 0;
+            calls += protect(change.address, change.size, change.protection, held) ? 1 : 0;
             continue;
         }
         auto cursor = change.address;
@@ -119,19 +135,19 @@ std::size_t Protector::applyLocked(std::span<const ProtectionChange> changes) {
         if (it != excluded.begin()) --it;
         for (; cursor < end && it != excluded.end() && it->first < end; ++it) {
             if (it->second <= cursor) continue;
-            if (it->first > cursor) calls += protect(cursor, it->first - cursor, change.protection) ? 1 : 0;
+            if (it->first > cursor) calls += protect(cursor, it->first - cursor, change.protection, held) ? 1 : 0;
             const auto skippedEnd = std::min(end, it->second);
             counts.neverArmed += skippedEnd - std::max(cursor, it->first);
             cursor = skippedEnd;
         }
-        if (cursor < end) calls += protect(cursor, end - cursor, change.protection) ? 1 : 0;
+        if (cursor < end) calls += protect(cursor, end - cursor, change.protection, held) ? 1 : 0;
     }
     return calls;
 }
 
-std::size_t Protector::Apply(std::span<const ProtectionChange> changes) {
+std::size_t Protector::Apply(std::span<const ProtectionChange> changes, bool* held) {
     std::lock_guard lock(mutex);
-    return applyLocked(changes);
+    return applyLocked(changes, held);
 }
 
 void Protector::Defer(std::span<const ProtectionChange> changes) {

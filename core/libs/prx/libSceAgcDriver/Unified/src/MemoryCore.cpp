@@ -29,6 +29,7 @@ bool MemoryCore::Install() {
 #ifdef _WIN32
     if (!GuestArena::GuestArenaSetGpuFaultHandler_nid_no_patch(handleGuestFault)) return false;
     GuestArena::GuestArenaSetGpuHostWriteHook_nid_no_patch(prepareGuestHostWrite);
+    if (std::getenv("APS5_RECODE_NO_PROTECT_OWNER") == nullptr) protector.Track(GuestArena::GuestArenaTrackProtect_nid_no_patch);
     return true;
 #else
     return false;
@@ -39,6 +40,7 @@ void MemoryCore::Uninstall() {
 #ifdef _WIN32
     GuestArena::GuestArenaSetGpuHostWriteHook_nid_no_patch(nullptr);
     GuestArena::GuestArenaSetGpuFaultHandler_nid_no_patch(nullptr);
+    protector.Track(nullptr);
 #endif
 }
 
@@ -123,14 +125,16 @@ bool MemoryCore::HandleFault(std::uint64_t address, bool write) {
         staleFaults.fetch_add(1, std::memory_order_relaxed);
         Events::Shared().Note(address & ~(PageBytes - 1), PageBytes);
         const ProtectionChange reopen{address & ~(PageBytes - 1), PageBytes, Protection::ReadWrite};
-        return protector.Apply(std::span(&reopen, 1)) == 1;
+        bool held = false;
+        return protector.Apply(std::span(&reopen, 1), &held) == 1 && !held;
     }
     std::vector<ProtectionChange> changes;
     if (!pages.HandleWrite(address, changes)) return false;
     Events::Shared().Note(address & ~(PageBytes - 1), PageBytes);
-    protector.Apply(changes);
+    bool held = false;
+    protector.Apply(changes, &held);
     writesOpened.fetch_add(1, std::memory_order_relaxed);
-    return true;
+    return !held;
 }
 
 void MemoryCore::PrepareHostWrite(std::uint64_t address, std::uint64_t size) {
