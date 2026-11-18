@@ -1,4 +1,5 @@
 #include "prx/libSceAgcDriver/Unified/include/Events.hpp"
+#include "prx/libSceAgcDriver/Execution/include/GuestMemory.hpp"
 #include <algorithm>
 
 namespace AgcDriver::Unified::Events {
@@ -85,9 +86,27 @@ ChangeLogCounts ChangeLog::Counts() const {
     return {notes.load(std::memory_order_relaxed), queries.load(std::memory_order_relaxed), regionSkips.load(std::memory_order_relaxed), changed.load(std::memory_order_relaxed), ownerExempt.load(std::memory_order_relaxed)};
 }
 
+namespace {
+
+void noteStore(std::uint64_t address, std::uint64_t bytes) {
+    Shared().Note(address, bytes);
+}
+
+}
+
 ChangeLog& Shared() {
-    static ChangeLog& log = *new ChangeLog();
+    static ChangeLog& log = []() -> ChangeLog& {
+        auto& created = *new ChangeLog();
+        GuestMemory::SetStoreHook(noteStore);
+        return created;
+    }();
     return log;
+}
+
+void NoteRanges(std::span<const std::pair<std::uint64_t, std::uint64_t>> ranges, std::uintptr_t owner) {
+    for (const auto& [begin, end] : ranges) {
+        if (end > begin) Shared().Note(begin, end - begin, owner);
+    }
 }
 
 }

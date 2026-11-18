@@ -3047,10 +3047,7 @@ void ShaderResources::buildComplete() {
         timing.descriptorsMs += phase(BuildPhase::Descriptors);
         noteReusable();
 #if ANYPS5_UNIFIED
-        if (reusable) {
-            const auto ranges = ProofRanges();
-            proofRangesRegistered = Unified::Shadow::NoteProofRanges(ranges);
-        }
+        if (reusable) registerProofSpans();
 #endif
         completed = true;
         if (BuildProfiled()) {
@@ -4161,7 +4158,7 @@ bool AnyPendingCpuWrites(const Context& context) {
     return (context.copiedWriters != nullptr && !context.copiedWriters->empty()) || !DrawCopiedWriters()->empty() || Recorder::PendingCompletionLabels() != 0;
 }
 
-bool CompletePendingCpuWrites(const Context& context, std::uint64_t address, std::size_t bytes) {
+bool PendingCpuWritesOverlap(const Context& context, std::uint64_t address, std::size_t bytes) {
     if (bytes == 0 || Recorder::InCompletion()) return false;
     auto* recorder = Recorder::Active();
     if (recorder == nullptr) return false;
@@ -4172,12 +4169,14 @@ bool CompletePendingCpuWrites(const Context& context, std::uint64_t address, std
     const auto overlaps = [&](const auto& writers) {
         return std::any_of(writers.begin(), writers.end(), [&](const auto& writer) { return writer->CopiedWritesOverlap(address, bytes); });
     };
-    if ((context.copiedWriters != nullptr && overlaps(*context.copiedWriters)) || overlaps(*drawWriters) || (labels && recorder->CompletionLabelIn(address, bytes))) {
-        Recorder::CountSync(4);
-        recorder->SyncThrough(address, bytes);
-        return true;
-    }
-    return false;
+    return (context.copiedWriters != nullptr && overlaps(*context.copiedWriters)) || overlaps(*drawWriters) || (labels && recorder->CompletionLabelIn(address, bytes));
+}
+
+bool CompletePendingCpuWrites(const Context& context, std::uint64_t address, std::size_t bytes) {
+    if (!PendingCpuWritesOverlap(context, address, bytes)) return false;
+    Recorder::CountSync(4);
+    Recorder::Active()->SyncThrough(address, bytes);
+    return true;
 }
 
 const ShaderRecompiler::DescriptorBinding* ShaderResources::tableImages(std::span<const CompiledShader> shaders, ShaderRecompiler::ShaderStage stage) {
@@ -4524,7 +4523,53 @@ ShaderResources::IndexOutcome ShaderResources::indexRevalidate(std::span<const C
     return outcome(partial || !replaced.empty() ? IndexOutcome::Partial : IndexOutcome::Accepted);
 }
 
+#if ANYPS5_UNIFIED
+void ShaderResources::registerProofSpans() {
+    const auto ranges = ProofRanges();
+    proofRangesRegistered = Unified::Shadow::NoteProofRanges(ranges);
+    proofSpans.clear();
+    std::vector<std::pair<std::uint64_t, std::uint64_t>> owned;
+    for (const auto& image : storageTextures) {
+        if (image == nullptr) continue;
+        const auto begin = image->Descriptor().baseAddress;
+        const auto end = begin + image->GuestBytes();
+        if (begin == 0 || end <= begin) continue;
+        proofSpans.push_back({begin, end, reinterpret_cast<std::uintptr_t>(image.get())});
+        owned.emplace_back(begin, end);
+    }
+    std::sort(owned.begin(), owned.end());
+    auto written = guestMemory.Writes();
+    std::sort(written.begin(), written.end());
+    for (const auto& range : ranges) {
+        if (std::binary_search(owned.begin(), owned.end(), range)) continue;
+        const bool own = std::binary_search(written.begin(), written.end(), range);
+        proofSpans.push_back({range.first, range.second, own ? reinterpret_cast<std::uintptr_t>(this) : 0});
+    }
+    proofStamp = {};
+}
+
+bool ShaderResources::revalidateVerified(std::span<const CompiledShader> shaders, ProofReport* report) {
+    const auto& log = Unified::Events::Shared();
+    const auto serial = log.Serial();
+    const Unified::Proof::Guards guards{{0, DepthSurfacesSerial(), MultisampleClaimSerial(), RetiredImportSerial(), HostImportSetGeneration()}};
+    const bool cpuWriters = (AnyPendingCpuWrites(context) && std::any_of(proofSpans.begin(), proofSpans.end(), [&](const Unified::Proof::Span& span) { return PendingCpuWritesOverlap(context, span.begin, static_cast<std::size_t>(span.end - span.begin)); }));
+    const auto miss = Unified::Proof::Verdict(log, proofStamp, guards, cpuWriters, proofRangesRegistered, proofSpans);
+    const bool ok = revalidateEpoch(shaders, report);
+    Unified::Proof::SharedTally().Count(miss, ok);
+    if (miss == Unified::Proof::Miss::Guard && ok) Unified::Proof::SharedTally().CountGuards(proofStamp.guards, guards);
+    proofStamp = {serial, guards, ok};
+    return ok;
+}
+#endif
+
 bool ShaderResources::Revalidate(std::span<const CompiledShader> shaders, ProofReport* report) {
+#if ANYPS5_UNIFIED
+    if (Unified::Proof::VerifyActive()) return revalidateVerified(shaders, report);
+#endif
+    return revalidateEpoch(shaders, report);
+}
+
+bool ShaderResources::revalidateEpoch(std::span<const CompiledShader> shaders, ProofReport* report) {
     if (!registeredImageViewsCurrent(registeredImageViews)) {
         if (report != nullptr) *report = {ProofPath::Full, ProofFailure::Other};
         provedEpoch = 0;

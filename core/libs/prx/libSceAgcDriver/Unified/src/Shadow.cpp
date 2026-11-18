@@ -2,6 +2,7 @@
 #include "prx/libSceAgcDriver/Unified/include/Front.hpp"
 #include "prx/libSceAgcDriver/Unified/include/MemoryCore.hpp"
 #include "prx/libSceAgcDriver/Unified/include/Events.hpp"
+#include "prx/libSceAgcDriver/Unified/include/ProofVerdict.hpp"
 #include "prx/libc/include/GuestArena.hpp"
 #include "prx/libSceAgcDriver/Unified/include/RecordVerify.hpp"
 #include "prx/libSceAgcDriver/Unified/include/RecordDraw.hpp"
@@ -159,7 +160,7 @@ void report() {
         last = now;
     }
     if (!Active()) {
-        const auto memory = memoryLine() + Record::VerifyLine() + Record::HandoffLine();
+        const auto memory = memoryLine() + Record::VerifyLine() + Record::HandoffLine() + Proof::VerdictLine();
         if (!memory.empty()) std::fputs(memory.c_str(), stderr);
         return;
     }
@@ -185,6 +186,7 @@ void report() {
     line += memoryLine();
     line += Record::VerifyLine();
     line += Record::HandoffLine();
+    line += Proof::VerdictLine();
     std::fputs(line.c_str(), stderr);
 }
 

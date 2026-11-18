@@ -2787,6 +2787,26 @@ struct BreakWhenStored {
     ~BreakWhenStored() { BreakProofs(); }
 };
 
+static std::atomic<StoreHook> storeHook{nullptr};
+
+struct NoteStore {
+    NoteStore(std::uint64_t address, std::size_t bytes) : address(address), bytes(bytes) { note(); }
+    ~NoteStore() { note(); }
+    NoteStore(const NoteStore&) = delete;
+    NoteStore& operator=(const NoteStore&) = delete;
+
+private:
+    void note() const {
+        if (const auto hook = storeHook.load(std::memory_order_acquire); hook != nullptr && bytes != 0) hook(address, bytes);
+    }
+    std::uint64_t address;
+    std::size_t bytes;
+};
+
+void SetStoreHook(StoreHook hook) {
+    storeHook.store(hook, std::memory_order_release);
+}
+
 static std::atomic<bool> ownStoreCompare{false};
 
 void SetOwnStoreCompare(bool compare) {
@@ -2798,6 +2818,7 @@ std::uint64_t storeOwn(std::uint64_t address, std::size_t bytes, bool imaged, co
     const auto pinned = pinStoreRanges(address, bytes);
     BreakProofs();
     const BreakWhenStored breakStored;
+    const NoteStore noteStore(address, bytes);
     const auto stampStored = [complete](WriteTracker& tracker, std::pair<std::uint64_t, std::uint64_t> stored) -> std::uint64_t {
         if (stored.second <= stored.first) return 0;
         ++tracker.generation;
@@ -2866,6 +2887,7 @@ std::uint64_t StoreOwnBytes(std::uint64_t address, std::span<const std::byte> so
 static std::uint64_t markWritten(std::uint64_t address, std::size_t bytes, bool complete, std::uint64_t* order = nullptr) {
     BreakProofs();
     const BreakWhenStored breakStored;
+    const NoteStore noteStore(address, bytes);
     auto& tracker = Tracker();
     auto lock = lockTracker(tracker);
     if (order != nullptr) *order = 0;
@@ -3877,6 +3899,7 @@ void WriteChanged(std::uint64_t address, std::span<const std::byte> current, std
 static void writeChanged(std::uint64_t address, std::span<const std::byte> current, std::span<const std::byte> original, [[maybe_unused]] std::uint32_t byteStoreLimit, bool keepGuest) {
     require(current.size() == original.size(), "write-back snapshot sizes differ");
     BreakProofs();
+    const NoteStore noteStore(address, current.size());
     if (current.empty()) return;
     // A store: the hook sync it makes orders this write after a pending GPU write, whatever a read
     // site above it was doing (the [hooksync] line counts stores apart).
@@ -3942,6 +3965,7 @@ static_assert(std::atomic_ref<std::uint64_t>::is_always_lock_free && std::atomic
 std::size_t WriteChangedIfHeld(std::uint64_t address, std::span<const std::byte> current, std::span<const std::byte> original, std::uint64_t unchangedSince) {
     require(current.size() == original.size(), "write-back snapshot sizes differ");
     BreakProofs();
+    const NoteStore noteStore(address, current.size());
     if (current.empty()) return 0;
     const ReadSiteScope site(ReadSite::Store);
     FlushGpuWrites(address, current.size());

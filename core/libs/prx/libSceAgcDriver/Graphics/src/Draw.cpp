@@ -56,6 +56,7 @@
 #include <utility>
 #if ANYPS5_UNIFIED
 #include "prx/libSceAgcDriver/Unified/include/Shadow.hpp"
+#include "prx/libSceAgcDriver/Unified/include/Events.hpp"
 #endif
 
 namespace AgcDriver::Graphics {
@@ -2953,6 +2954,7 @@ void recordDraw(const Context& context, const State& state, const Pm4::DrawParam
     }
     const PassAccess passAccess{passReads, passWrites, passImages, passAttachments, unknownMemory, unknownWrites, passWriteOnly};
 #if ANYPS5_UNIFIED
+    Unified::Events::NoteRanges(resources.GpuWrites(), reinterpret_cast<std::uintptr_t>(&resources));
     Unified::Shadow::NoteGuestAccess(passReads, resources.GpuWrites(), unknownMemory);
 #endif
     const bool fenced = state.depth.has_value() || !record.proxies.empty();

@@ -7,6 +7,8 @@
 #include <cstdint>
 #include <memory>
 #include <mutex>
+#include <span>
+#include <utility>
 
 namespace AgcDriver::Unified::Events {
 
@@ -61,6 +63,7 @@ private:
 };
 
 ChangeLog& Shared();
+void NoteRanges(std::span<const std::pair<std::uint64_t, std::uint64_t>> ranges, std::uintptr_t owner = 0);
 
 }
 

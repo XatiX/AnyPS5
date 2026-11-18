@@ -166,6 +166,8 @@ void AdoptLatestCollectEpoch();
 std::uint64_t ProofSerial();
 std::uint64_t OwnProofBreaks();
 void BreakProofs();
+using StoreHook = void (*)(std::uint64_t address, std::uint64_t bytes);
+void SetStoreHook(StoreHook hook);
 void MarkProofThread();
 std::uint64_t CollectEpoch();
 std::uint64_t CollectEpochBumps();
