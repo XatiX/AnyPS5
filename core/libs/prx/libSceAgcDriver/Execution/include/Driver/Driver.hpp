@@ -334,6 +334,7 @@ private:
     bool enqueueDmaPacket(std::span<const std::uint32_t> packet, std::uint32_t opcode, std::uint32_t queue, const QueueState& state);
     bool enqueueSampleDumpPacket(std::span<const std::uint32_t> packet, std::uint32_t opcode, std::uint32_t queue);
     bool enqueueConstantRamDump(std::span<const std::uint32_t> packet, std::uint32_t opcode, std::uint32_t queue, const QueueState& state);
+    bool enqueueClockStore(std::span<const std::uint32_t> packet, std::uint32_t opcode, std::uint32_t queue, const QueueState& state);
     void commitStore(std::uint32_t queue, std::uint64_t address, std::span<const std::byte> bytes);
     void commitLabel(std::uint32_t queue, std::uint64_t address, std::span<const std::byte> bytes, std::optional<std::uint32_t> interrupt);
     void submitDueAfterCommit(VulkanDevice* localDevice);

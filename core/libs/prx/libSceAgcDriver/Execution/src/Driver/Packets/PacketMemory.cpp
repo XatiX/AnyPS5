@@ -440,6 +440,17 @@ bool Driver::enqueueDmaPacket(std::span<const std::uint32_t> packet, std::uint32
                 }
             }
         }
+        static const bool copyOnGpu = std::getenv("APS5_NO_PIPELINE_COPY_ON_GPU") == nullptr;
+        if (copyOnGpu && copy.bytes <= gpuStoreLimit) {
+            GuestMemory::TagGpuLockSite(GuestMemory::GpuLockSite::Copy);
+            std::lock_guard gpuLock(GuestMemory::GpuMutex());
+            const auto localDevice = device.Load();
+            if (localDevice != nullptr && localDevice->StoresPendingOver(copy.source, copy.bytes) && localDevice->GpuCopyPossible(copy.destination, copy.source, copy.bytes)) {
+                recordDeferredLabels(localDevice.get(), queue);
+                const auto outcome = localDevice->CopyBuffer(copy.destination, copy.source, copy.bytes, 0, std::numeric_limits<std::size_t>::max(), 0, 0, queue, [](std::span<const std::byte>, std::uint64_t) {});
+                if (outcome.path == 1 || outcome.path == 3) return;
+            }
+        }
         std::vector<std::byte> bytes(copy.bytes);
         GuestMemory::Read(copy.source, bytes, 1);
         commitStore(queue, copy.destination, bytes);
@@ -461,6 +472,26 @@ bool Driver::enqueueConstantRamDump(std::span<const std::uint32_t> packet, std::
     auto queued = bytes;
     DrawPipeline::Queue0().EnqueueStore([this, queue, address, bytes = std::move(bytes)] {
         GuestMemory::SetCurrentPacket(0x83, queue);
+        commitStore(queue, address, bytes);
+    }, address, std::move(queued));
+    return true;
+}
+
+bool Driver::enqueueClockStore(std::span<const std::uint32_t> packet, std::uint32_t opcode, std::uint32_t queue, const QueueState& state) {
+    static const bool enabled = std::getenv("APS5_NO_PIPELINE_CLOCK_STORES") == nullptr && std::getenv("APS5_CPU_STORES") == nullptr;
+    if (!enabled || opcode != 0x40 || queue != 0 || packet.size() < 6 || !DrawPipeline::Active() || !deferredLabels().labels.empty()) return false;
+    if (Pm4::CopyDataToRegister(packet) || Pm4::CopyDataSource(packet) != Pm4::CopyDataGpuClockSource) return false;
+    constexpr std::size_t gpuStoreLimit = 65536;
+    const auto store = Pm4::ResolveStore(packet, state, gpuStoreLimit);
+    if (!store.has_value()) return false;
+    const auto stored = store->Bytes();
+    if (stored.empty() || !GuestMemory::Accessible(reinterpret_cast<const void*>(store->address), stored.size(), true)) return false;
+    if (DrawPipeline::Queue0().Overlaps(store->address, stored.size())) return false;
+    const auto address = store->address;
+    std::vector<std::byte> bytes(stored.begin(), stored.end());
+    auto queued = bytes;
+    DrawPipeline::Queue0().EnqueueStore([this, queue, address, bytes = std::move(bytes)] {
+        GuestMemory::SetCurrentPacket(0x40, queue);
         commitStore(queue, address, bytes);
     }, address, std::move(queued));
     return true;
