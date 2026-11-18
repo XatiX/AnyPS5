@@ -130,6 +130,7 @@ option(ANYPS5_LIBRESSL_ORACLE "Build guest_libressl_oracle, which compares libSc
 option(ANYPS5_USE_SYSTEM_DEPS "Resolve SDL2, freetype, Vulkan-Headers, SPIRV-Headers, glslang and SPIRV-Tools from the system instead of the bundled submodules" OFF)
 add_compile_definitions(APS5_ENABLE_TIMING_LOG=$<BOOL:${APS5_ENABLE_TIMING_LOG}>)
 include(cmake/SystemDeps.cmake)
+include(cmake/GpuBackend.cmake)
 
 set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)

@@ -535,6 +535,7 @@ set_source_files_properties(${CMAKE_CURRENT_SOURCE_DIR}/Execution/src/TraceFile.
 )
 set_property(SOURCE ${CMAKE_CURRENT_SOURCE_DIR}/Execution/src/VulkanDevice.cpp APPEND PROPERTY COMPILE_DEFINITIONS VK_ENABLE_BETA_EXTENSIONS)
 
+include(${CMAKE_CURRENT_SOURCE_DIR}/Unified/sources.cmake)
 add_library(libSceAgcDriver SHARED EXCLUDE_FROM_ALL
         ${agcDriverSources}
 )
