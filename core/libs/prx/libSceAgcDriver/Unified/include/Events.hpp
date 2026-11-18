@@ -32,7 +32,7 @@ public:
 
     [[nodiscard]] std::uint64_t Serial() const { return serial.load(std::memory_order_acquire); }
     std::uint64_t Note(std::uint64_t address, std::uint64_t bytes, std::uintptr_t owner = 0);
-    [[nodiscard]] bool ChangedSince(std::uint64_t address, std::uint64_t bytes, std::uint64_t stamp, std::uintptr_t owner = 0) const;
+    [[nodiscard]] bool ChangedSince(std::uint64_t address, std::uint64_t bytes, std::uint64_t stamp, std::uintptr_t owner = 0, bool* exempted = nullptr) const;
     [[nodiscard]] ChangeLogCounts Counts() const;
 
 private:
@@ -63,6 +63,7 @@ private:
 };
 
 ChangeLog& Shared();
+std::uint64_t ThreadNotes();
 void NoteRanges(std::span<const std::pair<std::uint64_t, std::uint64_t>> ranges, std::uintptr_t owner = 0);
 
 }

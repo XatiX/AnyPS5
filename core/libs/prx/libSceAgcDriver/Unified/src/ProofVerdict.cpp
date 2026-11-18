@@ -15,15 +15,19 @@ enum Outcome : std::size_t {
 
 }
 
-Miss Verdict(const Events::ChangeLog& log, const Stamp& last, const Guards& now, bool cpuWriters, bool registered, std::span<const Span> spans) {
+Miss Verdict(const Events::ChangeLog& log, const Stamp& last, const Guards& now, bool cpuWriters, bool registered, std::span<const Span> spans, bool* exempted) {
     if (!last.valid) return Miss::NoStamp;
     if (!registered) return Miss::Unregistered;
     if (last.guards != now) return Miss::Guard;
     if (cpuWriters) return Miss::CpuWrites;
     for (const auto& span : spans) {
-        if (log.ChangedSince(span.begin, span.end - span.begin, last.serial, span.owner)) return Miss::Range;
+        if (log.ChangedSince(span.begin, span.end - span.begin, last.serial, span.owner, exempted)) return Miss::Range;
     }
     return Miss::None;
+}
+
+void Tally::CountAgreed(std::size_t path, bool exempted) {
+    if (path < PathCount) agreedBy[exempted ? 1 : 0][path].fetch_add(1, std::memory_order_relaxed);
 }
 
 void Tally::Count(Miss miss, bool existing) {
@@ -48,6 +52,12 @@ void Tally::CountGuards(const Guards& last, const Guards& now) {
 VerdictCounts Tally::Counts() const {
     VerdictCounts counts;
     for (std::size_t i = 0; i < GuardCount; ++i) counts.guardMoves[i] = guardMoves[i].load(std::memory_order_relaxed);
+    counts.workSeen = workSeen.load(std::memory_order_relaxed);
+    counts.shortcuts = shortcuts.load(std::memory_order_relaxed);
+    counts.shortcutFallbacks = shortcutFallbacks.load(std::memory_order_relaxed);
+    for (std::size_t exempt = 0; exempt < 2; ++exempt) {
+        for (std::size_t path = 0; path < PathCount; ++path) counts.agreedBy[exempt][path] = agreedBy[exempt][path].load(std::memory_order_relaxed);
+    }
     counts.agreed = outcomes[Agreed].load(std::memory_order_relaxed);
     counts.unsafe = outcomes[Unsafe].load(std::memory_order_relaxed);
     counts.bothRefused = outcomes[BothRefused].load(std::memory_order_relaxed);
@@ -63,13 +73,21 @@ bool VerifyActive() {
     return active;
 }
 
+bool ShortcutActive() {
+    static const bool active = [] {
+        const char* value = std::getenv("APS5_RECODE_PROOF");
+        return value != nullptr && std::strcmp(value, "1") == 0;
+    }();
+    return active;
+}
+
 Tally& SharedTally() {
     static Tally& tally = *new Tally();
     return tally;
 }
 
 std::string VerdictLine() {
-    if (!VerifyActive()) return {};
+    if (!VerifyActive() && !ShortcutActive()) return {};
     const auto counts = SharedTally().Counts();
     const auto& missed = counts.opportunities;
     const auto& moves = counts.guardMoves;
@@ -79,7 +97,12 @@ std::string VerdictLine() {
         static_cast<unsigned long long>(missed[static_cast<std::size_t>(Miss::NoStamp)]), static_cast<unsigned long long>(missed[static_cast<std::size_t>(Miss::Unregistered)]),
         static_cast<unsigned long long>(missed[static_cast<std::size_t>(Miss::Guard)]), static_cast<unsigned long long>(moves[0]), static_cast<unsigned long long>(moves[1]), static_cast<unsigned long long>(moves[2]), static_cast<unsigned long long>(moves[3]), static_cast<unsigned long long>(moves[4]),
         static_cast<unsigned long long>(missed[static_cast<std::size_t>(Miss::CpuWrites)]), static_cast<unsigned long long>(missed[static_cast<std::size_t>(Miss::Range)]));
-    return line;
+    const auto& by = counts.agreedBy;
+    char paths[384];
+    std::snprintf(paths, sizeof(paths), "[recode-proof] agreed by existing path (clean/own exempt): fast %llu/%llu, own refreshed %llu/%llu, full %llu/%llu; clean agreements whose own proof noted changes over the spans %llu; shortcuts %llu, tail fallbacks %llu\n",
+        static_cast<unsigned long long>(by[0][0]), static_cast<unsigned long long>(by[1][0]), static_cast<unsigned long long>(by[0][1]), static_cast<unsigned long long>(by[1][1]), static_cast<unsigned long long>(by[0][2]), static_cast<unsigned long long>(by[1][2]),
+        static_cast<unsigned long long>(counts.workSeen), static_cast<unsigned long long>(counts.shortcuts), static_cast<unsigned long long>(counts.shortcutFallbacks));
+    return std::string(line) + paths;
 }
 
 }

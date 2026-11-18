@@ -4553,18 +4553,60 @@ bool ShaderResources::revalidateVerified(std::span<const CompiledShader> shaders
     const auto serial = log.Serial();
     const Unified::Proof::Guards guards{{0, DepthSurfacesSerial(), MultisampleClaimSerial(), RetiredImportSerial(), HostImportSetGeneration()}};
     const bool cpuWriters = (AnyPendingCpuWrites(context) && std::any_of(proofSpans.begin(), proofSpans.end(), [&](const Unified::Proof::Span& span) { return PendingCpuWritesOverlap(context, span.begin, static_cast<std::size_t>(span.end - span.begin)); }));
-    const auto miss = Unified::Proof::Verdict(log, proofStamp, guards, cpuWriters, proofRangesRegistered, proofSpans);
-    const bool ok = revalidateEpoch(shaders, report);
-    Unified::Proof::SharedTally().Count(miss, ok);
-    if (miss == Unified::Proof::Miss::Guard && ok) Unified::Proof::SharedTally().CountGuards(proofStamp.guards, guards);
+    bool exempted = false;
+    const auto miss = Unified::Proof::Verdict(log, proofStamp, guards, cpuWriters, proofRangesRegistered, proofSpans, &exempted);
+    auto& tally = Unified::Proof::SharedTally();
+    const bool clean = miss == Unified::Proof::Miss::None && !exempted && lastProofFast;
+    if (clean && Unified::Proof::ShortcutActive() && registeredImageViewsCurrent(registeredImageViews)) {
+        const bool tail = provedByLog(report);
+        tally.CountShortcut(tail);
+        if (tail) {
+            proofStamp = {serial, guards, true};
+            return true;
+        }
+    }
+    ProofReport local;
+    auto& proof = report != nullptr ? *report : local;
+    const auto ownNotes = Unified::Events::ThreadNotes();
+    const bool ok = revalidateEpoch(shaders, &proof);
+    const bool noted = Unified::Events::ThreadNotes() != ownNotes;
+    tally.Count(miss, ok);
+    if (miss == Unified::Proof::Miss::None && ok) {
+        tally.CountAgreed(static_cast<std::size_t>(proof.path), exempted);
+        if (clean && noted && Unified::Proof::Verdict(log, {serial, guards, true}, guards, false, true, proofSpans) != Unified::Proof::Miss::None) tally.CountWorkSeen();
+    }
+    if (miss == Unified::Proof::Miss::Guard && ok) tally.CountGuards(proofStamp.guards, guards);
     proofStamp = {serial, guards, ok};
+    lastProofFast = ok && proof.path == ProofPath::Fast;
     return ok;
+}
+
+bool ShaderResources::provedByLog(ProofReport* report) {
+    for (const auto& region : directRegions) static_cast<void>(FlushDepthPlanes(region.begin, static_cast<std::size_t>(region.end - region.begin)));
+    if (!guestMemory.StagingDecisionsCurrent()) return false;
+    if (auto* recorder = Recorder::Active(); recorder != nullptr) {
+        try {
+            guestMemory.RecordStagingCopies(*recorder);
+        } catch (const std::exception&) {
+            return false;
+        }
+    }
+    for (const auto& texture : textures) {
+        if (texture == nullptr) continue;
+        if (texture->HasReuseLookup()) {
+            if (!texture->ReuseLookupHolds()) return false;
+        } else if (texture->IsDepthCopy()) {
+            texture->RefreshDepthCopy();
+        }
+    }
+    if (report != nullptr) *report = {ProofPath::Fast, ProofFailure::None};
+    return true;
 }
 #endif
 
 bool ShaderResources::Revalidate(std::span<const CompiledShader> shaders, ProofReport* report) {
 #if ANYPS5_UNIFIED
-    if (Unified::Proof::VerifyActive()) return revalidateVerified(shaders, report);
+    if (Unified::Proof::VerifyActive() || Unified::Proof::ShortcutActive()) return revalidateVerified(shaders, report);
 #endif
     return revalidateEpoch(shaders, report);
 }

@@ -4,6 +4,16 @@
 
 namespace AgcDriver::Unified::Events {
 
+namespace {
+
+thread_local std::uint64_t threadNotes = 0;
+
+}
+
+std::uint64_t ThreadNotes() {
+    return threadNotes;
+}
+
 ChangeLog::ChangeLog() : buckets(new Bucket[BucketCount]), regions(new std::atomic<std::uint64_t>[RegionCount]) {
     for (std::size_t region = 0; region < RegionCount; ++region) regions[region].store(0, std::memory_order_relaxed);
 }
@@ -12,6 +22,7 @@ std::uint64_t ChangeLog::Note(std::uint64_t address, std::uint64_t bytes, std::u
     if (bytes == 0) return Serial();
     const auto epoch = serial.fetch_add(1, std::memory_order_acq_rel) + 1;
     notes.fetch_add(1, std::memory_order_relaxed);
+    ++threadNotes;
     const auto first = address / BucketBytes;
     const auto last = (address + bytes - 1) / BucketBytes;
     const auto span = std::min<std::uint64_t>(last - first + 1, BucketCount);
@@ -50,7 +61,7 @@ ChangeLog::Seen ChangeLog::read(const Bucket& bucket) const {
     }
 }
 
-bool ChangeLog::ChangedSince(std::uint64_t address, std::uint64_t bytes, std::uint64_t stamp, std::uintptr_t owner) const {
+bool ChangeLog::ChangedSince(std::uint64_t address, std::uint64_t bytes, std::uint64_t stamp, std::uintptr_t owner, bool* exemptedOut) const {
     if (bytes == 0) return false;
     queries.fetch_add(1, std::memory_order_relaxed);
     const auto firstRegion = address / RegionBytes;
@@ -78,7 +89,10 @@ bool ChangeLog::ChangedSince(std::uint64_t address, std::uint64_t bytes, std::ui
         changed.fetch_add(1, std::memory_order_relaxed);
         return true;
     }
-    if (exempted) ownerExempt.fetch_add(1, std::memory_order_relaxed);
+    if (exempted) {
+        ownerExempt.fetch_add(1, std::memory_order_relaxed);
+        if (exemptedOut != nullptr) *exemptedOut = true;
+    }
     return false;
 }
 

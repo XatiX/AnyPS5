@@ -40,7 +40,9 @@ enum class Miss : std::uint8_t {
     Count
 };
 
-[[nodiscard]] Miss Verdict(const Events::ChangeLog& log, const Stamp& last, const Guards& now, bool cpuWriters, bool registered, std::span<const Span> spans);
+[[nodiscard]] Miss Verdict(const Events::ChangeLog& log, const Stamp& last, const Guards& now, bool cpuWriters, bool registered, std::span<const Span> spans, bool* exempted = nullptr);
+
+inline constexpr std::size_t PathCount = 3;
 
 struct VerdictCounts {
     std::uint64_t agreed = 0;
@@ -48,21 +50,33 @@ struct VerdictCounts {
     std::uint64_t bothRefused = 0;
     std::array<std::uint64_t, static_cast<std::size_t>(Miss::Count)> opportunities{};
     std::array<std::uint64_t, GuardCount> guardMoves{};
+    std::array<std::array<std::uint64_t, PathCount>, 2> agreedBy{};
+    std::uint64_t workSeen = 0;
+    std::uint64_t shortcuts = 0;
+    std::uint64_t shortcutFallbacks = 0;
 };
 
 class Tally {
 public:
     void Count(Miss miss, bool existing);
     void CountGuards(const Guards& last, const Guards& now);
+    void CountAgreed(std::size_t path, bool exempted);
+    void CountWorkSeen() { workSeen.fetch_add(1, std::memory_order_relaxed); }
+    void CountShortcut(bool taken) { (taken ? shortcuts : shortcutFallbacks).fetch_add(1, std::memory_order_relaxed); }
     [[nodiscard]] VerdictCounts Counts() const;
 
 private:
+    std::atomic<std::uint64_t> workSeen{0};
+    std::atomic<std::uint64_t> shortcuts{0};
+    std::atomic<std::uint64_t> shortcutFallbacks{0};
     std::array<std::atomic<std::uint64_t>, 3> outcomes{};
     std::array<std::atomic<std::uint64_t>, static_cast<std::size_t>(Miss::Count)> opportunities{};
     std::array<std::atomic<std::uint64_t>, GuardCount> guardMoves{};
+    std::array<std::array<std::atomic<std::uint64_t>, PathCount>, 2> agreedBy{};
 };
 
 bool VerifyActive();
+bool ShortcutActive();
 Tally& SharedTally();
 std::string VerdictLine();
 

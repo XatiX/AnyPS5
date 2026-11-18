@@ -812,9 +812,11 @@ private:
     bool revalidateEpoch(std::span<const CompiledShader> shaders, ProofReport* report);
 #if ANYPS5_UNIFIED
     bool revalidateVerified(std::span<const CompiledShader> shaders, ProofReport* report);
+    bool provedByLog(ProofReport* report);
     void registerProofSpans();
     std::vector<Unified::Proof::Span> proofSpans;
     Unified::Proof::Stamp proofStamp;
+    bool lastProofFast = false;
 #endif
     // The import table's identity when the direct regions' serials were last proved.
     HostImportsProof importsProof;
