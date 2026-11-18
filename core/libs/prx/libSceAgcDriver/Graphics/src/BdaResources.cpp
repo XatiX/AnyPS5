@@ -331,9 +331,9 @@ BdaResources::BdaResources(const Context& context, const GuestBufferMemory& memo
 #if ANYPS5_UNIFIED
     if (Unified::ResidencyService::PageTableEnabled()) {
         auto& service = Unified::ResidencyService::Get();
-        Require(service.Attach(context), "APS5_RECODE_PAGE_TABLE: the residency service did not attach (no sparse residency buffers or device addresses)");
+        Require(service.Attach(context), "GPU page table: the residency service did not attach (no sparse residency buffers or device addresses)");
         table = service.PageTableBuffer();
-        Require(table != nullptr, "APS5_RECODE_PAGE_TABLE: the residency service has no page table");
+        Require(table != nullptr, "GPU page table: the residency service has no page table");
         tableBytes = ShaderRecompiler::BdaAbi::PageTableBytes(Unified::PageTableLeafCapacity);
         Require(tableBytes <= context.limits.maxStorageBufferRange && ShaderRecompiler::BdaAbi::FaultBufferBytes <= context.limits.maxStorageBufferRange, "BDA descriptors exceed storage buffer range limit");
         tableGuardSerial = MultisampleTargetRangeGeneration();
