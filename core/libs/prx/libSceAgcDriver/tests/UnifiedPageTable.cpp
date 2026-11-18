@@ -261,6 +261,13 @@ void testCollectChecksOpenPages() {
     contents[1] = 7;
     Expect(collect() == std::vector<DirtyRange>{{Base + PageBytes, PageBytes}}, "an open page is reported when its content changed");
     Expect(collect().empty(), "an open page is reported once per change");
+    std::vector<ProtectionChange> changes;
+    table.ConsumeDirty(changes);
+    provenCalls.clear();
+    Expect(collect().empty() && provenCalls == std::vector<bool>{false, false}, "pages armed after an upload are checked, not reported unseen");
+    table.HandleWrite(Base, changes);
+    provenCalls.clear();
+    Expect(collect() == std::vector<DirtyRange>{{Base, PageBytes}} && provenCalls == std::vector<bool>{true}, "a write fault is reported without a content check");
 }
 
 int main() {

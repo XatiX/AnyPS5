@@ -172,13 +172,9 @@ void MemoryCore::LandGpuWrite(std::uint64_t address, std::span<const std::byte> 
 void MemoryCore::CollectWrites(std::uint64_t address, std::uint64_t size, PageTable::WrittenRun written, void* context) {
     std::lock_guard lock(collectMutex);
     pages.Collect(address, size, written, context, [this](std::uint64_t page, bool proven) {
-        if (proven) {
-            collectHashes.erase(page);
-            return true;
-        }
         const auto hash = PageHash(page);
         auto [entry, inserted] = collectHashes.try_emplace(page, hash);
-        if (inserted || entry->second != hash) {
+        if (proven || (!inserted && entry->second != hash)) {
             entry->second = hash;
             return true;
         }

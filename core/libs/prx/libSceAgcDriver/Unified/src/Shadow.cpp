@@ -367,12 +367,6 @@ namespace {
 
 void coreNoteWritten(std::uintptr_t address, std::size_t bytes) {
     MemoryCore::Get().NoteDriverWrite(address, bytes);
-    static const bool audit = std::getenv("APS5_RECODE_AUDIT_CORE_WRITES") != nullptr;
-    if (!audit) return;
-    auto& state = writeAudit();
-    std::lock_guard lock(state.mutex);
-    const auto end = address + bytes;
-    for (auto page = address & ~(PageBytes - 1); page < end; page += PageBytes) state.hashes.erase(page);
 }
 
 const GuestMemory::CoreWriteHooks coreWriteHooks{coreCoversWrites, coreCollectWrites, coreNoteWritten};

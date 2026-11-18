@@ -3006,7 +3006,11 @@ std::uint64_t StoreOwnBytes(std::uint64_t address, std::span<const std::byte> so
 }
 
 static std::uint64_t markWritten(std::uint64_t address, std::size_t bytes, bool complete, std::uint64_t* order = nullptr) {
-    if (const auto* hooks = coreWriteHooks.load(std::memory_order_acquire); hooks != nullptr && hooks->written != nullptr && bytes != 0) hooks->written(static_cast<std::uintptr_t>(address), bytes);
+    if (const auto* hooks = coreWriteHooks.load(std::memory_order_acquire); hooks != nullptr && hooks->written != nullptr && bytes != 0) {
+        const auto blockFirst = address & ~(std::uint64_t{WriteBlockBytes} - 1);
+        const auto blockStop = (address + bytes + WriteBlockBytes - 1) & ~(std::uint64_t{WriteBlockBytes} - 1);
+        hooks->written(static_cast<std::uintptr_t>(blockFirst), static_cast<std::size_t>(blockStop - blockFirst));
+    }
     BreakProofs();
     const BreakWhenStored breakStored;
     const NoteStore noteStore(address, bytes);

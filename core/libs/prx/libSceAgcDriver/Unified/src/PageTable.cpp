@@ -91,6 +91,7 @@ void PageTable::setState(std::uint64_t page, PageState next) {
             word |= bit;
             ++region->unreportedPages;
         }
+        if (next == PageState::CpuDirty) region->written[slot / 64] |= bit;
     }
     state = next;
 }
@@ -355,12 +356,15 @@ void PageTable::Collect(std::uint64_t address, std::uint64_t size, WrittenRun wr
             auto& word = region->unreported[slot / 64];
             const auto bit = std::uint64_t{1} << (slot % 64);
             const bool unreported = (word & bit) != 0;
+            auto& writtenWord = region->written[slot / 64];
+            const bool proven = (writtenWord & bit) != 0;
             if (unreported) {
                 word &= ~bit;
+                writtenWord &= ~bit;
                 --region->unreportedPages;
             }
             if (!unreported && region->states[slot] != PageState::CpuDirty) continue;
-            if (changed && !changed(page, unreported)) continue;
+            if (changed && !changed(page, proven)) continue;
             if (runEnd != page) {
                 flush();
                 runBegin = page;

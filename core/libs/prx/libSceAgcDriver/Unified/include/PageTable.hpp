@@ -82,6 +82,7 @@ private:
         std::array<std::uint32_t, RegionPages> lastConsume{};
         std::array<std::uint64_t, RegionPages / 64> listed{};
         std::array<std::uint64_t, RegionPages / 64> unreported{};
+        std::array<std::uint64_t, RegionPages / 64> written{};
         std::uint32_t dirtyPages = 0;
         std::uint32_t trackedPages = 0;
         std::uint32_t writablePages = 0;
