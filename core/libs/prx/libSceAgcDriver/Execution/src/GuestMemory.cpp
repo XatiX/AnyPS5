@@ -333,6 +333,7 @@ std::atomic<std::uint64_t> collectDirty{0};
 std::atomic<std::uint64_t> collectDirtyRuns{0};
 #endif
 std::atomic<std::uint64_t> trackerWaits{0};
+std::atomic<std::uint64_t> trackerHandOffs{0};
 std::atomic<std::uint64_t> trackerAcquisitions{0};
 std::uintptr_t PagesBase();
 std::size_t PagesSize();
@@ -573,7 +574,7 @@ public:
             AgcDriver::ProfilePrint_nid_no_patch(" %s %llu calls %.0f MiB %.1f s", MemoryCounterNames[i], static_cast<unsigned long long>(totals[i][0]), totals[i][1] / 1048576.0, totals[i][2] / 1e9);
         }
         AgcDriver::ProfilePrint_nid_no_patch(" collect-memo hits %llu (%llu from other threads' walks), collect epochs %llu", static_cast<unsigned long long>(collectMemoHits.load()), static_cast<unsigned long long>(sharedWalkHits.load()), static_cast<unsigned long long>(collectEpochBumps.load()));
-        AgcDriver::ProfilePrint_nid_no_patch(" collect-dirty %llu tracker waits %llu / %llu", static_cast<unsigned long long>(collectDirty.load()), static_cast<unsigned long long>(trackerWaits.load()), static_cast<unsigned long long>(trackerAcquisitions.load()));
+        AgcDriver::ProfilePrint_nid_no_patch(" collect-dirty %llu tracker waits %llu / %llu, hand-offs %llu", static_cast<unsigned long long>(collectDirty.load()), static_cast<unsigned long long>(trackerWaits.load()), static_cast<unsigned long long>(trackerAcquisitions.load()), static_cast<unsigned long long>(trackerHandOffs.load()));
         AgcDriver::ProfilePrint_nid_no_patch(" | arena 0x%llx+0x%llx image 0x%llx+0x%llx forgets %llu (%.0f MiB)", static_cast<unsigned long long>(PagesBase()), static_cast<unsigned long long>(PagesSize()), static_cast<unsigned long long>(ImagePagesBase()), static_cast<unsigned long long>(ImagePagesSize()), static_cast<unsigned long long>(forgetCalls.load()), forgetBytes.load() / 1048576.0);
         {
             std::lock_guard lock(state.callersMutex);
@@ -1905,6 +1906,11 @@ public:
         publish();
     }
 
+    bool HandOff() {
+        static const bool enabled = std::getenv("APS5_NO_TRACKER_HANDOFF") == nullptr;
+        return enabled && lock.mutex()->HandOff(500);
+    }
+
     void Suspend() {
         lock.unlock();
     }
@@ -2090,23 +2096,81 @@ void noteRefusedWalk(WriteTracker& tracker, std::uint64_t first, std::uint64_t s
 }
 #endif
 
-bool walkWrites(WriteTracker& tracker, std::uint64_t first, std::uint64_t stop, StampKind kind, bool armedOnly = false, const WindowCopy* window = nullptr) {
-    ++tracker.generation;
+bool walkWrites(WriteTracker& tracker, std::uint64_t first, std::uint64_t stop, StampKind kind, bool armedOnly = false, const WindowCopy* window = nullptr, bool bump = true, bool* dirty = nullptr) {
+    if (bump) ++tracker.generation;
     observationPoint(1);
     StampRuns runs{tracker, kind, 0, window, {}};
 #ifdef _WIN32
     const bool complete = collectWindowsWrites(runs, first, stop, armedOnly);
+    if (dirty != nullptr) *dirty = runs.stamped != 0;
 #else
     const auto dirtyRuns = collectDirtyRuns.load(std::memory_order_relaxed);
     const auto collect = armedOnly ? &GuestWriteWatch::GuestWriteWatchCollectArmed_nid_postfix : &GuestWriteWatch::GuestWriteWatchCollect_nid_postfix;
     const bool complete = collect(static_cast<std::uintptr_t>(first), static_cast<std::size_t>(stop - first), &stampWrittenRun, &runs);
     if (collectDirtyRuns.load(std::memory_order_relaxed) != dirtyRuns) collectDirty.fetch_add(1, std::memory_order_relaxed);
+    if (dirty != nullptr) *dirty = collectDirtyRuns.load(std::memory_order_relaxed) != dirtyRuns;
 #endif
     if (window != nullptr) stampWindowRuns(runs);
 #ifdef _WIN32
     if (!complete) noteRefusedWalk(tracker, first, stop);
 #endif
     return complete;
+}
+
+std::atomic<std::uint64_t> frameSerial{1};
+constexpr std::uint32_t LargeCleanWalks = 3;
+constexpr auto LargeCleanMaxAge = std::chrono::milliseconds(50);
+std::atomic<std::uint64_t> largeCleanSkips{0};
+std::atomic<std::uint64_t> largeCleanSkippedMiB{0};
+
+struct LargeClean {
+    std::uint64_t stop = 0;
+    std::uint32_t cleanWalks = 0;
+    std::uint64_t frame = 0;
+    std::chrono::steady_clock::time_point walkedAt{};
+    std::uint64_t unwatched = 0;
+    std::uint64_t mapping = 0;
+};
+
+struct LargeCleanRanges {
+    AgcDriver::Mutex mutex;
+    std::unordered_map<std::uint64_t, LargeClean> ranges;
+};
+
+LargeCleanRanges& largeCleanRanges() {
+    static auto* ranges = new LargeCleanRanges;
+    return *ranges;
+}
+
+std::uint64_t largeCleanBytes() {
+    static const std::uint64_t bytes = [] {
+        if (std::getenv("APS5_STRICT_COLLECTS") != nullptr) return std::numeric_limits<std::uint64_t>::max();
+        const char* value = std::getenv("APS5_LARGE_CLEAN_MIB");
+        return (value != nullptr ? std::strtoull(value, nullptr, 10) : 8ull) << 20u;
+    }();
+    return bytes;
+}
+
+bool largeCleanSkip(std::uint64_t first, std::uint64_t stop, std::uint64_t unwatched, std::uint64_t mapping) {
+    auto& state = largeCleanRanges();
+    std::lock_guard lock(state.mutex);
+    const auto found = state.ranges.find(first);
+    if (found == state.ranges.end()) return false;
+    const auto& entry = found->second;
+    return entry.cleanWalks >= LargeCleanWalks && stop <= entry.stop && entry.frame == frameSerial.load(std::memory_order_acquire) && entry.unwatched == unwatched && entry.mapping == mapping && std::chrono::steady_clock::now() - entry.walkedAt < LargeCleanMaxAge;
+}
+
+void largeCleanNote(std::uint64_t first, std::uint64_t stop, bool dirty, std::uint64_t unwatched, std::uint64_t mapping) {
+    auto& state = largeCleanRanges();
+    std::lock_guard lock(state.mutex);
+    auto& entry = state.ranges[first];
+    const bool same = entry.stop == stop && entry.unwatched == unwatched && entry.mapping == mapping;
+    entry.cleanWalks = dirty ? 0u : same ? entry.cleanWalks + 1u : 1u;
+    entry.stop = stop;
+    entry.frame = frameSerial.load(std::memory_order_acquire);
+    entry.walkedAt = std::chrono::steady_clock::now();
+    entry.unwatched = unwatched;
+    entry.mapping = mapping;
 }
 
 struct CollectSinceSlot {};
@@ -2124,6 +2188,14 @@ Observation observe(std::uint64_t address, std::size_t bytes, bool memoized) {
     const auto since = shared && sharedCollectWalks.load(std::memory_order_relaxed) ? HostThreadSlot<std::uint64_t, CollectSinceSlot>::Get() : 0;
     if (shared && tracker.observedSince(first, stop, epoch, since, unwatchSerial.load(std::memory_order_acquire), GuestAllocations::GuestAllocationsGeneration_nid_postfix())) {
         collectMemoHits.fetch_add(1, std::memory_order_relaxed);
+        return {Status::Complete, tracker.stable.load(std::memory_order_acquire)};
+    }
+    const bool large = memoized && collectMemoEnabled() && stop - first >= largeCleanBytes();
+    const auto unwatched = unwatchSerial.load(std::memory_order_acquire);
+    const auto mapping = GuestAllocations::GuestAllocationsGeneration_nid_postfix();
+    if (large && largeCleanSkip(first, stop, unwatched, mapping)) {
+        largeCleanSkips.fetch_add(1, std::memory_order_relaxed);
+        largeCleanSkippedMiB.fetch_add((stop - first) >> 20u, std::memory_order_relaxed);
         return {Status::Complete, tracker.stable.load(std::memory_order_acquire)};
     }
     auto lock = lockTracker(tracker);
@@ -2174,11 +2246,27 @@ Observation observe(std::uint64_t address, std::size_t bytes, bool memoized) {
     const auto walkStarted = !runs.empty() ? SteadyNanoseconds() : 0;
     std::size_t done = 0;
     auto status = Status::Complete;
+    constexpr std::uint64_t HandOffBytes = std::uint64_t{2} << 20u;
+    bool dirty = false;
+    const auto walkRun = [&](std::uint64_t from, std::uint64_t to) {
+        bool bump = true;
+        for (auto cursor = from; cursor < to;) {
+            const auto next = to - cursor > HandOffBytes ? cursor + HandOffBytes : to;
+            bool chunkDirty = false;
+            const bool complete = walkWrites(tracker, cursor, next, StampKind::Cpu, false, nullptr, bump, &chunkDirty);
+            dirty = dirty || chunkDirty || !complete;
+            if (!complete) return false;
+            cursor = next;
+            bump = cursor < to && lock.HandOff();
+            if (bump) trackerHandOffs.fetch_add(1, std::memory_order_relaxed);
+        }
+        return true;
+    };
     for (auto& run : runs) {
-        bool complete = walkWrites(tracker, run.first, run.stop, StampKind::Cpu);
+        bool complete = walkRun(run.first, run.stop);
         if (!complete && (run.first < first || run.stop > stop)) {
             run = {std::max(first, run.first), std::min(stop, run.stop), true};
-            complete = walkWrites(tracker, run.first, run.stop, StampKind::Cpu);
+            complete = walkRun(run.first, run.stop);
         }
         if (!complete) {
 #ifdef _WIN32
@@ -2200,6 +2288,7 @@ Observation observe(std::uint64_t address, std::size_t bytes, bool memoized) {
         const auto end = tracker.blockOf(runs[index].stop);
         if (end > from) tracker.publishObserved(from, end - 1, tick, walkStarted);
     }
+    if (large && !runs.empty()) largeCleanNote(first, stop, dirty, unwatched, mapping);
     if (status != Status::Complete) return {status, 0};
     return {Status::Complete, generation};
 }
@@ -2222,6 +2311,22 @@ std::uint64_t CollectWritesUncached(std::uint64_t address, std::size_t bytes) {
 
 void SetObservationHookForTest(void (*hook)(int point)) {
     observationHook.store(hook, std::memory_order_release);
+}
+
+void NoteFrame() {
+    frameSerial.fetch_add(1, std::memory_order_acq_rel);
+    static std::atomic<std::int64_t> printed{0};
+    const auto now = std::chrono::duration_cast<std::chrono::seconds>(std::chrono::steady_clock::now().time_since_epoch()).count();
+    if (auto seen = printed.load(); now - seen >= 10 && printed.compare_exchange_strong(seen, now) && largeCleanBytes() != std::numeric_limits<std::uint64_t>::max()) {
+        std::size_t tracked = 0, clean = 0;
+        {
+            auto& state = largeCleanRanges();
+            std::lock_guard lock(state.mutex);
+            tracked = state.ranges.size();
+            for (const auto& [first, entry] : state.ranges) clean += entry.cleanWalks >= LargeCleanWalks ? 1u : 0u;
+        }
+        AgcDriver::ProfilePrint_nid_no_patch("[large-clean] %llu walks skipped (%llu MiB, cumulative); %zu large ranges tracked, %zu clean\n", static_cast<unsigned long long>(largeCleanSkips.load()), static_cast<unsigned long long>(largeCleanSkippedMiB.load()), tracked, clean);
+    }
 }
 
 std::uint64_t WriteGeneration() {

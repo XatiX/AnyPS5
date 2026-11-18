@@ -37,6 +37,18 @@ public:
         if (state.exchange(Unlocked, std::memory_order_release) == Contended) WakeOne(state);
     }
 
+    bool HandOff(std::uint32_t spins) noexcept {
+        if (state.load(std::memory_order_relaxed) != Contended) return false;
+        unlock();
+        for (std::uint32_t spin = 0; spin < spins && state.load(std::memory_order_relaxed) == Unlocked; ++spin) {
+#if defined(__x86_64__) || defined(_M_X64)
+            __builtin_ia32_pause();
+#endif
+        }
+        lock();
+        return true;
+    }
+
 private:
     static constexpr std::uint32_t Unlocked = 0;
     static constexpr std::uint32_t Locked = 1;
