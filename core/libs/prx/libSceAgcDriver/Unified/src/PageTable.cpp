@@ -133,7 +133,7 @@ void PageTable::AdvanceFrame() {
     ++frameEpoch;
 }
 
-std::vector<DirtyRange> PageTable::ConsumeDirty(std::vector<ProtectionChange>& changes) {
+std::vector<DirtyRange> PageTable::ConsumeDirty(std::vector<ProtectionChange>& changes, const WriteCheck& written) {
     std::lock_guard lock(mutex);
     ++consumeEpoch;
     ++counts.consumes;
@@ -150,6 +150,20 @@ std::vector<DirtyRange> PageTable::ConsumeDirty(std::vector<ProtectionChange>& c
         if ((region->listed[slot / 64] & (std::uint64_t{1} << (slot % 64))) == 0) continue;
         unlist(page);
         if (region->states[slot] != PageState::CpuDirty) continue;
+        if (region->busyUntil[slot] != 0 && written && !written(page, false)) {
+            ++counts.unchangedBusy;
+            const auto epoch = framePaced ? frameEpoch : consumeEpoch;
+            if (region->busyUntil[slot] > epoch) {
+                keep.push_back(page);
+                continue;
+            }
+            region->busyUntil[slot] = 0;
+            region->streak[slot] = 0;
+            ++counts.rearmed;
+            setState(page, PageState::CpuClean);
+            appendChange(changes, page, Protection::ReadOnly);
+            continue;
+        }
         ++counts.consumedPages;
         const auto address = page * PageBytes;
         const auto gapSafe = [&] {
@@ -178,6 +192,7 @@ std::vector<DirtyRange> PageTable::ConsumeDirty(std::vector<ProtectionChange>& c
         if (busyUntil == 0 && streak >= BusyAfterWrites) {
             busyUntil = epoch + BusyConsumes;
             ++counts.keptBusy;
+            if (written) static_cast<void>(written(page, true));
             keep.push_back(page);
             continue;
         }

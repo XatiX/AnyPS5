@@ -116,13 +116,13 @@ std::string memoryLine() {
     const auto protect = MemoryCore::Get().Protection().Counts();
     const auto consumes = totals.consumes.load(std::memory_order_relaxed);
     const auto nanoseconds = totals.consumeNanoseconds.load(std::memory_order_relaxed);
-    char line[640];
-    std::snprintf(line, sizeof(line), "[recode-memory] registered %llu ranges %llu MiB, %llu outside the arena; consumes %llu, dirty ranges %llu, dirty %llu MiB, consume %.1f us avg %.1f us max; write faults opened %llu, host writes opened %llu, stale %llu, gpu-owned %llu, foreign %llu; kept busy %llu, rearmed %llu; protect calls %llu (%llu MiB), split %llu, skipped %llu MiB, failures %llu\n",
+    char line[896];
+    std::snprintf(line, sizeof(line), "[recode-memory] registered %llu ranges %llu MiB, %llu outside the arena; consumes %llu, dirty ranges %llu, dirty %llu MiB, consume %.1f us avg %.1f us max; write faults opened %llu, host writes opened %llu, stale %llu, gpu-owned %llu, foreign %llu; kept busy %llu, rearmed %llu, busy unchanged %llu; protect calls %llu (%llu MiB), split %llu, skipped %llu MiB, failures %llu\n",
         static_cast<unsigned long long>(totals.registrations.load(std::memory_order_relaxed)), static_cast<unsigned long long>(totals.registeredBytes.load(std::memory_order_relaxed) >> 20), static_cast<unsigned long long>(totals.outsideArena.load(std::memory_order_relaxed)),
         static_cast<unsigned long long>(consumes), static_cast<unsigned long long>(totals.ranges.load(std::memory_order_relaxed)), static_cast<unsigned long long>(totals.dirtyBytes.load(std::memory_order_relaxed) >> 20),
         consumes == 0 ? 0.0 : static_cast<double>(nanoseconds) / static_cast<double>(consumes) / 1000.0, static_cast<double>(totals.maxConsumeNanoseconds.exchange(0, std::memory_order_relaxed)) / 1000.0,
         static_cast<unsigned long long>(core.writesOpened), static_cast<unsigned long long>(core.hostWritesOpened), static_cast<unsigned long long>(core.staleFaults), static_cast<unsigned long long>(core.gpuOwnedFaults), static_cast<unsigned long long>(core.foreignFaults),
-        static_cast<unsigned long long>(table.keptBusy), static_cast<unsigned long long>(table.rearmed),
+        static_cast<unsigned long long>(table.keptBusy), static_cast<unsigned long long>(table.rearmed), static_cast<unsigned long long>(table.unchangedBusy),
         static_cast<unsigned long long>(protect.calls), static_cast<unsigned long long>(protect.bytes >> 20), static_cast<unsigned long long>(protect.splitCalls), static_cast<unsigned long long>(protect.skippedBytes >> 20), static_cast<unsigned long long>(protect.failures));
     return line;
 }

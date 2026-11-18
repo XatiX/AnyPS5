@@ -1,4 +1,6 @@
 #include "prx/libSceAgcDriver/Unified/include/MemoryCore.hpp"
+#include <array>
+#include <cstdlib>
 #ifdef _WIN32
 #include "prx/libc/include/GuestArena.hpp"
 #endif
@@ -49,10 +51,29 @@ void MemoryCore::Unregister(std::uint64_t address, std::uint64_t size) {
     protector.Apply(pages.Unregister(address, size));
 }
 
+std::uint64_t MemoryCore::PageHash(std::uint64_t page) {
+    const auto* words = reinterpret_cast<const std::uint64_t*>(page * PageBytes);
+    std::array<std::uint64_t, 4> lanes{0x9e3779b97f4a7c15ull, 0xc2b2ae3d27d4eb4full, 0x165667b19e3779f9ull, 0x27d4eb2f165667c5ull};
+    for (std::size_t i = 0; i < PageBytes / sizeof(std::uint64_t); i += lanes.size()) {
+        for (std::size_t lane = 0; lane < lanes.size(); ++lane) lanes[lane] = (lanes[lane] ^ words[i + lane]) * 0x100000001b3ull + (lanes[lane] >> 29u);
+    }
+    return lanes[0] ^ (lanes[1] * 31u) ^ (lanes[2] * 131u) ^ (lanes[3] * 1031u);
+}
+
 std::vector<DirtyRange> MemoryCore::ConsumeDirty() {
+    static const bool hashBusy = std::getenv("APS5_RECODE_NO_BUSY_HASH") == nullptr;
     std::lock_guard lock(mutex);
     std::vector<ProtectionChange> changes;
-    auto ranges = pages.ConsumeDirty(changes);
+    const PageTable::WriteCheck written = [this](std::uint64_t page, bool proven) {
+        const auto hash = PageHash(page);
+        auto [entry, inserted] = busyHashes.try_emplace(page, hash);
+        if (inserted || proven || entry->second != hash) {
+            entry->second = hash;
+            return true;
+        }
+        return false;
+    };
+    auto ranges = hashBusy ? pages.ConsumeDirty(changes, written) : pages.ConsumeDirty(changes);
     protector.Apply(changes);
     return ranges;
 }

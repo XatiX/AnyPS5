@@ -130,8 +130,41 @@ void testFramePacedPagesStayOpen() {
     Expect(table.StateOf(Base) == PageState::CpuDirty && table.Counts().keptBusy == 1, "a page written in three frames in a row stays open across the submissions of later frames");
 }
 
+void testUnchangedBusyPagesAreNotReported() {
+    PageTable table;
+    std::vector<ProtectionChange> changes;
+    table.Register(Base, PageBytes);
+    table.ConsumeDirty(changes);
+    bool changed = true;
+    int proven = 0;
+    const PageTable::WriteCheck written = [&](std::uint64_t, bool isProven) {
+        if (isProven) ++proven;
+        return isProven || changed;
+    };
+    for (int round = 0; round < 3; ++round) {
+        changes.clear();
+        table.HandleWrite(Base, changes);
+        changes.clear();
+        table.ConsumeDirty(changes, written);
+    }
+    Expect(proven == 1 && table.Counts().keptBusy == 1, "the consume that makes a page busy records it as written");
+    changed = false;
+    changes.clear();
+    Expect(table.ConsumeDirty(changes, written).empty(), "an unchanged busy page is not reported");
+    Expect(table.StateOf(Base) == PageState::CpuDirty && changes.empty() && table.Counts().unchangedBusy == 1, "an unchanged busy page stays open");
+    changed = true;
+    Expect(table.ConsumeDirty(changes, written).size() == 1, "a changed busy page is reported");
+    changed = false;
+    for (std::uint32_t round = 0; round < PageTable::BusyConsumes + 1; ++round) {
+        changes.clear();
+        table.ConsumeDirty(changes, written);
+    }
+    Expect(table.StateOf(Base) == PageState::CpuClean, "an unchanged page is armed again when its busy window ends");
+}
+
 int main() {
     testFramePacedPagesStayOpen();
+    testUnchangedBusyPagesAreNotReported();
     testRegisteredPagesUploadOnceThenArm();
     testWriteFaultOpensOnePage();
     testGapsMergeOnlyOverCpuPages();

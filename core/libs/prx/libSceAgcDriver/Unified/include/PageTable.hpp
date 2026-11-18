@@ -4,6 +4,7 @@
 #include <array>
 #include <cstddef>
 #include <cstdint>
+#include <functional>
 #include <memory>
 #include <mutex>
 #include <unordered_map>
@@ -41,6 +42,7 @@ struct PageTableCounts {
     std::uint64_t consumedPages = 0;
     std::uint64_t keptBusy = 0;
     std::uint64_t rearmed = 0;
+    std::uint64_t unchangedBusy = 0;
     std::uint64_t gpuOwnedPages = 0;
 };
 
@@ -53,7 +55,8 @@ public:
     std::vector<ProtectionChange> Register(std::uint64_t address, std::uint64_t size);
     std::vector<ProtectionChange> Unregister(std::uint64_t address, std::uint64_t size);
     bool HandleWrite(std::uint64_t address, std::vector<ProtectionChange>& changes);
-    std::vector<DirtyRange> ConsumeDirty(std::vector<ProtectionChange>& changes);
+    using WriteCheck = std::function<bool(std::uint64_t page, bool proven)>;
+    std::vector<DirtyRange> ConsumeDirty(std::vector<ProtectionChange>& changes, const WriteCheck& written = {});
     void AdvanceFrame();
     std::vector<ProtectionChange> MarkGpuOwned(std::uint64_t address, std::uint64_t size);
     std::vector<DirtyRange> GpuOwnedIn(std::uint64_t address, std::uint64_t size) const;

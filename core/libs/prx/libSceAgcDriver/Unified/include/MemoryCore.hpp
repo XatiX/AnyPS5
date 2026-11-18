@@ -6,6 +6,7 @@
 #include <atomic>
 #include <cstdint>
 #include <mutex>
+#include <unordered_map>
 #include <vector>
 
 namespace AgcDriver::Unified {
@@ -36,8 +37,11 @@ public:
     [[nodiscard]] MemoryCoreCounts Counts() const;
 
 private:
+    static std::uint64_t PageHash(std::uint64_t page);
+
     std::mutex mutex;
     PageTable pages;
+    std::unordered_map<std::uint64_t, std::uint64_t> busyHashes;
     Protector protector;
     std::atomic<std::uint64_t> writesOpened{0};
     std::atomic<std::uint64_t> hostWritesOpened{0};
