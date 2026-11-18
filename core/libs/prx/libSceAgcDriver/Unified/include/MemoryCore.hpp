@@ -19,6 +19,7 @@ struct MemoryCoreCounts {
     std::uint64_t foreignFaults = 0;
     std::uint64_t staleFaults = 0;
     std::uint64_t landedBytes = 0;
+    std::uint64_t driverPagesSettled = 0;
 };
 
 class MemoryCore {
@@ -39,6 +40,7 @@ public:
     void PrepareHostWrite(std::uint64_t address, std::uint64_t size);
     void LandGpuWrite(std::uint64_t address, std::span<const std::byte> bytes);
     void CollectWrites(std::uint64_t address, std::uint64_t size, PageTable::WrittenRun written, void* context);
+    void NoteDriverWrite(std::uint64_t address, std::uint64_t size);
     [[nodiscard]] PageTable& Pages() { return pages; }
     [[nodiscard]] Protector& Protection() { return protector; }
     [[nodiscard]] MemoryCoreCounts Counts() const;
@@ -60,6 +62,7 @@ private:
     std::atomic<std::uint64_t> foreignFaults{0};
     std::atomic<std::uint64_t> staleFaults{0};
     std::atomic<std::uint64_t> landedBytes{0};
+    std::atomic<std::uint64_t> driverPagesSettled{0};
 };
 
 }

@@ -186,8 +186,18 @@ void MemoryCore::CollectWrites(std::uint64_t address, std::uint64_t size, PageTa
     });
 }
 
+void MemoryCore::NoteDriverWrite(std::uint64_t address, std::uint64_t size) {
+    if (size == 0) return;
+    std::lock_guard lock(collectMutex);
+    pages.Collect(address, size, [](void*, std::uintptr_t, std::uintptr_t) {}, nullptr, [this](std::uint64_t page, bool) {
+        collectHashes.insert_or_assign(page, PageHash(page));
+        driverPagesSettled.fetch_add(1, std::memory_order_relaxed);
+        return false;
+    });
+}
+
 MemoryCoreCounts MemoryCore::Counts() const {
-    return {writesOpened.load(std::memory_order_relaxed), hostWritesOpened.load(std::memory_order_relaxed), gpuOwnedFaults.load(std::memory_order_relaxed), foreignFaults.load(std::memory_order_relaxed), staleFaults.load(std::memory_order_relaxed), landedBytes.load(std::memory_order_relaxed)};
+    return {writesOpened.load(std::memory_order_relaxed), hostWritesOpened.load(std::memory_order_relaxed), gpuOwnedFaults.load(std::memory_order_relaxed), foreignFaults.load(std::memory_order_relaxed), staleFaults.load(std::memory_order_relaxed), landedBytes.load(std::memory_order_relaxed), driverPagesSettled.load(std::memory_order_relaxed)};
 }
 
 }
