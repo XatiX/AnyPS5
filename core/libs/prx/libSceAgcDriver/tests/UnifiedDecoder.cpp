@@ -1,9 +1,13 @@
 #include "prx/libSceAgcDriver/Unified/include/Decoder.hpp"
 #include "prx/libSceAgcDriver/Unified/include/Order.hpp"
+#include "prx/libSceAgcDriver/Unified/include/Front.hpp"
 #include "prx/libSceAgcDriver/Execution/include/VideoOutput.hpp"
 #include <cstdint>
 #include <cstdio>
 #include <initializer_list>
+#include <map>
+#include <memory>
+#include <mutex>
 #include <vector>
 
 using namespace AgcDriver;
@@ -170,6 +174,45 @@ void testWaitEdgesFollowLabelStores() {
     auto always = waitFor(0, 5, 0x2000, 0);
     always.function = 0;
     Expect(order.Resolve(always) == Order::Verdict::Passes, "an always-true wait needs no edge");
+    auto first = waitFor(0, 6, 0x3000, 1);
+    auto second = waitFor(0, 7, 0x3004, 1);
+    static_cast<void>(order.Resolve(first));
+    static_cast<void>(order.Resolve(second));
+    Expect(order.PendingWaits() == 1 && order.Counts().superseded == 1, "a queue's newer pending wait supersedes its older one");
+}
+
+void testFrontDecodesQueuesOnTheirOwnThreads() {
+    constexpr std::uint32_t Rounds = 300;
+    std::mutex seenMutex;
+    std::map<std::uint32_t, std::uint64_t> seen;
+    {
+        Front front([&](const Operation& operation) {
+            std::lock_guard lock(seenMutex);
+            ++seen[operation.queue];
+        });
+        for (std::uint32_t round = 0; round < Rounds; ++round) {
+            auto compute = std::make_shared<DriverDetail::Submission>();
+            compute->serial = round * 2 + 1;
+            compute->queue = 0x20;
+            compute->commands = {type3(0x15, 5), 1, 1, 1, 1, type3(0x49, 8), 0x0, 1u << 29u, 0x8000, 0x0, round + 1, 0x0, 0x0};
+            front.Push(compute);
+            auto graphics = std::make_shared<DriverDetail::Submission>();
+            graphics->serial = round * 2 + 2;
+            graphics->queue = 0;
+            graphics->commands = {type3(0x3c, 7), 0x3, 0x8000, 0x0, round + 1, 0xffffffffu, 0x10, type3(0x2d, 3), 3, 2};
+            front.Push(graphics);
+        }
+        const auto totals = front.Totals();
+        Expect(totals.size() == 2, "one lane per queue");
+        for (const auto& lane : totals) {
+            Expect(lane.submissions == Rounds, "every pushed submission is decoded, past the ring depth");
+            Expect(lane.counts.operations == Rounds * 2, "each submission gives two operations");
+        }
+        const auto counts = front.Ordering().Counts();
+        Expect(counts.edges + counts.released + counts.superseded + front.Ordering().PendingWaits() == Rounds, "every wait is ordered, released, superseded or still pending");
+        Expect(counts.edges + counts.released > 0, "waits across queues find the stores that meet them");
+    }
+    Expect(seen[0] == Rounds * 2 && seen[0x20] == Rounds * 2, "the consumer sees every operation of both queues");
 }
 
 void testConditionalRangesArePredicated() {
@@ -241,6 +284,7 @@ int main() {
     testFlipsAndIndirectRegisters();
     testFullRingAsksForRoom();
     testWaitEdgesFollowLabelStores();
+    testFrontDecodesQueuesOnTheirOwnThreads();
     if (failures != 0) {
         std::fprintf(stderr, "%d failure(s)\n", failures);
         return 1;

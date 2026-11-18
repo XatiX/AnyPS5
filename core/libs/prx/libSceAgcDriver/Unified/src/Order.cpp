@@ -20,6 +20,7 @@ Order::Verdict Order::Resolve(Operation& wait) {
         ++counts.edges;
         return Verdict::Edge;
     }
+    counts.superseded += std::erase_if(pending, [&](const Operation& held) { return held.queue == wait.queue; });
     pending.push_back(wait);
     ++counts.pending;
     return Verdict::Pending;

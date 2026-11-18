@@ -15,6 +15,7 @@ struct OrderCounts {
     std::uint64_t pending = 0;
     std::uint64_t released = 0;
     std::uint64_t overwritten = 0;
+    std::uint64_t superseded = 0;
 };
 
 class Order {
