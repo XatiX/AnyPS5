@@ -365,7 +365,11 @@ std::string writeAuditLine() {
 
 namespace {
 
-const GuestMemory::CoreWriteHooks coreWriteHooks{coreCoversWrites, coreCollectWrites};
+void coreNoteWritten(std::uintptr_t address, std::size_t bytes) {
+    MemoryCore::Get().PrepareHostWrite(address, bytes);
+}
+
+const GuestMemory::CoreWriteHooks coreWriteHooks{coreCoversWrites, coreCollectWrites, coreNoteWritten};
 
 }
 

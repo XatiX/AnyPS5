@@ -79,6 +79,7 @@ void SetFreshCollectHook(FreshCollectHook hook);
 struct CoreWriteHooks {
     bool (*covers)(std::uintptr_t address, std::size_t bytes) = nullptr;
     bool (*collect)(std::uintptr_t address, std::size_t bytes, void (*written)(void*, std::uintptr_t, std::uintptr_t), void* context) = nullptr;
+    void (*written)(std::uintptr_t address, std::size_t bytes) = nullptr;
 };
 void SetCoreWriteHooks(const CoreWriteHooks* hooks);
 #ifdef _WIN32
