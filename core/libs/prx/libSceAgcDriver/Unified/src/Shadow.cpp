@@ -37,6 +37,8 @@ struct MemoryTotals {
     std::atomic<std::uint64_t> registrations{0};
     std::atomic<std::uint64_t> registeredBytes{0};
     std::atomic<std::uint64_t> outsideArena{0};
+    std::atomic<std::uint64_t> accesses{0};
+    std::atomic<std::uint64_t> unknownAccesses{0};
     std::atomic<std::uint64_t> consumes{0};
     std::atomic<std::uint64_t> ranges{0};
     std::atomic<std::uint64_t> dirtyBytes{0};
@@ -117,8 +119,9 @@ std::string memoryLine() {
     const auto consumes = totals.consumes.load(std::memory_order_relaxed);
     const auto nanoseconds = totals.consumeNanoseconds.load(std::memory_order_relaxed);
     char line[896];
-    std::snprintf(line, sizeof(line), "[recode-memory] registered %llu ranges %llu MiB, %llu outside the arena; consumes %llu, dirty ranges %llu, dirty %llu MiB, consume %.1f us avg %.1f us max; write faults opened %llu, host writes opened %llu, stale %llu, gpu-owned %llu, foreign %llu; kept busy %llu, rearmed %llu, busy unchanged %llu; protect calls %llu (%llu MiB), split %llu, skipped %llu MiB, failures %llu\n",
+    std::snprintf(line, sizeof(line), "[recode-memory] registered %llu ranges %llu MiB, %llu outside the arena; backend accesses %llu, unknown memory %llu; consumes %llu, dirty ranges %llu, dirty %llu MiB, consume %.1f us avg %.1f us max; write faults opened %llu, host writes opened %llu, stale %llu, gpu-owned %llu, foreign %llu; kept busy %llu, rearmed %llu, busy unchanged %llu; protect calls %llu (%llu MiB), split %llu, skipped %llu MiB, failures %llu\n",
         static_cast<unsigned long long>(totals.registrations.load(std::memory_order_relaxed)), static_cast<unsigned long long>(totals.registeredBytes.load(std::memory_order_relaxed) >> 20), static_cast<unsigned long long>(totals.outsideArena.load(std::memory_order_relaxed)),
+        static_cast<unsigned long long>(totals.accesses.load(std::memory_order_relaxed)), static_cast<unsigned long long>(totals.unknownAccesses.load(std::memory_order_relaxed)),
         static_cast<unsigned long long>(consumes), static_cast<unsigned long long>(totals.ranges.load(std::memory_order_relaxed)), static_cast<unsigned long long>(totals.dirtyBytes.load(std::memory_order_relaxed) >> 20),
         consumes == 0 ? 0.0 : static_cast<double>(nanoseconds) / static_cast<double>(consumes) / 1000.0, static_cast<double>(totals.maxConsumeNanoseconds.exchange(0, std::memory_order_relaxed)) / 1000.0,
         static_cast<unsigned long long>(core.writesOpened), static_cast<unsigned long long>(core.hostWritesOpened), static_cast<unsigned long long>(core.staleFaults), static_cast<unsigned long long>(core.gpuOwnedFaults), static_cast<unsigned long long>(core.foreignFaults),
@@ -180,8 +183,11 @@ bool DrawScope() {
     return drawScope();
 }
 
-void NoteGuestAccess(GuestRanges reads, GuestRanges writes) {
+void NoteGuestAccess(GuestRanges reads, GuestRanges writes, bool unknown) {
     if (!drawScope() || !memoryInstalled()) return;
+    auto& totals = memoryTotals();
+    totals.accesses.fetch_add(1, std::memory_order_relaxed);
+    if (unknown) totals.unknownAccesses.fetch_add(1, std::memory_order_relaxed);
     for (const auto& [begin, end] : reads) registerRange(begin, end);
     for (const auto& [begin, end] : writes) registerRange(begin, end);
 }

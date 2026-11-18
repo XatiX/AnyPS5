@@ -16,7 +16,7 @@ bool Active();
 bool MemoryActive();
 bool DrawScope();
 void NoteGpuMapping(const GuestAllocations::Mapped& ranges);
-void NoteGuestAccess(GuestRanges reads, GuestRanges writes);
+void NoteGuestAccess(GuestRanges reads, GuestRanges writes, bool unknown);
 std::shared_ptr<DriverDetail::Submission> Copy(const DriverDetail::Submission& submission);
 void Tee(const DriverDetail::Submission& submission);
 

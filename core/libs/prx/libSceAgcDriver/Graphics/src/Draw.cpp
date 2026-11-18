@@ -2953,7 +2953,7 @@ void recordDraw(const Context& context, const State& state, const Pm4::DrawParam
     }
     const PassAccess passAccess{passReads, passWrites, passImages, passAttachments, unknownMemory, unknownWrites, passWriteOnly};
 #if ANYPS5_UNIFIED
-    Unified::Shadow::NoteGuestAccess(passReads, resources.GpuWrites());
+    Unified::Shadow::NoteGuestAccess(passReads, resources.GpuWrites(), unknownMemory);
 #endif
     const bool fenced = state.depth.has_value() || !record.proxies.empty();
     resources.RequireGuestBuffers();

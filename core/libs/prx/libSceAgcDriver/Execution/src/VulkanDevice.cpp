@@ -5986,7 +5986,7 @@ void VulkanDevice::recordDispatch(RecordedDispatch& record) {
 #if ANYPS5_UNIFIED
     if (Unified::Shadow::DrawScope()) {
         const auto reads = resources.DeviceReads();
-        Unified::Shadow::NoteGuestAccess(reads, resources.GpuWrites());
+        Unified::Shadow::NoteGuestAccess(reads, resources.GpuWrites(), resources.HoldsLease() || resources.UsesAddressTable() || resources.HasCopiedWrites());
     }
 #endif
     using CommandClass = Graphics::Recorder::CommandClass;
