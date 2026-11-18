@@ -81,12 +81,15 @@ public:
     void CountAgreed(std::size_t path, bool exempted);
     void CountWorkSeen() { workSeen.fetch_add(1, std::memory_order_relaxed); }
     void CountRangeKind(SpanKind kind) { rangeKinds[static_cast<std::size_t>(kind)].fetch_add(1, std::memory_order_relaxed); }
+    void CountViewWriter(std::size_t writer) { viewWriters[writer < 5 ? writer : 4].fetch_add(1, std::memory_order_relaxed); }
+    [[nodiscard]] std::array<std::uint64_t, 5> ViewWriters() const { return {viewWriters[0].load(), viewWriters[1].load(), viewWriters[2].load(), viewWriters[3].load(), viewWriters[4].load()}; }
     void CountShortcut(bool taken) { (taken ? shortcuts : shortcutFallbacks).fetch_add(1, std::memory_order_relaxed); }
     [[nodiscard]] VerdictCounts Counts() const;
 
 private:
     std::atomic<std::uint64_t> workSeen{0};
     std::array<std::atomic<std::uint64_t>, static_cast<std::size_t>(SpanKind::Count)> rangeKinds{};
+    std::array<std::atomic<std::uint64_t>, 5> viewWriters{};
     std::atomic<std::uint64_t> shortcuts{0};
     std::atomic<std::uint64_t> shortcutFallbacks{0};
     std::array<std::atomic<std::uint64_t>, 3> outcomes{};

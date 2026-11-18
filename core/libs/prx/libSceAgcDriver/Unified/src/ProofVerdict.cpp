@@ -110,7 +110,10 @@ std::string VerdictLine() {
     char ranges[256];
     std::snprintf(ranges, sizeof(ranges), "[recode-proof] range refusals of proved objects by span: storage %llu, view %llu, snapshot %llu, keys %llu, direct %llu, written %llu, buffer %llu\n",
         static_cast<unsigned long long>(kinds[0]), static_cast<unsigned long long>(kinds[1]), static_cast<unsigned long long>(kinds[2]), static_cast<unsigned long long>(kinds[3]), static_cast<unsigned long long>(kinds[4]), static_cast<unsigned long long>(kinds[5]), static_cast<unsigned long long>(kinds[6]));
-    return std::string(line) + paths + ranges;
+    const auto writers = SharedTally().ViewWriters();
+    char views[224];
+    std::snprintf(views, sizeof(views), "[recode-proof] view refusals by last writer: cpu or store %llu, the source %llu, image set %llu, a draw or dispatch %llu, another image %llu\n", static_cast<unsigned long long>(writers[0]), static_cast<unsigned long long>(writers[1]), static_cast<unsigned long long>(writers[2]), static_cast<unsigned long long>(writers[3]), static_cast<unsigned long long>(writers[4]));
+    return std::string(line) + paths + ranges + views;
 }
 
 }

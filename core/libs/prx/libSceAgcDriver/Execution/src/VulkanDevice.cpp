@@ -5985,7 +5985,7 @@ void VulkanDevice::recordDispatch(RecordedDispatch& record) {
         covered = 0;
     }
 #if ANYPS5_UNIFIED
-    Unified::Events::NoteRanges(resources.GpuWrites(), reinterpret_cast<std::uintptr_t>(&resources));
+    Unified::Events::NoteRanges(resources.GpuWrites(), Unified::Events::ResourceOwner(&resources));
     if (Unified::Shadow::DrawScope()) {
         const auto reads = resources.DeviceReads();
         Unified::Shadow::NoteGuestAccess(reads, resources.GpuWrites(), resources.HoldsLease() || resources.UsesAddressTable() || resources.HasCopiedWrites());

@@ -96,6 +96,17 @@ bool ChangeLog::ChangedSince(std::uint64_t address, std::uint64_t bytes, std::ui
     return false;
 }
 
+std::uintptr_t ChangeLog::ChangedOwner(std::uint64_t address, std::uint64_t bytes, std::uint64_t stamp) const {
+    if (bytes == 0) return 0;
+    const auto first = address / BucketBytes;
+    const auto last = std::min<std::uint64_t>((address + bytes - 1) / BucketBytes, first + BucketCount - 1);
+    for (auto index = first; index <= last; ++index) {
+        const auto seen = read(buckets[bucketOf(index * BucketBytes)]);
+        if (seen.epoch > stamp) return seen.owner;
+    }
+    return 0;
+}
+
 ChangeLogCounts ChangeLog::Counts() const {
     return {notes.load(std::memory_order_relaxed), queries.load(std::memory_order_relaxed), regionSkips.load(std::memory_order_relaxed), changed.load(std::memory_order_relaxed), ownerExempt.load(std::memory_order_relaxed)};
 }

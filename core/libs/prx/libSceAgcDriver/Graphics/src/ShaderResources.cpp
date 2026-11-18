@@ -4556,7 +4556,7 @@ void ShaderResources::registerProofSpans() {
     for (const auto& region : directRegions) add(region.begin, region.end - region.begin, 0, Kind::Direct);
     const auto& written = guestMemory.Writes();
     for (const auto& [begin, end] : written) {
-        if (end > begin) add(begin, end - begin, reinterpret_cast<std::uintptr_t>(this), Kind::Written);
+        if (end > begin) add(begin, end - begin, Unified::Events::ResourceOwner(this), Kind::Written);
     }
     const auto ownWrite = [&](std::uint64_t begin, std::uint64_t end) {
         return std::find(written.begin(), written.end(), std::pair{begin, end}) != written.end();
@@ -4603,7 +4603,13 @@ bool ShaderResources::revalidateVerified(std::span<const CompiledShader> shaders
         if (clean && noted) tally.CountWorkSeen();
     }
     if (miss == Unified::Proof::Miss::Guard && ok) tally.CountGuards(proofStamp.guards, guards);
-    if (miss == Unified::Proof::Miss::Range && ok && changed != nullptr) tally.CountRangeKind(changed->kind);
+    if (miss == Unified::Proof::Miss::Range && ok && changed != nullptr) {
+        tally.CountRangeKind(changed->kind);
+        if (changed->kind == Unified::Proof::SpanKind::View) {
+            const auto writer = log.ChangedOwner(changed->begin, changed->end - changed->begin, proofStamp.serial);
+            tally.CountViewWriter(writer == 0 ? 0 : writer == changed->owner ? 1 : writer == Unified::Events::ImageSetOwner ? 2 : (writer & 1u) != 0 ? 3 : 4);
+        }
+    }
     proofStamp = {serial, imageSerial, guards, ok};
     lastProofFast = ok && proof.path == ProofPath::Fast;
     return ok;

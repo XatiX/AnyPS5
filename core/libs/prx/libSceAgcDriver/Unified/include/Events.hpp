@@ -34,6 +34,7 @@ public:
     std::uint64_t Note(std::uint64_t address, std::uint64_t bytes, std::uintptr_t owner = 0);
     [[nodiscard]] bool ChangedSince(std::uint64_t address, std::uint64_t bytes, std::uint64_t stamp, std::uintptr_t owner = 0, bool* exempted = nullptr) const;
     [[nodiscard]] ChangeLogCounts Counts() const;
+    [[nodiscard]] std::uintptr_t ChangedOwner(std::uint64_t address, std::uint64_t bytes, std::uint64_t stamp) const;
 
 private:
     struct Bucket {
@@ -62,9 +63,15 @@ private:
     mutable std::atomic<std::uint64_t> ownerExempt{0};
 };
 
+inline constexpr std::uintptr_t ImageSetOwner = 2;
+
+inline std::uintptr_t ResourceOwner(const void* resources) {
+    return reinterpret_cast<std::uintptr_t>(resources) | 1u;
+}
+
 ChangeLog& Shared();
 ChangeLog& Images();
-void NoteImage(std::uint64_t address, std::uint64_t bytes, std::uintptr_t owner = 0);
+void NoteImage(std::uint64_t address, std::uint64_t bytes, std::uintptr_t owner = ImageSetOwner);
 std::uint64_t ThreadNotes();
 
 class StoreOwner {

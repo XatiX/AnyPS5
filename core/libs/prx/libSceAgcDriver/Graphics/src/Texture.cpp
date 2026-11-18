@@ -4881,16 +4881,19 @@ void StorageTexture::markLayersPending(std::uint32_t first, std::uint32_t count)
         static_cast<void>(hooked);
     }
     ++version;
-    notePendingChange();
     if (const auto format = ResolveTextureFormat(descriptor.format); format == VK_FORMAT_R8_UINT || format == VK_FORMAT_R8_UNORM) eightBitWrites().fetch_add(1, std::memory_order_release);
     const bool wasLent = std::exchange(lent, false);
     if (dirty) {
-        if (wasLent || newUnits) BumpPendingSerial();
+        if (wasLent || newUnits) {
+            BumpPendingSerial();
+            notePendingChange();
+        }
         return;
     }
     dirty = true;
     pending.textures.push_back(this);
     BumpPendingSerial();
+    notePendingChange();
 }
 
 void StorageTexture::reconcilePending() {
