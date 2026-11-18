@@ -3,6 +3,7 @@
 #include "prx/libSceAgcDriver/Unified/include/Front.hpp"
 #include "prx/libSceAgcDriver/Unified/include/Shadow.hpp"
 #include "prx/libSceAgcDriver/Unified/include/Replay.hpp"
+#include "prx/libSceAgcDriver/Unified/include/RecordState.hpp"
 #include "prx/libSceAgcDriver/Execution/include/SubmissionCapture.hpp"
 #include "prx/libSceAgcDriver/Execution/include/VideoOutput.hpp"
 #include "../tools/Pm4Analysis.hpp"
@@ -331,6 +332,41 @@ void testUsesReportIndexAndIndirectRanges() {
     Expect(state.Counts().useReports == 2, "one report per operation");
 }
 
+void testRebuiltStateResolvesLikeTheDecoder() {
+    std::vector<std::uint32_t> indices(256, 0);
+    const auto base = reinterpret_cast<std::uint64_t>(indices.data());
+    const auto second = base + 256;
+    Stream stream;
+    stream.Add({type3(0x26, 3), static_cast<std::uint32_t>(base), static_cast<std::uint32_t>(base >> 32u)});
+    stream.Add({type3(0x2f, 2), 3});
+    stream.Add({type3(0x35, 5), 64, 4, 16, 0});
+    stream.SetContext(0x8e, 0x7);
+    stream.Add({type3(0x2a, 2), 1});
+    stream.Add({type3(0x35, 5), 64, 8, 32, 0});
+    stream.Add({type3(0x26, 3), static_cast<std::uint32_t>(second), static_cast<std::uint32_t>(second >> 32u)});
+    stream.Add({type3(0x2f, 2), 1});
+    stream.Add({type3(0x35, 5), 64, 0, 12, 0});
+    DecodeState state(0);
+    state.SetResolve(true);
+    Recorded sink(state);
+    sink.retire = false;
+    DecodeSubmission(stream.submission, state, sink);
+    Expect(sink.operations.size() == 3 && state.Counts().resolved == 3, "three indexed draws resolve");
+    int matched = 0;
+    for (const auto& operation : sink.operations) {
+        const auto queue = Record::QueueStateAt(state, operation.snapshots);
+        if (!queue) continue;
+        const auto packet = std::span<const std::uint32_t>(stream.submission.commands).subspan(operation.packetOffset, 5);
+        const auto draw = Pm4::ResolveDraw(packet, *queue);
+        const bool same = draw.indexAddress == operation.address && draw.indexCount == operation.size && draw.instanceCount == (operation.value & 0xffffffffu) && draw.indexSize == (operation.value >> 32u);
+        if (same) ++matched;
+    }
+    Expect(matched == 3, "the state rebuilt from each draw's snapshots resolves the draw as the decoder did");
+    const auto* context = state.Context(sink.operations.back().snapshots.context);
+    const auto rebuilt = Record::QueueStateAt(state, sink.operations.back().snapshots);
+    Expect(rebuilt && context != nullptr && rebuilt->context.at(0x8e) == 0x7, "the rebuilt state carries the context snapshot");
+}
+
 void testConditionalRangesArePredicated() {
     Stream stream;
     const auto condition = stream.Add({type3(0x22, 5), 0x1000, 0x2, 0x0, 3});
@@ -405,6 +441,7 @@ int main() {
     testReplayMatchesThePacketAnalysis();
     testResolveFillsDrawParametersAndKeys();
     testUsesReportIndexAndIndirectRanges();
+    testRebuiltStateResolvesLikeTheDecoder();
     if (failures != 0) {
         std::fprintf(stderr, "%d failure(s)\n", failures);
         return 1;
