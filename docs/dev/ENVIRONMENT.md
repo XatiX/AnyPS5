@@ -358,6 +358,7 @@ The code reads environment names through `getenv`, `IsEnvironmentSet`, `kibSetti
 | `APS5_NO_LABEL_READ_TRAP` | presence | `core/libs/prx/libSceAgcDriver/Graphics/src/Texture.cpp` |  | on macOS, stores pending linear and small storage images before a label instead of trapping reads of their pages until something stores them |
 | `APS5_NO_LABEL_RUNS` | presence | `core/libs/prx/libSceAgcDriver/Graphics/src/Recorder.cpp` |  | records every store in a run of its own between a barrier pair |
 | `APS5_NO_LABEL_SHORTCUT` | presence | `core/libs/prx/libSceAgcDriver/Execution/src/Driver/Synchronization/WaitMemory.cpp` |  | disables the pending-label table shortcut in a memory wait |
+| `APS5_NO_LARGE_WRITTEN_SHADOW` | presence | `core/libs/prx/libSceAgcDriver/Graphics/src/GuestBufferMemory.cpp` |  | discrete GPU: a written element of a build without an address table is staged only up to the 8 MiB window again, instead of up to 128 MiB |
 | `APS5_NO_LAST_FRAGMENT_OUTPUTS` | presence | `core/libs/prx/libSceAgcDriver/Graphics/src/Draw.cpp` |  | asks the shared validation memo for every draw instead of serving a repeat of the thread's last fragment-output key |
 | `APS5_NO_LAYER_CLEAR` | presence | `core/libs/prx/libSceAgcDriver/Graphics/src/Texture.cpp` |  | tracks every surface as one layer instead of per array layer |
 | `APS5_NO_LAYER_REFUSAL_MEMO` | presence | `core/libs/prx/libSceAgcDriver/Graphics/src/Texture.cpp` |  | re-checks a layer whose surface check failed at its current generation on every fill |

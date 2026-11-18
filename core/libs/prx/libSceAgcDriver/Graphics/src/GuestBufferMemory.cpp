@@ -6198,6 +6198,7 @@ VkBufferUsageFlags gpuCopyUsage(const Context& context, bool addressable) {
 // window takes those elements there. APS5_ATOMIC_STAGE_MAX_KIB (1024) bounds the atomic one.
 constexpr std::uint64_t SweptShadowMax = std::uint64_t{16} << 20u;
 constexpr std::uint64_t DiscreteWrittenShadowMax = std::uint64_t{8} << 20u;
+constexpr std::uint64_t DiscretePlainWrittenShadowMax = std::uint64_t{128} << 20u;
 constexpr std::uint64_t DiscreteSweptShadowMax = std::uint64_t{256} << 20u;
 
 bool writtenShadowEnabled() {
@@ -6224,6 +6225,11 @@ std::uint64_t writtenShadowMax(bool discreteGpu) {
     static const std::uint64_t setting = kibSetting("APS5_WRITTEN_SHADOW_MAX_KIB", 0);
     if (setting != 0) return setting;
     return discreteGpu ? DiscreteWrittenShadowMax : std::uint64_t{2048} << 10u;
+}
+
+std::uint64_t plainWrittenShadowMax(bool discreteGpu) {
+    static const bool large = std::getenv("APS5_NO_LARGE_WRITTEN_SHADOW") == nullptr && std::getenv("APS5_WRITTEN_SHADOW_MAX_KIB") == nullptr;
+    return discreteGpu && large ? DiscretePlainWrittenShadowMax : writtenShadowMax(discreteGpu);
 }
 
 std::uint64_t atomicStageMax() {
@@ -6445,7 +6451,8 @@ bool GuestBufferMemory::stagingWanted(const Region& region, bool addressable) co
     const auto bytes = region.end - region.begin;
     if (!WritesOverlap(region.begin, static_cast<std::size_t>(bytes))) return false;
     if (region.atomic && atomicStagingEnabled() && bytes <= atomicStageMax()) return true;
-    return writtenShadowEnabled() && bytes >= writtenShadowMin() && bytes <= (region.swept ? std::max(writtenShadowMax(context.discreteGpu), context.discreteGpu ? DiscreteSweptShadowMax : SweptShadowMax) : writtenShadowMax(context.discreteGpu));
+    const auto writtenMax = region.overlay ? writtenShadowMax(context.discreteGpu) : plainWrittenShadowMax(context.discreteGpu);
+    return writtenShadowEnabled() && bytes >= writtenShadowMin() && bytes <= (region.swept ? std::max(writtenMax, context.discreteGpu ? DiscreteSweptShadowMax : SweptShadowMax) : writtenMax);
 }
 
 bool GuestBufferMemory::overlayCandidate(const Region& inside, bool readOnly) const {
