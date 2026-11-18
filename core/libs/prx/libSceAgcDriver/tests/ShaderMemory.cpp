@@ -35,6 +35,9 @@
 #include "BdaAbi.hpp"
 #include "ImageTableAbi.hpp"
 #include "ShaderDiskCache.hpp"
+#if defined(ANYPS5_UNIFIED)
+#include "prx/libSceAgcDriver/Unified/include/SlotRequests.hpp"
+#endif
 #include <limits>
 #include <spirv/unified1/spirv.hpp>
 #include <algorithm>
@@ -5699,6 +5702,28 @@ void verifySamplerLimits() {
     RecompileResult decoded;
     require(ShaderDiskCache::DecodeResult(encoded, decoded) && decoded.directHeap && decoded.directSlotCount == heap.result->directSlotCount && decoded.directSlotDword == heap.result->directSlotDword, "heap mode: the disk cache does not keep the slot count and dword");
     std::cout << "heap mode: 20 direct samplers and 3 images read " << heap.result->directSlotCount << " heap slots (the default binds " << defaultElements << " elements) from shader data dword " << heap.result->directSlotDword << "; no per-draw image or sampler bindings\n";
+#if defined(ANYPS5_UNIFIED)
+    const auto source = PrepareShader(heapRequest);
+    require(source != nullptr && source->artifact != nullptr, "heap mode: the compiled variant is not reachable for slot requests");
+    std::vector<AgcDriver::Unified::Heap::SlotRequest> requests;
+    AgcDriver::Unified::Heap::SlotStatistics statistics;
+    std::string reason;
+    require(AgcDriver::Unified::Heap::BuildSlotRequests(source->artifact->info, heap.capture->snapshot, requests, statistics, reason, true), ("heap mode: slot requests failed: " + reason).c_str());
+    require(requests.size() == heap.result->directSlotCount, "heap mode: one slot request per heap slot");
+    std::uint32_t samplerRequests = 0;
+    std::uint32_t pointRequests = 0;
+    std::uint32_t activeImages = 0;
+    for (const auto& request : requests) {
+        if ((request.flags & AgcDriver::Unified::Heap::RequestFlag::Sampler) != 0u) {
+            samplerRequests++;
+            if ((request.flags & AgcDriver::Unified::Heap::RequestFlag::Point) != 0u) pointRequests++;
+        } else if ((request.flags & AgcDriver::Unified::Heap::RequestFlag::Inactive) == 0u) {
+            activeImages++;
+        }
+    }
+    require(samplerRequests == Direct * 2u && pointRequests == Direct && activeImages == 3u, ("heap mode: slot requests hold " + std::to_string(samplerRequests) + " sampler elements (" + std::to_string(pointRequests) + " point) and " + std::to_string(activeImages) + " active images, expected 40 (20) and 3").c_str());
+    std::cout << "heap mode: " << requests.size() << " slot requests: 40 sampler elements, half point filtered, 3 active images and " << statistics.inactiveImages << " inactive\n";
+#endif
 
     constexpr std::uint32_t TableDirect = 18u;
     std::vector<std::pair<std::uint32_t, std::uint32_t>> tablePairs;

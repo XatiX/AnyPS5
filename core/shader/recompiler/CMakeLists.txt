@@ -269,6 +269,9 @@ function(add_shader_recompiler target runtimeTarget)
             DebugProbeActive
             DecodeRdnaInstruction
             DepthBitsTextureWidth
+            DescriptorBindingForImage
+            ImageBindingResourceClass
+            ResourceMaterializer::RuntimeImageMode
             ExactF32Arithmetic
             HashBytes
             LayoutBarycentricEmulation

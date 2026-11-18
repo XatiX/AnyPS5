@@ -8,6 +8,9 @@ add_test_executable(agc_shader_memory_tests EXCLUDE_FROM_ALL
         Graphics/src/RuntimeSwitches.cpp
         Graphics/src/TextureFormat.cpp
 )
+if(ANYPS5_GPU_BACKEND STREQUAL "unified")
+    target_sources(agc_shader_memory_tests PRIVATE Unified/src/SlotRequests.cpp)
+endif()
 target_include_directories(agc_shader_memory_tests PRIVATE ${LIBS_INCLUDE_DIR} ${ANYPS5_VULKAN_HEADERS_INCLUDE_DIR})
 target_link_libraries(agc_shader_memory_tests PRIVATE shader_recompiler_agc_driver libc)
 set_target_properties(agc_shader_memory_tests PROPERTIES CXX_EXTENSIONS OFF)
