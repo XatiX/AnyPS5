@@ -99,6 +99,13 @@ void Driver::wakeQueueZeroForCompletions() {
     changed.notify_all();
 }
 
+void Driver::wakeQueueZeroForIdleResults() {
+    if (!queue0Dormant.load(std::memory_order_seq_cst)) return;
+    std::lock_guard lock(mutex);
+    idleEpoch.fetch_add(1, std::memory_order_release);
+    changed.notify_all();
+}
+
 std::uint64_t Driver::submitFlipWork(std::uint32_t queue) {
     GuestMemory::TagGpuLockSite(GuestMemory::GpuLockSite::End);
     std::lock_guard gpuLock(GuestMemory::GpuMutex());
@@ -246,7 +253,13 @@ void Driver::run(std::uint32_t id) noexcept {
                         if (ready()) break;
                         if (id == 0 && allQueuesIdle() && !completionsPending()
                             && ((idleStore && !storeIdleResults && Graphics::StorageTexture::AnyPending()) || idleEpoch.load(std::memory_order_acquire) != idleEpochAtCheck)) continue;
-                        if (id == 0) queue0Dormant.store(true, std::memory_order_relaxed);
+                        if (id == 0) {
+                            queue0Dormant.store(true, std::memory_order_seq_cst);
+                            if (idleStore && !storeIdleResults && Graphics::StorageTexture::AnyPending() && allQueuesIdle() && !completionsPending()) {
+                                queue0Dormant.store(false, std::memory_order_relaxed);
+                                continue;
+                            }
+                        }
                         const auto idleEpochAtWait = idleEpoch.load(std::memory_order_acquire);
                         changed.wait(lock, [&] { return ready() || (id == 0 && (idleEpoch.load(std::memory_order_acquire) != idleEpochAtWait || completionsPending())); });
                         if (id == 0) queue0Dormant.store(false, std::memory_order_relaxed);

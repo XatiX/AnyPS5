@@ -29,8 +29,9 @@ namespace {
 
 bool DispatchItemsEnabled() {
     static const bool enabled = [] {
+        if (std::getenv("APS5_NO_PIPELINE_DISPATCH") != nullptr) return false;
         const char* text = std::getenv("APS5_PIPELINE_DISPATCH");
-        return text != nullptr && text[0] != '\0' && text[0] != '0';
+        return text == nullptr || (text[0] != '\0' && text[0] != '0');
     }();
     return enabled;
 }
@@ -45,7 +46,11 @@ std::atomic<std::uint64_t> itemRecipeLess{0};
 std::atomic<std::uint64_t> itemNotPlain{0};
 
 bool DispatchMissItemsEnabled() {
-    return Graphics::RuntimeSwitches::Set(Graphics::RuntimeSwitch::PipelineDispatchMisses);
+    return !Graphics::RuntimeSwitches::Set(Graphics::RuntimeSwitch::NoPipelineDispatchMisses);
+}
+
+bool ItemWritesMapped(std::span<const DrawPipeline::Range> writes) {
+    return std::all_of(writes.begin(), writes.end(), [](const DrawPipeline::Range& range) { return range.first < range.second && GuestMemory::Accessible(reinterpret_cast<const void*>(range.first), 1, true); });
 }
 
 void NoteItemFallback(ItemFallback reason) {
@@ -391,6 +396,7 @@ void Driver::dispatch(QueueState& queue, std::span<const std::uint32_t> packet, 
         if (cached && keepVariant != nullptr && keepVariant->recipe.load(std::memory_order_acquire) != nullptr) {
             bool bounded = false;
             itemWrites = DispatchWriteRanges(*compiledResult, bounded);
+            bounded = bounded && ItemWritesMapped(itemWrites);
             pipelined = bounded;
             if (!bounded) NoteItemFallback(ItemFallback::Writes);
         } else if (queueMisses && cached && keepVariant != nullptr) {
@@ -576,6 +582,7 @@ void Driver::dispatch(QueueState& queue, std::span<const std::uint32_t> packet, 
         if (queued) {
             bool bounded = false;
             itemWrites = DispatchWriteRanges(*compiledResult, bounded);
+            bounded = bounded && ItemWritesMapped(itemWrites);
             pipelined = bounded;
             if (!bounded) NoteItemFallback(ItemFallback::Writes);
         }
@@ -644,6 +651,7 @@ void Driver::dispatch(QueueState& queue, std::span<const std::uint32_t> packet, 
                 std::snprintf(where, sizeof(where), "compute shader 0x%llx: ", static_cast<unsigned long long>(address));
                 throw std::runtime_error(where + std::string(error.what()));
             }
+            wakeQueueZeroForIdleResults();
         }, std::move(itemWrites));
         ReportDispatchItems(profile);
         return;
