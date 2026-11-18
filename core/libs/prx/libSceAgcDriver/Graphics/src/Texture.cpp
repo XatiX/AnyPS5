@@ -6372,7 +6372,7 @@ void StorageTexture::BumpPendingSerial() {
 
 void StorageTexture::notePendingChange() const {
 #if ANYPS5_UNIFIED
-    AgcDriver::Unified::Events::Shared().Note(descriptor.baseAddress, guestBytes, reinterpret_cast<std::uintptr_t>(this));
+    AgcDriver::Unified::Events::NoteImage(descriptor.baseAddress, guestBytes, reinterpret_cast<std::uintptr_t>(this));
 #endif
 }
 
@@ -6447,7 +6447,7 @@ std::size_t StorageTexture::DiscardPendingInside(std::uint64_t address, std::siz
     if (discarded != 0) {
         BumpPendingSerial();
 #if ANYPS5_UNIFIED
-        AgcDriver::Unified::Events::Shared().Note(address, bytes);
+        AgcDriver::Unified::Events::NoteImage(address, bytes);
 #endif
     }
     return discarded;
@@ -6654,6 +6654,9 @@ bool StorageTexture::clearByKeysFill(DccKeys keys, std::uint8_t key) {
 }
 
 bool StorageTexture::FillClear(std::span<const std::uint32_t, 4> pattern, std::uint32_t layer, const char*& refusal, bool allowRegisterClear) {
+#if ANYPS5_UNIFIED
+    const AgcDriver::Unified::Events::StoreOwner storeOwner(reinterpret_cast<std::uintptr_t>(this));
+#endif
     // Debug aid (APS5_TRACE_FILL_COVER=1): the first layer covers refused, with the surface, the
     // pattern and the generation the refusal was memoized at (ClassifyFill's layerRefusedGeneration).
     static const bool trace = std::getenv("APS5_TRACE_FILL_COVER") != nullptr;
@@ -6855,6 +6858,9 @@ const char* StorageTexture::CopyRefusal(const Context& context, const StorageTex
 }
 
 bool StorageTexture::CopyFrom(StorageTexture& source, const char*& refusal) {
+#if ANYPS5_UNIFIED
+    const AgcDriver::Unified::Events::StoreOwner storeOwner(reinterpret_cast<std::uintptr_t>(this));
+#endif
     refusal = CopyRefusal(context, this, source, descriptor.baseAddress);
     if (refusal != nullptr) return false;
     auto* recorder = Recorder::Active();
@@ -7383,6 +7389,9 @@ void StorageTexture::storeTrappedOverlaps(const char* reason) {
 }
 
 void StorageTexture::writeBack(std::uint64_t address, std::size_t bytes) {
+#if ANYPS5_UNIFIED
+    const AgcDriver::Unified::Events::StoreOwner storeOwner(reinterpret_cast<std::uintptr_t>(this));
+#endif
     if (readTrapped.load(std::memory_order_acquire)) {
         address = descriptor.baseAddress;
         bytes = static_cast<std::size_t>(guestBytes);
@@ -7453,6 +7462,9 @@ bool StorageTexture::cpuLeftUnchanged(std::uint32_t layer, std::uint64_t from, s
 }
 
 void StorageTexture::writeBackLayers(const std::vector<bool>& layers) {
+#if ANYPS5_UNIFIED
+    const AgcDriver::Unified::Events::StoreOwner storeOwner(reinterpret_cast<std::uintptr_t>(this));
+#endif
     CaptureTrace::Log("writeback image=%llx generation=%llu reason=%s units=%zu", static_cast<unsigned long long>(descriptor.baseAddress), static_cast<unsigned long long>(generation), flushReason, static_cast<std::size_t>(std::count(layers.begin(), layers.end(), true)));
     static const bool profile = std::getenv("APS5_PROFILE_DRAW") != nullptr;
     PhaseTimer timer;
@@ -8006,7 +8018,7 @@ StorageTexture::~StorageTexture() {
             pending.textures.remove(this);
             BumpPendingSerial();
 #if ANYPS5_UNIFIED
-            AgcDriver::Unified::Events::Shared().Note(descriptor.baseAddress, guestBytes);
+            AgcDriver::Unified::Events::NoteImage(descriptor.baseAddress, guestBytes);
 #endif
             static std::atomic<int> reports{0};
             if (reports.fetch_add(1) < 4) std::fprintf(stderr, "[gpu] storage image 0x%llx destroyed with GPU results pending\n", static_cast<unsigned long long>(descriptor.baseAddress));

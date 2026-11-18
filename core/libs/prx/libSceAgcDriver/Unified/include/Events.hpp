@@ -13,7 +13,7 @@
 namespace AgcDriver::Unified::Events {
 
 inline constexpr std::uint64_t BucketBytes = 0x10000;
-inline constexpr std::size_t BucketCount = std::size_t{1} << 16u;
+inline constexpr std::size_t BucketCount = std::size_t{1} << 18u;
 inline constexpr std::uint64_t RegionBytes = 0x400000;
 inline constexpr std::size_t RegionCount = std::size_t{1} << 12u;
 inline constexpr std::size_t WriterStripes = 256;
@@ -63,7 +63,20 @@ private:
 };
 
 ChangeLog& Shared();
+ChangeLog& Images();
+void NoteImage(std::uint64_t address, std::uint64_t bytes, std::uintptr_t owner = 0);
 std::uint64_t ThreadNotes();
+
+class StoreOwner {
+public:
+    explicit StoreOwner(std::uintptr_t owner);
+    ~StoreOwner();
+    StoreOwner(const StoreOwner&) = delete;
+    StoreOwner& operator=(const StoreOwner&) = delete;
+
+private:
+    std::uintptr_t previous;
+};
 void NoteRanges(std::span<const std::pair<std::uint64_t, std::uint64_t>> ranges, std::uintptr_t owner = 0);
 
 }

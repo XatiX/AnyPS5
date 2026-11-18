@@ -15,13 +15,16 @@ enum Outcome : std::size_t {
 
 }
 
-Miss Verdict(const Events::ChangeLog& log, const Stamp& last, const Guards& now, bool cpuWriters, bool registered, std::span<const Span> spans, bool* exempted) {
+Miss Verdict(const Events::ChangeLog& log, const Events::ChangeLog& images, const Stamp& last, const Guards& now, bool cpuWriters, bool registered, std::span<const Span> spans, bool* exempted, const Span** changed) {
     if (!last.valid) return Miss::NoStamp;
     if (!registered) return Miss::Unregistered;
     if (last.guards != now) return Miss::Guard;
     if (cpuWriters) return Miss::CpuWrites;
     for (const auto& span : spans) {
-        if (log.ChangedSince(span.begin, span.end - span.begin, last.serial, span.owner, exempted)) return Miss::Range;
+        const bool inPlace = ReadInPlace(span.kind);
+        if (!(inPlace ? images : log).ChangedSince(span.begin, span.end - span.begin, inPlace ? last.imageSerial : last.serial, span.owner, exempted)) continue;
+        if (changed != nullptr) *changed = &span;
+        return Miss::Range;
     }
     return Miss::None;
 }
@@ -53,6 +56,7 @@ VerdictCounts Tally::Counts() const {
     VerdictCounts counts;
     for (std::size_t i = 0; i < GuardCount; ++i) counts.guardMoves[i] = guardMoves[i].load(std::memory_order_relaxed);
     counts.workSeen = workSeen.load(std::memory_order_relaxed);
+    for (std::size_t i = 0; i < rangeKinds.size(); ++i) counts.rangeKinds[i] = rangeKinds[i].load(std::memory_order_relaxed);
     counts.shortcuts = shortcuts.load(std::memory_order_relaxed);
     counts.shortcutFallbacks = shortcutFallbacks.load(std::memory_order_relaxed);
     for (std::size_t exempt = 0; exempt < 2; ++exempt) {
@@ -102,7 +106,11 @@ std::string VerdictLine() {
     std::snprintf(paths, sizeof(paths), "[recode-proof] agreed by existing path (clean/own exempt): fast %llu/%llu, own refreshed %llu/%llu, full %llu/%llu; clean agreements whose own proof noted changes over the spans %llu; shortcuts %llu, tail fallbacks %llu\n",
         static_cast<unsigned long long>(by[0][0]), static_cast<unsigned long long>(by[1][0]), static_cast<unsigned long long>(by[0][1]), static_cast<unsigned long long>(by[1][1]), static_cast<unsigned long long>(by[0][2]), static_cast<unsigned long long>(by[1][2]),
         static_cast<unsigned long long>(counts.workSeen), static_cast<unsigned long long>(counts.shortcuts), static_cast<unsigned long long>(counts.shortcutFallbacks));
-    return std::string(line) + paths;
+    const auto& kinds = counts.rangeKinds;
+    char ranges[256];
+    std::snprintf(ranges, sizeof(ranges), "[recode-proof] range refusals of proved objects by span: storage %llu, view %llu, snapshot %llu, keys %llu, direct %llu, written %llu, buffer %llu\n",
+        static_cast<unsigned long long>(kinds[0]), static_cast<unsigned long long>(kinds[1]), static_cast<unsigned long long>(kinds[2]), static_cast<unsigned long long>(kinds[3]), static_cast<unsigned long long>(kinds[4]), static_cast<unsigned long long>(kinds[5]), static_cast<unsigned long long>(kinds[6]));
+    return std::string(line) + paths + ranges;
 }
 
 }

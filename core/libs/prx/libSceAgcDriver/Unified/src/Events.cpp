@@ -102,10 +102,20 @@ ChangeLogCounts ChangeLog::Counts() const {
 
 namespace {
 
+thread_local std::uintptr_t storeOwner = 0;
+
 void noteStore(std::uint64_t address, std::uint64_t bytes) {
-    Shared().Note(address, bytes);
+    Shared().Note(address, bytes, storeOwner);
 }
 
+}
+
+StoreOwner::StoreOwner(std::uintptr_t owner) : previous(storeOwner) {
+    storeOwner = owner;
+}
+
+StoreOwner::~StoreOwner() {
+    storeOwner = previous;
 }
 
 ChangeLog& Shared() {
@@ -115,6 +125,16 @@ ChangeLog& Shared() {
         return created;
     }();
     return log;
+}
+
+ChangeLog& Images() {
+    static ChangeLog& log = *new ChangeLog();
+    return log;
+}
+
+void NoteImage(std::uint64_t address, std::uint64_t bytes, std::uintptr_t owner) {
+    Shared().Note(address, bytes, owner);
+    Images().Note(address, bytes, owner);
 }
 
 void NoteRanges(std::span<const std::pair<std::uint64_t, std::uint64_t>> ranges, std::uintptr_t owner) {

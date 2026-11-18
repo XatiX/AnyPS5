@@ -50,7 +50,7 @@ std::shared_ptr<Texture> TextureCache::Get(std::span<const std::uint32_t> words,
     auto texture = std::make_shared<Texture>(context, *context.detiler, resource, components, snapshot);
     const auto retained = snapshot.size() + texture->AllocationBytes();
 #if ANYPS5_UNIFIED
-    AgcDriver::Unified::Events::Shared().Note(resource.baseAddress, bytes);
+    AgcDriver::Unified::Events::NoteImage(resource.baseAddress, bytes);
 #endif
     entries.push_back({key, std::move(snapshot), texture});
     retainedBytes += retained;

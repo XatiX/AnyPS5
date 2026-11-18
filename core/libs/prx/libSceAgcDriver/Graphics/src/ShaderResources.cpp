@@ -268,7 +268,7 @@ UncachedImages& Uncached() {
 
 void noteImageSetChange(std::uint64_t address, std::uint64_t bytes) {
 #if ANYPS5_UNIFIED
-    AgcDriver::Unified::Events::Shared().Note(address, bytes);
+    AgcDriver::Unified::Events::NoteImage(address, bytes);
 #else
     static_cast<void>(address);
     static_cast<void>(bytes);
@@ -4525,43 +4525,70 @@ ShaderResources::IndexOutcome ShaderResources::indexRevalidate(std::span<const C
 
 #if ANYPS5_UNIFIED
 void ShaderResources::registerProofSpans() {
-    const auto ranges = ProofRanges();
-    proofRangesRegistered = Unified::Shadow::NoteProofRanges(ranges);
+    using Kind = Unified::Proof::SpanKind;
+    proofRangesRegistered = Unified::Shadow::NoteProofRanges(ProofRanges());
     proofSpans.clear();
-    std::vector<std::pair<std::uint64_t, std::uint64_t>> owned;
+    std::vector<std::pair<std::uint64_t, std::uint64_t>> covered;
+    const auto add = [&](std::uint64_t address, std::uint64_t bytes, std::uintptr_t owner, Kind kind) {
+        if (address == 0 || bytes == 0) return;
+        proofSpans.push_back({address, address + bytes, owner, kind});
+        covered.emplace_back(address, address + bytes);
+    };
     for (const auto& image : storageTextures) {
         if (image == nullptr) continue;
-        const auto begin = image->Descriptor().baseAddress;
-        const auto end = begin + image->GuestBytes();
-        if (begin == 0 || end <= begin) continue;
-        proofSpans.push_back({begin, end, reinterpret_cast<std::uintptr_t>(image.get())});
-        owned.emplace_back(begin, end);
+        const auto& own = image->Descriptor();
+        add(own.baseAddress, image->GuestBytes(), reinterpret_cast<std::uintptr_t>(image.get()), Kind::Storage);
+        if (own.dccAddress != 0) add(own.dccAddress, DccKeyBytes(image->GuestBytes()), 0, Kind::Keys);
     }
-    std::sort(owned.begin(), owned.end());
-    auto written = guestMemory.Writes();
-    std::sort(written.begin(), written.end());
-    for (const auto& range : ranges) {
-        if (std::binary_search(owned.begin(), owned.end(), range)) continue;
-        const bool own = std::binary_search(written.begin(), written.end(), range);
-        proofSpans.push_back({range.first, range.second, own ? reinterpret_cast<std::uintptr_t>(this) : 0});
+    for (const auto& surface : validatedTextures) {
+        const auto& resource = surface.resource;
+        add(resource.baseAddress, surface.bytes, reinterpret_cast<std::uintptr_t>(surface.source), surface.source != nullptr ? Kind::View : Kind::Snapshot);
+        if (resource.dccAddress != 0) add(resource.dccAddress, DccKeyBytes(surface.bytes), 0, Kind::Keys);
     }
+    const auto unowned = covered;
+    const auto known = [&](std::uint64_t address, std::uint64_t bytes) {
+        return std::find(unowned.begin(), unowned.end(), std::pair{address, address + bytes}) != unowned.end();
+    };
+    for (const auto& range : describedRanges) {
+        if (!known(range.address, range.bytes)) add(range.address, range.bytes, 0, Kind::Snapshot);
+        if (range.dccAddress != 0 && !known(range.dccAddress, DccKeyBytes(range.bytes))) add(range.dccAddress, DccKeyBytes(range.bytes), 0, Kind::Keys);
+    }
+    for (const auto& region : directRegions) add(region.begin, region.end - region.begin, 0, Kind::Direct);
+    const auto& written = guestMemory.Writes();
+    for (const auto& [begin, end] : written) {
+        if (end > begin) add(begin, end - begin, reinterpret_cast<std::uintptr_t>(this), Kind::Written);
+    }
+    const auto ownWrite = [&](std::uint64_t begin, std::uint64_t end) {
+        return std::find(written.begin(), written.end(), std::pair{begin, end}) != written.end();
+    };
+    for (const auto& allocation : allocations) {
+        if (allocation.guest && !ownWrite(allocation.address, allocation.address + allocation.size)) add(allocation.address, allocation.size, 0, Kind::Buffer);
+    }
+    for (const auto& [begin, end] : guestMemory.DeviceReads()) {
+        if (end > begin && !ownWrite(begin, end)) add(begin, end - begin, 0, Kind::Buffer);
+    }
+    std::sort(proofSpans.begin(), proofSpans.end(), [](const auto& left, const auto& right) { return std::tie(left.begin, left.end, left.owner) < std::tie(right.begin, right.end, right.owner); });
+    proofSpans.erase(std::unique(proofSpans.begin(), proofSpans.end(), [](const auto& left, const auto& right) { return left.begin == right.begin && left.end == right.end && left.owner == right.owner; }), proofSpans.end());
     proofStamp = {};
 }
 
 bool ShaderResources::revalidateVerified(std::span<const CompiledShader> shaders, ProofReport* report) {
     const auto& log = Unified::Events::Shared();
     const auto serial = log.Serial();
+    const auto& images = Unified::Events::Images();
+    const auto imageSerial = images.Serial();
     const Unified::Proof::Guards guards{{0, DepthSurfacesSerial(), MultisampleClaimSerial(), RetiredImportSerial(), HostImportSetGeneration()}};
     const bool cpuWriters = (AnyPendingCpuWrites(context) && std::any_of(proofSpans.begin(), proofSpans.end(), [&](const Unified::Proof::Span& span) { return PendingCpuWritesOverlap(context, span.begin, static_cast<std::size_t>(span.end - span.begin)); }));
     bool exempted = false;
-    const auto miss = Unified::Proof::Verdict(log, proofStamp, guards, cpuWriters, proofRangesRegistered, proofSpans, &exempted);
+    const Unified::Proof::Span* changed = nullptr;
+    const auto miss = Unified::Proof::Verdict(log, images, proofStamp, guards, cpuWriters, proofRangesRegistered, proofSpans, &exempted, &changed);
     auto& tally = Unified::Proof::SharedTally();
-    const bool clean = miss == Unified::Proof::Miss::None && !exempted && lastProofFast;
+    const bool clean = miss == Unified::Proof::Miss::None && lastProofFast;
     if (clean && Unified::Proof::ShortcutActive() && registeredImageViewsCurrent(registeredImageViews)) {
         const bool tail = provedByLog(report);
         tally.CountShortcut(tail);
         if (tail) {
-            proofStamp = {serial, guards, true};
+            proofStamp = {serial, imageSerial, guards, true};
             return true;
         }
     }
@@ -4573,10 +4600,11 @@ bool ShaderResources::revalidateVerified(std::span<const CompiledShader> shaders
     tally.Count(miss, ok);
     if (miss == Unified::Proof::Miss::None && ok) {
         tally.CountAgreed(static_cast<std::size_t>(proof.path), exempted);
-        if (clean && noted && Unified::Proof::Verdict(log, {serial, guards, true}, guards, false, true, proofSpans) != Unified::Proof::Miss::None) tally.CountWorkSeen();
+        if (clean && noted) tally.CountWorkSeen();
     }
     if (miss == Unified::Proof::Miss::Guard && ok) tally.CountGuards(proofStamp.guards, guards);
-    proofStamp = {serial, guards, ok};
+    if (miss == Unified::Proof::Miss::Range && ok && changed != nullptr) tally.CountRangeKind(changed->kind);
+    proofStamp = {serial, imageSerial, guards, ok};
     lastProofFast = ok && proof.path == ProofPath::Fast;
     return ok;
 }

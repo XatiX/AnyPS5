@@ -64,7 +64,7 @@ void testAliasingIsConservative() {
     log.Note(alias, 0x10);
     Expect(log.ChangedSince(alias, 0x10, stamp), "the written address itself is changed");
     Expect(log.ChangedSince(Base, 0x10, stamp), "an address sharing the written bucket and region reads as changed, never as unchanged");
-    Expect(!log.ChangedSince(Base + BucketBytes * BucketCount, 0x10, stamp), "an address sharing only the bucket is still answered by its quiet region");
+    Expect(!log.ChangedSince(alias + BucketBytes, 0x10, stamp), "another bucket of the written region is unchanged");
     Expect(log.ChangedSince(Base, BucketBytes * (BucketCount + 1), stamp), "a range wider than the table is changed whenever anything moved");
 }
 
