@@ -42,6 +42,9 @@ namespace {
 
 std::atomic<void (*)(std::uintptr_t, std::size_t)> hostWriteHook{nullptr};
 std::atomic<void (*)(std::uintptr_t, std::size_t)> gpuHostWriteHook{nullptr};
+#ifdef _WIN32
+std::atomic<std::uint8_t* (*)(std::uintptr_t, std::size_t)> viewResolver{nullptr};
+#endif
 
 std::atomic<void (*)(std::uintptr_t, std::size_t)> hostReadHook{nullptr};
 
@@ -1046,6 +1049,17 @@ void GuestArenaPrepareHostRead_nid_no_patch(const void* pointer, std::size_t byt
     if (address == 0 || bytes == 0 || bytes > std::numeric_limits<std::uintptr_t>::max() - address) return;
     if (const auto hook = hostReadHook.load(std::memory_order_acquire)) hook(address, bytes);
 }
+
+#ifdef _WIN32
+void GuestArenaSetViewResolver_nid_no_patch(std::uint8_t* (*resolver)(std::uintptr_t address, std::size_t bytes)) {
+    viewResolver.store(resolver, std::memory_order_release);
+}
+
+std::uint8_t* GuestArenaViewAddress_nid_no_patch(std::uintptr_t address, std::size_t bytes) {
+    const auto resolver = viewResolver.load(std::memory_order_acquire);
+    return resolver != nullptr && bytes != 0 ? resolver(address, bytes) : nullptr;
+}
+#endif
 
 void GuestArenaSetGpuHostWriteHook_nid_no_patch(void (*hook)(std::uintptr_t address, std::size_t bytes)) {
     gpuHostWriteHook.store(hook, std::memory_order_release);

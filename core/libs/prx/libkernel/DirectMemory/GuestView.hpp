@@ -32,6 +32,7 @@ public:
     std::uint8_t* DirectAddress(std::uint64_t physical) const { return view + guestBytes + physical; }
     HANDLE Chunk(std::uintptr_t guest, std::uint64_t* offset);
     void MarkUsed(std::uintptr_t guest, std::size_t bytes);
+    bool Mapped(std::uintptr_t guest, std::size_t bytes) const;
     void Discard(std::uintptr_t guest, std::size_t bytes);
     void MapDirect(HANDLE section, std::uint64_t physical, std::size_t bytes);
     void UnmapDirect(HANDLE section, std::uint64_t physical, std::size_t bytes);

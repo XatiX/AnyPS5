@@ -3599,7 +3599,7 @@ VulkanDevice::CopyOutcome VulkanDevice::CopyBuffer(std::uint64_t destination, st
         // outstanding on the range) and nothing recorded.
         std::vector<std::byte> expected;
         if (verify) expected.assign(reinterpret_cast<const std::byte*>(source), reinterpret_cast<const std::byte*>(source) + bytes);
-        GuestMemory::StoreOwnBytes(destination, bytes, [&] { std::memcpy(reinterpret_cast<void*>(destination), reinterpret_cast<const void*>(source), bytes); });
+        GuestMemory::StoreOwnBytes(destination, bytes, [&] { std::memcpy(GuestMemory::OwnStoreTarget(destination, bytes), reinterpret_cast<const void*>(source), bytes); });
         outcome.path = 0;
         outcome.sourceSettledBySignal = settledBySignal;
         if (verify) {

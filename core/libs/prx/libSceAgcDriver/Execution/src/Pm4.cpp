@@ -1220,7 +1220,7 @@ void Execute(std::span<const std::uint32_t> packet, QueueState& queue) {
         case 0x39: {
             const auto semaphore = address(packet[1], packet[2]);
             auto* word = reinterpret_cast<std::uint64_t*>(semaphore);
-            std::atomic_ref<std::uint64_t> shared(*word);
+            std::atomic_ref<std::uint64_t> shared(*static_cast<std::uint64_t*>(GuestMemory::OwnStoreTarget(semaphore, sizeof(*word))));
             const auto prepare = [&] {
                 GuestMemory::GuardRead(semaphore, sizeof(*word));
                 GuestMemory::FlushGpuWrites(semaphore, sizeof(*word));

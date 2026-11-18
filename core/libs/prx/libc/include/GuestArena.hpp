@@ -87,6 +87,8 @@ void GuestArenaForgetSection_nid_postfix(void* section);
 bool GuestArenaBeginHostImport_nid_no_patch(void* pointer, std::size_t bytes);
 void GuestArenaEndHostImport_nid_no_patch(void* pointer, std::size_t bytes);
 bool GuestArenaForgetReusableSection_nid_no_patch(void* section);
+void GuestArenaSetViewResolver_nid_no_patch(std::uint8_t* (*resolver)(std::uintptr_t address, std::size_t bytes));
+std::uint8_t* GuestArenaViewAddress_nid_no_patch(std::uintptr_t address, std::size_t bytes);
 #else
 void GuestArenaSetSharedBacking_nid_postfix(SharedBackingResolver resolver);
 void GuestArenaSetSharedBackingWriter_nid_no_patch(SharedBackingWriter writer);
