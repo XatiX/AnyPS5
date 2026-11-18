@@ -28,7 +28,7 @@ class Front {
 public:
     using Consumer = std::function<void(const Operation&)>;
 
-    explicit Front(Consumer consumer = {}, bool resolve = false);
+    explicit Front(Consumer consumer = {}, bool resolve = false, UseSink uses = {});
     ~Front();
     Front(const Front&) = delete;
     Front& operator=(const Front&) = delete;
@@ -47,6 +47,7 @@ private:
 
     Consumer consumer;
     bool resolve;
+    UseSink uses;
     Order order;
     std::mutex lanesMutex;
     std::map<std::uint32_t, std::unique_ptr<Lane>> lanes;

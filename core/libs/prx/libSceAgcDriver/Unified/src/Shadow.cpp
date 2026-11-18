@@ -6,15 +6,29 @@
 #include <chrono>
 #include <cstdio>
 #include <cstdlib>
+#include <cstring>
 #include <mutex>
+#include <set>
+#include <span>
+#include <utility>
 #include <string>
 
 namespace AgcDriver::Unified::Shadow {
 
 namespace {
 
+bool drawScope() {
+    static const bool scoped = [] {
+        const char* value = std::getenv("APS5_RECODE_MEMORY");
+        return value != nullptr && std::strcmp(value, "draws") == 0;
+    }();
+    return scoped;
+}
+
+void registerUses(std::span<const GuestUse> uses);
+
 Front& front() {
-    static Front& shared = *new Front({}, std::getenv("APS5_RECODE_RESOLVE") != nullptr);
+    static Front& shared = *new Front({}, std::getenv("APS5_RECODE_RESOLVE") != nullptr || drawScope(), drawScope() ? UseSink(registerUses) : UseSink());
     return shared;
 }
 
@@ -48,6 +62,24 @@ bool memoryInstalled() {
         return ok;
     }();
     return installed;
+}
+
+void registerUses(std::span<const GuestUse> uses) {
+    if (!memoryInstalled()) return;
+    static std::mutex seenMutex;
+    static std::set<std::pair<std::uint64_t, std::uint64_t>>& seen = *new std::set<std::pair<std::uint64_t, std::uint64_t>>();
+    auto& totals = memoryTotals();
+    for (const auto& use : uses) {
+        const auto first = use.address & ~(PageBytes - 1);
+        const auto last = (use.address + use.size + PageBytes - 1) & ~(PageBytes - 1);
+        {
+            std::lock_guard lock(seenMutex);
+            if (!seen.emplace(first, last).second) continue;
+        }
+        MemoryCore::Get().Register(first, last - first);
+        totals.registrations.fetch_add(1, std::memory_order_relaxed);
+        totals.registeredBytes.fetch_add(last - first, std::memory_order_relaxed);
+    }
 }
 
 void consumeMemory() {
@@ -136,7 +168,7 @@ bool MemoryActive() {
 }
 
 void NoteGpuMapping(const GuestAllocations::Mapped& ranges) {
-    if (!MemoryActive() || !memoryInstalled()) return;
+    if (!MemoryActive() || drawScope() || !memoryInstalled()) return;
     auto& totals = memoryTotals();
     for (const auto& weak : ranges) {
         const auto range = weak.lock();
@@ -167,7 +199,7 @@ void Tee(const DriverDetail::Submission& submission) {
         consumeMemory();
         if (!submission.flips.empty() && memoryInstalled()) MemoryCore::Get().AdvanceFrame();
     }
-    if (Active()) front().Push(Copy(submission));
+    if (Active() || drawScope()) front().Push(Copy(submission));
     report();
 }
 

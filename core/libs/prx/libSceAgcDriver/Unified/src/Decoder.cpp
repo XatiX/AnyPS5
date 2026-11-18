@@ -226,11 +226,29 @@ private:
             return false;
         }
         ++state.counts.resolved;
+        if (state.uses) reportDrawUses(draw, ids);
         const std::uint64_t address = draw.indirect.has_value() ? draw.indirect->arguments : draw.indexAddress;
         const std::uint64_t size = draw.indirect.has_value() ? draw.indirect->RangeBytes() : draw.indexCount;
         resolvedKey = key;
         emit(kind, address, size, draw.instanceCount | (static_cast<std::uint64_t>(draw.indexSize) << 32u), ids);
         return true;
+    }
+
+    void reportDrawUses(const Pm4::DrawParameters& draw, const SnapshotIds& ids) {
+        auto& buffer = state.useBuffer;
+        buffer.clear();
+        DrawUses(draw, buffer);
+        if (ids.context != state.targetContext) {
+            state.targetContext = ids.context;
+            try {
+                TargetUses(state.state, buffer);
+            } catch (const std::exception&) {
+                ++state.counts.useErrors;
+            }
+        }
+        if (buffer.empty()) return;
+        ++state.counts.useReports;
+        state.uses(buffer);
     }
 
     void dispatch(std::span<const std::uint32_t> packet, std::uint32_t opcode) {
@@ -252,6 +270,11 @@ private:
         const auto ids = snapshot();
         if (direct) emit(OpKind::Dispatch, 0, packet[3], join(packet[1], packet[2]), ids);
         else emit(OpKind::DispatchIndirect, address, 12, 0, ids);
+        if (state.uses && !direct && address != 0) {
+            const GuestUse use{address, 12, false};
+            ++state.counts.useReports;
+            state.uses(std::span(&use, 1));
+        }
         noteDispatch(packet, direct);
     }
 

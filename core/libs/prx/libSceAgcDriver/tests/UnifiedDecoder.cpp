@@ -6,6 +6,7 @@
 #include "prx/libSceAgcDriver/Execution/include/SubmissionCapture.hpp"
 #include "prx/libSceAgcDriver/Execution/include/VideoOutput.hpp"
 #include "../tools/Pm4Analysis.hpp"
+#include <algorithm>
 #include <cstdint>
 #include <filesystem>
 #include <cstdio>
@@ -309,6 +310,27 @@ void testResolveFillsDrawParametersAndKeys() {
     Expect(!unresolved.empty() && !unresolved[0].resolved && plain.Counts().resolved == 0, "without resolve nothing is resolved");
 }
 
+void testUsesReportIndexAndIndirectRanges() {
+    std::vector<std::uint16_t> indices(64, 0);
+    std::vector<std::uint32_t> arguments(4, 1);
+    const auto indexAddress = reinterpret_cast<std::uint64_t>(indices.data());
+    const auto argumentAddress = reinterpret_cast<std::uint64_t>(arguments.data());
+    Stream stream;
+    stream.Add({type3(0x27, 6), 64, static_cast<std::uint32_t>(indexAddress), static_cast<std::uint32_t>(indexAddress >> 32u), 48, 0});
+    stream.Add({type3(0x16, 4), static_cast<std::uint32_t>(argumentAddress), static_cast<std::uint32_t>(argumentAddress >> 32u), 1});
+    DecodeState state(0);
+    state.SetResolve(true);
+    std::vector<GuestUse> seen;
+    state.SetUses([&seen](std::span<const GuestUse> uses) { seen.insert(seen.end(), uses.begin(), uses.end()); });
+    decode(stream, state);
+    const GuestUse index{indexAddress, 96, false};
+    const GuestUse dispatch{argumentAddress, 12, false};
+    Expect(state.Counts().resolveErrors == 0, "the indexed draw resolves");
+    Expect(std::find(seen.begin(), seen.end(), index) != seen.end(), "an indexed draw reports its index range");
+    Expect(std::find(seen.begin(), seen.end(), dispatch) != seen.end(), "an indirect dispatch reports its argument range");
+    Expect(state.Counts().useReports == 2, "one report per operation");
+}
+
 void testConditionalRangesArePredicated() {
     Stream stream;
     const auto condition = stream.Add({type3(0x22, 5), 0x1000, 0x2, 0x0, 3});
@@ -382,6 +404,7 @@ int main() {
     testShadowCopyKeepsWhatTheDecoderReads();
     testReplayMatchesThePacketAnalysis();
     testResolveFillsDrawParametersAndKeys();
+    testUsesReportIndexAndIndirectRanges();
     if (failures != 0) {
         std::fprintf(stderr, "%d failure(s)\n", failures);
         return 1;
