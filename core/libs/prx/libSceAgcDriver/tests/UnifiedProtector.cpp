@@ -112,6 +112,12 @@ void testWriteFaultOpensACleanPage() {
     Expect(core.Pages().StateOf(base + PageBytes) == PageState::CpuDirty, "the written page is dirty");
     const auto second = core.ConsumeDirty();
     Expect(second.size() == 1 && second[0].address == base + PageBytes && second[0].size == PageBytes, "the next consume uploads only the written page");
+    Expect(protectionAt(base + 2 * PageBytes) == PAGE_READONLY, "an untouched page stays armed");
+    core.PrepareHostWrite(base + 2 * PageBytes + 0x10, PageBytes);
+    Expect(protectionAt(base + 2 * PageBytes) == PAGE_READWRITE && protectionAt(base + 3 * PageBytes) == PAGE_READWRITE, "a host write opens every clean page it covers before it runs");
+    Expect(core.Counts().hostWritesOpened == 2, "both pages are counted as opened by the host write");
+    const auto third = core.ConsumeDirty();
+    Expect(third.size() == 1 && third[0].address == base + 2 * PageBytes && third[0].size == 2 * PageBytes, "the pages the host wrote are uploaded at the next consume");
     core.Unregister(base, 4 * PageBytes);
     Expect(protectionAt(base) == PAGE_READWRITE, "unregistering opens the pages");
     release(base);

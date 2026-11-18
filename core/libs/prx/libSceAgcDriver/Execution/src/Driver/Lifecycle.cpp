@@ -19,6 +19,9 @@
 #include "ShaderDiskCache.hpp"
 #include "prx/libc/include/GuestArena.hpp"
 #include "prx/libc/include/GuestWriteWatch.hpp"
+#if ANYPS5_UNIFIED
+#include "prx/libSceAgcDriver/Unified/include/Shadow.hpp"
+#endif
 #include <atomic>
 #include <cstdint>
 #include <cstdio>
@@ -235,6 +238,9 @@ Driver::Driver() {
     }
     GuestArena::GuestArenaSetHostWriteHook_nid_no_patch(&GuestMemory::PrepareHostWrite);
     GuestAllocations::GuestAllocationsSetGpuMapObserver_nid_postfix([](const GuestAllocations::Mapped& ranges, std::uint64_t generation) {
+#if ANYPS5_UNIFIED
+        Unified::Shadow::NoteGpuMapping(ranges);
+#endif
         const auto import = [&] {
             try {
                 const auto current = Driver::Get().device.Load();

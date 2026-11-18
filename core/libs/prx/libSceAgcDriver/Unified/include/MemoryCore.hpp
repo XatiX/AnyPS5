@@ -5,14 +5,17 @@
 #include "prx/libSceAgcDriver/Unified/include/Protector.hpp"
 #include <atomic>
 #include <cstdint>
+#include <mutex>
 #include <vector>
 
 namespace AgcDriver::Unified {
 
 struct MemoryCoreCounts {
     std::uint64_t writesOpened = 0;
+    std::uint64_t hostWritesOpened = 0;
     std::uint64_t gpuOwnedFaults = 0;
     std::uint64_t foreignFaults = 0;
+    std::uint64_t staleFaults = 0;
 };
 
 class MemoryCore {
@@ -26,16 +29,20 @@ public:
     std::vector<DirtyRange> ConsumeDirty();
     void MarkGpuOwned(std::uint64_t address, std::uint64_t size);
     bool HandleFault(std::uint64_t address, bool write);
+    void PrepareHostWrite(std::uint64_t address, std::uint64_t size);
     [[nodiscard]] PageTable& Pages() { return pages; }
     [[nodiscard]] Protector& Protection() { return protector; }
     [[nodiscard]] MemoryCoreCounts Counts() const;
 
 private:
+    std::mutex mutex;
     PageTable pages;
     Protector protector;
     std::atomic<std::uint64_t> writesOpened{0};
+    std::atomic<std::uint64_t> hostWritesOpened{0};
     std::atomic<std::uint64_t> gpuOwnedFaults{0};
     std::atomic<std::uint64_t> foreignFaults{0};
+    std::atomic<std::uint64_t> staleFaults{0};
 };
 
 }
