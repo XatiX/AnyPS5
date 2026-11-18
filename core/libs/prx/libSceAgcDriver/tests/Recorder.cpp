@@ -4794,6 +4794,17 @@ bool carriedShadowTests(const Device& device, Recorder& recorder) {
     Require(GuestBufferMemory::CarriedShadowCopies() == first + 1, "a staged region nobody wrote since its last use was not copied in from that use's device shadow");
     recorder.Sync();
     Require(std::all_of(static_cast<const std::byte*>(block), static_cast<const std::byte*>(block) + bytes, [](std::byte value) { return value == std::byte{0x11}; }), "a carried copy-in changed the guest bytes");
+    const auto afterCompletion = GuestBufferMemory::CarriedShadowCopies();
+    use(recorder);
+    Require(GuestBufferMemory::CarriedShadowCopies() == afterCompletion + 1, "a staged region nobody wrote since its last use was not carried once that use's batch completed");
+    recorder.Sync();
+    const std::array<std::pair<std::uint64_t, std::uint64_t>, 1> later{{{element, element + 4096}}};
+    recorder.NotePendingWrites(later);
+    recorder.Sync();
+    const auto afterLaterWrite = GuestBufferMemory::CarriedShadowCopies();
+    use(recorder);
+    Require(GuestBufferMemory::CarriedShadowCopies() == afterLaterWrite, "a staged region a completed later GPU write overlapped was carried from the older shadow");
+    recorder.Sync();
     use(recorder);
     std::memset(reinterpret_cast<void*>(element + 8192), 0x22, 4096);
     AgcDriver::GuestMemory::BumpCollectEpoch();

@@ -5198,6 +5198,7 @@ bool Recorder::Reap() {
 
 void Recorder::finish(std::unique_ptr<Batch> batch, bool wait, int source, bool releaseNow) {
     inFlightKeptBytes -= batch->keptBytes;
+    GuestBufferMemory::RetireCarriedShadows(context.device, batch->writes, batch->writeNotes);
     // The batch's writes stay published until its completions ran, on every exit path.
     struct Finishing {
         Recorder& recorder;

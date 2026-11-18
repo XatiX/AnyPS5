@@ -7126,7 +7126,14 @@ struct CarriedShadows {
     AgcDriver::Mutex mutex;
     std::map<std::pair<std::uint64_t, std::uint64_t>, CarriedShadow> entries;
     std::uint64_t bytes = 0;
+    std::uint64_t longest = 0;
+    std::atomic<std::size_t> count{0};
 };
+
+bool carriedPastCompletion() {
+    static const bool enabled = std::getenv("APS5_NO_CARRIED_PAST_COMPLETION") == nullptr;
+    return enabled;
+}
 
 CarriedShadows& Carried() {
     static CarriedShadows shadows;
@@ -7144,6 +7151,7 @@ void clearCarriedShadows(VkDevice device) {
         shadows.bytes -= entry->first.second - entry->first.first;
         entry = shadows.entries.erase(entry);
     }
+    shadows.count.store(shadows.entries.size(), std::memory_order_relaxed);
 }
 
 std::shared_ptr<Buffer> takeCarriedShadow(const Context& context, const Recorder& recorder, std::uint64_t begin, std::uint64_t end) {
@@ -7157,9 +7165,12 @@ std::shared_ptr<Buffer> takeCarriedShadow(const Context& context, const Recorder
         shadow = std::move(found->second);
         shadows.bytes -= end - begin;
         shadows.entries.erase(found);
+        shadows.count.store(shadows.entries.size(), std::memory_order_relaxed);
     }
     const auto bytes = static_cast<std::size_t>(end - begin);
-    if (shadow.device != context.device || shadow.recorderId != recorder.Id() || shadow.note == 0 || recorder.NewestWriteNote(begin, bytes) != shadow.note) return nullptr;
+    if (shadow.device != context.device || shadow.recorderId != recorder.Id() || shadow.note == 0) return nullptr;
+    const auto newest = recorder.NewestWriteNote(begin, bytes);
+    if (newest != shadow.note && (newest > shadow.note || !carriedPastCompletion())) return nullptr;
     if (shadow.importSerial == 0 || HostImportSerial(context, begin, bytes, false) != shadow.importSerial) return nullptr;
     static_cast<void>(GuestMemory::CollectWrites(begin, bytes));
     if (!GuestMemory::UnchangedSince(begin, bytes, shadow.generation)) return nullptr;
@@ -7170,6 +7181,26 @@ std::shared_ptr<Buffer> takeCarriedShadow(const Context& context, const Recorder
 
 std::uint64_t GuestBufferMemory::CarriedShadowCopies() {
     return carriedShadowCopies.load(std::memory_order_relaxed);
+}
+
+void GuestBufferMemory::RetireCarriedShadows(VkDevice device, std::span<const std::pair<std::uint64_t, std::uint64_t>> writes, std::span<const std::uint64_t> notes) {
+    auto& shadows = Carried();
+    if (writes.empty() || shadows.count.load(std::memory_order_relaxed) == 0) return;
+    std::lock_guard lock(shadows.mutex);
+    for (std::size_t index = 0; index < writes.size() && !shadows.entries.empty(); ++index) {
+        const auto [begin, end] = writes[index];
+        const auto note = index < notes.size() ? notes[index] : std::numeric_limits<std::uint64_t>::max();
+        auto entry = shadows.entries.lower_bound({begin > shadows.longest ? begin - shadows.longest : 0, 0});
+        while (entry != shadows.entries.end() && entry->first.first < end) {
+            if (entry->first.second > begin && entry->second.device == device && note > entry->second.note) {
+                shadows.bytes -= entry->first.second - entry->first.first;
+                entry = shadows.entries.erase(entry);
+            } else {
+                ++entry;
+            }
+        }
+    }
+    shadows.count.store(shadows.entries.size(), std::memory_order_relaxed);
 }
 
 void GuestBufferMemory::NoteCarriedShadows(const Recorder& recorder) const {
@@ -7186,11 +7217,13 @@ void GuestBufferMemory::NoteCarriedShadows(const Recorder& recorder) const {
         std::lock_guard lock(shadows.mutex);
         auto [entry, inserted] = shadows.entries.try_emplace({region.begin, region.end});
         if (inserted) shadows.bytes += bytes;
+        shadows.longest = std::max(shadows.longest, bytes);
         entry->second = {region.buffer, context.device, recorder.Id(), serial, note, generation};
         if (shadows.entries.size() > CarriedShadows::MaxEntries || shadows.bytes > CarriedShadows::MaxBytes) {
             shadows.entries.clear();
             shadows.bytes = 0;
         }
+        shadows.count.store(shadows.entries.size(), std::memory_order_relaxed);
     }
 }
 
@@ -7264,8 +7297,7 @@ void GuestBufferMemory::recordGpuCopies(std::span<Region* const> copies, bool ad
         }
         recorder->Keep(region->buffer);
         std::shared_ptr<Buffer> carried;
-        if (region->deviceLocal && inputSnapshot == nullptr && !region->sparse && region->mirror == nullptr && region->bufferEnd == 0) carried = takeCarriedShadow(context, *recorder, region->begin, region->end);
-        if (carried != nullptr) {
+        if (region->deviceLocal && inputSnapshot == nullptr && !region->sparse && region->mirror == nullptr && region->bufferEnd == 0) carried = takeCarriedShadow(context, *recorder, region->begin, region->end);        if (carried != nullptr) {
             carriedShadowCopies.fetch_add(1, std::memory_order_relaxed);
             if (carried->Handle() != region->buffer->Handle()) {
                 CopyBuffer(context, commands, carried->Handle(), 0, region->buffer->Handle(), 0, bytes);

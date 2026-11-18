@@ -7626,7 +7626,10 @@ void ShaderResources::MarkGpuWrites(Recorder& recorder) {
     // recorded here after the work: those regions then need no CPU write-back (HasCopiedWrites),
     // and the note and mark below cover them like direct writes.
     if (inRun != nullptr && recorder.RunOpen() && guestMemory.HasGpuCopies()) {
-        recorder.AfterRun([inRun](Recorder& after) { inRun->guestMemory.RecordCopyBacks(after); });
+        recorder.AfterRun([inRun](Recorder& after) {
+            inRun->guestMemory.RecordCopyBacks(after);
+            inRun->guestMemory.NoteCarriedShadows(after);
+        });
         guestMemory.MarkStagedWrites();
     } else {
         guestMemory.RecordCopyBacks(recorder);
