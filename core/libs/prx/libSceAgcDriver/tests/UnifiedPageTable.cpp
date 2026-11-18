@@ -202,7 +202,70 @@ void testBusyPagesListed() {
     Expect(busy.size() == 1 && busy[0] == Base / PageBytes, "the page dirty in three consumes is the one busy page listed");
 }
 
+void collectInto(void* context, std::uintptr_t begin, std::uintptr_t end) {
+    static_cast<std::vector<DirtyRange>*>(context)->push_back({begin, end - begin});
+}
+
+std::vector<DirtyRange> collected(PageTable& table, std::uint64_t address, std::uint64_t size) {
+    std::vector<DirtyRange> runs;
+    table.Collect(address, size, collectInto, &runs);
+    return runs;
+}
+
+void testCollectReportsWritesOnce() {
+    PageTable table;
+    table.Reserve(Base, 8 * PageBytes);
+    Expect(!table.Covers(Base, PageBytes), "reserved pages are not covered");
+    table.MakeResident(Base, 4 * PageBytes);
+    Expect(table.Covers(Base, 4 * PageBytes) && !table.Covers(Base, 5 * PageBytes), "resident pages are covered, reserved ones are not");
+    Expect(collected(table, Base, 4 * PageBytes) == std::vector<DirtyRange>{{Base, 4 * PageBytes}}, "dirty pages are reported");
+    std::vector<ProtectionChange> changes;
+    table.ConsumeDirty(changes);
+    Expect(collected(table, Base, 4 * PageBytes) == std::vector<DirtyRange>{{Base, 4 * PageBytes}}, "pages armed since the last collect are reported once more");
+    Expect(collected(table, Base, 4 * PageBytes).empty(), "clean pages are not reported again");
+    changes.clear();
+    table.HandleWrite(Base + 2 * PageBytes, changes);
+    Expect(collected(table, Base, 4 * PageBytes) == std::vector<DirtyRange>{{Base + 2 * PageBytes, PageBytes}}, "a written page is reported");
+    Expect(collected(table, Base, 4 * PageBytes) == std::vector<DirtyRange>{{Base + 2 * PageBytes, PageBytes}}, "a page still open is reported at every collect");
+    Expect(collected(table, Base + 3 * PageBytes, PageBytes).empty(), "a collect reports only its range");
+    table.ConsumeDirty(changes);
+    static_cast<void>(collected(table, Base, 4 * PageBytes));
+    static_cast<void>(table.MarkGpuOwned(Base, PageBytes));
+    Expect(collected(table, Base, 4 * PageBytes).empty(), "GPU-owned pages are not reported");
+    static_cast<void>(table.Reclaim(Base, PageBytes, false));
+    Expect(collected(table, Base, 4 * PageBytes) == std::vector<DirtyRange>{{Base, PageBytes}}, "a page read back from the GPU is reported once");
+    Expect(collected(table, Base, 4 * PageBytes).empty(), "a read-back page is not reported again");
+}
+
+void testCollectChecksOpenPages() {
+    PageTable table;
+    table.Reserve(Base, 2 * PageBytes);
+    table.MakeResident(Base, 2 * PageBytes);
+    std::vector<std::uint64_t> contents(2, 0);
+    std::vector<std::uint64_t> seen(2, ~0ull);
+    std::vector<bool> provenCalls;
+    const PageTable::WriteCheck changed = [&](std::uint64_t page, bool proven) {
+        provenCalls.push_back(proven);
+        const auto index = page - Base / PageBytes;
+        const bool differs = proven || seen[index] != contents[index];
+        seen[index] = contents[index];
+        return differs;
+    };
+    const auto collect = [&] {
+        std::vector<DirtyRange> runs;
+        table.Collect(Base, 2 * PageBytes, collectInto, &runs, changed);
+        return runs;
+    };
+    Expect(collect() == std::vector<DirtyRange>{{Base, 2 * PageBytes}} && provenCalls == std::vector<bool>{true, true}, "pages that changed state are reported without a content check");
+    Expect(collect().empty(), "open pages whose content is unchanged are not reported");
+    contents[1] = 7;
+    Expect(collect() == std::vector<DirtyRange>{{Base + PageBytes, PageBytes}}, "an open page is reported when its content changed");
+    Expect(collect().empty(), "an open page is reported once per change");
+}
+
 int main() {
+    testCollectReportsWritesOnce();
+    testCollectChecksOpenPages();
     testReservedPagesStayOpenUntilResident();
     testOwnedByNeedsEveryPage();
     testBusyPagesListed();

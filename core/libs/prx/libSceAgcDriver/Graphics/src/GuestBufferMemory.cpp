@@ -122,8 +122,6 @@ struct ImageMirror {
     std::uint64_t serial = 0;
     std::atomic<std::uint64_t> watchedSerial{0};
     std::uint64_t lastDispatch = 0;
-    // Served by the memory core's residency ledger: its device buffer starts at guest
-    // `ownedOrigin`, guest `base` is at `ownedAddress`, and the core uploads the guest's writes.
     bool owned = false;
     VkBuffer ownedBuffer = VK_NULL_HANDLE;
     VkDeviceAddress ownedAddress = 0;

@@ -67,6 +67,9 @@ public:
     std::vector<DirtyRange> GpuOwnedIn(std::uint64_t address, std::uint64_t size) const;
     std::vector<ProtectionChange> Reclaim(std::uint64_t address, std::uint64_t size, bool forWrite);
     [[nodiscard]] PageState StateOf(std::uint64_t address) const;
+    [[nodiscard]] bool Covers(std::uint64_t address, std::uint64_t size) const;
+    using WrittenRun = void (*)(void* context, std::uintptr_t begin, std::uintptr_t end);
+    void Collect(std::uint64_t address, std::uint64_t size, WrittenRun written, void* context, const WriteCheck& changed = {});
     [[nodiscard]] bool RegionDirty(std::uint64_t address) const;
     [[nodiscard]] std::size_t DirtyPages() const;
     [[nodiscard]] PageTableCounts Counts() const;
@@ -78,7 +81,11 @@ private:
         std::array<std::uint32_t, RegionPages> busyUntil{};
         std::array<std::uint32_t, RegionPages> lastConsume{};
         std::array<std::uint64_t, RegionPages / 64> listed{};
+        std::array<std::uint64_t, RegionPages / 64> unreported{};
         std::uint32_t dirtyPages = 0;
+        std::uint32_t trackedPages = 0;
+        std::uint32_t writablePages = 0;
+        std::uint32_t unreportedPages = 0;
     };
 
     Region* regionOf(std::uint64_t page, bool create);

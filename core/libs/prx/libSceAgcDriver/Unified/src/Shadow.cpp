@@ -16,11 +16,16 @@
 #include <cstring>
 #include <mutex>
 #include <map>
+#include <algorithm>
+#include <unordered_map>
+#include <vector>
 #include <span>
 #include <utility>
 #include <string>
 
 namespace AgcDriver::Unified::Shadow {
+
+std::string writeAuditLine();
 
 namespace {
 
@@ -166,6 +171,7 @@ std::string memoryLine() {
         std::snprintf(ownedLine, sizeof(ownedLine), "[recode-owned] serves %llu, walks %llu (%.1f ms), upload records %llu (%.1f ms)\n", static_cast<unsigned long long>(serves), static_cast<unsigned long long>(totals.ownedWalks.load(std::memory_order_relaxed)), static_cast<double>(totals.ownedWalkNanoseconds.load(std::memory_order_relaxed)) / 1e6, static_cast<unsigned long long>(totals.ownedRecords.load(std::memory_order_relaxed)), static_cast<double>(totals.ownedRecordNanoseconds.load(std::memory_order_relaxed)) / 1e6);
         owned = ownedLine;
     }
+    owned += writeAuditLine();
     return std::string(line) + eventLine + ResidencyService::Get().Line() + owned;
 }
 
@@ -274,9 +280,103 @@ void NoteGpuMapping(const GuestAllocations::Mapped& ranges) {
     }
 }
 
+namespace {
+
+bool coreCoversWrites(std::uintptr_t address, std::size_t bytes) {
+    return MemoryCore::Get().Pages().Covers(address, bytes);
+}
+
+struct WriteAudit {
+    std::mutex mutex;
+    std::unordered_map<std::uint64_t, std::uint64_t> hashes;
+    std::vector<std::pair<std::uintptr_t, std::uintptr_t>> reported;
+    std::atomic<std::uint64_t> pages{0};
+    std::atomic<std::uint64_t> misses{0};
+    std::vector<std::uintptr_t> listed;
+};
+
+WriteAudit& writeAudit() {
+    static auto* audit = new WriteAudit;
+    return *audit;
+}
+
+struct AuditForward {
+    void (*written)(void*, std::uintptr_t, std::uintptr_t);
+    void* context;
+    std::vector<std::pair<std::uintptr_t, std::uintptr_t>>* runs;
+};
+
+void auditWritten(void* context, std::uintptr_t begin, std::uintptr_t end) {
+    auto* forward = static_cast<AuditForward*>(context);
+    forward->runs->emplace_back(begin, end);
+    forward->written(forward->context, begin, end);
+}
+
+bool coreCollectWrites(std::uintptr_t address, std::size_t bytes, void (*written)(void*, std::uintptr_t, std::uintptr_t), void* context) {
+    static const bool audit = std::getenv("APS5_RECODE_AUDIT_CORE_WRITES") != nullptr;
+    if (!audit) {
+        MemoryCore::Get().CollectWrites(address, bytes, written, context);
+        return true;
+    }
+    auto& state = writeAudit();
+    std::lock_guard lock(state.mutex);
+    state.reported.clear();
+    AuditForward forward{written, context, &state.reported};
+    auto& pages = MemoryCore::Get().Pages();
+    MemoryCore::Get().CollectWrites(address, bytes, auditWritten, &forward);
+    const auto end = address + bytes;
+    for (auto page = address & ~(PageBytes - 1); page < end; page += PageBytes) {
+        const auto kind = pages.StateOf(page);
+        if (kind != PageState::CpuClean && kind != PageState::CpuDirty) continue;
+        std::uint64_t hash = 0xcbf29ce484222325ull;
+        const auto* words = reinterpret_cast<const std::uint64_t*>(page);
+        for (std::size_t i = 0; i < PageBytes / sizeof(std::uint64_t); ++i) hash = (hash ^ words[i]) * 0x100000001b3ull;
+        state.pages.fetch_add(1, std::memory_order_relaxed);
+        auto [entry, inserted] = state.hashes.try_emplace(page, hash);
+        if (inserted || entry->second == hash) continue;
+        entry->second = hash;
+        bool seen = false;
+        for (const auto& [from, to] : state.reported) seen = seen || (page >= from && page < to);
+        if (seen) continue;
+        if (state.listed.size() < 8 && std::find(state.listed.begin(), state.listed.end(), page) == state.listed.end()) state.listed.push_back(page);
+        state.misses.fetch_add(1, std::memory_order_relaxed);
+    }
+    return true;
+}
+
+}
+
+std::string writeAuditLine() {
+    auto& state = writeAudit();
+    if (state.pages.load(std::memory_order_relaxed) == 0) return {};
+    std::string pages;
+    {
+        std::lock_guard lock(state.mutex);
+        for (const auto page : state.listed) {
+            char one[32];
+            std::snprintf(one, sizeof(one), " 0x%llx", static_cast<unsigned long long>(page));
+            pages += one;
+        }
+    }
+    char text[160];
+    std::snprintf(text, sizeof(text), "[recode-audit] pages hashed %llu, missed writes %llu, first missed pages", static_cast<unsigned long long>(state.pages.load(std::memory_order_relaxed)), static_cast<unsigned long long>(state.misses.load(std::memory_order_relaxed)));
+    return std::string(text) + pages + "\n";
+}
+
+namespace {
+
+const GuestMemory::CoreWriteHooks coreWriteHooks{coreCoversWrites, coreCollectWrites};
+
+}
+
 bool ServesOwned() {
     static const bool serves = ResidencyService::Enabled() && std::getenv("APS5_RECODE_NO_OWNED_REGIONS") == nullptr;
-    return serves && memoryInstalled();
+    if (!serves || !memoryInstalled()) return false;
+    static const bool hooked = [] {
+        if (std::getenv("APS5_RECODE_CORE_WRITES") != nullptr) GuestMemory::SetCoreWriteHooks(&coreWriteHooks);
+        return true;
+    }();
+    return hooked;
 }
 
 bool ServeOwned(const Graphics::Context& context, std::uint64_t address, std::uint64_t size, OwnedSpan* span) {

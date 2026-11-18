@@ -129,6 +129,12 @@ struct WriteSubscription {
 namespace {
 
 constexpr std::uint64_t IndexBlockBytes = 65536;
+std::atomic<const CoreWriteHooks*> coreWriteHooks{nullptr};
+
+bool coreCovers(std::uint64_t address, std::size_t bytes) {
+    const auto* hooks = coreWriteHooks.load(std::memory_order_acquire);
+    return hooks != nullptr && hooks->covers(static_cast<std::uintptr_t>(address), bytes);
+}
 constexpr std::size_t MaxRecordedBumps = 1024;
 constexpr std::uint64_t SpanGapBytes = std::uint64_t{1} << 20;
 
@@ -1528,9 +1534,9 @@ struct WriteTracker {
 
     bool covers(std::uint64_t address, std::size_t bytes) const {
 #ifdef _WIN32
-        return coverage.Covers(address, bytes) && !GuestArena::GuestArenaHostRegionOverlaps_nid_postfix(static_cast<std::uintptr_t>(address), bytes);
+        return (coverage.Covers(address, bytes) || coreCovers(address, bytes)) && !GuestArena::GuestArenaHostRegionOverlaps_nid_postfix(static_cast<std::uintptr_t>(address), bytes);
 #else
-        return address + bytes <= LeafCount * LeafBlocks * WriteBlockBytes && GuestWriteWatch::GuestWriteWatchCovers_nid_postfix(static_cast<std::uintptr_t>(address), bytes);
+        return address + bytes <= LeafCount * LeafBlocks * WriteBlockBytes && (GuestWriteWatch::GuestWriteWatchCovers_nid_postfix(static_cast<std::uintptr_t>(address), bytes) || coreCovers(address, bytes));
 #endif
     }
 
@@ -2056,6 +2062,10 @@ bool collectWindowsWrites(StampRuns& runs, std::uint64_t first, std::uint64_t st
     const bool fresh = runs.kind == StampKind::Fresh;
     if (fresh) {
         if (const auto hook = freshCollectHook.load(std::memory_order_acquire)) return hook(static_cast<std::uintptr_t>(first), static_cast<std::size_t>(stop - first), &stampWrittenRun, &runs);
+    } else if (const auto* hooks = coreWriteHooks.load(std::memory_order_acquire); hooks != nullptr && !tracker.coverage.Covers(first, static_cast<std::size_t>(stop - first)) && hooks->covers(static_cast<std::uintptr_t>(first), static_cast<std::size_t>(stop - first))) {
+        const bool complete = hooks->collect(static_cast<std::uintptr_t>(first), static_cast<std::size_t>(stop - first), &stampWrittenRun, &runs);
+        if (complete && runs.stamped != 0) collectDirty.fetch_add(1, std::memory_order_relaxed);
+        return complete;
     }
     const auto collect = fresh ? &GuestArena::GuestArenaCollectFreshWrites_nid_postfix : armedOnly ? &GuestArena::GuestArenaCollectArmedWrites_nid_postfix : &GuestArena::GuestArenaCollectWrites_nid_postfix;
     static const bool singlePass = std::getenv("APS5_NO_SINGLE_PASS_COLLECT") == nullptr;
@@ -2105,7 +2115,9 @@ bool walkWrites(WriteTracker& tracker, std::uint64_t first, std::uint64_t stop, 
     if (dirty != nullptr) *dirty = runs.stamped != 0;
 #else
     const auto dirtyRuns = collectDirtyRuns.load(std::memory_order_relaxed);
-    const auto collect = armedOnly ? &GuestWriteWatch::GuestWriteWatchCollectArmed_nid_postfix : &GuestWriteWatch::GuestWriteWatchCollect_nid_postfix;
+    const auto* hooks = coreWriteHooks.load(std::memory_order_acquire);
+    const bool core = hooks != nullptr && !GuestWriteWatch::GuestWriteWatchCovers_nid_postfix(static_cast<std::uintptr_t>(first), static_cast<std::size_t>(stop - first)) && hooks->covers(static_cast<std::uintptr_t>(first), static_cast<std::size_t>(stop - first));
+    const auto collect = core ? hooks->collect : armedOnly ? &GuestWriteWatch::GuestWriteWatchCollectArmed_nid_postfix : &GuestWriteWatch::GuestWriteWatchCollect_nid_postfix;
     const bool complete = collect(static_cast<std::uintptr_t>(first), static_cast<std::size_t>(stop - first), &stampWrittenRun, &runs);
     if (collectDirtyRuns.load(std::memory_order_relaxed) != dirtyRuns) collectDirty.fetch_add(1, std::memory_order_relaxed);
     if (dirty != nullptr) *dirty = collectDirtyRuns.load(std::memory_order_relaxed) != dirtyRuns;
@@ -2143,7 +2155,7 @@ LargeCleanRanges& largeCleanRanges() {
 }
 
 std::uint64_t largeCleanBytes() {
-    static const std::uint64_t bytes = [] {
+    static const std::uint64_t bytes = []() -> std::uint64_t {
         if (std::getenv("APS5_STRICT_COLLECTS") != nullptr) return std::numeric_limits<std::uint64_t>::max();
         const char* value = std::getenv("APS5_LARGE_CLEAN_MIB");
         return (value != nullptr ? std::strtoull(value, nullptr, 10) : 8ull) << 20u;
@@ -2579,6 +2591,10 @@ void SetFreshCollectHook(FreshCollectHook hook) {
     freshCollectHook.store(hook, std::memory_order_release);
 }
 #endif
+
+void SetCoreWriteHooks(const CoreWriteHooks* hooks) {
+    coreWriteHooks.store(hooks, std::memory_order_release);
+}
 
 void Unwatch(std::uint64_t address, std::size_t bytes) {
     if (bytes == 0 || bytes > std::numeric_limits<std::uint64_t>::max() - address) return;

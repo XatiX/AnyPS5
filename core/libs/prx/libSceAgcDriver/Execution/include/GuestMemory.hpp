@@ -76,6 +76,13 @@ void SetImportWalkFailureForTest(int walk, std::uint64_t span = 0);
 using FreshCollectHook = bool (*)(std::uintptr_t address, std::size_t bytes, void (*written)(void*, std::uintptr_t, std::uintptr_t), void* context);
 void SetFreshCollectHook(FreshCollectHook hook);
 #endif
+struct CoreWriteHooks {
+    bool (*covers)(std::uintptr_t address, std::size_t bytes) = nullptr;
+    bool (*collect)(std::uintptr_t address, std::size_t bytes, void (*written)(void*, std::uintptr_t, std::uintptr_t), void* context) = nullptr;
+};
+void SetCoreWriteHooks(const CoreWriteHooks* hooks);
+#ifdef _WIN32
+#endif
 bool Watched(std::uint64_t address, std::size_t bytes);
 bool OnlyRewatchedSince(std::uint64_t address, std::size_t bytes, std::uint64_t generation);
 bool Rewatched(std::uint64_t address, std::size_t bytes);

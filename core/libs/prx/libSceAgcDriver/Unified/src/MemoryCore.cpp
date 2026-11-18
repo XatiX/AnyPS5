@@ -2,9 +2,7 @@
 #include "prx/libSceAgcDriver/Unified/include/Events.hpp"
 #include <array>
 #include <cstdlib>
-#ifdef _WIN32
 #include "prx/libc/include/GuestArena.hpp"
-#endif
 
 namespace AgcDriver::Unified {
 
@@ -32,14 +30,16 @@ bool MemoryCore::Install() {
     if (std::getenv("APS5_RECODE_NO_PROTECT_OWNER") == nullptr) protector.Track(GuestArena::GuestArenaTrackProtect_nid_no_patch);
     return true;
 #else
-    return false;
+    if (!GuestArena::GuestArenaSetGpuFaultHandler_nid_no_patch(handleGuestFault)) return false;
+    GuestArena::GuestArenaSetGpuHostWriteHook_nid_no_patch(prepareGuestHostWrite);
+    return true;
 #endif
 }
 
 void MemoryCore::Uninstall() {
-#ifdef _WIN32
     GuestArena::GuestArenaSetGpuHostWriteHook_nid_no_patch(nullptr);
     GuestArena::GuestArenaSetGpuFaultHandler_nid_no_patch(nullptr);
+#ifdef _WIN32
     protector.Track(nullptr);
 #endif
 }
@@ -148,6 +148,23 @@ void MemoryCore::PrepareHostWrite(std::uint64_t address, std::uint64_t size) {
         if (pages.HandleWrite(page, changes)) hostWritesOpened.fetch_add(1, std::memory_order_relaxed);
     }
     protector.Apply(changes);
+}
+
+void MemoryCore::CollectWrites(std::uint64_t address, std::uint64_t size, PageTable::WrittenRun written, void* context) {
+    std::lock_guard lock(collectMutex);
+    pages.Collect(address, size, written, context, [this](std::uint64_t page, bool proven) {
+        if (proven) {
+            collectHashes.erase(page);
+            return true;
+        }
+        const auto hash = PageHash(page);
+        auto [entry, inserted] = collectHashes.try_emplace(page, hash);
+        if (inserted || entry->second != hash) {
+            entry->second = hash;
+            return true;
+        }
+        return false;
+    });
 }
 
 MemoryCoreCounts MemoryCore::Counts() const {
