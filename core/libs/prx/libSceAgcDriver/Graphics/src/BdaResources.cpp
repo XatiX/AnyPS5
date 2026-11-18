@@ -619,6 +619,7 @@ void BdaResources::markWrittenPages(const BdaResources& record) const {
     Require(words[Abi::WrittenOverflowWord] == 0, "more than " + std::to_string(Abi::WrittenPageSlots) + " chunks of " + std::to_string(Abi::WrittenChunkPages) + " pages stored to through the BDA table in one use are not implemented");
     const auto count = words[Abi::WrittenCountWord];
     if (count == 0) return;
+    std::vector<std::pair<std::uint64_t, std::uint64_t>> written;
     Require(Abi::ForEachWrittenRange(words, [&](std::uint64_t begin, std::size_t bytes) {
         const auto end = begin + bytes;
         for (const auto& [base, size] : imageTableRanges) {
@@ -628,8 +629,12 @@ void BdaResources::markWrittenPages(const BdaResources& record) const {
                 Require(false, message.str());
             }
         }
-        GuestMemory::MarkPossiblyWritten(begin, bytes);
+        written.emplace_back(begin, bytes);
     }), "invalid BDA written-page record");
+#if ANYPS5_UNIFIED
+    if (pageTable) Unified::Shadow::LandGpuWrites(written);
+#endif
+    for (const auto& [begin, bytes] : written) GuestMemory::MarkPossiblyWritten(begin, static_cast<std::size_t>(bytes));
     for (std::uint32_t claim = 0; claim < count; ++claim) {
         const auto slot = words[Abi::WrittenListWord + claim];
         words[Abi::WrittenSlotsWord + 2 * slot] = 0;

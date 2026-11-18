@@ -463,6 +463,16 @@ void ServeFaultPages(std::span<const std::uint64_t> pages) {
     }
 }
 
+void LandGpuWrites(GuestRanges ranges) {
+    static const bool ahead = std::getenv("APS5_RECODE_NO_READBACK_AHEAD") == nullptr;
+    if (!ahead || ranges.empty() || !ServesOwned()) return;
+    std::unique_lock<GuestMemory::GpuMutexType> gpu(GuestMemory::GpuMutex(), std::defer_lock);
+    if (!GuestMemory::GpuMutex().HeldByThisThread()) gpu.lock();
+    const auto pieces = ResidencyService::Get().ReadBack(ranges);
+    auto& core = MemoryCore::Get();
+    for (const auto& piece : pieces) core.LandGpuWrite(piece.guest, piece.bytes);
+}
+
 bool OwnedUploadsPending() {
     return ServesOwned() && ResidencyService::Get().Pending();
 }

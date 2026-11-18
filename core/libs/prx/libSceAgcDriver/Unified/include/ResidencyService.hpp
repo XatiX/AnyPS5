@@ -38,6 +38,7 @@ public:
     std::optional<DeviceSpan> Serve(std::uint64_t address, std::uint64_t size, std::span<const std::pair<std::uint64_t, std::uint64_t>> committed);
     bool ServeFaultPage(std::uint64_t page, std::uint64_t allocation, std::uint64_t allocationBytes, std::span<const std::pair<std::uint64_t, std::uint64_t>> committed);
     [[nodiscard]] std::shared_ptr<Graphics::Buffer> PageTableBuffer() const;
+    std::vector<PendingUpload> ReadBack(std::span<const std::pair<std::uint64_t, std::uint64_t>> ranges);
     [[nodiscard]] bool Pending() const;
     std::size_t Record(VkCommandBuffer commands, std::vector<std::shared_ptr<void>>& kept);
     void AdvanceFrame();
@@ -59,6 +60,9 @@ private:
     std::uint64_t pageLeavesDropped = 0;
     std::uint64_t faultPagesServed = 0;
     std::uint64_t faultPagesRefused = 0;
+    std::uint64_t readBacks = 0;
+    std::uint64_t readBackBytes = 0;
+    std::uint64_t readBackMissedBytes = 0;
     std::vector<std::pair<std::uint64_t, std::uint64_t>> queued;
     std::map<std::uint64_t, std::uint64_t> served;
     std::uint64_t serveRefusals = 0;

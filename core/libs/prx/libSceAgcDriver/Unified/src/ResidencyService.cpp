@@ -167,6 +167,55 @@ std::shared_ptr<Graphics::Buffer> ResidencyService::PageTableBuffer() const {
     return pageBuffer;
 }
 
+std::vector<PendingUpload> ResidencyService::ReadBack(std::span<const std::pair<std::uint64_t, std::uint64_t>> ranges) {
+    std::vector<PendingUpload> pieces;
+    if (!Attached() || ranges.empty()) return pieces;
+    std::lock_guard lock(mutex);
+    std::size_t total = 0;
+    for (const auto& [address, bytes] : ranges) {
+        const auto end = address + bytes;
+        for (auto at = address; at < end;) {
+            const auto next = std::min(end, (at & ~(ChunkBytes - 1)) + ChunkBytes);
+            const auto span = ledger->Translate(at, next - at);
+            if (!span) {
+                readBackMissedBytes += next - at;
+            } else if (!pieces.empty() && pieces.back().handle == span->handle && pieces.back().offset + pieces.back().bytes.size() == span->offset && pieces.back().guest + pieces.back().bytes.size() == at) {
+                pieces.back().bytes.resize(pieces.back().bytes.size() + (next - at));
+                total += next - at;
+            } else {
+                pieces.push_back({span->handle, span->offset, at, std::vector<std::byte>(next - at)});
+                total += next - at;
+            }
+            at = next;
+        }
+    }
+    if (pieces.empty()) return pieces;
+    Graphics::Buffer staging(*context, total, VK_BUFFER_USAGE_TRANSFER_DST_BIT);
+    {
+        Graphics::CommandBatch batch(*context);
+        Graphics::RecordMemoryBarrier(*context, batch.Handle(), VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, ResidentAccess, VK_ACCESS_TRANSFER_READ_BIT);
+        const auto copy = context->Function<PFN_vkCmdCopyBuffer>("vkCmdCopyBuffer");
+        std::size_t at = 0;
+        for (const auto& piece : pieces) {
+            const VkBufferCopy region{piece.offset, at, piece.bytes.size()};
+            copy(batch.Handle(), bufferOf(piece.handle), staging.Handle(), 1, &region);
+            at += piece.bytes.size();
+        }
+        Graphics::RecordMemoryBarrier(*context, batch.Handle(), VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_HOST_BIT, VK_ACCESS_TRANSFER_WRITE_BIT, VK_ACCESS_HOST_READ_BIT);
+        batch.SubmitAndWait();
+    }
+    staging.Invalidate();
+    const auto bytes = staging.Bytes();
+    std::size_t at = 0;
+    for (auto& piece : pieces) {
+        std::memcpy(piece.bytes.data(), bytes.data() + at, piece.bytes.size());
+        at += piece.bytes.size();
+    }
+    ++readBacks;
+    readBackBytes += total;
+    return pieces;
+}
+
 bool ResidencyService::Prepare(std::uint64_t address, std::uint64_t size) {
     if (!Attached()) return false;
     std::lock_guard lock(mutex);
@@ -263,9 +312,9 @@ std::string ResidencyService::Line() const {
         static_cast<unsigned long long>(recordedUploads), static_cast<unsigned long long>(recordedBytes >> 20), static_cast<unsigned long long>(served.size()), static_cast<unsigned long long>(serveRefusals));
     if (!pages) return line;
     char table[320];
-    std::snprintf(table, sizeof(table), "[recode-page-table] leaves %u of %u, updates %llu (%llu MiB), leaves dropped %llu, shared pages %llu; fault pages served %llu, refused %llu\n", pages->Leaves(), PageTableLeafCapacity,
+    std::snprintf(table, sizeof(table), "[recode-page-table] leaves %u of %u, updates %llu (%llu MiB), leaves dropped %llu, shared pages %llu; fault pages served %llu, refused %llu; read backs %llu (%llu KiB), not resident %llu KiB\n", pages->Leaves(), PageTableLeafCapacity,
         static_cast<unsigned long long>(pageUpdates), static_cast<unsigned long long>(pageUpdateBytes >> 20), static_cast<unsigned long long>(pageLeavesDropped), static_cast<unsigned long long>(ledgerCounts.sharedPages),
-        static_cast<unsigned long long>(faultPagesServed), static_cast<unsigned long long>(faultPagesRefused));
+        static_cast<unsigned long long>(faultPagesServed), static_cast<unsigned long long>(faultPagesRefused), static_cast<unsigned long long>(readBacks), static_cast<unsigned long long>(readBackBytes >> 10), static_cast<unsigned long long>(readBackMissedBytes >> 10));
     return std::string(line) + table;
 }
 

@@ -6,6 +6,7 @@
 #include <atomic>
 #include <cstdint>
 #include <mutex>
+#include <span>
 #include <unordered_map>
 #include <vector>
 
@@ -17,6 +18,7 @@ struct MemoryCoreCounts {
     std::uint64_t gpuOwnedFaults = 0;
     std::uint64_t foreignFaults = 0;
     std::uint64_t staleFaults = 0;
+    std::uint64_t landedBytes = 0;
 };
 
 class MemoryCore {
@@ -35,6 +37,7 @@ public:
     void MarkGpuOwned(std::uint64_t address, std::uint64_t size);
     bool HandleFault(std::uint64_t address, bool write);
     void PrepareHostWrite(std::uint64_t address, std::uint64_t size);
+    void LandGpuWrite(std::uint64_t address, std::span<const std::byte> bytes);
     void CollectWrites(std::uint64_t address, std::uint64_t size, PageTable::WrittenRun written, void* context);
     [[nodiscard]] PageTable& Pages() { return pages; }
     [[nodiscard]] Protector& Protection() { return protector; }
@@ -56,6 +59,7 @@ private:
     std::atomic<std::uint64_t> gpuOwnedFaults{0};
     std::atomic<std::uint64_t> foreignFaults{0};
     std::atomic<std::uint64_t> staleFaults{0};
+    std::atomic<std::uint64_t> landedBytes{0};
 };
 
 }
