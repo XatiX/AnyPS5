@@ -709,6 +709,18 @@ StorageFailures& StorageFailed() {
     return failures;
 }
 
+bool SharedSampledSurfaces() {
+    static const bool enabled = std::getenv("APS5_NO_SHARED_SAMPLED_SURFACE") == nullptr;
+    return enabled;
+}
+
+GuestTextureResource sampledStorageSurface(const GuestTextureResource& resource) {
+    if (resource.dimension != TextureDimension::k2DArray || resource.depthOrLastArray != 0 || resource.baseArray != 0) return resource;
+    auto surface = resource;
+    surface.dimension = TextureDimension::k2D;
+    return surface;
+}
+
 // The cached storage image for a sampled descriptor, or null when it cannot be made (then the
 // snapshot path serves the descriptor, as before). Every null return counts as a fallback.
 std::shared_ptr<StorageTexture> sampledStorageSource(const Context& context, const GuestTextureResource& resource, std::uint64_t guestBytes) {
@@ -727,7 +739,7 @@ std::shared_ptr<StorageTexture> sampledStorageSource(const Context& context, con
         }
     }
     try {
-        return cachedStorageTexture(context, {}, resource, 0, guestBytes);
+        return cachedStorageTexture(context, {}, SharedSampledSurfaces() ? sampledStorageSurface(resource) : resource, 0, guestBytes);
     } catch (const std::exception& error) {
         counters.storageFallbacks.fetch_add(1, std::memory_order_relaxed);
         std::lock_guard lock(failures.mutex);
@@ -4078,7 +4090,7 @@ ShaderResources::OwnRefreshFallback ShaderResources::refreshOwnObjects(std::span
         const auto address = surface.resource.baseAddress;
         const auto bytes = static_cast<std::size_t>(surface.bytes);
         const bool imported = SampledFromStorageEligible(context, surface.resource, surface.bytes);
-        overlap.sourceEligible = imported && SurfaceKey(context, source->Descriptor()) == SurfaceKey(context, surface.resource);
+        overlap.sourceEligible = imported && SurfaceKey(context, source->Descriptor()) == SurfaceKey(context, SharedSampledSurfaces() ? sampledStorageSurface(surface.resource) : surface.resource);
         overlap.depthCompare = depthCompare;
         overlap.sourceRefreshed = false;
         const auto found = pendingLookupSource(context, surface.resource, surface.bytes, depthCompare).source;
