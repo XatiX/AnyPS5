@@ -83,16 +83,53 @@ void PageTable::setState(std::uint64_t page, PageState next) {
 }
 
 std::vector<ProtectionChange> PageTable::Register(std::uint64_t address, std::uint64_t size) {
+    Reserve(address, size);
+    return MakeResident(address, size);
+}
+
+void PageTable::Reserve(std::uint64_t address, std::uint64_t size) {
     std::lock_guard lock(mutex);
     for (auto page = firstPage(address); page < endPage(address, size); ++page) {
         auto* region = regionOf(page, true);
-        if (region->states[slotOf(page)] != PageState::Untracked) continue;
+        if (region->states[slotOf(page)] == PageState::Untracked) setState(page, PageState::Reserved);
+    }
+}
+
+std::vector<ProtectionChange> PageTable::MakeResident(std::uint64_t address, std::uint64_t size) {
+    std::lock_guard lock(mutex);
+    for (auto page = firstPage(address); page < endPage(address, size); ++page) {
+        auto* region = regionOf(page, false);
+        if (region == nullptr || region->states[slotOf(page)] != PageState::Reserved) continue;
         setState(page, PageState::CpuDirty);
         region->busyUntil[slotOf(page)] = 0;
         region->streak[slotOf(page)] = 0;
         list(page);
     }
     return {};
+}
+
+bool PageTable::OwnedBy(std::uint64_t address, std::uint64_t size) const {
+    std::lock_guard lock(mutex);
+    if (size == 0) return false;
+    for (auto page = firstPage(address); page < endPage(address, size); ++page) {
+        const auto* region = regionOf(page);
+        if (region == nullptr || region->states[slotOf(page)] == PageState::Untracked) return false;
+    }
+    return true;
+}
+
+std::vector<std::uint64_t> PageTable::BusyPages() const {
+    std::lock_guard lock(mutex);
+    std::vector<std::uint64_t> busy;
+    for (const auto page : dirty) {
+        const auto* region = regionOf(page);
+        if (region == nullptr) continue;
+        const auto slot = slotOf(page);
+        if (region->busyUntil[slot] != 0 && region->states[slot] == PageState::CpuDirty) busy.push_back(page);
+    }
+    std::sort(busy.begin(), busy.end());
+    busy.erase(std::unique(busy.begin(), busy.end()), busy.end());
+    return busy;
 }
 
 std::vector<ProtectionChange> PageTable::Unregister(std::uint64_t address, std::uint64_t size) {
@@ -214,7 +251,7 @@ std::vector<ProtectionChange> PageTable::MarkGpuOwned(std::uint64_t address, std
         if (region == nullptr) continue;
         const auto slot = slotOf(page);
         const auto state = region->states[slot];
-        if (state == PageState::Untracked || state == PageState::GpuOwned) continue;
+        if (state == PageState::Untracked || state == PageState::GpuOwned || state == PageState::Reserved) continue;
         unlist(page);
         region->busyUntil[slot] = 0;
         region->streak[slot] = 0;

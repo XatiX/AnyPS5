@@ -16,7 +16,7 @@ inline constexpr std::uint64_t PageBytes = 0x1000;
 inline constexpr std::uint64_t RegionBytes = 0x400000;
 inline constexpr std::size_t RegionPages = RegionBytes / PageBytes;
 
-enum class PageState : std::uint8_t { Untracked, CpuClean, CpuDirty, GpuOwned };
+enum class PageState : std::uint8_t { Untracked, CpuClean, CpuDirty, GpuOwned, Reserved };
 
 enum class Protection : std::uint8_t { ReadWrite, ReadOnly, NoAccess };
 
@@ -54,7 +54,11 @@ public:
     static constexpr std::uint32_t QuietEpochs = 2;
 
     std::vector<ProtectionChange> Register(std::uint64_t address, std::uint64_t size);
+    void Reserve(std::uint64_t address, std::uint64_t size);
+    std::vector<ProtectionChange> MakeResident(std::uint64_t address, std::uint64_t size);
     std::vector<ProtectionChange> Unregister(std::uint64_t address, std::uint64_t size);
+    [[nodiscard]] bool OwnedBy(std::uint64_t address, std::uint64_t size) const;
+    [[nodiscard]] std::vector<std::uint64_t> BusyPages() const;
     bool HandleWrite(std::uint64_t address, std::vector<ProtectionChange>& changes);
     using WriteCheck = std::function<bool(std::uint64_t page, bool proven)>;
     std::vector<DirtyRange> ConsumeDirty(std::vector<ProtectionChange>& changes, const WriteCheck& written = {});

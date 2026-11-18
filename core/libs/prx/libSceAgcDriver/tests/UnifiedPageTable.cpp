@@ -163,7 +163,49 @@ void testUnchangedBusyPagesAreNotReported() {
     Expect(table.StateOf(Base) == PageState::CpuClean && changes.size() == 1, "a busy page unchanged for two epochs is armed again before its busy window ends");
 }
 
+void testReservedPagesStayOpenUntilResident() {
+    PageTable table;
+    table.Reserve(Base, 4 * PageBytes);
+    std::vector<ProtectionChange> changes;
+    Expect(table.StateOf(Base) == PageState::Reserved && table.DirtyPages() == 0, "reserved pages are owned but not listed");
+    Expect(table.ConsumeDirty(changes).empty() && changes.empty(), "a reserved range uploads and protects nothing");
+    Expect(!table.HandleWrite(Base, changes) && changes.empty(), "a write to a reserved page is not the table's fault");
+    Expect(table.MarkGpuOwned(Base, PageBytes).empty() && table.StateOf(Base) == PageState::Reserved, "a reserved page does not become GPU-owned");
+    static_cast<void>(table.MakeResident(Base + PageBytes, 2 * PageBytes));
+    Expect(table.StateOf(Base) == PageState::Reserved && table.StateOf(Base + PageBytes) == PageState::CpuDirty && table.DirtyPages() == 2, "only the pages made resident are listed");
+    const auto ranges = table.ConsumeDirty(changes);
+    Expect(ranges.size() == 1 && ranges[0] == DirtyRange{Base + PageBytes, 2 * PageBytes}, "resident pages upload once");
+    Expect(changes.size() == 1 && changes[0] == ProtectionChange{Base + PageBytes, 2 * PageBytes, Protection::ReadOnly}, "resident pages are armed, reserved ones are not");
+    changes = table.Unregister(Base, 4 * PageBytes);
+    Expect(changes.size() == 1 && changes[0] == ProtectionChange{Base + PageBytes, 2 * PageBytes, Protection::ReadWrite} && table.StateOf(Base) == PageState::Untracked, "unregistering opens the armed pages and forgets the reserved ones");
+}
+
+void testOwnedByNeedsEveryPage() {
+    PageTable table;
+    table.Reserve(Base, 2 * PageBytes);
+    static_cast<void>(table.Register(Base + 2 * PageBytes, PageBytes));
+    Expect(table.OwnedBy(Base, 3 * PageBytes), "reserved and resident pages are both owned");
+    Expect(!table.OwnedBy(Base, 4 * PageBytes), "a range reaching an unregistered page is not owned");
+    Expect(!table.OwnedBy(Base, 0), "an empty range is not owned");
+}
+
+void testBusyPagesListed() {
+    PageTable table;
+    static_cast<void>(table.Register(Base, 2 * PageBytes));
+    std::vector<ProtectionChange> changes;
+    for (int round = 0; round < 3; ++round) {
+        static_cast<void>(table.HandleWrite(Base, changes));
+        static_cast<void>(table.ConsumeDirty(changes));
+        changes.clear();
+    }
+    const auto busy = table.BusyPages();
+    Expect(busy.size() == 1 && busy[0] == Base / PageBytes, "the page dirty in three consumes is the one busy page listed");
+}
+
 int main() {
+    testReservedPagesStayOpenUntilResident();
+    testOwnedByNeedsEveryPage();
+    testBusyPagesListed();
     testFramePacedPagesStayOpen();
     testUnchangedBusyPagesAreNotReported();
     testRegisteredPagesUploadOnceThenArm();
