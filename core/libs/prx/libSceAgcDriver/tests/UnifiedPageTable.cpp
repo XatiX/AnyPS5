@@ -256,7 +256,7 @@ void testCollectChecksOpenPages() {
         table.Collect(Base, 2 * PageBytes, collectInto, &runs, changed);
         return runs;
     };
-    Expect(collect() == std::vector<DirtyRange>{{Base, 2 * PageBytes}} && provenCalls == std::vector<bool>{true, true}, "pages that changed state are reported without a content check");
+    Expect(collect() == std::vector<DirtyRange>{{Base, 2 * PageBytes}} && provenCalls == std::vector<bool>{false, false}, "pages made resident are content-checked, not proven written");
     Expect(collect().empty(), "open pages whose content is unchanged are not reported");
     contents[1] = 7;
     Expect(collect() == std::vector<DirtyRange>{{Base + PageBytes, PageBytes}}, "an open page is reported when its content changed");
@@ -270,7 +270,39 @@ void testCollectChecksOpenPages() {
     Expect(collect() == std::vector<DirtyRange>{{Base, PageBytes}} && provenCalls == std::vector<bool>{true}, "a write fault is reported without a content check");
 }
 
+void testDeviceWrittenPagesReportOnlyCpuWrites() {
+    PageTable table;
+    table.Reserve(Base, 2 * PageBytes);
+    table.MakeResident(Base, 2 * PageBytes);
+    std::vector<std::uint64_t> contents(2, 0);
+    std::vector<std::uint64_t> seen(2, 0);
+    const PageTable::WriteCheck changed = [&](std::uint64_t page, bool proven) {
+        const auto index = page - Base / PageBytes;
+        const bool differs = proven || seen[index] != contents[index];
+        seen[index] = contents[index];
+        return differs;
+    };
+    const auto collect = [&] {
+        std::vector<DirtyRange> runs;
+        table.Collect(Base, 2 * PageBytes, collectInto, &runs, changed);
+        return runs;
+    };
+    static_cast<void>(collect());
+    const auto armed = table.MarkDeviceWritten(Base, 2 * PageBytes);
+    Expect(armed == std::vector<ProtectionChange>{{Base, 2 * PageBytes, Protection::ReadOnly}} && table.StateOf(Base) == PageState::CpuClean, "open pages written by the device are armed for CPU writes");
+    contents[0] = 5;
+    contents[1] = 9;
+    Expect(collect().empty(), "device writes are not reported as CPU writes");
+    std::vector<ProtectionChange> changes;
+    table.HandleWrite(Base + PageBytes, changes);
+    contents[1] = 11;
+    Expect(collect() == std::vector<DirtyRange>{{Base + PageBytes, PageBytes}}, "a CPU write after the device write is reported");
+    contents[1] = 12;
+    Expect(collect() == std::vector<DirtyRange>{{Base + PageBytes, PageBytes}}, "a page reopened by the CPU is content-checked again");
+}
+
 int main() {
+    testDeviceWrittenPagesReportOnlyCpuWrites();
     testCollectReportsWritesOnce();
     testCollectChecksOpenPages();
     testReservedPagesStayOpenUntilResident();

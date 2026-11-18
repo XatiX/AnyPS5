@@ -184,12 +184,9 @@ void MemoryCore::CollectWrites(std::uint64_t address, std::uint64_t size, PageTa
 
 void MemoryCore::NoteDriverWrite(std::uint64_t address, std::uint64_t size) {
     if (size == 0) return;
-    std::lock_guard lock(collectMutex);
-    pages.Collect(address, size, [](void*, std::uintptr_t, std::uintptr_t) {}, nullptr, [this](std::uint64_t page, bool) {
-        collectHashes.insert_or_assign(page, PageHash(page));
-        driverPagesSettled.fetch_add(1, std::memory_order_relaxed);
-        return false;
-    });
+    std::lock_guard lock(mutex);
+    protector.Apply(pages.MarkDeviceWritten(address, size));
+    driverPagesSettled.fetch_add((size + PageBytes - 1) / PageBytes, std::memory_order_relaxed);
 }
 
 MemoryCoreCounts MemoryCore::Counts() const {

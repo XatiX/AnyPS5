@@ -91,8 +91,10 @@ void PageTable::setState(std::uint64_t page, PageState next) {
             word |= bit;
             ++region->unreportedPages;
         }
-        if (next == PageState::CpuDirty) region->written[slot / 64] |= bit;
+        if (next == PageState::CpuDirty && (state == PageState::Reserved || state == PageState::Untracked)) region->written[slot / 64] &= ~bit;
+        else if (next == PageState::CpuDirty) region->written[slot / 64] |= bit;
     }
+    if (!tracked(next) || next == PageState::CpuDirty) region->device[slotOf(page) / 64] &= ~(std::uint64_t{1} << (slotOf(page) % 64));
     state = next;
 }
 
@@ -275,6 +277,33 @@ std::vector<ProtectionChange> PageTable::MarkGpuOwned(std::uint64_t address, std
     return changes;
 }
 
+std::vector<ProtectionChange> PageTable::MarkDeviceWritten(std::uint64_t address, std::uint64_t size) {
+    std::lock_guard lock(mutex);
+    std::vector<ProtectionChange> changes;
+    for (auto page = firstPage(address); page < endPage(address, size); ++page) {
+        auto* region = regionOf(page, false);
+        if (region == nullptr) continue;
+        const auto slot = slotOf(page);
+        const auto state = region->states[slot];
+        if (state != PageState::CpuClean && state != PageState::CpuDirty) continue;
+        if (state == PageState::CpuDirty) {
+            unlist(page);
+            region->busyUntil[slot] = 0;
+            region->streak[slot] = 0;
+            setState(page, PageState::CpuClean);
+            appendChange(changes, page, Protection::ReadOnly);
+        }
+        const auto bit = std::uint64_t{1} << (slot % 64);
+        if ((region->unreported[slot / 64] & bit) != 0) {
+            region->unreported[slot / 64] &= ~bit;
+            --region->unreportedPages;
+        }
+        region->written[slot / 64] &= ~bit;
+        region->device[slot / 64] |= bit;
+    }
+    return changes;
+}
+
 std::vector<DirtyRange> PageTable::GpuOwnedIn(std::uint64_t address, std::uint64_t size) const {
     std::lock_guard lock(mutex);
     std::vector<DirtyRange> ranges;
@@ -364,6 +393,11 @@ void PageTable::Collect(std::uint64_t address, std::uint64_t size, WrittenRun wr
                 --region->unreportedPages;
             }
             if (!unreported && region->states[slot] != PageState::CpuDirty) continue;
+            const bool device = (region->device[slot / 64] & bit) != 0;
+            if (device && !proven) {
+                if (changed) static_cast<void>(changed(page, false));
+                continue;
+            }
             if (changed && !changed(page, proven)) continue;
             if (runEnd != page) {
                 flush();

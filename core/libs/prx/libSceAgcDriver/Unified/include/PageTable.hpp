@@ -64,6 +64,7 @@ public:
     std::vector<DirtyRange> ConsumeDirty(std::vector<ProtectionChange>& changes, const WriteCheck& written = {});
     void AdvanceFrame();
     std::vector<ProtectionChange> MarkGpuOwned(std::uint64_t address, std::uint64_t size);
+    std::vector<ProtectionChange> MarkDeviceWritten(std::uint64_t address, std::uint64_t size);
     std::vector<DirtyRange> GpuOwnedIn(std::uint64_t address, std::uint64_t size) const;
     std::vector<ProtectionChange> Reclaim(std::uint64_t address, std::uint64_t size, bool forWrite);
     [[nodiscard]] PageState StateOf(std::uint64_t address) const;
@@ -83,6 +84,7 @@ private:
         std::array<std::uint64_t, RegionPages / 64> listed{};
         std::array<std::uint64_t, RegionPages / 64> unreported{};
         std::array<std::uint64_t, RegionPages / 64> written{};
+        std::array<std::uint64_t, RegionPages / 64> device{};
         std::uint32_t dirtyPages = 0;
         std::uint32_t trackedPages = 0;
         std::uint32_t writablePages = 0;
