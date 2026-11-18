@@ -19,7 +19,7 @@ class MemoryCore {
 public:
     static MemoryCore& Get();
 
-    void Install();
+    bool Install();
     void Uninstall();
     void Register(std::uint64_t address, std::uint64_t size);
     void Unregister(std::uint64_t address, std::uint64_t size);

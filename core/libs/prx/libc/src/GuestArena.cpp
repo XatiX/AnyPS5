@@ -5,6 +5,7 @@
 #include <algorithm>
 #include <atomic>
 #include <cstdint>
+#include <cstring>
 #include <exception>
 #ifndef _WIN32
 #include <cerrno>
@@ -733,8 +734,19 @@ std::atomic<bool (*)(std::uintptr_t, bool)>& gpuFaultHandler() {
 
 }
 
-void GuestArenaSetGpuFaultHandler_nid_no_patch(bool (*handler)(std::uintptr_t address, bool write)) {
+bool GuestArenaWriteFaultsAllowed_nid_no_patch() {
+    if (std::getenv("APS5_NO_PROTECT_TRACKING") != nullptr) return false;
+    if (std::getenv("APS5_PROTECT_TRACKING") != nullptr) return true;
+    constexpr std::size_t framedMarkOffset = 0x28;
+    constexpr char framedMark[8] = {'A', 'P', 'S', '5', 'R', 'Z', '0', '1'};
+    const auto* image = reinterpret_cast<const char*>(GetModuleHandleW(nullptr));
+    return image != nullptr && std::memcmp(image + framedMarkOffset, framedMark, sizeof(framedMark)) == 0;
+}
+
+bool GuestArenaSetGpuFaultHandler_nid_no_patch(bool (*handler)(std::uintptr_t address, bool write)) {
+    if (handler != nullptr && !GuestArenaWriteFaultsAllowed_nid_no_patch()) return false;
     gpuFaultHandler().store(handler, std::memory_order_release);
+    return true;
 }
 
 bool GuestArenaHandleGpuFault_nid_no_patch(EXCEPTION_POINTERS* exception) {

@@ -49,7 +49,8 @@ void GuestArenaSetAccessObserver_nid_postfix(void (*callback)(std::uintptr_t add
 #ifdef _WIN32
 bool GuestArenaHandleWrite_nid_postfix(std::uintptr_t address);
 bool GuestArenaHandleRead_nid_postfix(std::uintptr_t address);
-void GuestArenaSetGpuFaultHandler_nid_no_patch(bool (*handler)(std::uintptr_t address, bool write));
+bool GuestArenaWriteFaultsAllowed_nid_no_patch();
+bool GuestArenaSetGpuFaultHandler_nid_no_patch(bool (*handler)(std::uintptr_t address, bool write));
 bool GuestArenaHandleGpuFault_nid_no_patch(_EXCEPTION_POINTERS* exception);
 bool GuestArenaCopyOwned_nid_no_patch(std::uintptr_t source, void* destination, std::size_t bytes);
 bool GuestArenaCompareOwned_nid_no_patch(std::uintptr_t source, const void* expected, std::size_t bytes, bool* equal);

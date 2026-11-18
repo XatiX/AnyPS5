@@ -18,9 +18,11 @@ MemoryCore& MemoryCore::Get() {
     return core;
 }
 
-void MemoryCore::Install() {
+bool MemoryCore::Install() {
 #ifdef _WIN32
-    GuestArena::GuestArenaSetGpuFaultHandler_nid_no_patch(handleGuestFault);
+    return GuestArena::GuestArenaSetGpuFaultHandler_nid_no_patch(handleGuestFault);
+#else
+    return false;
 #endif
 }
 

@@ -94,7 +94,13 @@ void testWriteFaultOpensACleanPage() {
     const auto first = core.ConsumeDirty();
     Expect(first.size() == 1 && first[0].size == 4 * PageBytes, "the registered range uploads once");
     Expect(protectionAt(base + PageBytes) == PAGE_READONLY, "consumed pages are armed");
-    core.Install();
+    _putenv_s("APS5_PROTECT_TRACKING", "");
+    Expect(!core.Install(), "an image without the framed mark refuses write faults");
+    _putenv_s("APS5_PROTECT_TRACKING", "1");
+    _putenv_s("APS5_NO_PROTECT_TRACKING", "1");
+    Expect(!core.Install(), "the off switch refuses write faults even when forced");
+    _putenv_s("APS5_NO_PROTECT_TRACKING", "");
+    Expect(core.Install(), "forcing write faults installs the handler");
     void* handler = AddVectoredExceptionHandler(1, routeToGuestArena);
     auto* bytes = reinterpret_cast<volatile std::uint8_t*>(base + PageBytes + 8);
     *bytes = 0x5a;
