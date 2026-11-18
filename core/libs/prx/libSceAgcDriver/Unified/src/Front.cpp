@@ -37,6 +37,8 @@ struct Front::Lane {
     std::atomic<std::uint64_t> decoded{0};
     std::atomic<std::uint64_t> decodeNanoseconds{0};
     std::atomic<bool> stop{false};
+    std::mutex publishedMutex;
+    LaneTotals published;
     std::thread thread;
 };
 
@@ -88,6 +90,13 @@ void Front::run(Lane& lane) {
         const auto spent = std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - start).count();
         lane.decodeNanoseconds.fetch_add(static_cast<std::uint64_t>(spent), std::memory_order_relaxed);
         next->reset();
+        {
+            std::lock_guard lock(lane.publishedMutex);
+            lane.published.queue = lane.state.Queue();
+            ++lane.published.submissions;
+            lane.published.decodeNanoseconds += static_cast<std::uint64_t>(spent);
+            lane.published.counts = lane.state.Counts();
+        }
         lane.decoded.fetch_add(1, std::memory_order_release);
         lane.decoded.notify_all();
     }
@@ -105,11 +114,15 @@ void Front::Flush() {
     }
 }
 
-std::vector<LaneTotals> Front::Totals() {
-    Flush();
+std::vector<LaneTotals> Front::Totals(bool flush) {
+    if (flush) Flush();
     std::vector<LaneTotals> totals;
     std::lock_guard lock(lanesMutex);
-    for (auto& [queue, lane] : lanes) totals.push_back({queue, lane->decoded.load(std::memory_order_acquire), lane->decodeNanoseconds.load(std::memory_order_relaxed), lane->state.Counts()});
+    for (auto& [queue, lane] : lanes) {
+        std::lock_guard publishedLock(lane->publishedMutex);
+        totals.push_back(lane->published);
+        totals.back().queue = queue;
+    }
     return totals;
 }
 

@@ -201,6 +201,7 @@ private:
 
     void draw(OpKind kind, std::span<const std::uint32_t> packet) {
         ++state.counts.draws;
+        if (current.conditional) ++state.counts.conditionalDraws;
         const auto ids = snapshot();
         const std::uint64_t address = kind == OpKind::DrawIndirect && packet.size() >= 2 ? state.state.drawIndirectBase + packet[1] : 0;
         emit(kind, address, 0, packet.size() >= 2 ? packet[1] : 0, ids);
@@ -213,6 +214,7 @@ private:
             return;
         }
         ++state.counts.dispatches;
+        if (current.conditional) ++state.counts.conditionalDispatches;
         std::uint64_t address = 0;
         if (!direct) {
             try {

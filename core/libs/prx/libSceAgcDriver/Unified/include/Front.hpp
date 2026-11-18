@@ -35,7 +35,7 @@ public:
 
     void Push(std::shared_ptr<const DriverDetail::Submission> submission);
     void Flush();
-    [[nodiscard]] std::vector<LaneTotals> Totals();
+    [[nodiscard]] std::vector<LaneTotals> Totals(bool flush = true);
     [[nodiscard]] Order& Ordering() { return order; }
 
 private:

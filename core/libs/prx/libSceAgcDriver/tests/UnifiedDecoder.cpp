@@ -1,6 +1,7 @@
 #include "prx/libSceAgcDriver/Unified/include/Decoder.hpp"
 #include "prx/libSceAgcDriver/Unified/include/Order.hpp"
 #include "prx/libSceAgcDriver/Unified/include/Front.hpp"
+#include "prx/libSceAgcDriver/Unified/include/Shadow.hpp"
 #include "prx/libSceAgcDriver/Execution/include/VideoOutput.hpp"
 #include <cstdint>
 #include <cstdio>
@@ -215,6 +216,24 @@ void testFrontDecodesQueuesOnTheirOwnThreads() {
     Expect(seen[0] == Rounds * 2 && seen[0x20] == Rounds * 2, "the consumer sees every operation of both queues");
 }
 
+void testShadowCopyKeepsWhatTheDecoderReads() {
+    Stream stream;
+    const auto condition = stream.Add({type3(0x22, 5), 0x1000, 0x2, 0x0, 3});
+    stream.Draw(3);
+    stream.submission.conditionalEnds[condition] = stream.End();
+    const auto registers = stream.Add({type3(0x63, 5), 0x0, 0x0, 0x0, 1});
+    stream.submission.registerLists[registers] = {0x240, 0x1};
+    const auto flip = stream.Add({FlipPacketHeader, 0, 0, 0, 0, 0});
+    stream.submission.flips[flip] = nullptr;
+    stream.submission.flipHandles[flip] = 3;
+    stream.submission.labelWrites = {1, 2};
+    const auto copy = Shadow::Copy(stream.submission);
+    Expect(copy->serial == 9 && copy->queue == 0 && copy->commands == stream.submission.commands, "the copy keeps serial, queue and commands");
+    Expect(copy->conditionalEnds == stream.submission.conditionalEnds && copy->registerLists == stream.submission.registerLists && copy->flipHandles == stream.submission.flipHandles, "the copy keeps conditional ends, register lists and flip handles");
+    Expect(copy->flips.size() == 1 && copy->flips.begin()->first == flip && copy->flips.begin()->second == nullptr, "the copy marks flips without holding the flip request");
+    Expect(copy->labelWrites.empty(), "the copy leaves out the worker's bookkeeping");
+}
+
 void testConditionalRangesArePredicated() {
     Stream stream;
     const auto condition = stream.Add({type3(0x22, 5), 0x1000, 0x2, 0x0, 3});
@@ -228,7 +247,7 @@ void testConditionalRangesArePredicated() {
     if (operations.size() != 2) return;
     Expect(operations[0].predicated, "a draw inside COND_EXEC is predicated");
     Expect(!operations[1].predicated, "a draw after the conditional range is not");
-    Expect(state.Counts().conditional == 1, "the conditional count matches");
+    Expect(state.Counts().conditional == 1 && state.Counts().conditionalDraws == 1 && state.Counts().conditionalDispatches == 0, "the conditional counts match");
 }
 
 void testFlipsAndIndirectRegisters() {
@@ -285,6 +304,7 @@ int main() {
     testFullRingAsksForRoom();
     testWaitEdgesFollowLabelStores();
     testFrontDecodesQueuesOnTheirOwnThreads();
+    testShadowCopyKeepsWhatTheDecoderReads();
     if (failures != 0) {
         std::fprintf(stderr, "%d failure(s)\n", failures);
         return 1;

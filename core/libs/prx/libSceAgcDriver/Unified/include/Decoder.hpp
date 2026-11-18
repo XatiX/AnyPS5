@@ -30,6 +30,8 @@ struct DecodeCounts {
     std::uint64_t labelStores = 0;
     std::uint64_t waits = 0;
     std::uint64_t conditional = 0;
+    std::uint64_t conditionalDraws = 0;
+    std::uint64_t conditionalDispatches = 0;
     std::uint64_t stateFromMemory = 0;
     std::uint64_t stateErrors = 0;
     std::uint64_t snapshotStalls = 0;

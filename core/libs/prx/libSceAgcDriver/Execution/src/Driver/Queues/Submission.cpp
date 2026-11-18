@@ -15,6 +15,9 @@
 #include "prx/libSceAgcDriver/Eq/include/Event.hpp"
 #include "ThreadOwned.hpp"
 #include "prx/libc/include/HostThreadLocal.hpp"
+#if ANYPS5_UNIFIED
+#include "prx/libSceAgcDriver/Unified/include/Shadow.hpp"
+#endif
 #include <algorithm>
 #include <array>
 #include <atomic>
@@ -1031,6 +1034,9 @@ void Driver::noteWaitBlocked(std::uint32_t queue, std::uint64_t awaited, bool bl
 }
 
 void Driver::enqueue(Submission submission) {
+#if ANYPS5_UNIFIED
+    if (Unified::Shadow::Active()) Unified::Shadow::Tee(submission);
+#endif
     const auto queue = submission.queue;
     submission.waitFree = waitFree(submission);
     auto& worker = workers[queue];
