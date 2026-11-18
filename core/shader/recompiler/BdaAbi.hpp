@@ -9,8 +9,27 @@
 namespace ShaderRecompiler::BdaAbi {
 
 inline constexpr std::uint32_t Version = 1;
+inline constexpr std::uint32_t PageTableVersion = 2;
 inline constexpr std::uint32_t Read = 1;
 inline constexpr std::uint32_t Write = 2;
+
+inline constexpr bool Known(std::uint32_t version) {
+    return version == Version || version == PageTableVersion;
+}
+
+inline constexpr std::uint32_t PageTableHeaderWords = 4;
+inline constexpr std::uint32_t PageTablePageBits = 16;
+inline constexpr std::uint32_t PageTableLeafBits = 12;
+inline constexpr std::uint32_t PageTableRootBits = 16;
+inline constexpr std::uint32_t PageTableRootEntries = 1u << PageTableRootBits;
+inline constexpr std::uint32_t PageTableLeafEntries = 1u << PageTableLeafBits;
+inline constexpr std::uint32_t PageTableLeavesWord = PageTableHeaderWords + PageTableRootEntries;
+inline constexpr std::uint64_t PageTableAddressSpace = std::uint64_t{1} << (PageTablePageBits + PageTableLeafBits + PageTableRootBits);
+inline constexpr std::uint64_t PageTablePermissions = Read | Write;
+
+inline constexpr std::uint32_t PageTableBytes(std::uint32_t leaves) {
+    return (PageTableLeavesWord + leaves * PageTableLeafEntries * 2u) * static_cast<std::uint32_t>(sizeof(std::uint32_t));
+}
 
 struct Header {
     std::uint32_t version;

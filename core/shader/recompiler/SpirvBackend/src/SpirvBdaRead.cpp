@@ -402,9 +402,9 @@ std::uint32_t AddBdaImmediate(SpirvValueEmitContext& ctx, const IrValue& inst, s
 }
 
 void ValidateBdaTarget(const IrProgram& program, const SpirvTargetOptions& target) {
-    if (program.Info().usesFaultBuffer && target.bdaAbiVersion != BdaAbi::Version) throw std::runtime_error("the fault buffer needs the BDA fault ABI, which the target lacks");
+    if (program.Info().usesFaultBuffer && !BdaAbi::Known(target.bdaAbiVersion)) throw std::runtime_error("the fault buffer needs the BDA fault ABI, which the target lacks");
     if (!program.Info().usesDma) return;
-    if (target.bdaAbiVersion != BdaAbi::Version) throw std::runtime_error("unsupported BDA ABI version");
+    if (!BdaAbi::Known(target.bdaAbiVersion)) throw std::runtime_error("unsupported BDA ABI version");
     for (const auto capability : {spv::CapabilityInt64, spv::CapabilityPhysicalStorageBufferAddresses, spv::CapabilityStorageBuffer8BitAccess}) {
         if (std::find(target.supportedCapabilities.begin(), target.supportedCapabilities.end(), static_cast<std::uint32_t>(capability)) == target.supportedCapabilities.end()) throw std::runtime_error("BDA requires unsupported SPIR-V capability " + std::to_string(capability));
     }
