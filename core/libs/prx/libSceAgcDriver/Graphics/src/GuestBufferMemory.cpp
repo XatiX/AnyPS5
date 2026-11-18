@@ -427,6 +427,8 @@ struct HostImports {
     std::uint64_t reportedHeapUsage = 0;
     std::uint64_t ceiling = 0;
     std::uint32_t allocationFailures = 0;
+    std::uint64_t failedSpanBegin = 0;
+    std::uint64_t failedSpanEnd = 0;
     bool allocationFailed = false;
     std::uint8_t reportNoted = 0;
     std::map<std::uint64_t, std::uint64_t> spaceUses;
@@ -2604,9 +2606,22 @@ const HostImport* importRunAt(const Context& context, HostImports& state, Import
         if (std::string_view(step) == "vkAllocateMemory") {
             state.allocationFailed = true;
             if (!exhausted) state.allocationFailures = 0;
-            if (exhausted && (++state.allocationFailures >= 3 || live + bytes + budget / 8 >= budget)) {
+            static const bool spanFailures = std::getenv("APS5_NO_IMPORT_FAILURE_SPANS") == nullptr;
+            const bool sameSpan = spanFailures && state.allocationFailures != 0 && base <= state.failedSpanEnd && state.failedSpanBegin <= base + bytes;
+            if (exhausted) {
+                if (sameSpan) {
+                    state.failedSpanBegin = std::min(state.failedSpanBegin, base);
+                    state.failedSpanEnd = std::max(state.failedSpanEnd, base + bytes);
+                } else {
+                    ++state.allocationFailures;
+                    state.failedSpanBegin = base;
+                    state.failedSpanEnd = base + bytes;
+                }
+            }
+            const bool repeated = exhausted && state.allocationFailures >= 3;
+            if (exhausted && (repeated || live + bytes + budget / 8 >= budget)) {
                 state.ceiling = std::max<std::uint64_t>(pinnedTotal(state), 1);
-                std::fprintf(stderr, "[gpu] host import budget lowered to the %.1f MiB pinned after vkAllocateMemory failed %s\n", pinnedTotal(state) / 1048576.0, state.allocationFailures >= 3 ? "3 times in a row" : "within an eighth of the budget");
+                std::fprintf(stderr, "[gpu] host import budget lowered to the %.1f MiB pinned after vkAllocateMemory failed %s\n", pinnedTotal(state) / 1048576.0, repeated ? "3 times in a row" : "within an eighth of the budget");
             }
         }
 #ifdef _WIN32
