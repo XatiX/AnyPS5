@@ -20,6 +20,7 @@ std::shared_ptr<QueueState> RecordedState(const DriverDetail::Submission& submis
 void NoteDriverDraw(const QueueState& queue, const DriverDetail::Submission& submission, std::size_t packetOffset);
 void NoteGpuMapping(const GuestAllocations::Mapped& ranges);
 void NoteGuestAccess(GuestRanges reads, GuestRanges writes, bool unknown);
+bool NoteProofRanges(GuestRanges ranges);
 std::shared_ptr<DriverDetail::Submission> Copy(const DriverDetail::Submission& submission);
 void Tee(const DriverDetail::Submission& submission);
 

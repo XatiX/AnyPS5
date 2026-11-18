@@ -53,6 +53,7 @@
 #include "prx/libc/include/GuestAllocations.hpp"
 #if ANYPS5_UNIFIED
 #include "prx/libSceAgcDriver/Unified/include/Events.hpp"
+#include "prx/libSceAgcDriver/Unified/include/Shadow.hpp"
 #endif
 
 namespace AgcDriver::Graphics {
@@ -3045,6 +3046,12 @@ void ShaderResources::buildComplete() {
         }
         timing.descriptorsMs += phase(BuildPhase::Descriptors);
         noteReusable();
+#if ANYPS5_UNIFIED
+        if (reusable) {
+            const auto ranges = ProofRanges();
+            proofRangesRegistered = Unified::Shadow::NoteProofRanges(ranges);
+        }
+#endif
         completed = true;
         if (BuildProfiled()) {
             timing.completeMs = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - stageStart).count();
@@ -3100,6 +3107,36 @@ bool LoopGuardEnabled() {
     return enabled;
 }
 
+}
+
+std::vector<std::pair<std::uint64_t, std::uint64_t>> ShaderResources::ProofRanges() const {
+    std::vector<std::pair<std::uint64_t, std::uint64_t>> ranges;
+    const auto add = [&](std::uint64_t address, std::uint64_t bytes) {
+        if (address != 0 && bytes != 0) ranges.emplace_back(address, address + bytes);
+    };
+    for (const auto& range : describedRanges) {
+        add(range.address, range.bytes);
+        if (range.dccAddress != 0) add(range.dccAddress, DccKeyBytes(range.bytes));
+    }
+    for (const auto& image : storageTextures) {
+        if (image == nullptr) continue;
+        add(image->Descriptor().baseAddress, image->GuestBytes());
+        if (image->Descriptor().dccAddress != 0) add(image->Descriptor().dccAddress, DccKeyBytes(image->GuestBytes()));
+    }
+    for (const auto& surface : validatedTextures) {
+        add(surface.resource.baseAddress, surface.bytes);
+        if (surface.resource.dccAddress != 0) add(surface.resource.dccAddress, DccKeyBytes(surface.bytes));
+    }
+    for (const auto& region : directRegions) add(region.begin, region.end - region.begin);
+    for (const auto& allocation : allocations) {
+        if (allocation.guest) add(allocation.address, allocation.size);
+    }
+    for (const auto& range : guestMemory.DeviceReads()) ranges.push_back(range);
+    for (const auto& range : guestMemory.Writes()) ranges.push_back(range);
+    std::erase_if(ranges, [](const std::pair<std::uint64_t, std::uint64_t>& range) { return range.first == 0 || range.second <= range.first; });
+    std::sort(ranges.begin(), ranges.end());
+    ranges.erase(std::unique(ranges.begin(), ranges.end()), ranges.end());
+    return ranges;
 }
 
 void ShaderResources::noteReusable() {

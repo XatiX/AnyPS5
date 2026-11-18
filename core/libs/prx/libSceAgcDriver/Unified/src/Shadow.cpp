@@ -12,7 +12,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <mutex>
-#include <set>
+#include <map>
 #include <span>
 #include <utility>
 #include <string>
@@ -51,6 +51,8 @@ struct MemoryTotals {
     std::atomic<std::uint64_t> outsideArena{0};
     std::atomic<std::uint64_t> accesses{0};
     std::atomic<std::uint64_t> unknownAccesses{0};
+    std::atomic<std::uint64_t> proofObjects{0};
+    std::atomic<std::uint64_t> proofObjectsOutside{0};
     std::atomic<std::uint64_t> consumes{0};
     std::atomic<std::uint64_t> ranges{0};
     std::atomic<std::uint64_t> dirtyBytes{0};
@@ -80,24 +82,26 @@ bool memoryInstalled() {
     return installed;
 }
 
-void registerRange(std::uint64_t begin, std::uint64_t end) {
-    if (begin == 0 || end <= begin) return;
+bool registerRange(std::uint64_t begin, std::uint64_t end) {
+    if (begin == 0 || end <= begin) return false;
     static std::mutex seenMutex;
-    static std::set<std::pair<std::uint64_t, std::uint64_t>>& seen = *new std::set<std::pair<std::uint64_t, std::uint64_t>>();
+    static std::map<std::pair<std::uint64_t, std::uint64_t>, bool>& seen = *new std::map<std::pair<std::uint64_t, std::uint64_t>, bool>();
     const auto first = begin & ~(PageBytes - 1);
     const auto last = (end + PageBytes - 1) & ~(PageBytes - 1);
+    const bool inside = GuestArena::GuestArenaContains_nid_postfix(reinterpret_cast<const void*>(first), static_cast<std::size_t>(last - first));
     {
         std::lock_guard lock(seenMutex);
-        if (!seen.emplace(first, last).second) return;
+        if (!seen.emplace(std::pair{first, last}, inside).second) return inside;
     }
-    if (!GuestArena::GuestArenaContains_nid_postfix(reinterpret_cast<const void*>(first), static_cast<std::size_t>(last - first))) {
+    if (!inside) {
         memoryTotals().outsideArena.fetch_add(1, std::memory_order_relaxed);
-        return;
+        return false;
     }
     MemoryCore::Get().Register(first, last - first);
     auto& totals = memoryTotals();
     totals.registrations.fetch_add(1, std::memory_order_relaxed);
     totals.registeredBytes.fetch_add(last - first, std::memory_order_relaxed);
+    return true;
 }
 
 void registerUses(std::span<const GuestUse> uses) {
@@ -140,8 +144,8 @@ std::string memoryLine() {
         static_cast<unsigned long long>(table.keptBusy), static_cast<unsigned long long>(table.rearmed), static_cast<unsigned long long>(table.unchangedBusy),
         static_cast<unsigned long long>(protect.calls), static_cast<unsigned long long>(protect.bytes >> 20), static_cast<unsigned long long>(protect.splitCalls), static_cast<unsigned long long>(protect.skippedBytes >> 20), static_cast<unsigned long long>(protect.failures));
     const auto events = Events::Shared().Counts();
-    char eventLine[256];
-    std::snprintf(eventLine, sizeof(eventLine), "[recode-events] notes %llu serial %llu; queries %llu, region skips %llu, changed %llu, owner exempt %llu\n", static_cast<unsigned long long>(events.notes), static_cast<unsigned long long>(Events::Shared().Serial()), static_cast<unsigned long long>(events.queries), static_cast<unsigned long long>(events.regionSkips), static_cast<unsigned long long>(events.changed), static_cast<unsigned long long>(events.ownerExempt));
+    char eventLine[384];
+    std::snprintf(eventLine, sizeof(eventLine), "[recode-events] notes %llu serial %llu; queries %llu, region skips %llu, changed %llu, owner exempt %llu; proof objects %llu, with ranges outside the arena %llu\n", static_cast<unsigned long long>(events.notes), static_cast<unsigned long long>(Events::Shared().Serial()), static_cast<unsigned long long>(events.queries), static_cast<unsigned long long>(events.regionSkips), static_cast<unsigned long long>(events.changed), static_cast<unsigned long long>(events.ownerExempt), static_cast<unsigned long long>(totals.proofObjects.load(std::memory_order_relaxed)), static_cast<unsigned long long>(totals.proofObjectsOutside.load(std::memory_order_relaxed)));
     return std::string(line) + eventLine;
 }
 
@@ -222,6 +226,16 @@ void NoteGuestAccess(GuestRanges reads, GuestRanges writes, bool unknown) {
     if (unknown) totals.unknownAccesses.fetch_add(1, std::memory_order_relaxed);
     for (const auto& [begin, end] : reads) registerRange(begin, end);
     for (const auto& [begin, end] : writes) registerRange(begin, end);
+}
+
+bool NoteProofRanges(GuestRanges ranges) {
+    if (!drawScope() || !memoryInstalled()) return false;
+    bool registered = true;
+    for (const auto& [begin, end] : ranges) registered = registerRange(begin, end) && registered;
+    auto& totals = memoryTotals();
+    totals.proofObjects.fetch_add(1, std::memory_order_relaxed);
+    if (!registered) totals.proofObjectsOutside.fetch_add(1, std::memory_order_relaxed);
+    return registered;
 }
 
 void NoteGpuMapping(const GuestAllocations::Mapped& ranges) {
