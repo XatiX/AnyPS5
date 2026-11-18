@@ -51,6 +51,9 @@
 #include <unordered_set>
 #include <utility>
 #include "prx/libc/include/GuestAllocations.hpp"
+#if ANYPS5_UNIFIED
+#include "prx/libSceAgcDriver/Unified/include/Events.hpp"
+#endif
 
 namespace AgcDriver::Graphics {
 namespace {
@@ -262,11 +265,21 @@ UncachedImages& Uncached() {
     return uncached;
 }
 
+void noteImageSetChange(std::uint64_t address, std::uint64_t bytes) {
+#if ANYPS5_UNIFIED
+    AgcDriver::Unified::Events::Shared().Note(address, bytes);
+#else
+    static_cast<void>(address);
+    static_cast<void>(bytes);
+#endif
+}
+
 void noteUncached(const std::shared_ptr<StorageTexture>& image) {
     auto& uncached = Uncached();
     std::lock_guard lock(uncached.mutex);
     uncached.images.push_back(image);
     uncached.any.store(true, std::memory_order_release);
+    noteImageSetChange(image->Descriptor().baseAddress, image->GuestBytes());
 }
 
 std::atomic<bool>& TexturesReleased() {
@@ -289,6 +302,7 @@ void noteReleased(const std::shared_ptr<Texture>& texture, std::uint64_t address
     texture->MarkReleased();
     TexturesReleased().store(true, std::memory_order_release);
     GuestMemory::NoteTextureReleased(address);
+    noteImageSetChange(address, 1);
 }
 
 bool SamplerCacheDisabled() {
@@ -1364,6 +1378,7 @@ std::shared_ptr<Texture> cachedTexture(const Context& context, std::span<const s
     entry.present = Recorder::Presents();
     ++cache.counts.inserted;
     logLookup(madeRecord());
+    noteImageSetChange(resource.baseAddress, guestBytes);
     cache.entries.push_front(std::move(entry));
     cache.index[key] = cache.entries.begin();
     if (source != nullptr) cache.views.emplace(source.get(), cache.entries.begin());
@@ -1606,6 +1621,7 @@ std::shared_ptr<StorageTexture> cachedStorageTexture(const Context& context, std
             cache.index[key] = cache.entries.begin();
             cache.byImage[texture.get()] = cache.entries.begin();
             texture->SetCached(true);
+            noteImageSetChange(texture->Descriptor().baseAddress, texture->GuestBytes());
             counters.storageCreated.fetch_add(1, std::memory_order_relaxed);
             if (profile) LookupOutcomes::Add(LookupOutcomes::StorageMade, start);
         }

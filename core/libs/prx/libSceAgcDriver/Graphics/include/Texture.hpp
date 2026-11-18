@@ -804,6 +804,7 @@ private:
     void recordDirectUploadBarrier(VkCommandBuffer commands, bool discard);
     void recordDirectUploadDone(VkCommandBuffer commands);
     void release() noexcept;
+    void notePendingChange() const;
 
     Context context;
     TextureDetiler& detiler;
