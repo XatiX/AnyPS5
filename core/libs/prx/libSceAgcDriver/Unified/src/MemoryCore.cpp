@@ -1,4 +1,5 @@
 #include "prx/libSceAgcDriver/Unified/include/MemoryCore.hpp"
+#include "prx/libSceAgcDriver/Unified/include/Events.hpp"
 #include <array>
 #include <cstdlib>
 #ifdef _WIN32
@@ -75,6 +76,7 @@ std::vector<DirtyRange> MemoryCore::ConsumeDirty() {
     };
     auto ranges = hashBusy ? pages.ConsumeDirty(changes, written) : pages.ConsumeDirty(changes);
     protector.Apply(changes);
+    for (const auto& range : ranges) Events::Shared().Note(range.address, range.size);
     return ranges;
 }
 
@@ -97,11 +99,13 @@ bool MemoryCore::HandleFault(std::uint64_t address, bool write) {
     if (!write) return false;
     if (state != PageState::CpuClean) {
         staleFaults.fetch_add(1, std::memory_order_relaxed);
+        Events::Shared().Note(address & ~(PageBytes - 1), PageBytes);
         const ProtectionChange reopen{address & ~(PageBytes - 1), PageBytes, Protection::ReadWrite};
         return protector.Apply(std::span(&reopen, 1)) == 1;
     }
     std::vector<ProtectionChange> changes;
     if (!pages.HandleWrite(address, changes)) return false;
+    Events::Shared().Note(address & ~(PageBytes - 1), PageBytes);
     protector.Apply(changes);
     writesOpened.fetch_add(1, std::memory_order_relaxed);
     return true;
@@ -109,6 +113,7 @@ bool MemoryCore::HandleFault(std::uint64_t address, bool write) {
 
 void MemoryCore::PrepareHostWrite(std::uint64_t address, std::uint64_t size) {
     if (size == 0) return;
+    Events::Shared().Note(address, size);
     std::lock_guard lock(mutex);
     std::vector<ProtectionChange> changes;
     const auto end = address + size;
