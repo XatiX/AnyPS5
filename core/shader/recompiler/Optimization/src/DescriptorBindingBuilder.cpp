@@ -578,6 +578,7 @@ DescriptorBindingPlan DescriptorBindingBuilder::Prepare(const IrBindingLayout& l
     for (const auto& logical : layout.descriptors) {
         const bool imageHeap = ImageBindingResourceClass(logical.kind) != ImageResourceClass::None;
         const bool samplerHeap = logical.kind == DescriptorBindingKind::Samplers;
+        if ((imageHeap || samplerHeap) && layout.directSlotCount != 0u) continue;
         IrDescriptorBinding compact{logical.kind, {}};
         std::vector<std::uint32_t> originals;
         std::vector<bool> inactive;
@@ -707,6 +708,7 @@ DescriptorBindingPlan DescriptorBindingBuilder::Prepare(const IrBindingLayout& l
 DescriptorBindingPlan DescriptorBindingBuilder::Select(const DescriptorBindingPlan& plan, std::span<const std::uint32_t> bindings) const {
     DescriptorBindingPlan selected;
     std::set<std::uint32_t> remaining(bindings.begin(), bindings.end());
+    for (auto at = remaining.begin(); at != remaining.end();) at = *at >= RuntimeAbi::DirectHeapBindingBase && *at - RuntimeAbi::DirectHeapBindingBase < RuntimeAbi::DirectHeapBindingCount ? remaining.erase(at) : std::next(at);
     selected.bindings.reserve(remaining.size());
     for (const auto& binding : plan.bindings) {
         if (remaining.erase(binding.descriptor.binding) == 0u) continue;

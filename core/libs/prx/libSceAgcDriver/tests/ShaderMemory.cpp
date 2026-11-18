@@ -5681,6 +5681,25 @@ void verifySamplerLimits() {
     require(pairedImages == 3u, "sampler limits: the three direct images are not bound");
     std::cout << "sampler limits: 20 direct samplers bound as 40 sampler elements; the image sampled only through samplers 16 to 19 pairs with elements 32 to 39\n";
 
+    auto heapRequest = TableRequest(directCode, userData);
+    heapRequest.target.directResources = true;
+    const auto heap = CompileTable(heapRequest);
+    std::uint32_t defaultElements = 0u;
+    for (const auto& binding : direct.result->bindings) {
+        if (binding.role == DescriptorRole::GuestSamplers || binding.role == DescriptorRole::GuestImages) defaultElements += binding.count;
+    }
+    require(heap.result->directHeap && heap.result->directSlotCount >= defaultElements, ("heap mode: the program reads " + std::to_string(heap.result->directSlotCount) + " heap slots, fewer than the " + std::to_string(defaultElements) + " image and sampler elements the default compile binds").c_str());
+    require(!direct.result->directHeap && direct.result->directSlotCount == 0u, "heap mode: the default compile reads heap slots");
+    require(heap.key != direct.key, "heap mode: the cache key does not tell heap mode from the default");
+    for (const auto& binding : heap.result->bindings) {
+        require(binding.role != DescriptorRole::GuestSamplers && binding.role != DescriptorRole::GuestImages, "heap mode: an image or sampler is still bound per draw");
+    }
+    std::vector<std::byte> encoded;
+    ShaderDiskCache::EncodeResult(*heap.result, encoded);
+    RecompileResult decoded;
+    require(ShaderDiskCache::DecodeResult(encoded, decoded) && decoded.directHeap && decoded.directSlotCount == heap.result->directSlotCount && decoded.directSlotDword == heap.result->directSlotDword, "heap mode: the disk cache does not keep the slot count and dword");
+    std::cout << "heap mode: 20 direct samplers and 3 images read " << heap.result->directSlotCount << " heap slots (the default binds " << defaultElements << " elements) from shader data dword " << heap.result->directSlotDword << "; no per-draw image or sampler bindings\n";
+
     constexpr std::uint32_t TableDirect = 18u;
     std::vector<std::pair<std::uint32_t, std::uint32_t>> tablePairs;
     for (std::uint32_t sampler = 0; sampler < TableDirect; sampler++) tablePairs.emplace_back(sampler % 2u, sampler);
