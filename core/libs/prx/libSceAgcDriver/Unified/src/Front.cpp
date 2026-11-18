@@ -42,7 +42,7 @@ struct Front::Lane {
     std::thread thread;
 };
 
-Front::Front(Consumer consumer) : consumer(std::move(consumer)) {}
+Front::Front(Consumer consumer, bool resolve) : consumer(std::move(consumer)), resolve(resolve) {}
 
 Front::~Front() {
     std::lock_guard lock(lanesMutex);
@@ -61,6 +61,7 @@ Front::Lane& Front::laneFor(std::uint32_t queue) {
     auto& lane = lanes[queue];
     if (lane == nullptr) {
         lane = std::make_unique<Lane>(queue);
+        lane->state.SetResolve(resolve);
         Lane& created = *lane;
         created.thread = std::thread([this, &created] { run(created); });
     }

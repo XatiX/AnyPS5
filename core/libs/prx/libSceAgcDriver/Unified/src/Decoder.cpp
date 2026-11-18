@@ -1,7 +1,9 @@
 #include "prx/libSceAgcDriver/Unified/include/Decoder.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Pm4.hpp"
 #include "prx/libSceAgcDriver/Execution/include/VideoOutput.hpp"
+#include "prx/libSceAgcDriver/Execution/include/Driver/Draw/DrawRegisterKey.hpp"
 #include <algorithm>
+#include <optional>
 #include <cstring>
 #include <exception>
 #include <span>
@@ -194,6 +196,11 @@ private:
         operation.value = value;
         operation.mask = mask;
         operation.function = function;
+        if (resolvedKey.has_value()) {
+            operation.resolved = true;
+            operation.key = *resolvedKey;
+            resolvedKey.reset();
+        }
         ++state.counts.operations;
         if (current.conditional) ++state.counts.conditional;
         sink.Emit(operation);
@@ -204,7 +211,26 @@ private:
         if (current.conditional) ++state.counts.conditionalDraws;
         const auto ids = snapshot();
         const std::uint64_t address = kind == OpKind::DrawIndirect && packet.size() >= 2 ? state.state.drawIndirectBase + packet[1] : 0;
+        if (state.resolve && resolveDraw(kind, packet, ids)) return;
         emit(kind, address, 0, packet.size() >= 2 ? packet[1] : 0, ids);
+    }
+
+    bool resolveDraw(OpKind kind, std::span<const std::uint32_t> packet, const SnapshotIds& ids) {
+        Pm4::DrawParameters draw{};
+        std::uint64_t key = 0;
+        try {
+            draw = Pm4::ResolveDraw(packet, state.state);
+            key = DriverDetail::RegisterStateKey(state.state);
+        } catch (const std::exception&) {
+            ++state.counts.resolveErrors;
+            return false;
+        }
+        ++state.counts.resolved;
+        const std::uint64_t address = draw.indirect.has_value() ? draw.indirect->arguments : draw.indexAddress;
+        const std::uint64_t size = draw.indirect.has_value() ? draw.indirect->RangeBytes() : draw.indexCount;
+        resolvedKey = key;
+        emit(kind, address, size, draw.instanceCount | (static_cast<std::uint64_t>(draw.indexSize) << 32u), ids);
+        return true;
     }
 
     void dispatch(std::span<const std::uint32_t> packet, std::uint32_t opcode) {
@@ -311,6 +337,7 @@ private:
     Sink& sink;
     std::size_t conditionalUntil = 0;
     Current current;
+    std::optional<std::uint64_t> resolvedKey;
 };
 
 void DecodeState::RetireBefore(const SnapshotIds& ids) {

@@ -12,7 +12,7 @@ namespace AgcDriver::Unified::Shadow {
 namespace {
 
 Front& front() {
-    static Front& shared = *new Front();
+    static Front& shared = *new Front({}, std::getenv("APS5_RECODE_RESOLVE") != nullptr);
     return shared;
 }
 
@@ -32,8 +32,8 @@ void report() {
         conditionalDraws += lane.counts.conditionalDraws;
         dispatches += lane.counts.dispatches;
         conditionalDispatches += lane.counts.conditionalDispatches;
-        char part[256];
-        std::snprintf(part, sizeof(part), " q0x%x: %llu subs %llu ops %llu draws %llu dispatches %llu flips %.2f us/op stalls %llu memstate %llu errors %llu;", lane.queue, static_cast<unsigned long long>(lane.submissions), static_cast<unsigned long long>(lane.counts.operations), static_cast<unsigned long long>(lane.counts.draws), static_cast<unsigned long long>(lane.counts.dispatches), static_cast<unsigned long long>(lane.counts.flips), lane.NanosecondsPerOperation() / 1000.0, static_cast<unsigned long long>(lane.counts.snapshotStalls), static_cast<unsigned long long>(lane.counts.stateFromMemory), static_cast<unsigned long long>(lane.counts.stateErrors));
+        char part[384];
+        std::snprintf(part, sizeof(part), " q0x%x: %llu subs %llu ops %llu draws %llu dispatches %llu flips %.2f us/op stalls %llu memstate %llu errors %llu resolved %llu resolve errors %llu;", lane.queue, static_cast<unsigned long long>(lane.submissions), static_cast<unsigned long long>(lane.counts.operations), static_cast<unsigned long long>(lane.counts.draws), static_cast<unsigned long long>(lane.counts.dispatches), static_cast<unsigned long long>(lane.counts.flips), lane.NanosecondsPerOperation() / 1000.0, static_cast<unsigned long long>(lane.counts.snapshotStalls), static_cast<unsigned long long>(lane.counts.stateFromMemory), static_cast<unsigned long long>(lane.counts.stateErrors), static_cast<unsigned long long>(lane.counts.resolved), static_cast<unsigned long long>(lane.counts.resolveErrors));
         line += part;
     }
     const auto order = front().Ordering().Counts();

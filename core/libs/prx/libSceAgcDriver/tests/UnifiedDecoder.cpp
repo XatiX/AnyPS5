@@ -288,6 +288,27 @@ void testReplayMatchesThePacketAnalysis() {
     std::filesystem::remove_all(directory);
 }
 
+void testResolveFillsDrawParametersAndKeys() {
+    Stream stream;
+    stream.Add({type3(0x2f, 2), 4});
+    stream.Draw(12);
+    stream.Draw(12);
+    stream.SetContext(0x8e, 0x3);
+    stream.Draw(12);
+    DecodeState state(0);
+    state.SetResolve(true);
+    const auto operations = decode(stream, state);
+    Expect(operations.size() == 3, "three resolved draws");
+    if (operations.size() != 3) return;
+    Expect(state.Counts().resolved == 3 && state.Counts().resolveErrors == 0, "every draw resolves");
+    Expect(operations[0].resolved && operations[0].size == 12 && (operations[0].value & 0xffffffffu) == 4, "a resolved auto draw carries its vertex count and instance count");
+    Expect(operations[0].key == operations[1].key, "draws without a register write between them share a key");
+    Expect(operations[2].key != operations[1].key, "a context write changes the key");
+    DecodeState plain(0);
+    const auto unresolved = decode(stream, plain);
+    Expect(!unresolved.empty() && !unresolved[0].resolved && plain.Counts().resolved == 0, "without resolve nothing is resolved");
+}
+
 void testConditionalRangesArePredicated() {
     Stream stream;
     const auto condition = stream.Add({type3(0x22, 5), 0x1000, 0x2, 0x0, 3});
@@ -360,6 +381,7 @@ int main() {
     testFrontDecodesQueuesOnTheirOwnThreads();
     testShadowCopyKeepsWhatTheDecoderReads();
     testReplayMatchesThePacketAnalysis();
+    testResolveFillsDrawParametersAndKeys();
     if (failures != 0) {
         std::fprintf(stderr, "%d failure(s)\n", failures);
         return 1;

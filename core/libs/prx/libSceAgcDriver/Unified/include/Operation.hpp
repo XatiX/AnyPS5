@@ -49,6 +49,8 @@ struct Operation {
     std::uint64_t value = 0;
     std::uint64_t mask = ~std::uint64_t{0};
     std::uint8_t function = 0;
+    bool resolved = false;
+    std::uint64_t key = 0;
 };
 
 [[nodiscard]] constexpr bool IsDraw(OpKind kind) {

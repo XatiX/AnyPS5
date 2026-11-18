@@ -35,6 +35,8 @@ struct DecodeCounts {
     std::uint64_t stateFromMemory = 0;
     std::uint64_t stateErrors = 0;
     std::uint64_t snapshotStalls = 0;
+    std::uint64_t resolved = 0;
+    std::uint64_t resolveErrors = 0;
     std::uint64_t truncated = 0;
 };
 
@@ -50,6 +52,7 @@ public:
     explicit DecodeState(std::uint32_t queue) : queueId(queue) {}
 
     void RetireBefore(const SnapshotIds& ids);
+    void SetResolve(bool enabled) { resolve = enabled; }
     [[nodiscard]] const Registers* Context(std::uint64_t id) const { return context.Find(id); }
     [[nodiscard]] const Registers* UserConfig(std::uint64_t id) const { return userConfig.Find(id); }
     [[nodiscard]] const Registers* Shader(std::uint64_t id) const { return shader.Find(id); }
@@ -71,6 +74,7 @@ private:
     bool userConfigDirty = true;
     bool shaderDirty = true;
     bool scalarsDirty = true;
+    bool resolve = false;
     std::uint64_t sequence = 0;
     DecodeCounts counts;
 };
