@@ -2,8 +2,12 @@
 #include "prx/libSceAgcDriver/Unified/include/Order.hpp"
 #include "prx/libSceAgcDriver/Unified/include/Front.hpp"
 #include "prx/libSceAgcDriver/Unified/include/Shadow.hpp"
+#include "prx/libSceAgcDriver/Unified/include/Replay.hpp"
+#include "prx/libSceAgcDriver/Execution/include/SubmissionCapture.hpp"
 #include "prx/libSceAgcDriver/Execution/include/VideoOutput.hpp"
+#include "../tools/Pm4Analysis.hpp"
 #include <cstdint>
+#include <filesystem>
 #include <cstdio>
 #include <initializer_list>
 #include <map>
@@ -234,6 +238,56 @@ void testShadowCopyKeepsWhatTheDecoderReads() {
     Expect(copy->labelWrites.empty(), "the copy leaves out the worker's bookkeeping");
 }
 
+void testReplayMatchesThePacketAnalysis() {
+    const auto directory = std::filesystem::temp_directory_path() / "aps5-unified-replay";
+    std::filesystem::remove_all(directory);
+    std::filesystem::create_directories(directory);
+    std::vector<std::pair<std::uint32_t, std::vector<std::uint32_t>>> planned;
+    {
+        Stream graphics;
+        graphics.SetContext(0x8e, 0xf);
+        graphics.Draw(3);
+        const auto condition = graphics.Add({type3(0x22, 5), 0x1000, 0x2, 0x0, 3});
+        graphics.Draw(6);
+        graphics.Add({type3(0x49, 8), 0x0, 1u << 29u, 0x9000, 0x0, 1, 0x0, 0x0});
+        planned.emplace_back(0, graphics.submission.commands);
+        SubmissionCapture capture(directory);
+        auto first = SubmissionCapture::Prepare(0, SubmissionKind::Submit, graphics.submission.commands, {{condition, condition + 8}});
+        capture.Take(first, 1, 1000, {});
+        capture.Write(first);
+        Stream compute;
+        compute.Add({type3(0x3c, 7), 0x13, 0x9000, 0x0, 1, 0xffffffffu, 0x10});
+        compute.Dispatch(2, 2, 1);
+        compute.Dispatch(4, 1, 1);
+        auto second = SubmissionCapture::Prepare(0x20, SubmissionKind::Submit, compute.submission.commands, {});
+        capture.Take(second, 2, 2000, {});
+        capture.Write(second);
+    }
+    std::uint64_t analysedDraws = 0, analysedDispatches = 0;
+    for (const auto& captured : SubmissionCapture::Read(directory)) {
+        for (const auto& packet : Pm4Analysis::Decode(captured)) {
+            const auto opcode = (packet.header >> 8u) & 0xffu;
+            if (Pm4::DrawOpcode(opcode)) ++analysedDraws;
+            if (opcode == 0x15 || opcode == 0x16) ++analysedDispatches;
+        }
+    }
+    std::uint64_t draws = 0, dispatches = 0, conditionalDraws = 0;
+    {
+        Front front;
+        for (const auto& lane : ReplayCapture(directory, front)) {
+            draws += lane.counts.draws;
+            dispatches += lane.counts.dispatches;
+            conditionalDraws += lane.counts.conditionalDraws;
+        }
+        const auto order = front.Ordering().Counts();
+        Expect(order.edges + order.released == 1, "the replayed cross-queue wait finds its release");
+    }
+    Expect(analysedDraws == 2 && analysedDispatches == 2, "the packet analysis sees two draws and two dispatches");
+    Expect(draws == analysedDraws && dispatches == analysedDispatches, "the replayed decode counts match the packet analysis");
+    Expect(conditionalDraws == 1, "the captured conditional range marks the guarded draw");
+    std::filesystem::remove_all(directory);
+}
+
 void testConditionalRangesArePredicated() {
     Stream stream;
     const auto condition = stream.Add({type3(0x22, 5), 0x1000, 0x2, 0x0, 3});
@@ -305,6 +359,7 @@ int main() {
     testWaitEdgesFollowLabelStores();
     testFrontDecodesQueuesOnTheirOwnThreads();
     testShadowCopyKeepsWhatTheDecoderReads();
+    testReplayMatchesThePacketAnalysis();
     if (failures != 0) {
         std::fprintf(stderr, "%d failure(s)\n", failures);
         return 1;

@@ -1,7 +1,7 @@
 if(NOT ANYPS5_GPU_BACKEND STREQUAL "unified")
     return()
 endif()
-add_test_executable(agc_unified_decoder_tests EXCLUDE_FROM_ALL tests/UnifiedDecoder.cpp)
+add_test_executable(agc_unified_decoder_tests EXCLUDE_FROM_ALL tests/UnifiedDecoder.cpp tools/Pm4Analysis.cpp)
 target_include_directories(agc_unified_decoder_tests PRIVATE ${LIBS_INCLUDE_DIR})
 target_link_libraries(agc_unified_decoder_tests PRIVATE libSceAgc libSceAgcDriver libc libkernel)
 set_target_properties(agc_unified_decoder_tests PROPERTIES CXX_EXTENSIONS OFF)
