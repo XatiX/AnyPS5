@@ -23,6 +23,9 @@
 #include <stdexcept>
 #include <string>
 #include <utility>
+#if ANYPS5_UNIFIED
+#include "prx/libSceAgcDriver/Unified/include/Shadow.hpp"
+#endif
 
 namespace AgcDriver::DriverDetail {
 
@@ -77,6 +80,7 @@ bool keepsDrawPipeline(std::span<const std::uint32_t> packet, std::uint32_t head
         case 0x11: case 0x12: case 0x13: case 0x20: case 0x26: case 0x2a: case 0x2f: case 0x3f: case 0x42: case 0x58: case 0x59: case 0x69: case 0x76: case 0x79: case 0x7a: case 0x81: return true;
         case 0x46: return packet.size() >= 2 && (packet[1] & 0x3fu) != 0x39u;
         case 0x15: return orderedFills();
+        case 0x16: return orderedFills() && PipelineIndirectItems();
         case 0x40:
             return packet.size() >= 6 && !Pm4::CopyDataToRegister(packet) && Pm4::CopyDataSource(packet) == Pm4::CopyDataGpuClockSource &&
                    !DrawPipeline::Queue0().Overlaps(packet[4] | (static_cast<std::uint64_t>(packet[5]) << 32u), Pm4::CopyDataBytes(packet));
@@ -323,7 +327,7 @@ void Driver::execute(Submission& submission) {
         if (submission.queue != 0 && Graphics::Recorder::DispatchOverlapEnabled()) noteRingPacket(submission.queue, submission.serial, opcode, header);
         PerformanceTimer timing("Driver.Packet");
         if (!predicated) noteLabelIssue(packet, submission.queue);
-        if (pipelined && !predicated && header != FlipPacketHeader && header != RenderingWaitPacketHeader && !submission.flips.contains(cursor) && (enqueueLabelPacket(packet, opcode, submission.queue, releaseInterrupt(packet, opcode, false)) || enqueueDmaPacket(packet, opcode, submission.queue, queue) || enqueueConstantRamDump(packet, opcode, submission.queue, queue) || enqueueSampleDumpPacket(packet, opcode, submission.queue))) {
+        if (pipelined && !predicated && header != FlipPacketHeader && header != RenderingWaitPacketHeader && !submission.flips.contains(cursor) && (enqueueLabelPacket(packet, opcode, submission.queue, releaseInterrupt(packet, opcode, false)) || enqueueDmaPacket(packet, opcode, submission.queue, queue) || enqueueConstantRamDump(packet, opcode, submission.queue, queue) || enqueueClockStore(packet, opcode, submission.queue, queue) || enqueueSampleDumpPacket(packet, opcode, submission.queue))) {
             traceLabel(packet, submission.queue);
             recent.Record(cursor);
             cursor = nextCursor;
@@ -445,6 +449,7 @@ void Driver::execute(Submission& submission) {
             CheckFailure();
             std::uint64_t batchesAtFlip = 0, unsignaledAtFlip = 0;
             Graphics::StorageTexture::NoteFlip();
+            GuestMemory::NoteFrame();
             if (!drains) {
 
                 GuestMemory::TagGpuLockSite(GuestMemory::GpuLockSite::Flush);
@@ -547,7 +552,13 @@ void Driver::execute(Submission& submission) {
 
                 try {
                     std::string rejected;
-                    const auto verdict = draw(queue, packet, submission, cursor, rejected);
+#if ANYPS5_UNIFIED
+                    const auto recorded = Unified::Shadow::RecordedState(submission, cursor);
+                    auto& drawState = recorded != nullptr ? *recorded : queue;
+#else
+                    auto& drawState = queue;
+#endif
+                    const auto verdict = draw(drawState, packet, submission, cursor, rejected);
                     drawn = verdict == DrawVerdict::Drawn;
                     CaptureTrace::Log("draw submission=%llu queue=%x offset=%zu target=%llx mask=%x verdict=%d reason=%.256s", static_cast<unsigned long long>(submission.serial), submission.queue, cursor, static_cast<unsigned long long>(color), readRegister(queue.context, 0x8e), static_cast<int>(verdict), rejected.c_str());
                     if (verdict == DrawVerdict::Rejected) {

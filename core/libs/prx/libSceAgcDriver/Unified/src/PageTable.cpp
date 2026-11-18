@@ -88,7 +88,7 @@ std::vector<ProtectionChange> PageTable::Register(std::uint64_t address, std::ui
         auto* region = regionOf(page, true);
         if (region->states[slotOf(page)] != PageState::Untracked) continue;
         setState(page, PageState::CpuDirty);
-        region->busy[slotOf(page)] = 0;
+        region->busyUntil[slotOf(page)] = 0;
         region->streak[slotOf(page)] = 0;
         list(page);
     }
@@ -127,7 +127,13 @@ bool PageTable::HandleWrite(std::uint64_t address, std::vector<ProtectionChange>
     }
 }
 
-std::vector<DirtyRange> PageTable::ConsumeDirty(std::vector<ProtectionChange>& changes) {
+void PageTable::AdvanceFrame() {
+    std::lock_guard lock(mutex);
+    framePaced = true;
+    ++frameEpoch;
+}
+
+std::vector<DirtyRange> PageTable::ConsumeDirty(std::vector<ProtectionChange>& changes, const WriteCheck& written) {
     std::lock_guard lock(mutex);
     ++consumeEpoch;
     ++counts.consumes;
@@ -144,6 +150,20 @@ std::vector<DirtyRange> PageTable::ConsumeDirty(std::vector<ProtectionChange>& c
         if ((region->listed[slot / 64] & (std::uint64_t{1} << (slot % 64))) == 0) continue;
         unlist(page);
         if (region->states[slot] != PageState::CpuDirty) continue;
+        if (region->busyUntil[slot] != 0 && written && !written(page, false)) {
+            ++counts.unchangedBusy;
+            const auto epoch = framePaced ? frameEpoch : consumeEpoch;
+            if (region->busyUntil[slot] > epoch && epoch - region->lastConsume[slot] < QuietEpochs) {
+                keep.push_back(page);
+                continue;
+            }
+            region->busyUntil[slot] = 0;
+            region->streak[slot] = 0;
+            ++counts.rearmed;
+            setState(page, PageState::CpuClean);
+            appendChange(changes, page, Protection::ReadOnly);
+            continue;
+        }
         ++counts.consumedPages;
         const auto address = page * PageBytes;
         const auto gapSafe = [&] {
@@ -160,23 +180,24 @@ std::vector<DirtyRange> PageTable::ConsumeDirty(std::vector<ProtectionChange>& c
             ranges.push_back({address, PageBytes});
         }
         auto& streak = region->streak[slot];
-        auto& busy = region->busy[slot];
+        auto& busyUntil = region->busyUntil[slot];
         auto& last = region->lastConsume[slot];
-        streak = last + 1 == consumeEpoch ? static_cast<std::uint8_t>(std::min<int>(streak + 1, 255)) : 1;
-        last = consumeEpoch;
-        if (busy > 1) {
-            --busy;
+        const auto epoch = framePaced ? frameEpoch : consumeEpoch;
+        if (last != epoch) streak = last + 1 == epoch ? static_cast<std::uint8_t>(std::min<int>(streak + 1, 255)) : 1;
+        last = epoch;
+        if (busyUntil > epoch) {
             keep.push_back(page);
             continue;
         }
-        if (busy == 0 && streak >= BusyAfterWrites) {
-            busy = BusyConsumes;
+        if (busyUntil == 0 && streak >= BusyAfterWrites) {
+            busyUntil = epoch + BusyConsumes;
             ++counts.keptBusy;
+            if (written) static_cast<void>(written(page, true));
             keep.push_back(page);
             continue;
         }
-        if (busy == 1) streak = 0;
-        busy = 0;
+        if (busyUntil != 0) streak = 0;
+        busyUntil = 0;
         ++counts.rearmed;
         setState(page, PageState::CpuClean);
         appendChange(changes, page, Protection::ReadOnly);
@@ -195,7 +216,7 @@ std::vector<ProtectionChange> PageTable::MarkGpuOwned(std::uint64_t address, std
         const auto state = region->states[slot];
         if (state == PageState::Untracked || state == PageState::GpuOwned) continue;
         unlist(page);
-        region->busy[slot] = 0;
+        region->busyUntil[slot] = 0;
         region->streak[slot] = 0;
         setState(page, PageState::GpuOwned);
         appendChange(changes, page, Protection::NoAccess);

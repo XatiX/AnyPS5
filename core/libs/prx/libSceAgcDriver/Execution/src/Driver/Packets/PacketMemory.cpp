@@ -40,9 +40,14 @@ bool gdsSpan(std::uint64_t offset, std::size_t bytes) {
     return offset <= Pm4::GdsBytes && bytes <= Pm4::GdsBytes - offset;
 }
 
+bool gdsCopiesOnGpu() {
+    static const bool enabled = std::getenv("APS5_NO_GDS_GPU_COPY") == nullptr;
+    return enabled;
+}
+
 std::optional<Pm4::MemoryCopy> decodeCopy(std::span<const std::uint32_t> packet) {
     if (auto copy = Pm4::DecodeMemoryCopy(packet)) return copy;
-    if (packet.size() != 7 || !Pm4::GdsImportable()) return std::nullopt;
+    if (packet.size() != 7 || (!Pm4::GdsImportable() && !gdsCopiesOnGpu())) return std::nullopt;
     const auto source = Pm4::DmaSource(packet);
     const auto destination = Pm4::DmaDestination(packet);
     const std::size_t bytes = Pm4::DmaBytes(packet);
@@ -156,26 +161,31 @@ bool Driver::preparePacketMemory(const Submission& submission, QueueState& queue
         constexpr std::size_t gpuStoreLimit = 65536;
         bool drained = true;
         const auto copy = opcode == 0x50 ? decodeCopy(packet) : std::nullopt;
+        const bool gdsDestination = opcode == 0x50 && packet.size() >= 7 && Pm4::DmaDestination(packet) == Pm4::DmaSelectGds;
+        const bool gdsOnGpu = gdsDestination && Pm4::GdsImportable();
         const auto copyBehindPendingSource = [&] {
             if (!copy.has_value() || copy->bytes > gpuStoreLimit || !GuestMemory::Accessible(reinterpret_cast<const void*>(copy->source), copy->bytes) || !GuestMemory::Accessible(reinterpret_cast<const void*>(copy->destination), copy->bytes, true)) return false;
             const auto end = copy->source + copy->bytes;
             const std::array<std::pair<std::uint64_t, std::uint64_t>, 1> range{{{copy->source, end}}};
             const auto& queued = deferredLabels().labels;
             const bool labelQueued = std::any_of(queued.begin(), queued.end(), [&](const DeferredLabel& label) { return label.address < end && copy->source < label.address + label.size; });
-            if (!labelQueued && !Graphics::Recorder::SnapshotWriteOverlaps(copy->source, copy->bytes) && !Graphics::StorageTexture::AnyPendingOverlaps(range) && !Graphics::AnyShadowedOverlaps(copy->source, copy->bytes)) return false;
+            const bool hostGdsDestination = gdsDestination && !gdsOnGpu;
+            const auto destinationEnd = copy->destination + copy->bytes;
+            const std::array<std::pair<std::uint64_t, std::uint64_t>, 1> destinationRange{{{copy->destination, destinationEnd}}};
+            const bool destinationPending = hostGdsDestination && (Graphics::Recorder::SnapshotWriteOverlaps(copy->destination, copy->bytes) || Graphics::StorageTexture::AnyPendingOverlaps(destinationRange) || Graphics::AnyShadowedOverlaps(copy->destination, copy->bytes));
+            if (!labelQueued && !destinationPending && !Graphics::Recorder::SnapshotWriteOverlaps(copy->source, copy->bytes) && !Graphics::StorageTexture::AnyPendingOverlaps(range) && !Graphics::AnyShadowedOverlaps(copy->source, copy->bytes)) return false;
             GuestMemory::TagGpuLockSite(GuestMemory::GpuLockSite::Copy);
             std::lock_guard gpuLock(GuestMemory::GpuMutex());
             const auto localDevice = device.Load();
             if (localDevice == nullptr) return false;
             recordDeferredLabels(localDevice.get(), submission.queue);
-            if (!localDevice->StoresPendingOver(copy->source, copy->bytes) || !localDevice->GpuCopyPossible(copy->destination, copy->source, copy->bytes)) return false;
+            const bool pending = localDevice->StoresPendingOver(copy->source, copy->bytes) || (hostGdsDestination && localDevice->StoresPendingOver(copy->destination, copy->bytes));
+            if (!pending || !localDevice->GpuCopyPossible(copy->destination, copy->source, copy->bytes)) return false;
             const auto outcome = localDevice->CopyBuffer(copy->destination, copy->source, copy->bytes, 0, std::numeric_limits<std::size_t>::max(), 0, 0, submission.queue, [](std::span<const std::byte>, std::uint64_t) {});
             if (outcome.path != 1 && outcome.path != 3) throw std::runtime_error("AGC driver: a DMA_DATA copy of up to 64 KiB that GpuCopyPossible accepted took copy path " + std::to_string(outcome.path));
             return true;
         };
-        const bool gdsDestination = opcode == 0x50 && packet.size() >= 7 && Pm4::DmaDestination(packet) == Pm4::DmaSelectGds;
-        const bool gdsOnGpu = gdsDestination && Pm4::GdsImportable();
-        if ((!gdsDestination || gdsOnGpu) && copyBehindPendingSource()) {
+        if ((!gdsDestination || gdsOnGpu || gdsCopiesOnGpu()) && copyBehindPendingSource()) {
             ++copiesBehindPendingSources;
             wroteOnGpu = true;
             drained = false;
@@ -430,6 +440,17 @@ bool Driver::enqueueDmaPacket(std::span<const std::uint32_t> packet, std::uint32
                 }
             }
         }
+        static const bool copyOnGpu = std::getenv("APS5_NO_PIPELINE_COPY_ON_GPU") == nullptr;
+        if (copyOnGpu && copy.bytes <= gpuStoreLimit) {
+            GuestMemory::TagGpuLockSite(GuestMemory::GpuLockSite::Copy);
+            std::lock_guard gpuLock(GuestMemory::GpuMutex());
+            const auto localDevice = device.Load();
+            if (localDevice != nullptr && localDevice->StoresPendingOver(copy.source, copy.bytes) && localDevice->GpuCopyPossible(copy.destination, copy.source, copy.bytes)) {
+                recordDeferredLabels(localDevice.get(), queue);
+                const auto outcome = localDevice->CopyBuffer(copy.destination, copy.source, copy.bytes, 0, std::numeric_limits<std::size_t>::max(), 0, 0, queue, [](std::span<const std::byte>, std::uint64_t) {});
+                if (outcome.path == 1 || outcome.path == 3) return;
+            }
+        }
         std::vector<std::byte> bytes(copy.bytes);
         GuestMemory::Read(copy.source, bytes, 1);
         commitStore(queue, copy.destination, bytes);
@@ -451,6 +472,26 @@ bool Driver::enqueueConstantRamDump(std::span<const std::uint32_t> packet, std::
     auto queued = bytes;
     DrawPipeline::Queue0().EnqueueStore([this, queue, address, bytes = std::move(bytes)] {
         GuestMemory::SetCurrentPacket(0x83, queue);
+        commitStore(queue, address, bytes);
+    }, address, std::move(queued));
+    return true;
+}
+
+bool Driver::enqueueClockStore(std::span<const std::uint32_t> packet, std::uint32_t opcode, std::uint32_t queue, const QueueState& state) {
+    static const bool enabled = std::getenv("APS5_NO_PIPELINE_CLOCK_STORES") == nullptr && std::getenv("APS5_CPU_STORES") == nullptr;
+    if (!enabled || opcode != 0x40 || queue != 0 || packet.size() < 6 || !DrawPipeline::Active() || !deferredLabels().labels.empty()) return false;
+    if (Pm4::CopyDataToRegister(packet) || Pm4::CopyDataSource(packet) != Pm4::CopyDataGpuClockSource) return false;
+    constexpr std::size_t gpuStoreLimit = 65536;
+    const auto store = Pm4::ResolveStore(packet, state, gpuStoreLimit);
+    if (!store.has_value()) return false;
+    const auto stored = store->Bytes();
+    if (stored.empty() || !GuestMemory::Accessible(reinterpret_cast<const void*>(store->address), stored.size(), true)) return false;
+    if (DrawPipeline::Queue0().Overlaps(store->address, stored.size())) return false;
+    const auto address = store->address;
+    std::vector<std::byte> bytes(stored.begin(), stored.end());
+    auto queued = bytes;
+    DrawPipeline::Queue0().EnqueueStore([this, queue, address, bytes = std::move(bytes)] {
+        GuestMemory::SetCurrentPacket(0x40, queue);
         commitStore(queue, address, bytes);
     }, address, std::move(queued));
     return true;

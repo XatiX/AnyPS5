@@ -264,8 +264,8 @@ int main() {
             if (!probe) return VulkanTestSkipped;
         }
         const char* dispatchSwitch = std::getenv("APS5_PIPELINE_DISPATCH");
-        const bool pipelinedDispatch = dispatchSwitch != nullptr && dispatchSwitch[0] != '\0' && dispatchSwitch[0] != '0';
-        const bool dispatchMisses = pipelinedDispatch && std::getenv("APS5_PIPELINE_DISPATCH_MISSES") != nullptr;
+        const bool pipelinedDispatch = std::getenv("APS5_NO_PIPELINE_DISPATCH") == nullptr && (dispatchSwitch == nullptr || (dispatchSwitch[0] != '\0' && dispatchSwitch[0] != '0'));
+        const bool dispatchMisses = pipelinedDispatch && std::getenv("APS5_NO_PIPELINE_DISPATCH_MISSES") == nullptr;
 
         Shader shader{};
         shader.file_header = 0x34333231;
@@ -402,7 +402,7 @@ int main() {
             }
             std::printf("pipelined dispatch: missed dispatch round %zu, reads clear of the queued write: %s\n", round, Describe(clearHandling).c_str());
             if (dispatchMisses) check(clearHandling.queued && clearHandling.drains == 0, "a missed plain dispatch whose reads are clear of the queued write did not queue behind it: " + Describe(clearHandling));
-            if (!dispatchMisses) check(!clearHandling.queued && clearHandling.drains >= 1, "a missed dispatch did not drain the pipeline, and APS5_PIPELINE_DISPATCH_MISSES is off: " + Describe(clearHandling));
+            if (!dispatchMisses) check(!clearHandling.queued && clearHandling.drains >= 1, "a missed dispatch did not drain the pipeline, and APS5_NO_PIPELINE_DISPATCH_MISSES is set: " + Describe(clearHandling));
 
             const auto tableFill = FillPacket(static_cast<std::uint32_t>(reinterpret_cast<std::uintptr_t>(TargetB)), Table, 4u);
             std::vector<std::uint32_t> overlap(tableFill.begin(), tableFill.end());

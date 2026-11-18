@@ -49,6 +49,9 @@ void GuestArenaSetAccessObserver_nid_postfix(void (*callback)(std::uintptr_t add
 #ifdef _WIN32
 bool GuestArenaHandleWrite_nid_postfix(std::uintptr_t address);
 bool GuestArenaHandleRead_nid_postfix(std::uintptr_t address);
+bool GuestArenaWriteFaultsAllowed_nid_no_patch();
+bool GuestArenaSetGpuFaultHandler_nid_no_patch(bool (*handler)(std::uintptr_t address, bool write));
+bool GuestArenaHandleGpuFault_nid_no_patch(_EXCEPTION_POINTERS* exception);
 bool GuestArenaCopyOwned_nid_no_patch(std::uintptr_t source, void* destination, std::size_t bytes);
 bool GuestArenaCompareOwned_nid_no_patch(std::uintptr_t source, const void* expected, std::size_t bytes, bool* equal);
 bool GuestArenaRecoverRead_nid_no_patch(_EXCEPTION_POINTERS* exception);
@@ -97,6 +100,7 @@ bool GuestArenaArmOwned_nid_no_patch(std::uintptr_t address, std::size_t bytes, 
 bool GuestArenaOwnedUnchanged_nid_no_patch(std::uintptr_t address, std::size_t bytes, const std::uint64_t* words, std::size_t count);
 bool GuestArenaBeginHostWrite_nid_postfix(void* pointer, std::size_t bytes);
 void GuestArenaEndHostWrite_nid_postfix(void* pointer, std::size_t bytes);
+void GuestArenaSetGpuHostWriteHook_nid_no_patch(void (*hook)(std::uintptr_t address, std::size_t bytes));
 void GuestArenaSetHostWriteHook_nid_no_patch(void (*hook)(std::uintptr_t address, std::size_t bytes));
 void GuestArenaSetHostReadHook_nid_no_patch(void (*hook)(std::uintptr_t address, std::size_t bytes));
 void GuestArenaPrepareHostRead_nid_no_patch(const void* pointer, std::size_t bytes);

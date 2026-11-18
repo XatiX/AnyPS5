@@ -3,9 +3,13 @@
 #include "prx/libSceAgcDriver/Unified/include/Front.hpp"
 #include "prx/libSceAgcDriver/Unified/include/Shadow.hpp"
 #include "prx/libSceAgcDriver/Unified/include/Replay.hpp"
+#include "prx/libSceAgcDriver/Unified/include/RecordState.hpp"
+#include "prx/libSceAgcDriver/Unified/include/RecordVerify.hpp"
+#include "prx/libSceAgcDriver/Unified/include/RecordDraw.hpp"
 #include "prx/libSceAgcDriver/Execution/include/SubmissionCapture.hpp"
 #include "prx/libSceAgcDriver/Execution/include/VideoOutput.hpp"
 #include "../tools/Pm4Analysis.hpp"
+#include <algorithm>
 #include <cstdint>
 #include <filesystem>
 #include <cstdio>
@@ -191,7 +195,7 @@ void testFrontDecodesQueuesOnTheirOwnThreads() {
     std::mutex seenMutex;
     std::map<std::uint32_t, std::uint64_t> seen;
     {
-        Front front([&](const Operation& operation) {
+        Front front([&](const Operation& operation, const DecodeState&) {
             std::lock_guard lock(seenMutex);
             ++seen[operation.queue];
         });
@@ -309,6 +313,148 @@ void testResolveFillsDrawParametersAndKeys() {
     Expect(!unresolved.empty() && !unresolved[0].resolved && plain.Counts().resolved == 0, "without resolve nothing is resolved");
 }
 
+void testUsesReportIndexAndIndirectRanges() {
+    std::vector<std::uint16_t> indices(64, 0);
+    std::vector<std::uint32_t> arguments(4, 1);
+    const auto indexAddress = reinterpret_cast<std::uint64_t>(indices.data());
+    const auto argumentAddress = reinterpret_cast<std::uint64_t>(arguments.data());
+    Stream stream;
+    stream.Add({type3(0x27, 6), 64, static_cast<std::uint32_t>(indexAddress), static_cast<std::uint32_t>(indexAddress >> 32u), 48, 0});
+    stream.Add({type3(0x16, 4), static_cast<std::uint32_t>(argumentAddress), static_cast<std::uint32_t>(argumentAddress >> 32u), 1});
+    DecodeState state(0);
+    state.SetResolve(true);
+    std::vector<GuestUse> seen;
+    state.SetUses([&seen](std::span<const GuestUse> uses) { seen.insert(seen.end(), uses.begin(), uses.end()); });
+    decode(stream, state);
+    const GuestUse index{indexAddress, 96, false};
+    const GuestUse dispatch{argumentAddress, 12, false};
+    Expect(state.Counts().resolveErrors == 0, "the indexed draw resolves");
+    Expect(std::find(seen.begin(), seen.end(), index) != seen.end(), "an indexed draw reports its index range");
+    Expect(std::find(seen.begin(), seen.end(), dispatch) != seen.end(), "an indirect dispatch reports its argument range");
+    Expect(state.Counts().useReports == 2, "one report per operation");
+}
+
+void testRebuiltStateResolvesLikeTheDecoder() {
+    std::vector<std::uint32_t> indices(256, 0);
+    const auto base = reinterpret_cast<std::uint64_t>(indices.data());
+    const auto second = base + 256;
+    Stream stream;
+    stream.Add({type3(0x26, 3), static_cast<std::uint32_t>(base), static_cast<std::uint32_t>(base >> 32u)});
+    stream.Add({type3(0x2f, 2), 3});
+    stream.Add({type3(0x35, 5), 64, 4, 16, 0});
+    stream.SetContext(0x8e, 0x7);
+    stream.Add({type3(0x2a, 2), 1});
+    stream.Add({type3(0x35, 5), 64, 8, 32, 0});
+    stream.Add({type3(0x26, 3), static_cast<std::uint32_t>(second), static_cast<std::uint32_t>(second >> 32u)});
+    stream.Add({type3(0x2f, 2), 1});
+    stream.Add({type3(0x35, 5), 64, 0, 12, 0});
+    DecodeState state(0);
+    state.SetResolve(true);
+    Recorded sink(state);
+    sink.retire = false;
+    DecodeSubmission(stream.submission, state, sink);
+    Expect(sink.operations.size() == 3 && state.Counts().resolved == 3, "three indexed draws resolve");
+    int matched = 0;
+    for (const auto& operation : sink.operations) {
+        const auto queue = Record::QueueStateAt(state, operation.snapshots);
+        if (!queue) continue;
+        const auto packet = std::span<const std::uint32_t>(stream.submission.commands).subspan(operation.packetOffset, 5);
+        const auto draw = Pm4::ResolveDraw(packet, *queue);
+        const bool same = draw.indexAddress == operation.address && draw.indexCount == operation.size && draw.instanceCount == (operation.value & 0xffffffffu) && draw.indexSize == (operation.value >> 32u);
+        if (same) ++matched;
+    }
+    Expect(matched == 3, "the state rebuilt from each draw's snapshots resolves the draw as the decoder did");
+    const auto* context = state.Context(sink.operations.back().snapshots.context);
+    const auto rebuilt = Record::QueueStateAt(state, sink.operations.back().snapshots);
+    Expect(rebuilt && context != nullptr && rebuilt->context.at(0x8e) == 0x7, "the rebuilt state carries the context snapshot");
+}
+
+void testVerifierPairsDecodedAndDriverDraws() {
+    Stream stream;
+    stream.Draw(3);
+    stream.SetContext(0x8e, 0x5);
+    stream.Draw(6);
+    stream.Draw(9);
+    DecodeState state(0);
+    state.SetResolve(true);
+    Recorded sink(state);
+    sink.retire = false;
+    DecodeSubmission(stream.submission, state, sink);
+    Expect(sink.operations.size() == 3 && state.Counts().resolved == 3, "three resolved draws to verify");
+    if (sink.operations.size() != 3) return;
+    Record::Verifier verifier;
+    const auto& first = sink.operations[0];
+    const auto& second = sink.operations[1];
+    const auto& third = sink.operations[2];
+    verifier.NoteDecoded(first, state);
+    verifier.NoteDriverKey(first.key, 0, first.submission, first.packetOffset);
+    verifier.NoteDriverKey(second.key, 0, second.submission, second.packetOffset);
+    verifier.NoteDecoded(second, state);
+    verifier.NoteDecoded(third, state);
+    verifier.NoteDriverKey(third.key ^ 1u, 0, third.submission, third.packetOffset);
+    const auto counts = verifier.Counts();
+    Expect(counts.matched == 2, "equal keys match whichever side arrives first");
+    Expect(counts.mismatched == 1, "a different driver key is a mismatch");
+    Expect(counts.bridgeMismatched == 0 && counts.bridgeMissing == 0, "the rebuilt state gives the decoder's key at every draw");
+    Expect(counts.pending == 0, "every pair met");
+}
+
+void testSuspendResetsTheGraphicsState() {
+    const auto run = [](bool suspend) {
+        std::mutex seenMutex;
+        std::vector<bool> written;
+        {
+            Front front([&](const Operation& operation, const DecodeState& state) {
+                if (operation.kind != OpKind::Draw) return;
+                const auto rebuilt = Record::QueueStateAt(state, operation.snapshots);
+                std::lock_guard lock(seenMutex);
+                written.push_back(rebuilt && rebuilt->shader.contains(0x212));
+            });
+            auto first = std::make_shared<DriverDetail::Submission>();
+            first->serial = 1;
+            first->commands = {type3(0x76, 3), 0x212, 0x55, type3(0x2d, 3), 3, 2};
+            front.Push(first);
+            if (suspend) front.NoteSuspend();
+            auto second = std::make_shared<DriverDetail::Submission>();
+            second->serial = 2;
+            second->commands = {type3(0x2d, 3), 3, 2};
+            front.Push(second);
+            const auto totals = front.Totals();
+            Expect(totals.size() == 1 && totals[0].counts.resets == (suspend ? 1u : 0u), "a suspend resets the queue 0 lane once");
+        }
+        return written;
+    };
+    const auto kept = run(false);
+    const auto reset = run(true);
+    Expect(kept.size() == 2 && kept[0] && kept[1], "without a suspend the shader write carries into the next submission");
+    Expect(reset.size() == 2 && reset[0] && !reset[1], "after a suspend the next queue 0 submission starts from a fresh state, as the driver's does");
+}
+
+void testHandoffGivesEachDrawItsDecodedState() {
+    Stream stream;
+    stream.SetContext(0x8e, 0x3);
+    stream.Draw(3);
+    stream.SetContext(0x8e, 0x9);
+    stream.Draw(6);
+    DecodeState state(0);
+    Recorded sink(state);
+    sink.retire = false;
+    DecodeSubmission(stream.submission, state, sink);
+    if (sink.operations.size() != 2) {
+        Expect(false, "two draws to hand off");
+        return;
+    }
+    Record::Handoff handoff;
+    for (const auto& operation : sink.operations) handoff.Offer(operation, state);
+    const auto second = handoff.Take(0, sink.operations[1].submission, sink.operations[1].packetOffset, std::chrono::milliseconds(0));
+    const auto first = handoff.Take(0, sink.operations[0].submission, sink.operations[0].packetOffset, std::chrono::milliseconds(0));
+    Expect(first != nullptr && first->context.at(0x8e) == 0x3, "the first draw gets the state decoded at it");
+    Expect(second != nullptr && second->context.at(0x8e) == 0x9, "the second draw gets its own state, taken in any order");
+    Expect(handoff.Take(0, sink.operations[0].submission, sink.operations[0].packetOffset, std::chrono::milliseconds(1)) == nullptr, "a state is taken once");
+    const auto counts = handoff.Counts();
+    Expect(counts.offered == 2 && counts.taken == 2 && counts.missed == 1 && counts.pending == 0, "handoff counts");
+}
+
 void testConditionalRangesArePredicated() {
     Stream stream;
     const auto condition = stream.Add({type3(0x22, 5), 0x1000, 0x2, 0x0, 3});
@@ -382,6 +528,11 @@ int main() {
     testShadowCopyKeepsWhatTheDecoderReads();
     testReplayMatchesThePacketAnalysis();
     testResolveFillsDrawParametersAndKeys();
+    testUsesReportIndexAndIndirectRanges();
+    testRebuiltStateResolvesLikeTheDecoder();
+    testVerifierPairsDecodedAndDriverDraws();
+    testSuspendResetsTheGraphicsState();
+    testHandoffGivesEachDrawItsDecodedState();
     if (failures != 0) {
         std::fprintf(stderr, "%d failure(s)\n", failures);
         return 1;

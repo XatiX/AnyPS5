@@ -4,6 +4,7 @@
 #include <array>
 #include <cstddef>
 #include <cstdint>
+#include <functional>
 #include <memory>
 #include <mutex>
 #include <unordered_map>
@@ -41,6 +42,7 @@ struct PageTableCounts {
     std::uint64_t consumedPages = 0;
     std::uint64_t keptBusy = 0;
     std::uint64_t rearmed = 0;
+    std::uint64_t unchangedBusy = 0;
     std::uint64_t gpuOwnedPages = 0;
 };
 
@@ -49,11 +51,14 @@ public:
     static constexpr std::uint32_t MaxGapPages = 3;
     static constexpr std::uint8_t BusyAfterWrites = 3;
     static constexpr std::uint8_t BusyConsumes = 64;
+    static constexpr std::uint32_t QuietEpochs = 2;
 
     std::vector<ProtectionChange> Register(std::uint64_t address, std::uint64_t size);
     std::vector<ProtectionChange> Unregister(std::uint64_t address, std::uint64_t size);
     bool HandleWrite(std::uint64_t address, std::vector<ProtectionChange>& changes);
-    std::vector<DirtyRange> ConsumeDirty(std::vector<ProtectionChange>& changes);
+    using WriteCheck = std::function<bool(std::uint64_t page, bool proven)>;
+    std::vector<DirtyRange> ConsumeDirty(std::vector<ProtectionChange>& changes, const WriteCheck& written = {});
+    void AdvanceFrame();
     std::vector<ProtectionChange> MarkGpuOwned(std::uint64_t address, std::uint64_t size);
     std::vector<DirtyRange> GpuOwnedIn(std::uint64_t address, std::uint64_t size) const;
     std::vector<ProtectionChange> Reclaim(std::uint64_t address, std::uint64_t size, bool forWrite);
@@ -66,7 +71,7 @@ private:
     struct Region {
         std::array<PageState, RegionPages> states{};
         std::array<std::uint8_t, RegionPages> streak{};
-        std::array<std::uint8_t, RegionPages> busy{};
+        std::array<std::uint32_t, RegionPages> busyUntil{};
         std::array<std::uint32_t, RegionPages> lastConsume{};
         std::array<std::uint64_t, RegionPages / 64> listed{};
         std::uint32_t dirtyPages = 0;
@@ -84,6 +89,8 @@ private:
     std::unordered_map<std::uint64_t, std::unique_ptr<Region>> regions;
     std::vector<std::uint64_t> dirty;
     std::uint32_t consumeEpoch = 0;
+    std::uint32_t frameEpoch = 0;
+    bool framePaced = false;
     PageTableCounts counts;
 };
 

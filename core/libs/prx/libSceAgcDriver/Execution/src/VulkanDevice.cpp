@@ -115,6 +115,10 @@ void ResetCheckpointSnapshots() noexcept;
 #include <unordered_map>
 #include <vector>
 #include <utility>
+#if ANYPS5_UNIFIED
+#include "prx/libSceAgcDriver/Unified/include/Shadow.hpp"
+#include "prx/libSceAgcDriver/Unified/include/Events.hpp"
+#endif
 
 #ifndef _WIN32
 extern char** environ;
@@ -5980,6 +5984,13 @@ void VulkanDevice::recordDispatch(RecordedDispatch& record) {
         resources.forgetShaderDataWords(*record.shader);
         covered = 0;
     }
+#if ANYPS5_UNIFIED
+    Unified::Events::NoteRanges(resources.GpuWrites(), Unified::Events::ResourceOwner(&resources));
+    if (Unified::Shadow::DrawScope()) {
+        const auto reads = resources.DeviceReads();
+        Unified::Shadow::NoteGuestAccess(reads, resources.GpuWrites(), resources.HoldsLease() || resources.UsesAddressTable() || resources.HasCopiedWrites());
+    }
+#endif
     using CommandClass = Graphics::Recorder::CommandClass;
     if (Graphics::Recorder::BarrierValidate()) {
         if (argumentImport != nullptr) {

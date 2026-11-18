@@ -51,6 +51,10 @@
 #include <unordered_set>
 #include <utility>
 #include "prx/libc/include/GuestAllocations.hpp"
+#if ANYPS5_UNIFIED
+#include "prx/libSceAgcDriver/Unified/include/Events.hpp"
+#include "prx/libSceAgcDriver/Unified/include/Shadow.hpp"
+#endif
 
 namespace AgcDriver::Graphics {
 namespace {
@@ -262,11 +266,21 @@ UncachedImages& Uncached() {
     return uncached;
 }
 
+void noteImageSetChange(std::uint64_t address, std::uint64_t bytes) {
+#if ANYPS5_UNIFIED
+    AgcDriver::Unified::Events::NoteImage(address, bytes);
+#else
+    static_cast<void>(address);
+    static_cast<void>(bytes);
+#endif
+}
+
 void noteUncached(const std::shared_ptr<StorageTexture>& image) {
     auto& uncached = Uncached();
     std::lock_guard lock(uncached.mutex);
     uncached.images.push_back(image);
     uncached.any.store(true, std::memory_order_release);
+    noteImageSetChange(image->Descriptor().baseAddress, image->GuestBytes());
 }
 
 std::atomic<bool>& TexturesReleased() {
@@ -289,6 +303,7 @@ void noteReleased(const std::shared_ptr<Texture>& texture, std::uint64_t address
     texture->MarkReleased();
     TexturesReleased().store(true, std::memory_order_release);
     GuestMemory::NoteTextureReleased(address);
+    noteImageSetChange(address, 1);
 }
 
 bool SamplerCacheDisabled() {
@@ -694,6 +709,18 @@ StorageFailures& StorageFailed() {
     return failures;
 }
 
+bool SharedSampledSurfaces() {
+    static const bool enabled = std::getenv("APS5_NO_SHARED_SAMPLED_SURFACE") == nullptr;
+    return enabled;
+}
+
+GuestTextureResource sampledStorageSurface(const GuestTextureResource& resource) {
+    if (resource.dimension != TextureDimension::k2DArray || resource.depthOrLastArray != 0 || resource.baseArray != 0) return resource;
+    auto surface = resource;
+    surface.dimension = TextureDimension::k2D;
+    return surface;
+}
+
 // The cached storage image for a sampled descriptor, or null when it cannot be made (then the
 // snapshot path serves the descriptor, as before). Every null return counts as a fallback.
 std::shared_ptr<StorageTexture> sampledStorageSource(const Context& context, const GuestTextureResource& resource, std::uint64_t guestBytes) {
@@ -712,7 +739,7 @@ std::shared_ptr<StorageTexture> sampledStorageSource(const Context& context, con
         }
     }
     try {
-        return cachedStorageTexture(context, {}, resource, 0, guestBytes);
+        return cachedStorageTexture(context, {}, SharedSampledSurfaces() ? sampledStorageSurface(resource) : resource, 0, guestBytes);
     } catch (const std::exception& error) {
         counters.storageFallbacks.fetch_add(1, std::memory_order_relaxed);
         std::lock_guard lock(failures.mutex);
@@ -1364,6 +1391,7 @@ std::shared_ptr<Texture> cachedTexture(const Context& context, std::span<const s
     entry.present = Recorder::Presents();
     ++cache.counts.inserted;
     logLookup(madeRecord());
+    noteImageSetChange(resource.baseAddress, guestBytes);
     cache.entries.push_front(std::move(entry));
     cache.index[key] = cache.entries.begin();
     if (source != nullptr) cache.views.emplace(source.get(), cache.entries.begin());
@@ -1606,6 +1634,7 @@ std::shared_ptr<StorageTexture> cachedStorageTexture(const Context& context, std
             cache.index[key] = cache.entries.begin();
             cache.byImage[texture.get()] = cache.entries.begin();
             texture->SetCached(true);
+            noteImageSetChange(texture->Descriptor().baseAddress, texture->GuestBytes());
             counters.storageCreated.fetch_add(1, std::memory_order_relaxed);
             if (profile) LookupOutcomes::Add(LookupOutcomes::StorageMade, start);
         }
@@ -3029,6 +3058,9 @@ void ShaderResources::buildComplete() {
         }
         timing.descriptorsMs += phase(BuildPhase::Descriptors);
         noteReusable();
+#if ANYPS5_UNIFIED
+        if (reusable) registerProofSpans();
+#endif
         completed = true;
         if (BuildProfiled()) {
             timing.completeMs = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - stageStart).count();
@@ -3084,6 +3116,36 @@ bool LoopGuardEnabled() {
     return enabled;
 }
 
+}
+
+std::vector<std::pair<std::uint64_t, std::uint64_t>> ShaderResources::ProofRanges() const {
+    std::vector<std::pair<std::uint64_t, std::uint64_t>> ranges;
+    const auto add = [&](std::uint64_t address, std::uint64_t bytes) {
+        if (address != 0 && bytes != 0) ranges.emplace_back(address, address + bytes);
+    };
+    for (const auto& range : describedRanges) {
+        add(range.address, range.bytes);
+        if (range.dccAddress != 0) add(range.dccAddress, DccKeyBytes(range.bytes));
+    }
+    for (const auto& image : storageTextures) {
+        if (image == nullptr) continue;
+        add(image->Descriptor().baseAddress, image->GuestBytes());
+        if (image->Descriptor().dccAddress != 0) add(image->Descriptor().dccAddress, DccKeyBytes(image->GuestBytes()));
+    }
+    for (const auto& surface : validatedTextures) {
+        add(surface.resource.baseAddress, surface.bytes);
+        if (surface.resource.dccAddress != 0) add(surface.resource.dccAddress, DccKeyBytes(surface.bytes));
+    }
+    for (const auto& region : directRegions) add(region.begin, region.end - region.begin);
+    for (const auto& allocation : allocations) {
+        if (allocation.guest) add(allocation.address, allocation.size);
+    }
+    for (const auto& range : guestMemory.DeviceReads()) ranges.push_back(range);
+    for (const auto& range : guestMemory.Writes()) ranges.push_back(range);
+    std::erase_if(ranges, [](const std::pair<std::uint64_t, std::uint64_t>& range) { return range.first == 0 || range.second <= range.first; });
+    std::sort(ranges.begin(), ranges.end());
+    ranges.erase(std::unique(ranges.begin(), ranges.end()), ranges.end());
+    return ranges;
 }
 
 void ShaderResources::noteReusable() {
@@ -4028,7 +4090,7 @@ ShaderResources::OwnRefreshFallback ShaderResources::refreshOwnObjects(std::span
         const auto address = surface.resource.baseAddress;
         const auto bytes = static_cast<std::size_t>(surface.bytes);
         const bool imported = SampledFromStorageEligible(context, surface.resource, surface.bytes);
-        overlap.sourceEligible = imported && SurfaceKey(context, source->Descriptor()) == SurfaceKey(context, surface.resource);
+        overlap.sourceEligible = imported && SurfaceKey(context, source->Descriptor()) == SurfaceKey(context, SharedSampledSurfaces() ? sampledStorageSurface(surface.resource) : surface.resource);
         overlap.depthCompare = depthCompare;
         overlap.sourceRefreshed = false;
         const auto found = pendingLookupSource(context, surface.resource, surface.bytes, depthCompare).source;
@@ -4108,7 +4170,7 @@ bool AnyPendingCpuWrites(const Context& context) {
     return (context.copiedWriters != nullptr && !context.copiedWriters->empty()) || !DrawCopiedWriters()->empty() || Recorder::PendingCompletionLabels() != 0;
 }
 
-bool CompletePendingCpuWrites(const Context& context, std::uint64_t address, std::size_t bytes) {
+bool PendingCpuWritesOverlap(const Context& context, std::uint64_t address, std::size_t bytes) {
     if (bytes == 0 || Recorder::InCompletion()) return false;
     auto* recorder = Recorder::Active();
     if (recorder == nullptr) return false;
@@ -4119,12 +4181,14 @@ bool CompletePendingCpuWrites(const Context& context, std::uint64_t address, std
     const auto overlaps = [&](const auto& writers) {
         return std::any_of(writers.begin(), writers.end(), [&](const auto& writer) { return writer->CopiedWritesOverlap(address, bytes); });
     };
-    if ((context.copiedWriters != nullptr && overlaps(*context.copiedWriters)) || overlaps(*drawWriters) || (labels && recorder->CompletionLabelIn(address, bytes))) {
-        Recorder::CountSync(4);
-        recorder->SyncThrough(address, bytes);
-        return true;
-    }
-    return false;
+    return (context.copiedWriters != nullptr && overlaps(*context.copiedWriters)) || overlaps(*drawWriters) || (labels && recorder->CompletionLabelIn(address, bytes));
+}
+
+bool CompletePendingCpuWrites(const Context& context, std::uint64_t address, std::size_t bytes) {
+    if (!PendingCpuWritesOverlap(context, address, bytes)) return false;
+    Recorder::CountSync(4);
+    Recorder::Active()->SyncThrough(address, bytes);
+    return true;
 }
 
 const ShaderRecompiler::DescriptorBinding* ShaderResources::tableImages(std::span<const CompiledShader> shaders, ShaderRecompiler::ShaderStage stage) {
@@ -4471,7 +4535,129 @@ ShaderResources::IndexOutcome ShaderResources::indexRevalidate(std::span<const C
     return outcome(partial || !replaced.empty() ? IndexOutcome::Partial : IndexOutcome::Accepted);
 }
 
+#if ANYPS5_UNIFIED
+void ShaderResources::registerProofSpans() {
+    using Kind = Unified::Proof::SpanKind;
+    proofRangesRegistered = Unified::Shadow::NoteProofRanges(ProofRanges());
+    proofSpans.clear();
+    std::vector<std::pair<std::uint64_t, std::uint64_t>> covered;
+    const auto add = [&](std::uint64_t address, std::uint64_t bytes, std::uintptr_t owner, Kind kind) {
+        if (address == 0 || bytes == 0) return;
+        proofSpans.push_back({address, address + bytes, owner, kind});
+        covered.emplace_back(address, address + bytes);
+    };
+    for (const auto& image : storageTextures) {
+        if (image == nullptr) continue;
+        const auto& own = image->Descriptor();
+        add(own.baseAddress, image->GuestBytes(), reinterpret_cast<std::uintptr_t>(image.get()), Kind::Storage);
+        if (own.dccAddress != 0) add(own.dccAddress, DccKeyBytes(image->GuestBytes()), 0, Kind::Keys);
+    }
+    for (const auto& surface : validatedTextures) {
+        const auto& resource = surface.resource;
+        add(resource.baseAddress, surface.bytes, reinterpret_cast<std::uintptr_t>(surface.source), surface.source != nullptr ? Kind::View : Kind::Snapshot);
+        if (resource.dccAddress != 0) add(resource.dccAddress, DccKeyBytes(surface.bytes), 0, Kind::Keys);
+    }
+    const auto unowned = covered;
+    const auto known = [&](std::uint64_t address, std::uint64_t bytes) {
+        return std::find(unowned.begin(), unowned.end(), std::pair{address, address + bytes}) != unowned.end();
+    };
+    for (const auto& range : describedRanges) {
+        if (!known(range.address, range.bytes)) add(range.address, range.bytes, 0, Kind::Snapshot);
+        if (range.dccAddress != 0 && !known(range.dccAddress, DccKeyBytes(range.bytes))) add(range.dccAddress, DccKeyBytes(range.bytes), 0, Kind::Keys);
+    }
+    for (const auto& region : directRegions) add(region.begin, region.end - region.begin, 0, Kind::Direct);
+    const auto& written = guestMemory.Writes();
+    for (const auto& [begin, end] : written) {
+        if (end > begin) add(begin, end - begin, Unified::Events::ResourceOwner(this), Kind::Written);
+    }
+    const auto ownWrite = [&](std::uint64_t begin, std::uint64_t end) {
+        return std::find(written.begin(), written.end(), std::pair{begin, end}) != written.end();
+    };
+    for (const auto& allocation : allocations) {
+        if (allocation.guest && !ownWrite(allocation.address, allocation.address + allocation.size)) add(allocation.address, allocation.size, 0, Kind::Buffer);
+    }
+    for (const auto& [begin, end] : guestMemory.DeviceReads()) {
+        if (end > begin && !ownWrite(begin, end)) add(begin, end - begin, 0, Kind::Buffer);
+    }
+    std::sort(proofSpans.begin(), proofSpans.end(), [](const auto& left, const auto& right) { return std::tie(left.begin, left.end, left.owner) < std::tie(right.begin, right.end, right.owner); });
+    proofSpans.erase(std::unique(proofSpans.begin(), proofSpans.end(), [](const auto& left, const auto& right) { return left.begin == right.begin && left.end == right.end && left.owner == right.owner; }), proofSpans.end());
+    proofStamp = {};
+}
+
+bool ShaderResources::revalidateVerified(std::span<const CompiledShader> shaders, ProofReport* report) {
+    const auto& log = Unified::Events::Shared();
+    const auto serial = log.Serial();
+    const auto& images = Unified::Events::Images();
+    const auto imageSerial = images.Serial();
+    const Unified::Proof::Guards guards{{0, DepthSurfacesSerial(), MultisampleClaimSerial(), RetiredImportSerial(), HostImportSetGeneration()}};
+    const bool cpuWriters = (AnyPendingCpuWrites(context) && std::any_of(proofSpans.begin(), proofSpans.end(), [&](const Unified::Proof::Span& span) { return PendingCpuWritesOverlap(context, span.begin, static_cast<std::size_t>(span.end - span.begin)); }));
+    bool exempted = false;
+    const Unified::Proof::Span* changed = nullptr;
+    const auto miss = Unified::Proof::Verdict(log, images, proofStamp, guards, cpuWriters, proofRangesRegistered, proofSpans, &exempted, &changed);
+    auto& tally = Unified::Proof::SharedTally();
+    const bool clean = miss == Unified::Proof::Miss::None && lastProofFast;
+    if (clean && Unified::Proof::ShortcutActive() && registeredImageViewsCurrent(registeredImageViews)) {
+        const bool tail = provedByLog(report);
+        tally.CountShortcut(tail);
+        if (tail) {
+            proofStamp = {serial, imageSerial, guards, true};
+            return true;
+        }
+    }
+    ProofReport local;
+    auto& proof = report != nullptr ? *report : local;
+    const auto ownNotes = Unified::Events::ThreadNotes();
+    const bool ok = revalidateEpoch(shaders, &proof);
+    const bool noted = Unified::Events::ThreadNotes() != ownNotes;
+    tally.Count(miss, ok);
+    if (miss == Unified::Proof::Miss::None && ok) {
+        tally.CountAgreed(static_cast<std::size_t>(proof.path), exempted);
+        if (clean && noted) tally.CountWorkSeen();
+    }
+    if (miss == Unified::Proof::Miss::Guard && ok) tally.CountGuards(proofStamp.guards, guards);
+    if (miss == Unified::Proof::Miss::Range && ok && changed != nullptr) {
+        tally.CountRangeKind(changed->kind);
+        if (changed->kind == Unified::Proof::SpanKind::View) {
+            const auto writer = log.ChangedOwner(changed->begin, changed->end - changed->begin, proofStamp.serial);
+            tally.CountViewWriter(writer == 0 ? 0 : writer == changed->owner ? 1 : writer == Unified::Events::ImageSetOwner ? 2 : (writer & 1u) != 0 ? 3 : 4);
+        }
+    }
+    proofStamp = {serial, imageSerial, guards, ok};
+    lastProofFast = ok && proof.path == ProofPath::Fast;
+    return ok;
+}
+
+bool ShaderResources::provedByLog(ProofReport* report) {
+    for (const auto& region : directRegions) static_cast<void>(FlushDepthPlanes(region.begin, static_cast<std::size_t>(region.end - region.begin)));
+    if (!guestMemory.StagingDecisionsCurrent()) return false;
+    if (auto* recorder = Recorder::Active(); recorder != nullptr) {
+        try {
+            guestMemory.RecordStagingCopies(*recorder);
+        } catch (const std::exception&) {
+            return false;
+        }
+    }
+    for (const auto& texture : textures) {
+        if (texture == nullptr) continue;
+        if (texture->HasReuseLookup()) {
+            if (!texture->ReuseLookupHolds()) return false;
+        } else if (texture->IsDepthCopy()) {
+            texture->RefreshDepthCopy();
+        }
+    }
+    if (report != nullptr) *report = {ProofPath::Fast, ProofFailure::None};
+    return true;
+}
+#endif
+
 bool ShaderResources::Revalidate(std::span<const CompiledShader> shaders, ProofReport* report) {
+#if ANYPS5_UNIFIED
+    if (Unified::Proof::VerifyActive() || Unified::Proof::ShortcutActive()) return revalidateVerified(shaders, report);
+#endif
+    return revalidateEpoch(shaders, report);
+}
+
+bool ShaderResources::revalidateEpoch(std::span<const CompiledShader> shaders, ProofReport* report) {
     if (!registeredImageViewsCurrent(registeredImageViews)) {
         if (report != nullptr) *report = {ProofPath::Full, ProofFailure::Other};
         provedEpoch = 0;
@@ -7440,7 +7626,10 @@ void ShaderResources::MarkGpuWrites(Recorder& recorder) {
     // recorded here after the work: those regions then need no CPU write-back (HasCopiedWrites),
     // and the note and mark below cover them like direct writes.
     if (inRun != nullptr && recorder.RunOpen() && guestMemory.HasGpuCopies()) {
-        recorder.AfterRun([inRun](Recorder& after) { inRun->guestMemory.RecordCopyBacks(after); });
+        recorder.AfterRun([inRun](Recorder& after) {
+            inRun->guestMemory.RecordCopyBacks(after);
+            inRun->guestMemory.NoteCarriedShadows(after);
+        });
         guestMemory.MarkStagedWrites();
     } else {
         guestMemory.RecordCopyBacks(recorder);

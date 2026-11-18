@@ -56,6 +56,9 @@
 #include <tuple>
 #include <unordered_map>
 #include "prx/libc/include/general/AtomicSharedPtr.hpp"
+#if ANYPS5_UNIFIED
+#include "prx/libSceAgcDriver/Unified/include/Events.hpp"
+#endif
 
 namespace AgcDriver::Graphics {
 
@@ -4609,6 +4612,9 @@ void Recorder::AfterCompletions(std::uint64_t address, std::span<const std::byte
         completionStores.fetch_add(1, std::memory_order_acq_rel);
         GuestMemory::BreakProofs();
     }
+#if ANYPS5_UNIFIED
+    Unified::Events::Shared().Note(address, bytes.size());
+#endif
     // The table entry before the write note: the note bumps the generation a poller watches, and a
     // poller that sees the bump then finds the label without the GPU mutex.
     noteLabelOn(batch, address, bytes, stamp, queue, behindCompletion);
@@ -5192,6 +5198,7 @@ bool Recorder::Reap() {
 
 void Recorder::finish(std::unique_ptr<Batch> batch, bool wait, int source, bool releaseNow) {
     inFlightKeptBytes -= batch->keptBytes;
+    GuestBufferMemory::RetireCarriedShadows(context.device, batch->writes, batch->writeNotes);
     // The batch's writes stay published until its completions ran, on every exit path.
     struct Finishing {
         Recorder& recorder;

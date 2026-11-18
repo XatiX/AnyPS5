@@ -5,6 +5,7 @@
 #include <algorithm>
 #include <atomic>
 #include <cstdint>
+#include <cstring>
 #include <exception>
 #ifndef _WIN32
 #include <cerrno>
@@ -36,6 +37,7 @@ namespace GuestArena {
 namespace {
 
 std::atomic<void (*)(std::uintptr_t, std::size_t)> hostWriteHook{nullptr};
+std::atomic<void (*)(std::uintptr_t, std::size_t)> gpuHostWriteHook{nullptr};
 
 std::atomic<void (*)(std::uintptr_t, std::size_t)> hostReadHook{nullptr};
 
@@ -724,6 +726,40 @@ bool GuestArenaHandleRead_nid_postfix(std::uintptr_t address) {
     return WindowsMappings::Get().HandleRead(address);
 }
 
+namespace {
+
+std::atomic<bool (*)(std::uintptr_t, bool)>& gpuFaultHandler() {
+    static std::atomic<bool (*)(std::uintptr_t, bool)> handler{nullptr};
+    return handler;
+}
+
+}
+
+bool GuestArenaWriteFaultsAllowed_nid_no_patch() {
+    if (std::getenv("APS5_NO_PROTECT_TRACKING") != nullptr) return false;
+    if (std::getenv("APS5_PROTECT_TRACKING") != nullptr) return true;
+    constexpr std::size_t framedMarkOffset = 0x28;
+    constexpr char framedMark[8] = {'A', 'P', 'S', '5', 'R', 'Z', '0', '1'};
+    const auto* image = reinterpret_cast<const char*>(GetModuleHandleW(nullptr));
+    return image != nullptr && std::memcmp(image + framedMarkOffset, framedMark, sizeof(framedMark)) == 0;
+}
+
+bool GuestArenaSetGpuFaultHandler_nid_no_patch(bool (*handler)(std::uintptr_t address, bool write)) {
+    if (handler != nullptr && !GuestArenaWriteFaultsAllowed_nid_no_patch()) return false;
+    gpuFaultHandler().store(handler, std::memory_order_release);
+    return true;
+}
+
+bool GuestArenaHandleGpuFault_nid_no_patch(EXCEPTION_POINTERS* exception) {
+    const auto handler = gpuFaultHandler().load(std::memory_order_acquire);
+    if (handler == nullptr) return false;
+    const auto* record = exception->ExceptionRecord;
+    if (record->ExceptionCode != EXCEPTION_ACCESS_VIOLATION || record->NumberParameters < 2) return false;
+    const auto kind = record->ExceptionInformation[0];
+    if (kind != 0 && kind != 1) return false;
+    return handler(static_cast<std::uintptr_t>(record->ExceptionInformation[1]), kind == 1);
+}
+
 void GuestArenaPinWritable_nid_postfix(const void* pointer, std::size_t bytes) {
     if (!Arena::Get().Contains(pointer, bytes)) return;
     WindowsMappings::Get().Pin(reinterpret_cast<std::uintptr_t>(pointer), bytes);
@@ -1002,7 +1038,12 @@ void GuestArenaPrepareHostRead_nid_no_patch(const void* pointer, std::size_t byt
     if (const auto hook = hostReadHook.load(std::memory_order_acquire)) hook(address, bytes);
 }
 
+void GuestArenaSetGpuHostWriteHook_nid_no_patch(void (*hook)(std::uintptr_t address, std::size_t bytes)) {
+    gpuHostWriteHook.store(hook, std::memory_order_release);
+}
+
 bool GuestArenaBeginHostWrite_nid_postfix(void* pointer, std::size_t bytes) {
+    if (const auto hook = gpuHostWriteHook.load(std::memory_order_acquire); hook != nullptr && bytes != 0) hook(reinterpret_cast<std::uintptr_t>(pointer), bytes);
     if (const auto hook = hostWriteHook.load(std::memory_order_acquire); hook != nullptr && bytes != 0) hook(reinterpret_cast<std::uintptr_t>(pointer), bytes);
 #ifdef _WIN32
     return WindowsMappings::Get().BeginHostWrite(reinterpret_cast<std::uintptr_t>(pointer), bytes);

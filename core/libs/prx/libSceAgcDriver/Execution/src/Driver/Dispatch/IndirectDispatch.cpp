@@ -1,5 +1,6 @@
 #include "prx/libSceAgcDriver/Execution/include/Driver/Driver.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/Dispatch/IndirectDispatch.hpp"
+#include "prx/libSceAgcDriver/Execution/include/Driver/Draw/DrawPipeline.hpp"
 #include "prx/libSceAgcDriver/Execution/include/GuestMemory.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Pm4.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/GuestBufferMemory.hpp"
@@ -90,6 +91,7 @@ void Driver::dispatchIndirect(QueueState& queue, std::span<const std::uint32_t> 
     } scope{indirectSource(), indirectSource()};
     scope.source = IndirectSource{arguments, path, submission.queue, AheadArguments::None};
     if (path != IndirectGpu) {
+        if (submission.queue == 0 && DrawPipeline::Active() && DrawPipeline::Queue0().Busy()) DrawPipeline::Queue0().Drain(DrawPipeline::DrainReason::Packet, 0x16);
         const auto readStart = std::chrono::steady_clock::now();
         const auto direct = readDispatchArguments(submission.queue, arguments, initiator);
         countIndirect(path, std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - readStart).count());

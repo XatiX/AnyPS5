@@ -24,6 +24,9 @@
 #include <unordered_map>
 #include <unordered_set>
 #include <vector>
+#if ANYPS5_UNIFIED
+#include "prx/libSceAgcDriver/Unified/include/ProofVerdict.hpp"
+#endif
 
 namespace AgcDriver { class VulkanDevice; }
 namespace AgcDriver::GuestMemory { struct WriteSubscription; }
@@ -79,6 +82,7 @@ std::uint64_t SampledTextureCacheBudget(const Context& context);
 std::shared_ptr<Texture> CachedSampledTexture(const Context& context, std::span<const std::uint32_t> words, VkImageViewType multisampleViewType = VK_IMAGE_VIEW_TYPE_2D);
 bool SampledTexturesShareEntry(std::span<const std::uint32_t> first, std::span<const std::uint32_t> second);
 bool AnyPendingCpuWrites(const Context& context);
+bool PendingCpuWritesOverlap(const Context& context, std::uint64_t address, std::size_t bytes);
 bool CompletePendingCpuWrites(const Context& context, std::uint64_t address, std::size_t bytes);
 bool SpirvStoresThroughAddresses(std::span<const std::uint32_t> words);
 bool SpirvFaultReportOnly(std::span<const std::uint32_t> words, std::uint32_t set, std::uint32_t binding);
@@ -352,6 +356,8 @@ public:
     // ranges are fixed by the build), so a Revalidate's collects on the same worker are memo hits.
     void PrecollectSurfaces() const;
     bool Reusable() const { return reusable; }
+    std::vector<std::pair<std::uint64_t, std::uint64_t>> ProofRanges() const;
+    bool ProofRangesRegistered() const { return proofRangesRegistered; }
     void KeepStorageImageBytes(Recorder& recorder) const;
     const std::vector<std::uint64_t>& MultisampleSources() const { return multisampleSources; }
     static bool NeverReusable(std::span<const CompiledShader> shaders);
@@ -789,6 +795,7 @@ private:
     };
     std::vector<SamplerSource> samplerSources;
     bool reusable = false;
+    bool proofRangesRegistered = false;
     std::vector<DirectRegion> directRegions;
     std::vector<ValidatedSurface> validatedTextures;
     std::vector<ShaderRecompiler::RegisteredImageView> registeredImageViews;
@@ -802,6 +809,15 @@ private:
     std::uint64_t provedPending = 0;
     std::uint64_t provedRetired = 0;
     bool revalidateFull(std::span<const CompiledShader> shaders, ProofReport* report);
+    bool revalidateEpoch(std::span<const CompiledShader> shaders, ProofReport* report);
+#if ANYPS5_UNIFIED
+    bool revalidateVerified(std::span<const CompiledShader> shaders, ProofReport* report);
+    bool provedByLog(ProofReport* report);
+    void registerProofSpans();
+    std::vector<Unified::Proof::Span> proofSpans;
+    Unified::Proof::Stamp proofStamp;
+    bool lastProofFast = false;
+#endif
     // The import table's identity when the direct regions' serials were last proved.
     HostImportsProof importsProof;
     bool importsReconcilable = false;

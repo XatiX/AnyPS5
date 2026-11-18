@@ -1,6 +1,9 @@
 #include "prx/libSceAgcDriver/Graphics/include/TextureCache.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/TextureTiling.hpp"
 #include "prx/libSceAgcDriver/Execution/include/GuestMemory.hpp"
+#if ANYPS5_UNIFIED
+#include "prx/libSceAgcDriver/Unified/include/Events.hpp"
+#endif
 #include <algorithm>
 #include <cstring>
 #include <limits>
@@ -46,6 +49,9 @@ std::shared_ptr<Texture> TextureCache::Get(std::span<const std::uint32_t> words,
     GuestMemory::ReadCommitted(resource.baseAddress, snapshot);
     auto texture = std::make_shared<Texture>(context, *context.detiler, resource, components, snapshot);
     const auto retained = snapshot.size() + texture->AllocationBytes();
+#if ANYPS5_UNIFIED
+    AgcDriver::Unified::Events::NoteImage(resource.baseAddress, bytes);
+#endif
     entries.push_back({key, std::move(snapshot), texture});
     retainedBytes += retained;
     trim();

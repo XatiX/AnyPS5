@@ -166,6 +166,8 @@ void AdoptLatestCollectEpoch();
 std::uint64_t ProofSerial();
 std::uint64_t OwnProofBreaks();
 void BreakProofs();
+using StoreHook = void (*)(std::uint64_t address, std::uint64_t bytes);
+void SetStoreHook(StoreHook hook);
 void MarkProofThread();
 std::uint64_t CollectEpoch();
 std::uint64_t CollectEpochBumps();
@@ -179,6 +181,7 @@ struct Observation {
 };
 Observation Observe(std::uint64_t address, std::size_t bytes);
 void SetObservationHookForTest(void (*hook)(int point));
+void NoteFrame();
 // The tracker's current generation (every collect and MarkWritten bumps it): a stamp taken after
 // a set of driver stores, for UnchangedSinceCollected to compare against later. Read under the
 // tracker mutex, so every collect that bumped before it has finished its walk and every later

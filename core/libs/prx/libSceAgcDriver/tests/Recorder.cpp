@@ -4794,6 +4794,17 @@ bool carriedShadowTests(const Device& device, Recorder& recorder) {
     Require(GuestBufferMemory::CarriedShadowCopies() == first + 1, "a staged region nobody wrote since its last use was not copied in from that use's device shadow");
     recorder.Sync();
     Require(std::all_of(static_cast<const std::byte*>(block), static_cast<const std::byte*>(block) + bytes, [](std::byte value) { return value == std::byte{0x11}; }), "a carried copy-in changed the guest bytes");
+    const auto afterCompletion = GuestBufferMemory::CarriedShadowCopies();
+    use(recorder);
+    Require(GuestBufferMemory::CarriedShadowCopies() == afterCompletion + 1, "a staged region nobody wrote since its last use was not carried once that use's batch completed");
+    recorder.Sync();
+    const std::array<std::pair<std::uint64_t, std::uint64_t>, 1> later{{{element, element + 4096}}};
+    recorder.NotePendingWrites(later);
+    recorder.Sync();
+    const auto afterLaterWrite = GuestBufferMemory::CarriedShadowCopies();
+    use(recorder);
+    Require(GuestBufferMemory::CarriedShadowCopies() == afterLaterWrite, "a staged region a completed later GPU write overlapped was carried from the older shadow");
+    recorder.Sync();
     use(recorder);
     std::memset(reinterpret_cast<void*>(element + 8192), 0x22, 4096);
     AgcDriver::GuestMemory::BumpCollectEpoch();
@@ -4886,7 +4897,7 @@ bool readWrittenStagingTests(const Device& device, Recorder& recorder) {
     };
     Require(!boundInPlace(address + 4096, 1u << 20u, false), "a written 1 MiB element was not staged");
     Require(boundInPlace(address + 4096, 4u << 20u, false) != context.discreteGpu, context.discreteGpu ? "a written-only 4 MiB element was bound in place on a discrete GPU" : "a written-only 4 MiB element was staged past the written window");
-    Require(boundInPlace(address + 4096, 12u << 20u, false), "a written-only 12 MiB element was staged past the discrete written window");
+    Require(boundInPlace(address + 4096, 12u << 20u, false) != context.discreteGpu, context.discreteGpu ? "a written-only 12 MiB element was bound in place on a discrete GPU" : "a written-only 12 MiB element was staged past the written window");
     Require(!boundInPlace(address + 4096, 4u << 20u, true), "a read and written 4 MiB element was bound in place");
     const auto buildInPlace = [&](std::uint64_t dispatchThreads, bool read, std::uint32_t stride, std::uint32_t extent, std::uint32_t elementBytes = 12u << 20u) {
         const auto element = address + 4096;
@@ -4915,18 +4926,18 @@ bool readWrittenStagingTests(const Device& device, Recorder& recorder) {
         return direct;
     };
     Require(!buildInPlace((12u << 20u) / 16u, true, 16, 0), "a dispatch sweeping a read and written 12 MiB element bound it in place");
-    Require(buildInPlace(1024, true, 16, 0), "a dispatch touching 16 KiB of a read and written 12 MiB element staged all of it");
-    Require(buildInPlace(0, true, 16, 0), "a dispatch of unknown size staged a read and written 12 MiB element");
+    Require(buildInPlace(1024, true, 16, 0) != context.discreteGpu, context.discreteGpu ? "a dispatch touching 16 KiB of a read and written 12 MiB element bound it in place on a discrete GPU" : "a dispatch touching 16 KiB of a read and written 12 MiB element staged all of it");
+    Require(buildInPlace(0, true, 16, 0) != context.discreteGpu, context.discreteGpu ? "a dispatch of unknown size bound a read and written 12 MiB element in place on a discrete GPU" : "a dispatch of unknown size staged a read and written 12 MiB element");
     Require(buildInPlace((12u << 20u) / 32u, false, 32, 0) != context.discreteGpu, context.discreteGpu ? "a dispatch sweeping a written-only 12 MiB element of 32-byte records bound it in place on a discrete GPU" : "a dispatch sweeping a written-only 12 MiB element of 32-byte records staged it on a GPU without separate VRAM");
     Require(buildInPlace((12u << 20u) / 16u, false, 16, 0) != context.discreteGpu, context.discreteGpu ? "a dispatch sweeping a written-only 12 MiB element of 16-byte records bound it in place on a discrete GPU" : "a dispatch sweeping a written-only 12 MiB element of 16-byte records staged it on an integrated GPU");
     Require(buildInPlace((12u << 20u) / 12u, false, 12, 0) != context.discreteGpu, context.discreteGpu ? "a dispatch sweeping a written-only 12 MiB element of 12-byte records bound it in place on a discrete GPU" : "a dispatch sweeping a written-only 12 MiB element of 12-byte records staged it on an integrated GPU");
-    Require(buildInPlace(1024, false, 32, 0), "a dispatch touching 32 KiB of a written-only 12 MiB element staged all of it");
-    Require(buildInPlace((12u << 20u) / 32u, false, 0, 32), "a dispatch writing a written-only 12 MiB raw element staged it");
+    Require(buildInPlace(1024, false, 32, 0) != context.discreteGpu, context.discreteGpu ? "a dispatch touching 32 KiB of a written-only 12 MiB element bound it in place on a discrete GPU" : "a dispatch touching 32 KiB of a written-only 12 MiB element staged all of it");
+    Require(buildInPlace((12u << 20u) / 32u, false, 0, 32) != context.discreteGpu, context.discreteGpu ? "a dispatch writing a written-only 12 MiB raw element bound it in place on a discrete GPU" : "a dispatch writing a written-only 12 MiB raw element staged it");
     Require(buildInPlace(204800, false, 160, 0, 204800u * 160u) != context.discreteGpu, context.discreteGpu ? "a dispatch sweeping a written-only 31.25 MiB element of 160-byte records bound it in place on a discrete GPU" : "a dispatch sweeping a written-only 31.25 MiB element of 160-byte records staged it on a GPU without separate VRAM");
     Require(buildInPlace(204800, true, 160, 0, 204800u * 160u) != context.discreteGpu, context.discreteGpu ? "a dispatch sweeping a read and written 31.25 MiB element bound it in place on a discrete GPU" : "a dispatch sweeping a read and written 31.25 MiB element staged it past the 16 MiB cap on a GPU without separate VRAM");
     Require(!buildInPlace((12u << 20u) / 32u, true, 0, 32), "a dispatch sweeping a read and written 12 MiB raw element bound it in place");
-    Require(buildInPlace(1024, true, 0, 32), "a dispatch touching 32 KiB of a read and written 12 MiB raw element staged all of it");
-    Require(buildInPlace((12u << 20u) / 32u, true, 0, 0), "a raw element without an access extent was staged");
+    Require(buildInPlace(1024, true, 0, 32) != context.discreteGpu, context.discreteGpu ? "a dispatch touching 32 KiB of a read and written 12 MiB raw element bound it in place on a discrete GPU" : "a dispatch touching 32 KiB of a read and written 12 MiB raw element staged all of it");
+    Require(buildInPlace((12u << 20u) / 32u, true, 0, 0) != context.discreteGpu, context.discreteGpu ? "a raw element without an access extent was bound in place on a discrete GPU" : "a raw element without an access extent was staged");
     Require(std::all_of(static_cast<const std::byte*>(block), static_cast<const std::byte*>(block) + bytes, [](std::byte value) { return value == std::byte{0x11}; }), "a staged copy-back changed the guest bytes");
     {
         GuestAllocations::Mutation mutation;

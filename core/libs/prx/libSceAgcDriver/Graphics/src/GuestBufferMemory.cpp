@@ -427,6 +427,8 @@ struct HostImports {
     std::uint64_t reportedHeapUsage = 0;
     std::uint64_t ceiling = 0;
     std::uint32_t allocationFailures = 0;
+    std::uint64_t failedSpanBegin = 0;
+    std::uint64_t failedSpanEnd = 0;
     bool allocationFailed = false;
     std::uint8_t reportNoted = 0;
     std::map<std::uint64_t, std::uint64_t> spaceUses;
@@ -2604,9 +2606,22 @@ const HostImport* importRunAt(const Context& context, HostImports& state, Import
         if (std::string_view(step) == "vkAllocateMemory") {
             state.allocationFailed = true;
             if (!exhausted) state.allocationFailures = 0;
-            if (exhausted && (++state.allocationFailures >= 3 || live + bytes + budget / 8 >= budget)) {
+            static const bool spanFailures = std::getenv("APS5_NO_IMPORT_FAILURE_SPANS") == nullptr;
+            const bool sameSpan = spanFailures && state.allocationFailures != 0 && base <= state.failedSpanEnd && state.failedSpanBegin <= base + bytes;
+            if (exhausted) {
+                if (sameSpan) {
+                    state.failedSpanBegin = std::min(state.failedSpanBegin, base);
+                    state.failedSpanEnd = std::max(state.failedSpanEnd, base + bytes);
+                } else {
+                    ++state.allocationFailures;
+                    state.failedSpanBegin = base;
+                    state.failedSpanEnd = base + bytes;
+                }
+            }
+            const bool repeated = exhausted && state.allocationFailures >= 3;
+            if (exhausted && (repeated || live + bytes + budget / 8 >= budget)) {
                 state.ceiling = std::max<std::uint64_t>(pinnedTotal(state), 1);
-                std::fprintf(stderr, "[gpu] host import budget lowered to the %.1f MiB pinned after vkAllocateMemory failed %s\n", pinnedTotal(state) / 1048576.0, state.allocationFailures >= 3 ? "3 times in a row" : "within an eighth of the budget");
+                std::fprintf(stderr, "[gpu] host import budget lowered to the %.1f MiB pinned after vkAllocateMemory failed %s\n", pinnedTotal(state) / 1048576.0, repeated ? "3 times in a row" : "within an eighth of the budget");
             }
         }
 #ifdef _WIN32
@@ -6198,6 +6213,7 @@ VkBufferUsageFlags gpuCopyUsage(const Context& context, bool addressable) {
 // window takes those elements there. APS5_ATOMIC_STAGE_MAX_KIB (1024) bounds the atomic one.
 constexpr std::uint64_t SweptShadowMax = std::uint64_t{16} << 20u;
 constexpr std::uint64_t DiscreteWrittenShadowMax = std::uint64_t{8} << 20u;
+constexpr std::uint64_t DiscretePlainWrittenShadowMax = std::uint64_t{128} << 20u;
 constexpr std::uint64_t DiscreteSweptShadowMax = std::uint64_t{256} << 20u;
 
 bool writtenShadowEnabled() {
@@ -6224,6 +6240,11 @@ std::uint64_t writtenShadowMax(bool discreteGpu) {
     static const std::uint64_t setting = kibSetting("APS5_WRITTEN_SHADOW_MAX_KIB", 0);
     if (setting != 0) return setting;
     return discreteGpu ? DiscreteWrittenShadowMax : std::uint64_t{2048} << 10u;
+}
+
+std::uint64_t plainWrittenShadowMax(bool discreteGpu) {
+    static const bool large = std::getenv("APS5_NO_LARGE_WRITTEN_SHADOW") == nullptr && std::getenv("APS5_WRITTEN_SHADOW_MAX_KIB") == nullptr;
+    return discreteGpu && large ? DiscretePlainWrittenShadowMax : writtenShadowMax(discreteGpu);
 }
 
 std::uint64_t atomicStageMax() {
@@ -6445,7 +6466,8 @@ bool GuestBufferMemory::stagingWanted(const Region& region, bool addressable) co
     const auto bytes = region.end - region.begin;
     if (!WritesOverlap(region.begin, static_cast<std::size_t>(bytes))) return false;
     if (region.atomic && atomicStagingEnabled() && bytes <= atomicStageMax()) return true;
-    return writtenShadowEnabled() && bytes >= writtenShadowMin() && bytes <= (region.swept ? std::max(writtenShadowMax(context.discreteGpu), context.discreteGpu ? DiscreteSweptShadowMax : SweptShadowMax) : writtenShadowMax(context.discreteGpu));
+    const auto writtenMax = region.overlay ? writtenShadowMax(context.discreteGpu) : plainWrittenShadowMax(context.discreteGpu);
+    return writtenShadowEnabled() && bytes >= writtenShadowMin() && bytes <= (region.swept ? std::max(writtenMax, context.discreteGpu ? DiscreteSweptShadowMax : SweptShadowMax) : writtenMax);
 }
 
 bool GuestBufferMemory::overlayCandidate(const Region& inside, bool readOnly) const {
@@ -7104,7 +7126,14 @@ struct CarriedShadows {
     AgcDriver::Mutex mutex;
     std::map<std::pair<std::uint64_t, std::uint64_t>, CarriedShadow> entries;
     std::uint64_t bytes = 0;
+    std::uint64_t longest = 0;
+    std::atomic<std::size_t> count{0};
 };
+
+bool carriedPastCompletion() {
+    static const bool enabled = std::getenv("APS5_NO_CARRIED_PAST_COMPLETION") == nullptr;
+    return enabled;
+}
 
 CarriedShadows& Carried() {
     static CarriedShadows shadows;
@@ -7122,6 +7151,7 @@ void clearCarriedShadows(VkDevice device) {
         shadows.bytes -= entry->first.second - entry->first.first;
         entry = shadows.entries.erase(entry);
     }
+    shadows.count.store(shadows.entries.size(), std::memory_order_relaxed);
 }
 
 std::shared_ptr<Buffer> takeCarriedShadow(const Context& context, const Recorder& recorder, std::uint64_t begin, std::uint64_t end) {
@@ -7135,9 +7165,12 @@ std::shared_ptr<Buffer> takeCarriedShadow(const Context& context, const Recorder
         shadow = std::move(found->second);
         shadows.bytes -= end - begin;
         shadows.entries.erase(found);
+        shadows.count.store(shadows.entries.size(), std::memory_order_relaxed);
     }
     const auto bytes = static_cast<std::size_t>(end - begin);
-    if (shadow.device != context.device || shadow.recorderId != recorder.Id() || shadow.note == 0 || recorder.NewestWriteNote(begin, bytes) != shadow.note) return nullptr;
+    if (shadow.device != context.device || shadow.recorderId != recorder.Id() || shadow.note == 0) return nullptr;
+    const auto newest = recorder.NewestWriteNote(begin, bytes);
+    if (newest != shadow.note && (newest > shadow.note || !carriedPastCompletion())) return nullptr;
     if (shadow.importSerial == 0 || HostImportSerial(context, begin, bytes, false) != shadow.importSerial) return nullptr;
     static_cast<void>(GuestMemory::CollectWrites(begin, bytes));
     if (!GuestMemory::UnchangedSince(begin, bytes, shadow.generation)) return nullptr;
@@ -7148,6 +7181,26 @@ std::shared_ptr<Buffer> takeCarriedShadow(const Context& context, const Recorder
 
 std::uint64_t GuestBufferMemory::CarriedShadowCopies() {
     return carriedShadowCopies.load(std::memory_order_relaxed);
+}
+
+void GuestBufferMemory::RetireCarriedShadows(VkDevice device, std::span<const std::pair<std::uint64_t, std::uint64_t>> writes, std::span<const std::uint64_t> notes) {
+    auto& shadows = Carried();
+    if (writes.empty() || shadows.count.load(std::memory_order_relaxed) == 0) return;
+    std::lock_guard lock(shadows.mutex);
+    for (std::size_t index = 0; index < writes.size() && !shadows.entries.empty(); ++index) {
+        const auto [begin, end] = writes[index];
+        const auto note = index < notes.size() ? notes[index] : std::numeric_limits<std::uint64_t>::max();
+        auto entry = shadows.entries.lower_bound({begin > shadows.longest ? begin - shadows.longest : 0, 0});
+        while (entry != shadows.entries.end() && entry->first.first < end) {
+            if (entry->first.second > begin && entry->second.device == device && note > entry->second.note) {
+                shadows.bytes -= entry->first.second - entry->first.first;
+                entry = shadows.entries.erase(entry);
+            } else {
+                ++entry;
+            }
+        }
+    }
+    shadows.count.store(shadows.entries.size(), std::memory_order_relaxed);
 }
 
 void GuestBufferMemory::NoteCarriedShadows(const Recorder& recorder) const {
@@ -7164,11 +7217,13 @@ void GuestBufferMemory::NoteCarriedShadows(const Recorder& recorder) const {
         std::lock_guard lock(shadows.mutex);
         auto [entry, inserted] = shadows.entries.try_emplace({region.begin, region.end});
         if (inserted) shadows.bytes += bytes;
+        shadows.longest = std::max(shadows.longest, bytes);
         entry->second = {region.buffer, context.device, recorder.Id(), serial, note, generation};
         if (shadows.entries.size() > CarriedShadows::MaxEntries || shadows.bytes > CarriedShadows::MaxBytes) {
             shadows.entries.clear();
             shadows.bytes = 0;
         }
+        shadows.count.store(shadows.entries.size(), std::memory_order_relaxed);
     }
 }
 
@@ -7242,8 +7297,7 @@ void GuestBufferMemory::recordGpuCopies(std::span<Region* const> copies, bool ad
         }
         recorder->Keep(region->buffer);
         std::shared_ptr<Buffer> carried;
-        if (region->deviceLocal && inputSnapshot == nullptr && !region->sparse && region->mirror == nullptr && region->bufferEnd == 0) carried = takeCarriedShadow(context, *recorder, region->begin, region->end);
-        if (carried != nullptr) {
+        if (region->deviceLocal && inputSnapshot == nullptr && !region->sparse && region->mirror == nullptr && region->bufferEnd == 0) carried = takeCarriedShadow(context, *recorder, region->begin, region->end);        if (carried != nullptr) {
             carriedShadowCopies.fetch_add(1, std::memory_order_relaxed);
             if (carried->Handle() != region->buffer->Handle()) {
                 CopyBuffer(context, commands, carried->Handle(), 0, region->buffer->Handle(), 0, bytes);

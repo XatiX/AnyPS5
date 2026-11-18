@@ -5,8 +5,12 @@
 #include "prx/libSceAgcDriver/Execution/include/QueueState.hpp"
 #include "prx/libSceAgcDriver/Unified/include/Operation.hpp"
 #include "prx/libSceAgcDriver/Unified/include/SnapshotRing.hpp"
+#include "prx/libSceAgcDriver/Unified/include/Ranges.hpp"
 #include <cstddef>
 #include <cstdint>
+#include <functional>
+#include <span>
+#include <vector>
 
 namespace AgcDriver::Unified {
 
@@ -38,6 +42,9 @@ struct DecodeCounts {
     std::uint64_t resolved = 0;
     std::uint64_t resolveErrors = 0;
     std::uint64_t truncated = 0;
+    std::uint64_t useReports = 0;
+    std::uint64_t useErrors = 0;
+    std::uint64_t resets = 0;
 };
 
 class Sink {
@@ -47,12 +54,21 @@ public:
     virtual void MakeRoom() = 0;
 };
 
+using UseSink = std::function<void(std::span<const GuestUse> uses)>;
+
 class DecodeState {
 public:
     explicit DecodeState(std::uint32_t queue) : queueId(queue) {}
 
     void RetireBefore(const SnapshotIds& ids);
     void SetResolve(bool enabled) { resolve = enabled; }
+    void SetUses(UseSink sink) { uses = std::move(sink); }
+    void ResetQueueState() {
+        state = QueueState{};
+        contextDirty = userConfigDirty = shaderDirty = scalarsDirty = true;
+        targetContext = ~std::uint64_t{0};
+        ++counts.resets;
+    }
     [[nodiscard]] const Registers* Context(std::uint64_t id) const { return context.Find(id); }
     [[nodiscard]] const Registers* UserConfig(std::uint64_t id) const { return userConfig.Find(id); }
     [[nodiscard]] const Registers* Shader(std::uint64_t id) const { return shader.Find(id); }
@@ -75,6 +91,9 @@ private:
     bool shaderDirty = true;
     bool scalarsDirty = true;
     bool resolve = false;
+    UseSink uses;
+    std::vector<GuestUse> useBuffer;
+    std::uint64_t targetContext = ~std::uint64_t{0};
     std::uint64_t sequence = 0;
     DecodeCounts counts;
 };
