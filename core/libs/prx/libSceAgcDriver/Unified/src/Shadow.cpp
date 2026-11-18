@@ -421,6 +421,48 @@ bool ServeOwned(const Graphics::Context& context, std::uint64_t address, std::ui
     return true;
 }
 
+void ServeFaultPages(std::span<const std::uint64_t> pages) {
+    if (pages.empty() || !ServesOwned()) return;
+    auto& service = ResidencyService::Get();
+    if (!service.Attached()) return;
+    struct FaultPage {
+        std::uint64_t page = 0;
+        std::uint64_t first = 0;
+        std::uint64_t last = 0;
+    };
+    std::vector<FaultPage> found;
+    found.reserve(pages.size());
+    {
+        const auto lease = GuestAllocations::GuestAllocationsAcquire_nid_postfix();
+        for (const auto address : pages) {
+            const auto page = address & ~(GpuPageBytes - 1);
+            FaultPage entry{page, page, page + GpuPageBytes};
+            auto range = std::upper_bound(lease.begin(), lease.end(), page, [](std::uint64_t at, const auto& candidate) { return at < candidate->address; });
+            if (range != lease.begin()) {
+                const auto& allocation = *--range;
+                const auto first = allocation->address & ~(PageBytes - 1);
+                const auto last = (allocation->address + allocation->bytes + PageBytes - 1) & ~(PageBytes - 1);
+                if (allocation->bytes != 0 && first <= page && page + GpuPageBytes <= last) {
+                    entry.first = first;
+                    entry.last = last;
+                }
+            }
+            found.push_back(entry);
+        }
+    }
+    auto& core = MemoryCore::Get();
+    for (const auto& [page, first, last] : found) {
+        if (!GuestArena::GuestArenaContains_nid_postfix(reinterpret_cast<const void*>(page), static_cast<std::size_t>(GpuPageBytes))) continue;
+        const bool whole = registerRange(first, last);
+        if (!whole && first != page) registerRange(page, page + GpuPageBytes);
+        const auto committed = GuestMemory::CommittedRanges(page, static_cast<std::size_t>(GpuPageBytes));
+        core.Reserve(page, GpuPageBytes);
+        for (const auto& [from, to] : committed) core.MakeResident(from, to - from);
+        if (whole) service.ServeFaultPage(page, first, last - first, committed);
+        else service.ServeFaultPage(page, 0, 0, committed);
+    }
+}
+
 bool OwnedUploadsPending() {
     return ServesOwned() && ResidencyService::Get().Pending();
 }

@@ -1,4 +1,5 @@
 #include "prx/libSceAgcDriver/Unified/include/Residency.hpp"
+#include "prx/libSceAgcDriver/Unified/include/GpuPageTable.hpp"
 #include <algorithm>
 #include <limits>
 
@@ -92,6 +93,7 @@ std::uint64_t Residency::unbind(Range& range) {
         auto& slot = range.chunks[index];
         if (!slot) continue;
         binds.push_back({index * ChunkBytes, *slot, false});
+        unmapChunk(range, index);
         put(*slot);
         slot.reset();
     }
@@ -134,6 +136,7 @@ std::vector<GuestSpan> Residency::MakeResident(std::uint64_t address, std::uint6
     }
     for (std::size_t at = 0; at < taken.size(); ++at) {
         range.chunks[taken[at]] = binds[at].chunk;
+        mapChunk(range, taken[at]);
         const auto from = std::max(base, range.origin + taken[at] * ChunkBytes);
         const auto to = std::min(range.end, range.origin + (taken[at] + 1) * ChunkBytes);
         if (!made.empty() && made.back().address + made.back().size == from) made.back().size += to - from;
@@ -211,9 +214,37 @@ void Residency::SetBudget(std::uint64_t bytes) {
     budget = bytes;
 }
 
+void Residency::mapChunk(const Range& range, std::size_t index) {
+    if (pageTable == nullptr) return;
+    const auto guest = range.origin + index * ChunkBytes;
+    const auto deviceAddress = range.buffer.address + index * ChunkBytes;
+    if (const auto mapped = pageTable->Lookup(guest); mapped != 0 && mapped != deviceAddress) {
+        ++sharedPages;
+        return;
+    }
+    pageTable->Map(guest, ChunkBytes, deviceAddress, GpuPagePermissions);
+}
+
+void Residency::unmapChunk(const Range& range, std::size_t index) {
+    if (pageTable == nullptr) return;
+    const auto guest = range.origin + index * ChunkBytes;
+    if (pageTable->Lookup(guest) == range.buffer.address + index * ChunkBytes) pageTable->Unmap(guest, ChunkBytes);
+}
+
+void Residency::SetPageTable(GpuPageTable* table) {
+    std::lock_guard lock(mutex);
+    pageTable = table;
+    if (pageTable == nullptr) return;
+    for (const auto& [base, range] : ranges) {
+        for (std::size_t index = 0; index < range.chunks.size(); ++index) {
+            if (range.chunks[index]) mapChunk(range, index);
+        }
+    }
+}
+
 ResidencyCounts Residency::Counts() const {
     std::lock_guard lock(mutex);
-    return {ranges.size(), pools, boundBytes, budget, boundCount, evictedCount, refusedCount};
+    return {ranges.size(), pools, boundBytes, budget, boundCount, evictedCount, refusedCount, sharedPages};
 }
 
 }

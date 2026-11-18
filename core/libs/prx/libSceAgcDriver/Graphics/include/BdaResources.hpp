@@ -87,6 +87,7 @@ private:
     std::shared_ptr<BdaFaultChunk> faultChunk;
     VkDeviceSize faultOffset = 0;
     bool reportOnly = false;
+    bool pageTable = false;
     std::uint64_t lastUse = 0;
     std::size_t tableBytes = 0;
     std::uint64_t tableGuardSerial = 0;

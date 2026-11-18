@@ -2,6 +2,7 @@
 #define CORE_LIBS_PRX_LIBSCEAGCDRIVER_UNIFIED_INCLUDE_RESIDENCYSERVICE_HPP
 
 #include "prx/libSceAgcDriver/Graphics/include/Context.hpp"
+#include "prx/libSceAgcDriver/Unified/include/GpuPageTable.hpp"
 #include "prx/libSceAgcDriver/Unified/include/ResidentUploads.hpp"
 #include "prx/libSceAgcDriver/Unified/include/VulkanResidency.hpp"
 #include <atomic>
@@ -14,12 +15,19 @@
 #include <utility>
 #include <vector>
 
+namespace AgcDriver::Graphics {
+class Buffer;
+}
+
 namespace AgcDriver::Unified {
+
+inline constexpr std::uint32_t PageTableLeafCapacity = 1024;
 
 class ResidencyService {
 public:
     static ResidencyService& Get();
     static bool Enabled();
+    static bool PageTableEnabled();
 
     bool Attach(const Graphics::Context& context);
     [[nodiscard]] bool Attached() const;
@@ -28,6 +36,8 @@ public:
     bool Prepare(std::uint64_t address, std::uint64_t size);
     [[nodiscard]] std::optional<DeviceSpan> Translate(std::uint64_t address, std::uint64_t size) const;
     std::optional<DeviceSpan> Serve(std::uint64_t address, std::uint64_t size, std::span<const std::pair<std::uint64_t, std::uint64_t>> committed);
+    bool ServeFaultPage(std::uint64_t page, std::uint64_t allocation, std::uint64_t allocationBytes, std::span<const std::pair<std::uint64_t, std::uint64_t>> committed);
+    [[nodiscard]] std::shared_ptr<Graphics::Buffer> PageTableBuffer() const;
     [[nodiscard]] bool Pending() const;
     std::size_t Record(VkCommandBuffer commands, std::vector<std::shared_ptr<void>>& kept);
     void AdvanceFrame();
@@ -42,6 +52,13 @@ private:
     std::unique_ptr<VulkanResidency> device;
     std::unique_ptr<Residency> ledger;
     std::unique_ptr<ResidentUploads> uploads;
+    std::unique_ptr<GpuPageTable> pages;
+    std::shared_ptr<Graphics::Buffer> pageBuffer;
+    std::uint64_t pageUpdates = 0;
+    std::uint64_t pageUpdateBytes = 0;
+    std::uint64_t pageLeavesDropped = 0;
+    std::uint64_t faultPagesServed = 0;
+    std::uint64_t faultPagesRefused = 0;
     std::vector<std::pair<std::uint64_t, std::uint64_t>> queued;
     std::map<std::uint64_t, std::uint64_t> served;
     std::uint64_t serveRefusals = 0;

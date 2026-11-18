@@ -118,6 +118,7 @@ void ResetCheckpointSnapshots() noexcept;
 #if ANYPS5_UNIFIED
 #include "prx/libSceAgcDriver/Unified/include/Shadow.hpp"
 #include "prx/libSceAgcDriver/Unified/include/Events.hpp"
+#include "prx/libSceAgcDriver/Unified/include/ResidencyService.hpp"
 #endif
 
 #ifndef _WIN32
@@ -4738,9 +4739,20 @@ Graphics::SampleOrder VulkanDevice::HostSampleOrder(const Graphics::State& graph
     return Graphics::HostSampleLocationsFor(graphicsContext(), graphics).order;
 }
 
+namespace {
+
+std::uint32_t bdaAbiVersion() {
+#if ANYPS5_UNIFIED
+    if (Unified::ResidencyService::PageTableEnabled()) return ShaderRecompiler::BdaAbi::PageTableVersion;
+#endif
+    return ShaderRecompiler::BdaAbi::Version;
+}
+
+}
+
 ShaderRecompiler::SpirvTarget VulkanDevice::buildTarget() const {
     const auto& limits = state->properties.limits;
-    ShaderRecompiler::SpirvTarget target{VK_API_VERSION_1_1, state->meshShader ? 0x00010400u : 0x00010300u, state->subgroup.subgroupSize, ShaderRecompiler::BdaAbi::Version, state->capabilities, state->spirvExtensions, false, {limits.maxComputeWorkGroupSize[0], limits.maxComputeWorkGroupSize[1], limits.maxComputeWorkGroupSize[2]}, limits.maxComputeWorkGroupInvocations, limits.maxComputeSharedMemorySize, {}, {}};
+    ShaderRecompiler::SpirvTarget target{VK_API_VERSION_1_1, state->meshShader ? 0x00010400u : 0x00010300u, state->subgroup.subgroupSize, bdaAbiVersion(), state->capabilities, state->spirvExtensions, false, {limits.maxComputeWorkGroupSize[0], limits.maxComputeWorkGroupSize[1], limits.maxComputeWorkGroupSize[2]}, limits.maxComputeWorkGroupInvocations, limits.maxComputeSharedMemorySize, {}, {}};
     target.fragmentShaderBarycentricEnabled = state->fragmentShaderBarycentric;
     target.fragmentBarycentricBuiltins = state->fragmentBarycentricBuiltins;
     target.nonConstantImageOffsets = state->maintenance8;

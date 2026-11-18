@@ -3,6 +3,10 @@
 #include "prx/libSceAgcDriver/Graphics/include/MultisampleTarget.hpp"
 #include "ImageTableAbi.hpp"
 #include "prx/libSceAgcDriver/Execution/include/GuestMemory.hpp"
+#if ANYPS5_UNIFIED
+#include "prx/libSceAgcDriver/Unified/include/ResidencyService.hpp"
+#include "prx/libSceAgcDriver/Unified/include/Shadow.hpp"
+#endif
 #include <algorithm>
 #include <array>
 #include <atomic>
@@ -324,6 +328,19 @@ bool BdaResources::TakeFaultSlot(const Context& context) {
 }
 
 BdaResources::BdaResources(const Context& context, const GuestBufferMemory& memory, bool reportOnly) : BdaResources(context, reportOnly) {
+#if ANYPS5_UNIFIED
+    if (Unified::ResidencyService::PageTableEnabled()) {
+        auto& service = Unified::ResidencyService::Get();
+        Require(service.Attach(context), "APS5_RECODE_PAGE_TABLE: the residency service did not attach (no sparse residency buffers or device addresses)");
+        table = service.PageTableBuffer();
+        Require(table != nullptr, "APS5_RECODE_PAGE_TABLE: the residency service has no page table");
+        tableBytes = ShaderRecompiler::BdaAbi::PageTableBytes(Unified::PageTableLeafCapacity);
+        Require(tableBytes <= context.limits.maxStorageBufferRange && ShaderRecompiler::BdaAbi::FaultBufferBytes <= context.limits.maxStorageBufferRange, "BDA descriptors exceed storage buffer range limit");
+        tableGuardSerial = MultisampleTargetRangeGeneration();
+        pageTable = true;
+        return;
+    }
+#endif
     const auto cached = memory.CachedAddressTable();
     std::vector<ShaderRecompiler::BdaAbi::Range> built;
     if (!cached.has_value()) built = memory.AddressRanges();
@@ -446,7 +463,7 @@ std::span<const std::byte> BdaResources::TableBytes() const {
 }
 
 bool BdaResources::TableGuardCurrent(VkDevice device, std::span<const ShaderRecompiler::BdaAbi::Range> ranges) {
-    if (table == nullptr || tableGuardSerial == MultisampleTargetRangeGeneration()) return true;
+    if (table == nullptr || pageTable || tableGuardSerial == MultisampleTargetRangeGeneration()) return true;
     auto generation = tableGuardSerial;
     const auto filtered = ExcludeMultisampleTargetRanges(device, ranges, generation);
     const auto expected = filtered.has_value() ? std::span<const ShaderRecompiler::BdaAbi::Range>(*filtered) : ranges;
@@ -499,6 +516,17 @@ void BdaResources::checkFault(const BdaResources& record) const {
         return;
     }
     Require(report.state == ShaderRecompiler::BdaAbi::FaultState::Ready && (report.claim & ~(ShaderRecompiler::BdaAbi::FaultClaimed | ShaderRecompiler::BdaAbi::FaultClaimOtherFaults)) == 0, "incomplete or invalid BDA fault record");
+#if ANYPS5_UNIFIED
+    if (pageTable) {
+        std::vector<std::uint64_t> pages;
+        Require(ShaderRecompiler::BdaAbi::ForEachFaultPage(reinterpret_cast<const std::uint32_t*>(record.faultBytes().data()), [&](std::uint64_t page) { pages.push_back(page); }), "invalid BDA fault page list");
+        Unified::Shadow::ServeFaultPages(pages);
+        if (report.reason == ShaderRecompiler::BdaAbi::FaultReason::Unmapped && ShaderRecompiler::BdaAbi::OtherFaults(report) == 0) {
+            clearFaultSlot(record.faultBytes());
+            return;
+        }
+    }
+#endif
     Require(report.reason != ShaderRecompiler::BdaAbi::FaultReason::InvalidRectangle, "rect-list requires finite nondegenerate axis-aligned positions with equal positive W");
     if (report.reason == ShaderRecompiler::BdaAbi::FaultReason::LoopLimit) {
         // APS5_LOOP_GUARD: the shader left a loop that ran past the guard; the dispatch result is kept.
@@ -536,7 +564,7 @@ void BdaResources::checkFault(const BdaResources& record) const {
         throw std::runtime_error(message.str());
     }
     message << "BDA access failed: address=0x" << std::hex << report.address << " instruction=0x" << report.instruction << std::dec << " bytes=" << report.bytes << " stage=" << report.stage << " reason=" << static_cast<std::uint32_t>(report.reason);
-    if (report.reason == ShaderRecompiler::BdaAbi::FaultReason::Permission && table != nullptr) {
+    if (report.reason == ShaderRecompiler::BdaAbi::FaultReason::Permission && table != nullptr && !pageTable) {
         const auto bytes = table->Bytes();
         ShaderRecompiler::BdaAbi::Header header{};
         std::memcpy(&header, bytes.data(), sizeof(header));
