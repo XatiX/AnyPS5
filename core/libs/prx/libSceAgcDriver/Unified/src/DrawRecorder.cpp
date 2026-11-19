@@ -11,7 +11,9 @@
 #include "prx/libSceAgcDriver/Graphics/include/Texture.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/VertexInput.hpp"
 #include "prx/libSceAgcDriver/Unified/include/DataRing.hpp"
+#include "prx/libSceAgcDriver/Unified/include/Events.hpp"
 #include "prx/libSceAgcDriver/Unified/include/ResidencyService.hpp"
+#include "prx/libSceAgcDriver/Unified/include/Shadow.hpp"
 #include "prx/libSceAgcDriver/Unified/include/TableMirror.hpp"
 #include "prx/libSceAgcDriver/Unified/include/VulkanHeap.hpp"
 #include "BdaAbi.hpp"
@@ -45,6 +47,11 @@ struct MapBuffer {
     std::uint64_t serial = 0;
 };
 
+struct FaultBuffer {
+    std::shared_ptr<Graphics::Buffer> buffer;
+    std::uint64_t serial = 0;
+};
+
 struct Totals {
     std::uint64_t recorded = 0;
     std::uint64_t refused = 0;
@@ -57,6 +64,12 @@ struct Totals {
     std::uint64_t mapUploads = 0;
     std::uint64_t mapUploadBytes = 0;
     std::uint64_t mapRetired = 0;
+    std::uint64_t faultReads = 0;
+    std::uint64_t faults = 0;
+    std::uint64_t unmappedFaults = 0;
+    std::uint64_t faultPages = 0;
+    std::uint64_t writtenRanges = 0;
+    std::uint64_t writtenOverflows = 0;
     std::uint64_t nanoseconds = 0;
     std::map<std::string, std::uint64_t> reasons;
 };
@@ -207,10 +220,10 @@ public:
         line += "; linear target stores " + std::to_string(totals.linearStores);
         std::snprintf(text, sizeof(text), "; table maps %llu hits, %llu uploads (%.1f MiB), %llu retired, %zu held (%.1f MiB)", static_cast<unsigned long long>(totals.mapHits), static_cast<unsigned long long>(totals.mapUploads), static_cast<double>(totals.mapUploadBytes) / 1048576.0, static_cast<unsigned long long>(totals.mapRetired), maps.size(), static_cast<double>(mapBytes) / 1048576.0);
         line += text;
-        if (fault != nullptr) {
-            const auto bytes = fault->Bytes();
-            line += std::ranges::any_of(bytes, [](std::byte value) { return value != std::byte{0}; }) ? "; fault buffer written" : "; fault buffer clean";
-        }
+        std::snprintf(text, sizeof(text), "; fault buffers %zu in flight, %llu read: %llu faults (%llu unmapped), %llu fault pages served, %llu written ranges landed, %llu written overflows", faults.size(), static_cast<unsigned long long>(totals.faultReads), static_cast<unsigned long long>(totals.faults), static_cast<unsigned long long>(totals.unmappedFaults), static_cast<unsigned long long>(totals.faultPages), static_cast<unsigned long long>(totals.writtenRanges), static_cast<unsigned long long>(totals.writtenOverflows));
+        line += text;
+        for (const auto& [reasonCode, count] : faultReasons) line += "; fault reason " + std::to_string(reasonCode) + " " + std::to_string(count);
+        faultReasons.clear();
         for (const auto& [why, count] : totals.reasons) line += "; " + why + " " + std::to_string(count);
         const auto pools = totals.pools;
         totals = {};
@@ -232,8 +245,6 @@ private:
         device = context.device;
         alignment = std::max<std::uint64_t>(context.limits.minStorageBufferOffsetAlignment, 16u);
         ring = std::make_shared<Graphics::Buffer>(context, RingBytes, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_INDIRECT_BUFFER_BIT);
-        fault = std::make_shared<Graphics::Buffer>(context, ShaderRecompiler::BdaAbi::FaultBufferBytes, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT);
-        std::memset(fault->Bytes().data(), 0, fault->Bytes().size());
         space.emplace(RingBytes, alignment);
         std::fprintf(stderr, "[recode-record] ring %llu MiB, alignment %llu\n", static_cast<unsigned long long>(RingBytes >> 20u), static_cast<unsigned long long>(alignment));
         return true;
@@ -244,6 +255,58 @@ private:
         auto key = "dropped: " + reason.substr(0, 50);
         if (seen.insert(key).second) std::fprintf(stderr, "[recode-record] first drop: %s\n", reason.c_str());
         if (totals.reasons.size() < 24u || totals.reasons.contains(key)) totals.reasons[key]++;
+    }
+
+    void readFaults(Graphics::Buffer& buffer) {
+        namespace Abi = ShaderRecompiler::BdaAbi;
+        auto bytes = buffer.Bytes();
+        auto* words = reinterpret_cast<std::uint32_t*>(bytes.data());
+        totals.faultReads++;
+        if (words[Abi::WrittenOverflowWord] != 0u) totals.writtenOverflows++;
+        std::vector<std::pair<std::uint64_t, std::uint64_t>> written;
+        if (Abi::ForEachWrittenRange(words, [&](std::uint64_t begin, std::size_t size) { written.emplace_back(begin, size); })) {
+            totals.writtenRanges += written.size();
+            if (!written.empty()) {
+                Shadow::LandGpuWrites(written);
+                std::vector<std::pair<std::uint64_t, std::uint64_t>> ends;
+                ends.reserve(written.size());
+                for (const auto& [begin, size] : written) ends.emplace_back(begin, begin + size);
+                Events::NoteRanges(ends);
+            }
+        }
+        Abi::Fault report{};
+        std::memcpy(&report, bytes.data(), sizeof(report));
+        if (report.state == Abi::FaultState::Ready) {
+            totals.faults++;
+            const auto code = static_cast<std::uint32_t>(report.reason);
+            faultReasons[code]++;
+            if (report.reason == Abi::FaultReason::Unmapped) totals.unmappedFaults++;
+            if (seenFaults.insert(code).second) std::fprintf(stderr, "[recode-record] first fault: reason %u at 0x%llx, %u bytes, stage %u, pc 0x%x\n", code, static_cast<unsigned long long>(report.address), report.bytes, report.stage, report.instruction);
+            std::vector<std::uint64_t> pages;
+            if (Abi::ForEachFaultPage(words, [&](std::uint64_t page) { pages.push_back(page); }) && !pages.empty()) {
+                totals.faultPages += pages.size();
+            }
+        }
+        std::memset(bytes.data(), 0, bytes.size());
+    }
+
+    std::shared_ptr<Graphics::Buffer> faultFor(const Context& context, std::uint64_t serial, std::uint64_t completed) {
+        while (!faults.empty() && faults.front().serial <= completed && faults.front().serial != serial) {
+            readFaults(*faults.front().buffer);
+            spareFaults.push_back(std::move(faults.front().buffer));
+            faults.pop_front();
+        }
+        if (!faults.empty() && faults.back().serial == serial) return faults.back().buffer;
+        std::shared_ptr<Graphics::Buffer> buffer;
+        if (!spareFaults.empty()) {
+            buffer = std::move(spareFaults.back());
+            spareFaults.pop_back();
+        } else {
+            buffer = std::make_shared<Graphics::Buffer>(context, ShaderRecompiler::BdaAbi::FaultBufferBytes, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT);
+            std::memset(buffer->Bytes().data(), 0, buffer->Bytes().size());
+        }
+        faults.push_back({buffer, serial});
+        return buffer;
     }
 
     std::shared_ptr<Graphics::Buffer> mapBuffer(const Context& context, const Tables::Mirror& mirror, std::uint64_t serial, std::uint64_t completed) {
@@ -459,7 +522,7 @@ private:
                         }
                         info = {pageTable->Handle(), 0, VK_WHOLE_SIZE};
                         break;
-                    case Bindings::Source::Fault: info = {fault->Handle(), 0, VK_WHOLE_SIZE}; break;
+                    case Bindings::Source::Fault: info = {faultFor(context, serial, completed)->Handle(), 0, VK_WHOLE_SIZE}; break;
                     case Bindings::Source::TableMap: {
                         const auto& mirror = draw.stages.at(binding.stage).tableMap;
                         if (mirror == nullptr) {
@@ -628,7 +691,9 @@ private:
     VkDevice device = VK_NULL_HANDLE;
     std::uint64_t alignment = 16;
     std::shared_ptr<Graphics::Buffer> ring;
-    std::shared_ptr<Graphics::Buffer> fault;
+    std::deque<FaultBuffer> faults;
+    std::vector<std::shared_ptr<Graphics::Buffer>> spareFaults;
+    std::map<std::uint32_t, std::uint64_t> faultReasons;
     std::optional<RingSpace> space;
     std::map<std::vector<std::uint32_t>, VkDescriptorSetLayout> layouts;
     std::deque<std::pair<VkDescriptorPool, std::uint64_t>> pools;
@@ -637,6 +702,7 @@ private:
     std::map<std::uint64_t, MapBuffer> maps;
     std::uint64_t mapBytes = 0;
     std::set<std::string> seen;
+    std::set<std::uint32_t> seenFaults;
     Totals totals;
 };
 
