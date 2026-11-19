@@ -91,7 +91,7 @@ public:
             mirror = std::make_unique<Tables::TableMirror>(*refill, Events::Shared(), Events::Images());
             if (imagesRouted() && surfaces == nullptr) {
                 surfaceDevice = std::make_unique<Images::VulkanSurfaceDevice>(*context);
-                surfaces = std::make_unique<Images::SurfaceTable>(*surfaceDevice, Events::Shared(), Events::Images(), Events::GpuWrites());
+                surfaces = std::make_unique<Images::SurfaceTable>(*surfaceDevice, Events::Shared(), Events::GpuWrites());
                 targetViews = std::make_unique<Images::TargetViews>(*context);
                 publishedSurfaces.store(surfaces.get(), std::memory_order_release);
             }

@@ -51,9 +51,8 @@ SurfaceKey Key(std::uint64_t address) {
 void testSurfacesAreSharedAndQueued() {
     FakeDevice device;
     Events::ChangeLog shared;
-    Events::ChangeLog images;
     Events::ChangeLog gpuWrites;
-    SurfaceTable table(device, shared, images, gpuWrites);
+    SurfaceTable table(device, shared, gpuWrites);
     std::string reason;
     const auto first = table.Find(Key(0x200000000ull), words, reason);
     const auto second = table.Find(Key(0x200000000ull), words, reason);
@@ -61,7 +60,7 @@ void testSurfacesAreSharedAndQueued() {
     Expect(!first->ready && device.created == 1u, "a new surface is pending and created once");
     auto work = table.TakeWork();
     Expect(work.size() == 1u && table.TakeWork().empty(), "a new surface is queued once");
-    table.MarkReady(*work.front(), shared.Serial(), images.Serial());
+    table.MarkReady(*work.front(), shared.Serial(), gpuWrites.Serial());
     const auto ready = table.Find(Key(0x200000000ull), words, reason);
     Expect(ready.has_value() && ready->ready, "a detiled surface is ready");
 }
@@ -69,14 +68,13 @@ void testSurfacesAreSharedAndQueued() {
 void testWritesMakeSurfacesStale() {
     FakeDevice device;
     Events::ChangeLog shared;
-    Events::ChangeLog images;
     Events::ChangeLog gpuWrites;
-    SurfaceTable table(device, shared, images, gpuWrites);
+    SurfaceTable table(device, shared, gpuWrites);
     std::string reason;
     const auto key = Key(0x300000000ull);
     static_cast<void>(table.Find(key, words, reason));
     auto work = table.TakeWork();
-    table.MarkReady(*work.front(), shared.Serial(), images.Serial());
+    table.MarkReady(*work.front(), shared.Serial(), gpuWrites.Serial());
     static_cast<void>(shared.Note(0x400000000ull, 0x1000));
     Expect(table.Find(key, words, reason)->ready, "a write elsewhere leaves the surface ready");
     static_cast<void>(shared.Note(key.address + 0x2000u, 0x100));
@@ -92,9 +90,8 @@ void testRefusals() {
     FakeDevice device;
     device.refuse = true;
     Events::ChangeLog shared;
-    Events::ChangeLog images;
     Events::ChangeLog gpuWrites;
-    SurfaceTable table(device, shared, images, gpuWrites);
+    SurfaceTable table(device, shared, gpuWrites);
     std::string reason;
     Expect(!table.Find(Key(0x500000000ull), words, reason).has_value() && reason == "refused", "a surface the device refuses is not kept");
     Expect(table.Size() == 0u, "nothing is stored for a refusal");
@@ -105,9 +102,8 @@ void testRefusals() {
 void testGpuWrittenSurfacesAreLeftToTheExistingCache() {
     FakeDevice device;
     Events::ChangeLog shared;
-    Events::ChangeLog images;
     Events::ChangeLog gpuWrites;
-    SurfaceTable table(device, shared, images, gpuWrites);
+    SurfaceTable table(device, shared, gpuWrites);
     std::string reason;
     const auto key = Key(0x600000000ull);
     static_cast<void>(gpuWrites.Note(key.address, 0x1000));
@@ -119,14 +115,24 @@ void testGpuWrittenSurfacesAreLeftToTheExistingCache() {
 void testImageSetNotesAreNotGpuWrites() {
     FakeDevice device;
     Events::ChangeLog shared;
-    Events::ChangeLog images;
     Events::ChangeLog gpuWrites;
-    SurfaceTable table(device, shared, images, gpuWrites);
+    SurfaceTable table(device, shared, gpuWrites);
     std::string reason;
     const auto key = Key(0x700000000ull);
-    static_cast<void>(images.Note(key.address, 0x1000));
+    static_cast<void>(shared.Note(key.address, 0x1000, Events::ImageSetOwner));
     const auto found = table.Find(key, words, reason);
     Expect(found.has_value() && !found->gpuWritten && found->surface != nullptr && device.created == 1u, "an image-set note alone does not make a surface GPU-written");
+    auto work = table.TakeWork();
+    table.MarkReady(*work.front(), shared.Serial(), gpuWrites.Serial());
+    static_cast<void>(shared.Note(key.address, 0x1000, Events::ImageSetOwner));
+    Expect(table.Find(key, words, reason)->ready, "an image-set note leaves a detiled surface ready");
+    static_cast<void>(shared.Note(key.address + 0x1000u, 0x100));
+    Expect(!table.Find(key, words, reason)->ready, "a store after an image-set note makes the surface stale");
+    work = table.TakeWork();
+    table.MarkReady(*work.front(), shared.Serial(), gpuWrites.Serial());
+    static_cast<void>(gpuWrites.Note(key.address, 0x100, 8u));
+    const auto written = table.Find(key, words, reason);
+    Expect(written.has_value() && written->gpuWritten && !written->ready, "a GPU write hands a detiled surface back to the existing cache");
 }
 
 }

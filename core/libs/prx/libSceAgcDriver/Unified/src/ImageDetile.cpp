@@ -42,7 +42,7 @@ bool SurfaceDetiler::Record(Graphics::Recorder& recorder, SurfaceTable& table, c
     }
     const auto& key = surface->key;
     const auto stamp = Events::Shared().Serial();
-    const auto imageStamp = Events::Images().Serial();
+    const auto imageStamp = Events::GpuWrites().Serial();
     Shadow::OwnedSpan span;
     if (!Shadow::ServeOwned(context, key.address, key.bytes, &span) || span.handle == 0u || key.address < span.origin) {
         reason = "surface memory not resident";

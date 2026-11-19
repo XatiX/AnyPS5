@@ -61,7 +61,7 @@ std::optional<Found> SurfaceTable::Find(const SurfaceKey& key, std::span<const s
     }
     if (const auto found = surfaces.find(key); found != surfaces.end()) {
         auto& surface = found->second;
-        if (surface->state == State::Ready && (shared.ChangedSince(key.address, key.bytes, surface->stamp) || images.ChangedSince(key.address, key.bytes, surface->imageStamp))) {
+        if (surface->state == State::Ready && (shared.ChangedSince(key.address, key.bytes, surface->stamp, Events::ImageSetOwner) || gpuWrites.ChangedSince(key.address, key.bytes, surface->imageStamp))) {
             surface->state = State::Stale;
             work.push_back(surface);
             counts.stale++;
