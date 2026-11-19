@@ -157,7 +157,35 @@ bool BuildPrograms(const ProgramInputs& inputs, const DrawFacts& facts, ProgramS
         lap(PhaseCapture);
         memory = shaderMemory.Regions();
         request.context.memory = memory;
-        auto result = invocation.Materialize(*capture);
+        std::shared_ptr<const ShaderRecompiler::RecompileResult> result;
+        std::shared_ptr<const ShaderRecompiler::ResultTemplate> shape;
+        ShaderRecompiler::TemplateWords words;
+        if (inputs.templates != nullptr) {
+            const auto key = invocation.TemplateKey(*capture);
+            shape = inputs.templates->Find(key);
+            const bool stale = shape != nullptr && !shape->refillable && shape->snapshotKey != invocation.SnapshotKey(*capture);
+            if (shape == nullptr || stale) {
+                shape = invocation.BuildTemplate(*capture);
+                inputs.templates->CountBuild(stale);
+                inputs.templates->Store(key, shape);
+            }
+            result = shape->result;
+            if (shape->refillable) {
+                ShaderRecompiler::RefillTemplate(*shape, capture->snapshot, words);
+            } else {
+                words.pushConstants = result->pushConstants;
+                words.poisonedSrtReads = result->poisonedSrtReads;
+            }
+            if (inputs.verifyTemplates) {
+                const auto full = invocation.MaterializeUnshared(*capture);
+                if (const auto* difference = ShaderRecompiler::TemplateWordsDifference(*shape, words, *full)) {
+                    out.templateMismatches++;
+                    out.templateMismatch = difference;
+                }
+            }
+        } else {
+            result = invocation.Materialize(*capture);
+        }
         lap(PhaseMaterialize);
         if (result == nullptr) {
             reason = "materialize failed";
@@ -177,7 +205,7 @@ bool BuildPrograms(const ProgramInputs& inputs, const DrawFacts& facts, ProgramS
             reason = "compiled variant not reachable";
             return false;
         }
-        out.stages.push_back({stage, program.binary.codeAddress, result->pushConstants.empty() ? 0u : pushCursor, capture, std::move(result), source->artifact});
+        out.stages.push_back({stage, program.binary.codeAddress, result->pushConstants.empty() ? 0u : pushCursor, capture, std::move(result), source->artifact, std::move(shape), std::move(words)});
         pushCursor += static_cast<std::uint32_t>(out.stages.back().result->pushConstants.size());
     }
     return true;

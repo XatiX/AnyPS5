@@ -3,6 +3,7 @@
 
 #include "prx/libSceAgcDriver/Execution/include/Driver/Draw/DrawCache.hpp"
 #include "prx/libSceAgcDriver/Unified/include/Operation.hpp"
+#include "prx/libSceAgcDriver/Unified/include/Templates.hpp"
 #include "Optimization/ResourceProgram.hpp"
 #include "CompiledVariant.hpp"
 #include <array>
@@ -18,6 +19,8 @@ struct ProgramInputs {
     const Graphics::Context& context;
     const ShaderRecompiler::SpirvTarget& target;
     bool fixedSlots = false;
+    TemplateTable* templates = nullptr;
+    bool verifyTemplates = false;
 };
 
 struct StageProgram {
@@ -27,6 +30,8 @@ struct StageProgram {
     std::shared_ptr<const ShaderRecompiler::ResourceCapture> capture;
     std::shared_ptr<const ShaderRecompiler::RecompileResult> result;
     std::shared_ptr<const ShaderRecompiler::CompiledVariant> variant;
+    std::shared_ptr<const ShaderRecompiler::ResultTemplate> shape;
+    ShaderRecompiler::TemplateWords words;
 };
 
 enum ProgramPhase : std::size_t {
@@ -43,6 +48,8 @@ struct ProgramSet {
     std::vector<ShaderRecompiler::MemoryRegion> memory;
     std::vector<StageProgram> stages;
     std::array<std::uint64_t, PhaseCount> nanoseconds{};
+    std::uint32_t templateMismatches = 0;
+    const char* templateMismatch = nullptr;
 };
 
 [[nodiscard]] ShaderRecompiler::SpirvTarget HeapTarget(const ShaderRecompiler::SpirvTarget& device);

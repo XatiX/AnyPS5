@@ -31,6 +31,8 @@ struct Totals {
     std::uint64_t programNanoseconds = 0;
     std::uint64_t slotNanoseconds = 0;
     std::uint64_t lockBusy = 0;
+    std::uint64_t templateMismatches = 0;
+    const char* templateMismatch = nullptr;
     std::map<std::string, std::uint64_t> reasons;
     std::array<std::uint64_t, PhaseCount> phases{};
 };
@@ -79,9 +81,13 @@ public:
         const auto started = std::chrono::steady_clock::now();
         std::string reason;
         ProgramSet programs;
-        const ProgramInputs inputs{state.Live(), *submission->shaders, *context, target, fixedSlots};
+        const ProgramInputs inputs{state.Live(), *submission->shaders, *context, target, fixedSlots, &templates, verifyTemplates()};
         const bool built = BuildPrograms(inputs, operation.draw, programs, reason);
         for (std::size_t phase = 0; phase < PhaseCount; ++phase) totals.phases[phase] += programs.nanoseconds[phase];
+        if (programs.templateMismatches != 0) {
+            totals.templateMismatches += programs.templateMismatches;
+            totals.templateMismatch = programs.templateMismatch;
+        }
         if (!built) {
             refuse(reason);
             totals.programNanoseconds += elapsed(started);
@@ -133,12 +139,30 @@ public:
         std::snprintf(text, sizeof(text), "; per draw: decode %.1f, prepare %.1f, capture %.1f, materialize %.1f, variant %.1f us", perDraw(totals.phases[PhaseDecode]), perDraw(totals.phases[PhasePrepare]), perDraw(totals.phases[PhaseCapture]), perDraw(totals.phases[PhaseMaterialize]), perDraw(totals.phases[PhaseVariant]));
         line += text;
         line += "; gpu lock busy " + std::to_string(totals.lockBusy);
+        const auto shapes = templates.TakeCounts();
+        std::snprintf(text, sizeof(text), "; templates %llu hits, %llu builds (%llu stale), %llu evicted, %zu held, %.1f MiB", static_cast<unsigned long long>(shapes.hits), static_cast<unsigned long long>(shapes.builds), static_cast<unsigned long long>(shapes.rebuilds), static_cast<unsigned long long>(shapes.evictions), templates.Size(), static_cast<double>(templates.HeldBytes()) / 1048576.0);
+        line += text;
+        if (verifyTemplates()) line += "; template mismatches " + std::to_string(totals.templateMismatches) + (totals.templateMismatch != nullptr ? std::string(" (") + totals.templateMismatch + ")" : std::string());
         for (const auto& [reason, count] : totals.reasons) line += "; " + reason + " " + std::to_string(count);
         totals = {};
         return line;
     }
 
 private:
+    static bool verifyTemplates() {
+        static const bool enabled = [] {
+            const auto* value = std::getenv("APS5_RECODE_TEMPLATE_VERIFY");
+            return value != nullptr && value[0] == '1';
+        }();
+        return enabled;
+    }
+
+    static std::uint64_t templateBudget() {
+        const auto* value = std::getenv("APS5_RECODE_TEMPLATE_MB");
+        const std::uint64_t megabytes = value == nullptr || *value == '\0' ? 512u : std::strtoull(value, nullptr, 10);
+        return megabytes << 20u;
+    }
+
     static std::uint64_t elapsed(std::chrono::steady_clock::time_point from) {
         return static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - from).count());
     }
@@ -199,6 +223,7 @@ private:
     std::unique_ptr<Heap::SlotTable> table;
     std::unique_ptr<Heap::Memo> memo;
     std::unique_ptr<Heap::Refill> refill;
+    TemplateTable templates{templateBudget()};
     Totals totals;
     std::set<std::string> seenReasons;
     bool firstBuilt = false;
