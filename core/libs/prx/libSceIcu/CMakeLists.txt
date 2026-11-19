@@ -1,4 +1,5 @@
 add_library(libSceIcu SHARED EXCLUDE_FROM_ALL CharacterDigits.cpp Comparisons.cpp ConstrainedFieldPosition.cpp Enumeration.cpp ErrorName.cpp Export.cpp Invariant.cpp Iterator.cpp Numeric.cpp Set.cpp Tokenize.cpp Unescape.cpp Version.cpp Utf32.cpp JavaUtf8.cpp Compare.cpp Search.cpp Character.cpp Configuration.cpp LocaleCore.cpp Copy.cpp Utf16Search.cpp UtfConversions.cpp)
+target_sources(libSceIcu PRIVATE ConverterFileSeparator.cpp)
 target_include_directories(libSceIcu PRIVATE ${LIBS_INCLUDE_DIR})
 target_sources(libSceIcu PRIVATE RecoveredInventory.cpp)
 configure_windows_unwind(libSceIcu)
@@ -11,6 +12,7 @@ target_sources(libSceIcu PRIVATE CompareIter.cpp)
 target_sources(libSceIcu PRIVATE Space.cpp)
 target_sources(libSceIcu PRIVATE Utf8.cpp)
 target_sources(libSceIcu PRIVATE Resource.cpp)
+target_sources(libSceIcu PRIVATE DataInfo.cpp)
 target_sources(libSceIcu PRIVATE Properties.cpp CaseMapping.cpp CaseProperties.cpp)
 target_sources(libSceIcu PRIVATE Bidi.cpp CharsetDetection.cpp Normalization.cpp CodePoints.cpp)
 target_link_libraries(libSceIcu PRIVATE icu_common icu_i18n)
@@ -299,6 +301,19 @@ if(BUILD_TESTING)
     set_tests_properties(guest_icu_resource PROPERTIES TIMEOUT 10)
     if(WIN32)
         set_tests_properties(guest_icu_resource PROPERTIES ENVIRONMENT_MODIFICATION
+            "PATH=path_list_prepend:$<TARGET_FILE_DIR:libSceIcu>")
+    endif()
+endif()
+
+if(BUILD_TESTING)
+    add_test_executable(guest_icu_data_memory_tests ${CMAKE_CURRENT_SOURCE_DIR}/tests/DataInfo.cpp)
+    target_include_directories(guest_icu_data_memory_tests PRIVATE ${LIBS_INCLUDE_DIR})
+    target_link_libraries(guest_icu_data_memory_tests PRIVATE libSceIcu icu_common)
+    configure_windows_unwind(guest_icu_data_memory_tests)
+    add_test(NAME guest_icu_data_memory COMMAND guest_icu_data_memory_tests)
+    set_tests_properties(guest_icu_data_memory PROPERTIES TIMEOUT 10)
+    if(WIN32)
+        set_tests_properties(guest_icu_data_memory PROPERTIES ENVIRONMENT_MODIFICATION
             "PATH=path_list_prepend:$<TARGET_FILE_DIR:libSceIcu>")
     endif()
 endif()
@@ -611,6 +626,16 @@ if(BUILD_TESTING)
         set_tests_properties(guest_icu_converter_helpers PROPERTIES ENVIRONMENT_MODIFICATION
             "PATH=path_list_prepend:$<TARGET_FILE_DIR:libSceIcu>")
     endif()
+    add_test_executable(guest_icu_converter_file_separator_tests ${CMAKE_CURRENT_SOURCE_DIR}/tests/ConverterFileSeparator.cpp)
+    target_include_directories(guest_icu_converter_file_separator_tests PRIVATE ${LIBS_INCLUDE_DIR})
+    target_link_libraries(guest_icu_converter_file_separator_tests PRIVATE libSceIcu libkernel libc icu_common)
+    configure_windows_unwind(guest_icu_converter_file_separator_tests)
+    add_test(NAME guest_icu_converter_file_separator COMMAND guest_icu_converter_file_separator_tests)
+    set_tests_properties(guest_icu_converter_file_separator PROPERTIES TIMEOUT 20)
+    if(WIN32)
+        set_tests_properties(guest_icu_converter_file_separator PROPERTIES ENVIRONMENT_MODIFICATION
+            "PATH=path_list_prepend:$<TARGET_FILE_DIR:libSceIcu>")
+    endif()
     add_test_executable(guest_icu_copy_tests ${CMAKE_CURRENT_SOURCE_DIR}/tests/Copy.cpp)
     target_include_directories(guest_icu_copy_tests PRIVATE ${LIBS_INCLUDE_DIR})
     target_link_libraries(guest_icu_copy_tests PRIVATE libSceIcu)
@@ -649,6 +674,7 @@ endif()
 set(ICU_RECOVERED_SOURCES
     Calendar.cpp
     Collator.cpp
+    DataMemoryClose.cpp
     DateFormat.cpp
     DateIntervalFormat.cpp
     DateTimePatternGenerator.cpp
@@ -671,6 +697,7 @@ if(BUILD_TESTING)
     set(ICU_RECOVERED_TESTS
         tests/Calendar.cpp
         tests/Collator.cpp
+        tests/DataMemoryClose.cpp
         tests/DateFormat.cpp
         tests/DateIntervalFormat.cpp
         tests/DateTimePatternGenerator.cpp
@@ -691,12 +718,25 @@ if(BUILD_TESTING)
     list(TRANSFORM ICU_RECOVERED_TESTS PREPEND ${CMAKE_CURRENT_SOURCE_DIR}/)
     add_test_executable(guest_icu_recovered_signatures_tests ${ICU_RECOVERED_TESTS})
     target_include_directories(guest_icu_recovered_signatures_tests PRIVATE ${LIBS_INCLUDE_DIR})
-    target_link_libraries(guest_icu_recovered_signatures_tests PRIVATE libSceIcu)
+    target_link_libraries(guest_icu_recovered_signatures_tests PRIVATE libSceIcu icu_common)
     configure_windows_unwind(guest_icu_recovered_signatures_tests)
     add_test(NAME guest_icu_recovered_signatures COMMAND guest_icu_recovered_signatures_tests)
     set_tests_properties(guest_icu_recovered_signatures PROPERTIES TIMEOUT 30)
     if(WIN32)
         set_tests_properties(guest_icu_recovered_signatures PROPERTIES ENVIRONMENT_MODIFICATION
+            "PATH=path_list_prepend:$<TARGET_FILE_DIR:libSceIcu>")
+    endif()
+endif()
+
+if(BUILD_TESTING)
+    add_test_executable(guest_icu_resource_stack_tests ${CMAKE_CURRENT_SOURCE_DIR}/tests/ResourceStack.cpp)
+    target_include_directories(guest_icu_resource_stack_tests PRIVATE ${LIBS_INCLUDE_DIR})
+    target_link_libraries(guest_icu_resource_stack_tests PRIVATE libSceIcu)
+    configure_windows_unwind(guest_icu_resource_stack_tests)
+    add_test(NAME guest_icu_resource_stack COMMAND guest_icu_resource_stack_tests)
+    set_tests_properties(guest_icu_resource_stack PROPERTIES TIMEOUT 10)
+    if(WIN32)
+        set_tests_properties(guest_icu_resource_stack PROPERTIES ENVIRONMENT_MODIFICATION
             "PATH=path_list_prepend:$<TARGET_FILE_DIR:libSceIcu>")
     endif()
 endif()
