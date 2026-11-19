@@ -85,10 +85,10 @@ public:
             std::lock_guard lock(mutex);
             draw = resolve(operation, state);
         }
-        table.Offer(operation.queue, operation.submission, operation.packetOffset, std::move(draw));
+        handoff.Offer(operation.queue, operation.submission, operation.packetOffset, std::move(draw));
     }
 
-    PacketTable<ResolvedDraw>& Table() { return table; }
+    PacketTable<ResolvedDraw>& Table() { return handoff; }
 
 private:
     std::shared_ptr<const ResolvedDraw> resolve(const Operation& operation, const DecodeState& state) {
@@ -185,7 +185,7 @@ public:
         std::snprintf(text, sizeof(text), "; per draw: decode %.1f, prepare %.1f, capture %.1f, materialize %.1f, variant %.1f us", perDraw(totals.phases[PhaseDecode]), perDraw(totals.phases[PhasePrepare]), perDraw(totals.phases[PhaseCapture]), perDraw(totals.phases[PhaseMaterialize]), perDraw(totals.phases[PhaseVariant]));
         line += text;
         line += "; gpu lock busy " + std::to_string(totals.lockBusy);
-        const auto packets = table.TakeCounts();
+        const auto packets = handoff.TakeCounts();
         std::snprintf(text, sizeof(text), "; hand-off %llu offered (%llu refused), %llu found, %llu refused, %llu waited, %llu missed, %llu released, %llu dropped, %llu pending", static_cast<unsigned long long>(packets.offered), static_cast<unsigned long long>(packets.refusedOffers), static_cast<unsigned long long>(packets.found), static_cast<unsigned long long>(packets.refused), static_cast<unsigned long long>(packets.waited), static_cast<unsigned long long>(packets.missed), static_cast<unsigned long long>(packets.released), static_cast<unsigned long long>(packets.dropped), static_cast<unsigned long long>(packets.pending));
         line += text;
         std::snprintf(text, sizeof(text), "; access %.1f ranges per resolved draw, %llu incomplete (%llu indirect, %llu placeholder)", totals.resolved == 0 ? 0.0 : static_cast<double>(totals.uses) / static_cast<double>(totals.resolved), static_cast<unsigned long long>(totals.incomplete), static_cast<unsigned long long>(totals.indirect), static_cast<unsigned long long>(totals.placeholderDraws));
@@ -290,7 +290,7 @@ private:
     std::unique_ptr<Heap::Memo> memo;
     std::unique_ptr<Heap::Refill> refill;
     TemplateTable templates{templateBudget()};
-    PacketTable<ResolvedDraw> table;
+    PacketTable<ResolvedDraw> handoff;
     Totals totals;
     std::set<std::string> seenReasons;
     bool firstBuilt = false;
