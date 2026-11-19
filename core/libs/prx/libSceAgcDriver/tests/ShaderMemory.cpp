@@ -3815,6 +3815,32 @@ void verifyImageTableKeys() {
         static_cast<void>(ValidateAndOptimizeSpirv(a.spirv, request.target.vulkanVersion, request.target.spirvVersion));
 #endif
     }
+    guest.materials = {{{0u, 1u, 0u, 0u}, {0u, 0u, 0u, 0u}, {0u, 2u, 0u, 0u}}};
+    FillTableSrt(guest, guest.heap.data(), 32u, 3u);
+    auto heapRequest = TableRequest(TableMaterialCode, userData);
+    heapRequest.target.directResources = true;
+    const auto heap = CompileTable(heapRequest);
+    const auto& heapResult = *heap.result;
+    require(heapResult.directHeap, "image table heap mode: a table-only program did not take heap mode");
+    require(TableBinding(heapResult, DescriptorRole::ImageTableMap) != nullptr, "image table heap mode: the table map is no longer bound");
+    std::uint32_t heapTables = 0;
+    const auto& code = heapResult.spirv;
+    for (std::size_t word = 5; word < code.size();) {
+        const auto count = code[word] >> 16u;
+        if ((code[word] & 0xffffu) == spv::OpDecorate && count == 4u && code[word + 2] == spv::DecorationDescriptorSet && code[word + 3] == RuntimeAbi::DirectHeapSet) {
+            for (std::size_t other = 5; other < code.size();) {
+                const auto otherCount = code[other] >> 16u;
+                if ((code[other] & 0xffffu) == spv::OpDecorate && otherCount == 4u && code[other + 1] == code[word + 1] && code[other + 2] == spv::DecorationBinding && code[other + 3] >= RuntimeAbi::DirectHeapBindingBase) heapTables++;
+                other += otherCount == 0u ? 1u : otherCount;
+            }
+        }
+        word += count == 0u ? 1u : count;
+    }
+    require(heapTables != 0u, "image table heap mode: no table image array sits in the heap set");
+#if ANYPS5_ENABLE_SPIRV_TOOLS
+    static_cast<void>(ValidateAndOptimizeSpirv(heapResult.spirv, heapRequest.target.vulkanVersion, heapRequest.target.spirvVersion));
+#endif
+    std::cout << "image table heap mode: " << heapTables << " table image arrays in set " << RuntimeAbi::DirectHeapSet << "; the map stays a per-draw binding\n";
 }
 
 struct CountingMemory {

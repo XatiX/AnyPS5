@@ -2363,6 +2363,7 @@ TableAccessResult EmitTableAccess(SpirvValueEmitContext& ctx, const IrValue& ins
         result.flags = flags;
         live = selected;
         state.tableAccess.element = Binary(state, spv::OpIAdd, u32, LoadTableMap(state, ConstantU32(state, ImageTableAbi::HeaderElementBase)), element);
+        if (state.program.Metadata().directResources) state.tableAccess.element = LoadTableMap(state, Select(state, u32, checked, state.tableAccess.element, ConstantU32(state, 0u)));
         const auto& sources = state.program.Resources().descriptorSources;
         state.tableAccess.uniform = base.source < sources.size() && sources[base.source].tableColumn.has_value() && sources[base.source].tableColumn->selected;
         if (!state.tableAccess.uniform) DecorateTableNonUniform(state, state.tableAccess.element);
