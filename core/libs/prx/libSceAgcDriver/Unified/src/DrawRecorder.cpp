@@ -470,9 +470,10 @@ private:
         }
         device = context.device;
         alignment = std::max<std::uint64_t>(context.limits.minStorageBufferOffsetAlignment, 16u);
-        ring = std::make_shared<Graphics::Buffer>(context, RingBytes, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_INDIRECT_BUFFER_BIT);
+        const auto ringMemory = ResidencyService::ShaderReadMemory(context, RingBytes);
+        ring = std::make_shared<Graphics::Buffer>(context, RingBytes, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_INDIRECT_BUFFER_BIT, ringMemory);
         space.emplace(RingBytes, alignment);
-        std::fprintf(stderr, "[recode-record] ring %llu MiB, alignment %llu\n", static_cast<unsigned long long>(RingBytes >> 20u), static_cast<unsigned long long>(alignment));
+        std::fprintf(stderr, "[recode-record] ring %llu MiB, alignment %llu, %s memory\n", static_cast<unsigned long long>(RingBytes >> 20u), static_cast<unsigned long long>(alignment), (ringMemory & VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT) != 0 ? "device" : "host");
         return true;
     }
 
@@ -573,7 +574,7 @@ private:
             }
         }
         const auto bytes = std::max<std::size_t>(mirror.map.size() * sizeof(std::uint32_t), 16u);
-        auto buffer = std::make_shared<Graphics::Buffer>(context, bytes, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT);
+        auto buffer = std::make_shared<Graphics::Buffer>(context, bytes, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT, ResidencyService::ShaderReadMemory(context, bytes));
         std::memcpy(buffer->Bytes().data(), mirror.map.data(), mirror.map.size() * sizeof(std::uint32_t));
         mapBytes += buffer->Bytes().size();
         maps[mirror.id] = {buffer, serial};
