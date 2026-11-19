@@ -101,7 +101,7 @@ public:
             mirror = std::make_unique<Tables::TableMirror>(*refill, Events::Shared(), Events::Images());
             if (imagesRouted() && surfaces == nullptr) {
                 surfaceDevice = std::make_unique<Images::VulkanSurfaceDevice>(*context);
-                surfaces = std::make_unique<Images::SurfaceTable>(*surfaceDevice, Events::Shared(), Events::GpuWrites());
+                surfaces = std::make_unique<Images::SurfaceTable>(*surfaceDevice, Events::Shared(), Events::GpuWrites(), surfaceBudget());
                 targetViews = std::make_unique<Images::TargetViews>(*context);
                 publishedSurfaces.store(surfaces.get(), std::memory_order_release);
             }
@@ -322,7 +322,7 @@ public:
             line += text;
             if (surfaces != nullptr) {
                 const auto surfaceCounts = surfaces->TakeCounts();
-                std::snprintf(text, sizeof(text), "; surfaces %zu held, %llu lookups, %llu created, %llu ready, %llu pending, %llu stale, %llu detiled, %llu GPU-written to the existing cache, %llu refused", surfaces->Size(), static_cast<unsigned long long>(surfaceCounts.lookups), static_cast<unsigned long long>(surfaceCounts.created), static_cast<unsigned long long>(surfaceCounts.ready), static_cast<unsigned long long>(surfaceCounts.pending), static_cast<unsigned long long>(surfaceCounts.stale), static_cast<unsigned long long>(surfaceCounts.detiled), static_cast<unsigned long long>(surfaceCounts.gpuWritten), static_cast<unsigned long long>(totals.surfaceRefusals));
+                std::snprintf(text, sizeof(text), "; surfaces %zu held (%llu MiB), %llu evicted, %llu lookups, %llu created, %llu ready, %llu pending, %llu stale, %llu detiled, %llu GPU-written to the existing cache, %llu refused", surfaces->Size(), static_cast<unsigned long long>(surfaces->HeldBytes() >> 20u), static_cast<unsigned long long>(surfaceCounts.evicted),static_cast<unsigned long long>(surfaceCounts.lookups), static_cast<unsigned long long>(surfaceCounts.created), static_cast<unsigned long long>(surfaceCounts.ready), static_cast<unsigned long long>(surfaceCounts.pending), static_cast<unsigned long long>(surfaceCounts.stale), static_cast<unsigned long long>(surfaceCounts.detiled), static_cast<unsigned long long>(surfaceCounts.gpuWritten), static_cast<unsigned long long>(totals.surfaceRefusals));
                 line += text;
                 for (const auto& [why, count] : surfaceReasons) line += "; surface " + why + " " + std::to_string(count);
                 surfaceReasons.clear();
@@ -386,6 +386,12 @@ private:
             return value != nullptr && value[0] == '1';
         }();
         return enabled;
+    }
+
+    static std::uint64_t surfaceBudget() {
+        const auto* value = std::getenv("APS5_RECODE_SURFACE_MB");
+        const std::uint64_t megabytes = value == nullptr || *value == '\0' ? 2048u : std::strtoull(value, nullptr, 10);
+        return megabytes << 20u;
     }
 
     static std::uint64_t templateBudget() {

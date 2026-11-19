@@ -3,6 +3,7 @@
 #include "prx/libSceAgcDriver/Graphics/include/Resources.hpp"
 #include "BdaAbi.hpp"
 #include <algorithm>
+#include <bit>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -25,6 +26,8 @@ static_assert(ChunkBytes == GpuPageBytes);
 constexpr std::size_t PageTableRootBytes = Abi::PageTableLeavesWord * sizeof(std::uint32_t);
 constexpr std::size_t PageTableLeafBytes = GpuLeafEntries * sizeof(std::uint64_t);
 constexpr std::size_t ImportSpacesKept = 8;
+constexpr std::size_t StagingMinBytes = std::size_t{1} << 20u;
+constexpr std::size_t StagingIdleBytes = std::size_t{64} << 20u;
 
 }
 
@@ -278,6 +281,30 @@ std::optional<DeviceSpan> ResidencyService::Translate(std::uint64_t address, std
     return ledger->Translate(address, size);
 }
 
+std::shared_ptr<Graphics::Buffer> ResidencyService::staging(std::size_t bytes) {
+    const auto rounded = std::bit_ceil(std::max(bytes, StagingMinBytes));
+    std::size_t idle = 0;
+    for (const auto& buffer : stagingPool) {
+        if (buffer.use_count() != 1) continue;
+        if (buffer->Bytes().size() == rounded) {
+            ++stagingReused;
+            return buffer;
+        }
+        idle += buffer->Bytes().size();
+    }
+    if (idle + rounded > StagingIdleBytes) {
+        std::erase_if(stagingPool, [&](const std::shared_ptr<Graphics::Buffer>& buffer) {
+            if (idle + rounded <= StagingIdleBytes || buffer.use_count() != 1) return false;
+            idle -= buffer->Bytes().size();
+            return true;
+        });
+    }
+    auto created = std::make_shared<Graphics::Buffer>(*context, rounded, VK_BUFFER_USAGE_TRANSFER_SRC_BIT);
+    stagingPool.push_back(created);
+    ++stagingCreated;
+    return created;
+}
+
 bool ResidencyService::Pending() const {
     if (!Attached()) return false;
     std::lock_guard lock(mutex);
@@ -301,7 +328,7 @@ std::size_t ResidencyService::Record(VkCommandBuffer commands, std::vector<std::
     for (const auto& upload : taken) uploadBytes += upload.bytes.size();
     const auto tableBytes = (dirty.root ? PageTableRootBytes : 0) + dirty.leaves.size() * PageTableLeafBytes;
     const auto total = uploadBytes + tableBytes;
-    auto staging = std::make_shared<Graphics::Buffer>(*context, total, VK_BUFFER_USAGE_TRANSFER_SRC_BIT);
+    auto staging = this->staging(total);
     auto bytes = staging->Bytes();
     std::size_t at = 0;
     for (const auto& upload : taken) {
@@ -354,12 +381,14 @@ std::string ResidencyService::Line() const {
     std::lock_guard lock(mutex);
     const auto ledgerCounts = ledger->Counts();
     const auto uploadCounts = uploads->Counts();
-    char line[512];
-    std::snprintf(line, sizeof(line), "[recode-residency] ranges %llu, pools %llu, bound %llu MiB of %llu MiB budget, chunks bound %llu, evicted %llu, refused %llu; uploads dirty %llu (%llu MiB) full %llu (%llu MiB) not resident %llu MiB; recorded %llu (%llu MiB); served %llu, serves refused %llu\n",
+    std::uint64_t stagingHeld = 0;
+    for (const auto& buffer : stagingPool) stagingHeld += buffer->Bytes().size();
+    char line[640];
+    std::snprintf(line, sizeof(line), "[recode-residency] ranges %llu, pools %llu, bound %llu MiB of %llu MiB budget, chunks bound %llu, evicted %llu, refused %llu; uploads dirty %llu (%llu MiB) full %llu (%llu MiB) not resident %llu MiB; recorded %llu (%llu MiB); staging %llu created, %llu reused, %llu held (%llu MiB); served %llu, serves refused %llu\n",
         static_cast<unsigned long long>(ledgerCounts.ranges), static_cast<unsigned long long>(ledgerCounts.pools), static_cast<unsigned long long>(ledgerCounts.boundBytes >> 20), static_cast<unsigned long long>(ledgerCounts.budget >> 20),
         static_cast<unsigned long long>(ledgerCounts.bound), static_cast<unsigned long long>(ledgerCounts.evicted), static_cast<unsigned long long>(ledgerCounts.refused),
         static_cast<unsigned long long>(uploadCounts.dirtyUploads), static_cast<unsigned long long>(uploadCounts.dirtyBytes >> 20), static_cast<unsigned long long>(uploadCounts.fullUploads), static_cast<unsigned long long>(uploadCounts.fullBytes >> 20), static_cast<unsigned long long>(uploadCounts.skippedBytes >> 20),
-        static_cast<unsigned long long>(recordedUploads), static_cast<unsigned long long>(recordedBytes >> 20), static_cast<unsigned long long>(served.size()), static_cast<unsigned long long>(serveRefusals));
+        static_cast<unsigned long long>(recordedUploads), static_cast<unsigned long long>(recordedBytes >> 20), static_cast<unsigned long long>(stagingCreated), static_cast<unsigned long long>(stagingReused), static_cast<unsigned long long>(stagingPool.size()), static_cast<unsigned long long>(stagingHeld >> 20), static_cast<unsigned long long>(served.size()), static_cast<unsigned long long>(serveRefusals));
     if (!pages) return line;
     char table[512];
     std::snprintf(table, sizeof(table), "[recode-page-table] leaves %u of %u, updates %llu (%llu MiB), leaves dropped %llu, shared pages %llu; imports mapped %llu pages, %llu spaces, %llu pages of retired imports dropped; fault pages served %llu, already mapped %llu, refused %llu; read backs %llu (%llu KiB), not resident %llu KiB\n", pages->Leaves(), PageTableLeafCapacity,

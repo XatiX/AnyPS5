@@ -66,6 +66,8 @@ struct Surface {
     State state = State::Pending;
     std::uint64_t stamp = 0;
     std::uint64_t imageStamp = 0;
+    std::uint64_t used = 0;
+    bool retired = false;
 };
 
 struct Found {
@@ -83,11 +85,12 @@ struct TableCounts {
     std::uint64_t refused = 0;
     std::uint64_t detiled = 0;
     std::uint64_t gpuWritten = 0;
+    std::uint64_t evicted = 0;
 };
 
 class SurfaceTable {
 public:
-    SurfaceTable(SurfaceDevice& device, const Events::ChangeLog& shared, const Events::ChangeLog& gpuWrites) : device(device), shared(shared), gpuWrites(gpuWrites) {}
+    SurfaceTable(SurfaceDevice& device, const Events::ChangeLog& shared, const Events::ChangeLog& gpuWrites, std::uint64_t budgetBytes = 0) : device(device), shared(shared), gpuWrites(gpuWrites), budget(budgetBytes) {}
 
     [[nodiscard]] std::optional<Found> Find(const SurfaceKey& key, std::span<const std::uint32_t, 8> words, std::string& reason);
     [[nodiscard]] std::vector<std::shared_ptr<Surface>> TakeWork();
@@ -95,11 +98,14 @@ public:
     void Requeue(const std::shared_ptr<Surface>& surface);
     [[nodiscard]] TableCounts TakeCounts();
     [[nodiscard]] std::size_t Size() const;
+    [[nodiscard]] std::uint64_t HeldBytes() const;
 
 private:
     struct KeyHash {
         std::size_t operator()(const SurfaceKey& key) const;
     };
+
+    void evict();
 
     SurfaceDevice& device;
     const Events::ChangeLog& shared;
@@ -108,6 +114,9 @@ private:
     std::unordered_map<SurfaceKey, std::shared_ptr<Surface>, KeyHash> surfaces;
     std::vector<std::shared_ptr<Surface>> work;
     TableCounts counts;
+    std::uint64_t budget = 0;
+    std::uint64_t heldBytes = 0;
+    std::uint64_t clock = 0;
 };
 
 }

@@ -135,9 +135,34 @@ void testImageSetNotesAreNotGpuWrites() {
     Expect(written.has_value() && written->gpuWritten && !written->ready, "a GPU write hands a detiled surface back to the existing cache");
 }
 
+void testBudgetDropsLeastRecentlyUsed() {
+    FakeDevice device;
+    Events::ChangeLog shared;
+    Events::ChangeLog gpuWrites;
+    SurfaceTable table(device, shared, gpuWrites, 0x30000);
+    std::string reason;
+    const auto first = table.Find(Key(0x800000000ull), words, reason);
+    static_cast<void>(table.Find(Key(0x810000000ull), words, reason));
+    static_cast<void>(table.Find(Key(0x820000000ull), words, reason));
+    Expect(table.Size() == 3u && table.HeldBytes() == 0x30000u, "surfaces within the budget are all kept");
+    static_cast<void>(table.Find(Key(0x800000000ull), words, reason));
+    static_cast<void>(table.Find(Key(0x830000000ull), words, reason));
+    Expect(table.Size() == 2u && table.HeldBytes() == 0x20000u, "going over the budget drops down to seven eighths of it");
+    Expect(table.TakeCounts().evicted == 2u, "the drops are counted");
+    Expect(table.Find(Key(0x800000000ull), words, reason)->surface == first->surface, "the surface used last before the new one stays");
+    const auto work = table.TakeWork();
+    Expect(work.size() == 2u, "dropped surfaces leave the work queue");
+    for (const auto& surface : work) Expect(!surface->retired, "queued work is only live surfaces");
+    Expect(first->surface->device != nullptr, "a dropped surface stays alive while a draw holds it");
+    const auto created = device.created;
+    static_cast<void>(table.Find(Key(0x810000000ull), words, reason));
+    Expect(device.created == created + 1u, "a dropped surface is created again on its next lookup");
+}
+
 }
 
 int main() {
+    testBudgetDropsLeastRecentlyUsed();
     testGpuWrittenSurfacesAreLeftToTheExistingCache();
     testImageSetNotesAreNotGpuWrites();
     testSurfacesAreSharedAndQueued();

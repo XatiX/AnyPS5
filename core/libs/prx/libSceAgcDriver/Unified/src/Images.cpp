@@ -61,6 +61,7 @@ std::optional<Found> SurfaceTable::Find(const SurfaceKey& key, std::span<const s
     }
     if (const auto found = surfaces.find(key); found != surfaces.end()) {
         auto& surface = found->second;
+        surface->used = ++clock;
         if (surface->state == State::Ready && (shared.ChangedSince(key.address, key.bytes, surface->stamp, Events::ImageSetOwner) || gpuWrites.ChangedSince(key.address, key.bytes, surface->imageStamp))) {
             surface->state = State::Stale;
             work.push_back(surface);
@@ -78,17 +79,37 @@ std::optional<Found> SurfaceTable::Find(const SurfaceKey& key, std::span<const s
     auto surface = std::make_shared<Surface>();
     surface->key = key;
     surface->device = std::move(created);
+    surface->used = ++clock;
     surfaces.emplace(key, surface);
+    heldBytes += key.bytes;
     work.push_back(surface);
     counts.created++;
     counts.pending++;
+    if (budget != 0u && heldBytes > budget) evict();
     return Found{surface, false};
+}
+
+void SurfaceTable::evict() {
+    std::vector<std::pair<std::uint64_t, SurfaceKey>> order;
+    order.reserve(surfaces.size());
+    for (const auto& [key, surface] : surfaces) order.emplace_back(surface->used, key);
+    std::ranges::sort(order, {}, &std::pair<std::uint64_t, SurfaceKey>::first);
+    const auto target = budget - budget / 8u;
+    for (const auto& [used, key] : order) {
+        if (heldBytes <= target || surfaces.size() <= 1u) break;
+        const auto found = surfaces.find(key);
+        found->second->retired = true;
+        heldBytes -= key.bytes;
+        surfaces.erase(found);
+        counts.evicted++;
+    }
 }
 
 std::vector<std::shared_ptr<Surface>> SurfaceTable::TakeWork() {
     std::lock_guard lock(mutex);
     std::vector<std::shared_ptr<Surface>> taken;
     taken.swap(work);
+    std::erase_if(taken, [](const std::shared_ptr<Surface>& surface) { return surface->retired; });
     return taken;
 }
 
@@ -115,6 +136,11 @@ TableCounts SurfaceTable::TakeCounts() {
 std::size_t SurfaceTable::Size() const {
     std::lock_guard lock(mutex);
     return surfaces.size();
+}
+
+std::uint64_t SurfaceTable::HeldBytes() const {
+    std::lock_guard lock(mutex);
+    return heldBytes;
 }
 
 }

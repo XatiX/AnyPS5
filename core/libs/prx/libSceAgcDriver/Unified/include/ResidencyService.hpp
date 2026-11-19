@@ -51,6 +51,7 @@ public:
 
 private:
     ResidencyService() = default;
+    std::shared_ptr<Graphics::Buffer> staging(std::size_t bytes);
 
     mutable std::mutex mutex;
     std::optional<Graphics::Context> context;
@@ -81,6 +82,9 @@ private:
     std::atomic<bool> refused{false};
     std::uint64_t recordedUploads = 0;
     std::uint64_t recordedBytes = 0;
+    std::vector<std::shared_ptr<Graphics::Buffer>> stagingPool;
+    std::uint64_t stagingCreated = 0;
+    std::uint64_t stagingReused = 0;
 };
 
 }
