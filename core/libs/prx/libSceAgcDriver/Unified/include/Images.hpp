@@ -87,7 +87,7 @@ struct TableCounts {
 
 class SurfaceTable {
 public:
-    SurfaceTable(SurfaceDevice& device, const Events::ChangeLog& shared, const Events::ChangeLog& images) : device(device), shared(shared), images(images) {}
+    SurfaceTable(SurfaceDevice& device, const Events::ChangeLog& shared, const Events::ChangeLog& images, const Events::ChangeLog& gpuWrites) : device(device), shared(shared), images(images), gpuWrites(gpuWrites) {}
 
     [[nodiscard]] std::optional<Found> Find(const SurfaceKey& key, std::span<const std::uint32_t, 8> words, std::string& reason);
     [[nodiscard]] std::vector<std::shared_ptr<Surface>> TakeWork();
@@ -104,6 +104,7 @@ private:
     SurfaceDevice& device;
     const Events::ChangeLog& shared;
     const Events::ChangeLog& images;
+    const Events::ChangeLog& gpuWrites;
     mutable std::mutex mutex;
     std::unordered_map<SurfaceKey, std::shared_ptr<Surface>, KeyHash> surfaces;
     std::vector<std::shared_ptr<Surface>> work;

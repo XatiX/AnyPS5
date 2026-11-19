@@ -71,6 +71,7 @@ inline std::uintptr_t ResourceOwner(const void* resources) {
 
 ChangeLog& Shared();
 ChangeLog& Images();
+ChangeLog& GpuWrites();
 void NoteImage(std::uint64_t address, std::uint64_t bytes, std::uintptr_t owner = ImageSetOwner);
 std::uint64_t ThreadNotes();
 
