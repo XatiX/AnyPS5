@@ -30,6 +30,7 @@ struct Totals {
     std::uint64_t slots = 0;
     std::uint64_t programNanoseconds = 0;
     std::uint64_t slotNanoseconds = 0;
+    std::uint64_t lockBusy = 0;
     std::map<std::string, std::uint64_t> reasons;
     std::array<std::uint64_t, PhaseCount> phases{};
 };
@@ -131,6 +132,7 @@ public:
         }
         std::snprintf(text, sizeof(text), "; per draw: decode %.1f, prepare %.1f, capture %.1f, materialize %.1f, variant %.1f us", perDraw(totals.phases[PhaseDecode]), perDraw(totals.phases[PhasePrepare]), perDraw(totals.phases[PhaseCapture]), perDraw(totals.phases[PhaseMaterialize]), perDraw(totals.phases[PhaseVariant]));
         line += text;
+        line += "; gpu lock busy " + std::to_string(totals.lockBusy);
         for (const auto& [reason, count] : totals.reasons) line += "; " + reason + " " + std::to_string(count);
         totals = {};
         return line;
@@ -156,8 +158,12 @@ private:
         }
         std::shared_ptr<Graphics::Texture> texture;
         {
-            GuestMemory::TagGpuLockSite(GuestMemory::GpuLockSite::Draw);
-            std::lock_guard gpuLock(GuestMemory::GpuMutex());
+            GuestMemory::TagGpuLockSite(GuestMemory::GpuLockSite::Try);
+            std::unique_lock gpuLock(GuestMemory::GpuMutex(), std::try_to_lock);
+            if (!gpuLock.owns_lock()) {
+                totals.lockBusy++;
+                return std::nullopt;
+            }
             texture = Graphics::CachedSampledTexture(*context, request.words);
         }
         if (texture == nullptr || texture->Released()) return std::nullopt;
@@ -172,9 +178,13 @@ private:
         if (context->samplerCache == nullptr) return std::nullopt;
         std::shared_ptr<Graphics::Sampler> found;
         {
-            GuestMemory::TagGpuLockSite(GuestMemory::GpuLockSite::Draw);
-            std::lock_guard gpuLock(GuestMemory::GpuMutex());
-            found = context->samplerCache->Get(*context, std::span<const std::uint32_t>(request.words).first(4), false, false, true, false);
+            GuestMemory::TagGpuLockSite(GuestMemory::GpuLockSite::Try);
+            std::unique_lock gpuLock(GuestMemory::GpuMutex(), std::try_to_lock);
+            if (!gpuLock.owns_lock()) {
+                totals.lockBusy++;
+                return std::nullopt;
+            }
+            found =context->samplerCache->Get(*context, std::span<const std::uint32_t>(request.words).first(4), false, false, true, false);
         }
         if (found == nullptr) return std::nullopt;
         return Heap::ResolvedSampler{reinterpret_cast<std::uint64_t>(found->Handle()), found};
