@@ -27,6 +27,14 @@ namespace AgcDriver::Unified::Resolve {
 
 namespace {
 
+bool dispatchesRouted() {
+    static const bool enabled = [] {
+        const auto* value = std::getenv("APS5_RECODE_DISPATCH");
+        return value != nullptr && std::string_view(value) == "1";
+    }();
+    return enabled;
+}
+
 bool imagesRouted() {
     static const bool enabled = [] {
         const auto* value = std::getenv("APS5_RECODE_IMAGES");
@@ -72,6 +80,8 @@ public:
         attached = device;
         context = std::make_unique<Graphics::Context>(device->graphicsContext());
         target = HeapTarget(device->Target());
+        computeWave32 = HeapTarget(device->ComputeTarget(32u));
+        computeWave64 = HeapTarget(device->ComputeTarget(64u));
         fixedSlots = device->GraphicsPipelineLibraries();
         published.store(nullptr, std::memory_order_release);
         mirror.reset();
@@ -108,6 +118,16 @@ public:
     }
 
     void Consume(const Operation& operation, const DecodeState& state) {
+        if (IsDispatch(operation.kind)) {
+            if (!dispatchesRouted() || operation.queue != 0u) return;
+            std::shared_ptr<const ResolvedDraw> dispatch;
+            {
+                std::lock_guard lock(mutex);
+                dispatch = resolveDispatch(operation, state);
+            }
+            dispatchHandoff.Offer(operation.queue, operation.submission, operation.packetOffset, std::move(dispatch));
+            return;
+        }
         if (!IsDraw(operation.kind)) return;
         std::shared_ptr<const ResolvedDraw> draw;
         if (operation.resolved) {
@@ -118,6 +138,7 @@ public:
     }
 
     PacketTable<ResolvedDraw>& Table() { return handoff; }
+    PacketTable<ResolvedDraw>& DispatchTable() { return dispatchHandoff; }
     const Heap::VulkanHeapDevice* Device() const { return published.load(std::memory_order_acquire); }
     Images::SurfaceTable* SurfaceTableOf() const { return publishedSurfaces.load(std::memory_order_acquire); }
 
@@ -140,7 +161,7 @@ private:
             totals.templateMismatch = programs.templateMismatch;
         }
         if (!built) {
-            refuse(reason);
+            refuse(totals, reason);
             totals.programNanoseconds += elapsed(started);
             return nullptr;
         }
@@ -162,6 +183,44 @@ private:
         const auto beforeTargets = draw.uses.size();
         TargetUses(programs.decode.state, draw.uses);
         totals.targetUses += draw.uses.size() - beforeTargets;
+        draw.state = std::make_shared<const Graphics::State>(programs.decode.state);
+        return resolveStages(totals, std::move(draw), programs, beforeTargets, slotsStarted);
+    }
+
+    std::shared_ptr<const ResolvedDraw> resolveDispatch(const Operation& operation, const DecodeState& state) {
+        dispatchTotals.draws++;
+        const auto* submission = state.CurrentSubmission();
+        if (refill == nullptr || submission == nullptr || submission->shaders == nullptr) {
+            dispatchTotals.noDevice++;
+            return nullptr;
+        }
+        const auto started = std::chrono::steady_clock::now();
+        std::string reason;
+        ProgramSet programs;
+        ProgramInputs inputs{state.Live(), *submission->shaders, *context, target, fixedSlots, &templates, verifyTemplates()};
+        inputs.computeWave32 = &computeWave32;
+        inputs.computeWave64 = &computeWave64;
+        const bool built = BuildComputeProgram(inputs, operation.dispatch, programs, reason);
+        for (std::size_t phase = 0; phase < PhaseCount; ++phase) dispatchTotals.phases[phase] += programs.nanoseconds[phase];
+        dispatchTotals.programNanoseconds += elapsed(started);
+        if (!built) {
+            refuse(dispatchTotals, reason);
+            return nullptr;
+        }
+        const auto slotsStarted = std::chrono::steady_clock::now();
+        ResolvedDraw dispatch{operation, {}, {}, true};
+        const auto& facts = operation.dispatch;
+        if (facts.indirect) {
+            dispatchTotals.indirect++;
+            if (facts.indirectAddress != 0u) dispatch.uses.push_back({facts.indirectAddress, 3u * sizeof(std::uint32_t), false});
+            else dispatch.complete = false;
+        }
+        const auto beforeTargets = dispatch.uses.size();
+        return resolveStages(dispatchTotals, std::move(dispatch), programs, beforeTargets, slotsStarted);
+    }
+
+    std::shared_ptr<const ResolvedDraw> resolveStages(Totals& counts, ResolvedDraw draw, ProgramSet& programs, std::size_t beforeTargets, std::chrono::steady_clock::time_point slotsStarted) {
+        std::string reason;
         const auto beforeBuffers = draw.uses.size();
         const auto placeholdersBefore = refill->Counts().placeholders;
         std::vector<Heap::ImageUse> imageUses;
@@ -173,22 +232,22 @@ private:
             if (stage.result->directHeap) {
                 Heap::SlotStatistics statistics;
                 if (!Heap::BuildSlotRequests(stage.variant->info, stage.capture->snapshot, requests, statistics, reason, false)) {
-                    refuse(reason);
-                    totals.slotNanoseconds += elapsed(slotsStarted);
+                    refuse(counts, reason);
+                    counts.slotNanoseconds += elapsed(slotsStarted);
                     return nullptr;
                 }
             }
             ResolvedStage resolved{std::move(stage), {}};
             if (!refill->Fill(requests, resolved.slots, reason, &imageUses, &resolved.owners) ||!PatchSlots(*resolved.program.result, resolved.slots, resolved.program.words, reason)) {
-                refuse(reason);
-                totals.slotNanoseconds += elapsed(slotsStarted);
+                refuse(counts, reason);
+                counts.slotNanoseconds += elapsed(slotsStarted);
                 return nullptr;
             }
-            totals.slots += resolved.slots.size();
+            counts.slots += resolved.slots.size();
             if (std::ranges::any_of(resolved.program.result->bindings, [](const ShaderRecompiler::DescriptorBinding& binding) { return binding.role == ShaderRecompiler::DescriptorRole::ImageTableMap; })) {
                 if (!resolved.program.result->directHeap) {
-                    refuse("image tables outside heap mode");
-                    totals.slotNanoseconds += elapsed(slotsStarted);
+                    refuse(counts, "image tables outside heap mode");
+                    counts.slotNanoseconds += elapsed(slotsStarted);
                     return nullptr;
                 }
                 std::shared_ptr<const ShaderRecompiler::ResolvedImageTables> tables;
@@ -200,12 +259,12 @@ private:
                 const auto tablePlaceholders = refill->Counts().placeholders;
                 if (tables != nullptr) resolved.tableMap = mirror->Build(tables, reason, &tableUses);
                 if (resolved.tableMap == nullptr) {
-                    refuse(reason);
-                    totals.slotNanoseconds += elapsed(slotsStarted);
+                    refuse(counts, reason);
+                    counts.slotNanoseconds += elapsed(slotsStarted);
                     return nullptr;
                 }
                 tablePlaceholdersHere += refill->Counts().placeholders - tablePlaceholders;
-                totals.tableStages++;
+                counts.tableStages++;
             }
             draw.stages.push_back(std::move(resolved));
         }
@@ -213,35 +272,34 @@ private:
         for (auto index = beforeTargets; index < beforeBuffers; ++index) held.emplace_back(draw.uses[index].address, draw.uses[index].address + draw.uses[index].size);
         for (const auto& use : tableUses) {
             const auto pieces = Tables::Outside({use.memory.address, use.memory.address + use.memory.bytes}, held);
-            if (pieces.size() != 1u || pieces.front().second - pieces.front().first != use.memory.bytes) totals.tableTargetHolds++;
+            if (pieces.size() != 1u || pieces.front().second - pieces.front().first != use.memory.bytes) counts.tableTargetHolds++;
             for (const auto& [begin, end] : pieces) {
                 draw.uses.push_back({begin, end - begin, use.write});
-                totals.tableUses++;
+                counts.tableUses++;
             }
         }
-        totals.tablePlaceholders += tablePlaceholdersHere;
+        counts.tablePlaceholders += tablePlaceholdersHere;
         std::vector<Bindings::StageInput> inputsOfLayout;
         inputsOfLayout.reserve(draw.stages.size());
         for (const auto& stage : draw.stages) inputsOfLayout.push_back({stage.program.stage, stage.program.result.get()});
         if (!Bindings::Describe(inputsOfLayout, draw.layout, reason)) {
-            refuse(reason);
-            totals.slotNanoseconds += elapsed(slotsStarted);
+            refuse(counts, reason);
+            counts.slotNanoseconds += elapsed(slotsStarted);
             return nullptr;
         }
-        Bindings::CountSources(draw.layout, totals.sources);
-        draw.state = std::make_shared<const Graphics::State>(programs.decode.state);
-        totals.bufferUses += draw.uses.size() - beforeBuffers;
-        totals.imageUses += imageUses.size();
+        Bindings::CountSources(draw.layout, counts.sources);
+        counts.bufferUses += draw.uses.size() - beforeBuffers;
+        counts.imageUses += imageUses.size();
         for (const auto& use : imageUses) draw.uses.push_back({use.memory.address, use.memory.bytes, use.write});
         if (refill->Counts().placeholders - placeholdersBefore != tablePlaceholdersHere) {
             draw.complete = false;
-            totals.placeholderDraws++;
+            counts.placeholderDraws++;
         }
-        totals.slotNanoseconds += elapsed(slotsStarted);
-        totals.stages += draw.stages.size();
-        totals.uses += draw.uses.size();
-        if (!draw.complete) totals.incomplete++;
-        totals.resolved++;
+        counts.slotNanoseconds += elapsed(slotsStarted);
+        counts.stages += draw.stages.size();
+        counts.uses += draw.uses.size();
+        if (!draw.complete) counts.incomplete++;
+        counts.resolved++;
         return std::make_shared<const ResolvedDraw>(std::move(draw));
     }
 
@@ -293,6 +351,17 @@ public:
         line += text;
         if (verifyTemplates()) line += "; template mismatches " + std::to_string(totals.templateMismatches) + (totals.templateMismatch != nullptr ? std::string(" (") + totals.templateMismatch + ")" : std::string());
         for (const auto& [reason, count] : totals.reasons) line += "; " + reason + " " + std::to_string(count);
+        if (dispatchesRouted()) {
+            const auto& d = dispatchTotals;
+            const auto perDispatch = [&](std::uint64_t nanoseconds) { return d.draws == 0 ? 0.0 : static_cast<double>(nanoseconds) / 1000.0 / static_cast<double>(d.draws); };
+            std::snprintf(text, sizeof(text), "\n[recode-resolve] %llu dispatches, %llu resolved, %llu refused, %llu without device, %llu incomplete (%llu indirect, %llu placeholder); %llu slots, %.1f ranges per resolved dispatch [buffers %llu, images %llu]; programs %.1f us (capture %.1f, materialize %.1f), slots %.1f us per dispatch", static_cast<unsigned long long>(d.draws), static_cast<unsigned long long>(d.resolved), static_cast<unsigned long long>(d.refused), static_cast<unsigned long long>(d.noDevice), static_cast<unsigned long long>(d.incomplete), static_cast<unsigned long long>(d.indirect), static_cast<unsigned long long>(d.placeholderDraws), static_cast<unsigned long long>(d.slots), d.resolved == 0 ? 0.0 : static_cast<double>(d.uses) / static_cast<double>(d.resolved), static_cast<unsigned long long>(d.bufferUses), static_cast<unsigned long long>(d.imageUses), perDispatch(d.programNanoseconds), perDispatch(d.phases[PhaseCapture]), perDispatch(d.phases[PhaseMaterialize]), perDispatch(d.slotNanoseconds));
+            line += text;
+            const auto handed = dispatchHandoff.TakeCounts();
+            std::snprintf(text, sizeof(text), "; hand-off %llu offered, %llu found, %llu waited, %llu missed, %llu released, %llu dropped, %llu pending", static_cast<unsigned long long>(handed.offered), static_cast<unsigned long long>(handed.found), static_cast<unsigned long long>(handed.waited), static_cast<unsigned long long>(handed.missed), static_cast<unsigned long long>(handed.released), static_cast<unsigned long long>(handed.dropped), static_cast<unsigned long long>(handed.pending));
+            line += text;
+            for (const auto& [reason, count] : d.reasons) line += "; " + reason + " " + std::to_string(count);
+            dispatchTotals = {};
+        }
         totals = {};
         return line;
     }
@@ -329,11 +398,11 @@ private:
         return static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - from).count());
     }
 
-    void refuse(const std::string& reason) {
-        totals.refused++;
+    void refuse(Totals& counts, const std::string& reason) {
+        counts.refused++;
         auto key = reason.substr(0, 60);
-        if (seenReasons.insert(key).second) std::fprintf(stderr, "[recode-resolve] first refusal: %s\n", reason.c_str());
-        if (totals.reasons.size() < 16u || totals.reasons.contains(key)) totals.reasons[key]++;
+        if (seenReasons.insert((&counts == &dispatchTotals ? "dispatch " : "") + key).second) std::fprintf(stderr, "[recode-resolve] first %srefusal: %s\n", &counts == &dispatchTotals ? "dispatch " : "", reason.c_str());
+        if (counts.reasons.size() < 16u || counts.reasons.contains(key)) counts.reasons[key]++;
     }
 
     std::optional<Heap::ResolvedImage> image(const Heap::SlotRequest& request) {
@@ -439,6 +508,8 @@ private:
     std::shared_ptr<VulkanDevice> attached;
     std::unique_ptr<Graphics::Context> context;
     ShaderRecompiler::SpirvTarget target;
+    ShaderRecompiler::SpirvTarget computeWave32;
+    ShaderRecompiler::SpirvTarget computeWave64;
     bool fixedSlots = false;
     std::unique_ptr<Heap::VulkanHeapDevice> heap;
     std::atomic<const Heap::VulkanHeapDevice*> published{nullptr};
@@ -452,7 +523,9 @@ private:
     std::unique_ptr<Tables::TableMirror> mirror;
     TemplateTable templates{templateBudget()};
     PacketTable<ResolvedDraw> handoff;
+    PacketTable<ResolvedDraw> dispatchHandoff;
     Totals totals;
+    Totals dispatchTotals;
     std::set<std::string> seenReasons;
     std::set<std::string> seenSurfaceReasons;
     std::set<std::uint64_t> missedTargets;
@@ -490,6 +563,14 @@ std::string Line() {
 
 PacketTable<ResolvedDraw>& ResolvedDraws() {
     return shared().Table();
+}
+
+bool DispatchesActive() {
+    return Active() && dispatchesRouted();
+}
+
+PacketTable<ResolvedDraw>& ResolvedDispatches() {
+    return shared().DispatchTable();
 }
 
 const Heap::VulkanHeapDevice* HeapDevice() {

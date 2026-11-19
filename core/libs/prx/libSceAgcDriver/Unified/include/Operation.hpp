@@ -49,6 +49,15 @@ struct DrawFacts {
     std::uint64_t countAddress = 0;
 };
 
+struct DispatchFacts {
+    std::uint32_t groupsX = 0;
+    std::uint32_t groupsY = 0;
+    std::uint32_t groupsZ = 0;
+    std::uint32_t initiator = 0;
+    bool indirect = false;
+    std::uint64_t indirectAddress = 0;
+};
+
 struct Operation {
     OpKind kind = OpKind::Marker;
     std::uint8_t opcode = 0;
@@ -67,6 +76,7 @@ struct Operation {
     bool resolved = false;
     std::uint64_t key = 0;
     DrawFacts draw;
+    DispatchFacts dispatch;
 };
 
 [[nodiscard]] constexpr bool IsDraw(OpKind kind) {

@@ -2,10 +2,13 @@
 #include "prx/libSceAgcDriver/Execution/include/Driver/Diagnostics.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/Driver.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/Shaders/ShaderRegistry.hpp"
+#include "prx/libSceAgcDriver/Execution/include/Pm4.hpp"
 #include "prx/libSceAgcDriver/Execution/include/ShaderMemory.hpp"
+#include "prx/libSceAgcDriver/Graphics/include/ShaderInputState.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/Shaders.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/State.hpp"
 #include <algorithm>
+#include <array>
 #include <atomic>
 #include <chrono>
 #include <cstdio>
@@ -64,6 +67,79 @@ bool usesSamplerTables(const ShaderRecompiler::ShaderInfo& info) {
 
 bool usesImageTables(const ShaderRecompiler::ShaderInfo& info) {
     return std::ranges::any_of(info.images, [](const auto& image) { return image.table != ShaderRecompiler::NoTable; });
+}
+
+template <typename Lap>
+bool materializeStage(const ProgramInputs& inputs, ShaderRecompiler::RecompileRequest& request, const DriverDetail::ShaderSnapshot& snapshot, std::size_t codeOffset, std::uint32_t budget, ShaderMemory& shaderMemory, ProgramSet& out, const Lap& lap, StageProgram& stage, std::string& reason) {
+    const auto source = ShaderRecompiler::PrepareShader(request);
+    lap(PhaseVariant);
+    if (source == nullptr || source->artifact == nullptr) {
+        reason = "compiled variant not reachable";
+        return false;
+    }
+    if (usesSamplerTables(source->artifact->info.info)) {
+        reason = "sampler tables";
+        return false;
+    }
+    if (!tablesRouted() && usesImageTables(source->artifact->info.info)) {
+        reason = "image tables";
+        return false;
+    }
+    auto invocation = DriverDetail::InvocationFor(snapshot, codeOffset, request, false);
+    lap(PhasePrepare);
+    const auto capture = DriverDetail::CaptureInvocation(shaderMemory, snapshot, codeOffset, request, invocation);
+    lap(PhaseCapture);
+    out.memory = shaderMemory.Regions();
+    request.context.memory = out.memory;
+    std::shared_ptr<const ShaderRecompiler::RecompileResult> result;
+    std::shared_ptr<const ShaderRecompiler::ResultTemplate> shape;
+    ShaderRecompiler::TemplateWords words;
+    if (inputs.templates != nullptr) {
+        const auto key = invocation.TemplateKey(*capture);
+        shape = inputs.templates->Find(key);
+        const bool stale = shape != nullptr && !shape->refillable && shape->snapshotKey != invocation.SnapshotKey(*capture);
+        if (shape == nullptr || stale) {
+            shape = invocation.BuildTemplate(*capture);
+            inputs.templates->CountBuild(stale);
+            inputs.templates->Store(key, shape);
+            reportLargeTemplate(*shape);
+        }
+        result = shape->result;
+        if (shape->refillable) {
+            ShaderRecompiler::RefillTemplate(*shape, capture->snapshot, words);
+        } else {
+            words.pushConstants = result->pushConstants;
+            words.poisonedSrtReads = result->poisonedSrtReads;
+        }
+        if (inputs.verifyTemplates) {
+            const auto full = invocation.MaterializeUnshared(*capture);
+            if (const auto* difference = ShaderRecompiler::TemplateWordsDifference(*shape, words, *full)) {
+                out.templateMismatches++;
+                out.templateMismatch = difference;
+            }
+        }
+    } else {
+        result = invocation.Materialize(*capture);
+    }
+    lap(PhaseMaterialize);
+    if (result == nullptr) {
+        reason = "materialize failed";
+        return false;
+    }
+    if (!capture->snapshot.tables.nested.empty()) {
+        reason = "nested image tables";
+        return false;
+    }
+    if (result->pushConstants.size() > budget) {
+        reason = "push constants past the stage budget";
+        return false;
+    }
+    stage.capture = capture;
+    stage.result = std::move(result);
+    stage.variant = source->artifact;
+    stage.shape = std::move(shape);
+    stage.words = std::move(words);
+    return true;
 }
 
 }
@@ -186,69 +262,9 @@ bool BuildPrograms(const ProgramInputs& inputs, const DrawFacts& facts, ProgramS
             ShaderRecompiler::GraphicsCompileContext{program.firstUserSgpr, linked, Graphics::StageMeshConfiguration(state.stages, stage), state.stages.tessellation, {facts.indexAddress, facts.indexCount, facts.indexSize, facts.instanceCount}, std::nullopt},
         };
         lap(PhaseDecode);
-        const auto source = ShaderRecompiler::PrepareShader(request);
-        lap(PhaseVariant);
-        if (source == nullptr || source->artifact == nullptr) {
-            reason = "compiled variant not reachable";
-            return false;
-        }
-        if (usesSamplerTables(source->artifact->info.info)) {
-            reason = "sampler tables";
-            return false;
-        }
-        if (!tablesRouted() && usesImageTables(source->artifact->info.info)) {
-            reason = "image tables";
-            return false;
-        }
-        auto invocation = DriverDetail::InvocationFor(*program.snapshot, program.codeOffset, request, false);
-        lap(PhasePrepare);
-        const auto capture = DriverDetail::CaptureInvocation(shaderMemory, *program.snapshot, program.codeOffset, request, invocation);
-        lap(PhaseCapture);
-        memory = shaderMemory.Regions();
-        request.context.memory = memory;
-        std::shared_ptr<const ShaderRecompiler::RecompileResult> result;
-        std::shared_ptr<const ShaderRecompiler::ResultTemplate> shape;
-        ShaderRecompiler::TemplateWords words;
-        if (inputs.templates != nullptr) {
-            const auto key = invocation.TemplateKey(*capture);
-            shape = inputs.templates->Find(key);
-            const bool stale = shape != nullptr && !shape->refillable && shape->snapshotKey != invocation.SnapshotKey(*capture);
-            if (shape == nullptr || stale) {
-                shape = invocation.BuildTemplate(*capture);
-                inputs.templates->CountBuild(stale);
-                inputs.templates->Store(key, shape);
-                reportLargeTemplate(*shape);
-            }
-            result = shape->result;
-            if (shape->refillable) {
-                ShaderRecompiler::RefillTemplate(*shape, capture->snapshot, words);
-            } else {
-                words.pushConstants = result->pushConstants;
-                words.poisonedSrtReads = result->poisonedSrtReads;
-            }
-            if (inputs.verifyTemplates) {
-                const auto full = invocation.MaterializeUnshared(*capture);
-                if (const auto* difference = ShaderRecompiler::TemplateWordsDifference(*shape, words, *full)) {
-                    out.templateMismatches++;
-                    out.templateMismatch = difference;
-                }
-            }
-        } else {
-            result = invocation.Materialize(*capture);
-        }
-        lap(PhaseMaterialize);
-        if (result == nullptr) {
-            reason = "materialize failed";
-            return false;
-        }
-        if (!capture->snapshot.tables.nested.empty()) {
-            reason = "nested image tables";
-            return false;
-        }
-        if (result->pushConstants.size() > budget) {
-            reason = "push constants past the stage budget";
-            return false;
-        }
+        StageProgram built;
+        if (!materializeStage(inputs, request, *program.snapshot, program.codeOffset, budget, shaderMemory, out, lap, built, reason)) return false;
+        const auto& result = built.result;
         std::vector<ShaderRecompiler::VertexAttribute> attributes = result->vertexAttributes;
         for (auto& attribute : attributes) {
             const auto& live = vertexInfos[i];
@@ -263,9 +279,85 @@ bool BuildPrograms(const ProgramInputs& inputs, const DrawFacts& facts, ProgramS
             }
             attribute.resource = live->resources[attribute.location];
         }
-        out.stages.push_back({stage, program.binary.codeAddress, result->pushConstants.empty() ? 0u : pushCursor, capture, std::move(result), source->artifact, std::move(shape), std::move(words), std::move(attributes)});
+        built.stage = stage;
+        built.codeAddress = program.binary.codeAddress;
+        built.pushOffset = result->pushConstants.empty() ? 0u : pushCursor;
+        built.vertexAttributes = std::move(attributes);
+        out.stages.push_back(std::move(built));
         pushCursor += static_cast<std::uint32_t>(out.stages.back().result->pushConstants.size());
     }
+    return true;
+} catch (const std::exception& error) {
+    reason = error.what();
+    return false;
+}
+
+bool BuildComputeProgram(const ProgramInputs& inputs, const DispatchFacts& facts, ProgramSet& out, std::string& reason) try {
+    out.stages.clear();
+    out.memory.clear();
+    out.nanoseconds = {};
+    auto mark = std::chrono::steady_clock::now();
+    const auto lap = [&](ProgramPhase phase) {
+        const auto now = std::chrono::steady_clock::now();
+        out.nanoseconds[phase] += static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(now - mark).count());
+        mark = now;
+    };
+    const auto& shader = inputs.queue.shader;
+    const auto address = (static_cast<std::uint64_t>(DriverDetail::readRegister(shader, 0x20c)) << 8u) | (static_cast<std::uint64_t>(DriverDetail::readRegister(shader, 0x20d) & 0xffu) << 40u);
+    if (DriverDetail::SkippedShader(address) || DriverDetail::RefusedDispatch(address)) {
+        reason = "skipped or refused compute program";
+        return false;
+    }
+    auto snapshot = DriverDetail::RegisteredProgram(inputs.registry, address, {0});
+    if (snapshot == nullptr) snapshot = DriverDetail::ReadRawShader(address);
+    if (snapshot == nullptr || snapshot->type != 0) {
+        reason = "compute program without a compute shader";
+        return false;
+    }
+    const auto userCount = (DriverDetail::readRegister(shader, 0x213) >> 1u) & 0x1fu;
+    std::vector<std::uint32_t> userData;
+    userData.reserve(userCount);
+    for (std::uint32_t index = 0; index < userCount; ++index) userData.push_back(DriverDetail::readUserData(shader, 0x240 + index));
+    auto compute = Graphics::DecodeComputeStageInfo(shader, snapshot->header);
+    const auto codeOffset = static_cast<std::size_t>((address - snapshot->codeAddress) / sizeof(std::uint32_t));
+    const std::array<std::uint32_t, 3> groups{facts.groupsX, facts.groupsY, facts.groupsZ};
+    if (!facts.indirect && (facts.initiator & 0x20u) != 0u) {
+        for (std::uint32_t axis = 0; axis < 3; ++axis) {
+            if (groups[axis] % compute.numThreads[axis] != 0u) compute.partialThreads = groups;
+        }
+    }
+    if (!facts.indirect && (facts.initiator & 0x2u) != 0u) {
+        const auto partial = Pm4::PartialGroupThreads(groups, {DriverDetail::readRegister(shader, 0x207), DriverDetail::readRegister(shader, 0x208), DriverDetail::readRegister(shader, 0x209)});
+        if (partial != std::array<std::uint32_t, 3>{}) compute.partialThreads = partial;
+    }
+    if (facts.indirect && (facts.initiator & 0x20u) != 0u) {
+        reason = "indirect dispatch in thread units";
+        return false;
+    }
+    std::vector<ShaderRecompiler::MemoryRegion>& memory = out.memory;
+    memory.push_back({snapshot->codeAddress, std::as_bytes(std::span(snapshot->code))});
+    if (!snapshot->header.empty()) memory.push_back({snapshot->headerAddress, snapshot->header});
+    const auto waveSize = (facts.initiator & 0x8000u) != 0u ? 32u : 64u;
+    const auto* target = waveSize == 32u ? inputs.computeWave32 : inputs.computeWave64;
+    if (target == nullptr) {
+        reason = "no compute target";
+        return false;
+    }
+    constexpr std::uint32_t budget = 128u;
+    ShaderRecompiler::RecompileRequest request{
+        {Stage::Compute, address, std::span(snapshot->code).subspan(codeOffset), snapshot->headerAddress, snapshot->header},
+        {waveSize, 0, userData, compute, std::nullopt, std::nullopt, memory, DriverDetail::DispatchFloatMode(*snapshot, shader)},
+        *target,
+        {0, 0, 0, budget},
+    };
+    lap(PhaseDecode);
+    ShaderMemory shaderMemory(memory, nullptr, nullptr, nullptr, &DriverDetail::Driver::QueryPendingSpan);
+    StageProgram built;
+    if (!materializeStage(inputs, request, *snapshot, codeOffset, budget, shaderMemory, out, lap, built, reason)) return false;
+    built.stage = Stage::Compute;
+    built.codeAddress = address;
+    built.pushOffset = 0u;
+    out.stages.push_back(std::move(built));
     return true;
 } catch (const std::exception& error) {
     reason = error.what();

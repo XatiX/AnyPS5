@@ -1,6 +1,7 @@
 #include "prx/libSceAgcDriver/Unified/include/MemoryCore.hpp"
 #include "prx/libSceAgcDriver/Unified/include/Events.hpp"
 #include <array>
+#include <atomic>
 #include <cstdlib>
 #include <cstring>
 #include "prx/libc/include/GuestArena.hpp"
@@ -9,7 +10,10 @@ namespace AgcDriver::Unified {
 
 namespace {
 
+thread_local volatile bool landing = false;
+
 bool handleGuestFault(std::uintptr_t address, bool write) {
+    if (landing) return false;
     return MemoryCore::Get().HandleFault(address, write);
 }
 
@@ -151,8 +155,13 @@ void MemoryCore::PrepareHostWrite(std::uint64_t address, std::uint64_t size) {
     protector.Apply(changes);
 }
 
-void MemoryCore::LandGpuWrite(std::uint64_t address, std::span<const std::byte> bytes) {
+void MemoryCore::LandGpuWrite(std::uint64_t address, std::span<const std::byte> bytes, void* view) {
     if (bytes.empty()) return;
+    if (view != nullptr && view != reinterpret_cast<void*>(address)) {
+        std::memcpy(view, bytes.data(), bytes.size());
+        landedBytes.fetch_add(bytes.size(), std::memory_order_relaxed);
+        return;
+    }
     std::lock_guard lock(mutex);
     std::vector<ProtectionChange> open;
     std::vector<ProtectionChange> close;
@@ -164,7 +173,11 @@ void MemoryCore::LandGpuWrite(std::uint64_t address, std::span<const std::byte> 
         close.push_back({page, PageBytes, state == PageState::CpuClean ? Protection::ReadOnly : Protection::NoAccess});
     }
     protector.Apply(open);
+    landing = true;
+    std::atomic_signal_fence(std::memory_order_seq_cst);
     std::memcpy(reinterpret_cast<void*>(address), bytes.data(), bytes.size());
+    std::atomic_signal_fence(std::memory_order_seq_cst);
+    landing = false;
     protector.Apply(close);
     landedBytes.fetch_add(bytes.size(), std::memory_order_relaxed);
 }

@@ -202,6 +202,7 @@ private:
             operation.draw = resolvedDraw;
             resolvedKey.reset();
         }
+        if (IsDispatch(kind)) operation.dispatch = pendingDispatch;
         ++state.counts.operations;
         if (current.conditional) ++state.counts.conditional;
         sink.Emit(operation);
@@ -275,6 +276,15 @@ private:
             }
         }
         const auto ids = snapshot();
+        pendingDispatch = {};
+        pendingDispatch.initiator = packet.back();
+        pendingDispatch.indirect = !direct;
+        pendingDispatch.indirectAddress = address;
+        if (direct) {
+            pendingDispatch.groupsX = packet[1];
+            pendingDispatch.groupsY = packet[2];
+            pendingDispatch.groupsZ = packet[3];
+        }
         if (direct) emit(OpKind::Dispatch, 0, packet[3], join(packet[1], packet[2]), ids);
         else emit(OpKind::DispatchIndirect, address, 12, 0, ids);
         if (state.uses && !direct && address != 0) {
@@ -368,6 +378,7 @@ private:
     std::size_t conditionalUntil = 0;
     Current current;
     std::optional<std::uint64_t> resolvedKey;
+    DispatchFacts pendingDispatch;
     DrawFacts resolvedDraw;
 };
 

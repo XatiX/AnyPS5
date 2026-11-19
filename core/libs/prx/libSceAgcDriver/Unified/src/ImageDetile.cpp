@@ -8,6 +8,7 @@
 #include "prx/libSceAgcDriver/Unified/include/VulkanImages.hpp"
 #include <algorithm>
 #include <exception>
+#include <stdexcept>
 #include <vector>
 
 namespace AgcDriver::Unified::Images {
@@ -33,75 +34,89 @@ SurfaceDetiler::SurfaceDetiler(const Graphics::Context& context) : context(conte
 
 SurfaceDetiler::~SurfaceDetiler() = default;
 
-bool SurfaceDetiler::Record(Graphics::Recorder& recorder, SurfaceTable& table, const std::shared_ptr<Surface>& surface, std::string& reason) {
-    auto* vulkan = dynamic_cast<VulkanSurface*>(surface->device.get());
-    if (vulkan == nullptr) {
-        reason = "surface without a Vulkan image";
-        counts.refused++;
-        return false;
-    }
-    const auto& key = surface->key;
+void SurfaceDetiler::Record(Graphics::Recorder& recorder, SurfaceTable& table, std::span<const std::shared_ptr<Surface>> surfaces, const Refused& refused) {
+    struct Served {
+        const std::shared_ptr<Surface>* surface = nullptr;
+        VulkanSurface* vulkan = nullptr;
+        VkBuffer buffer = VK_NULL_HANDLE;
+        std::uint64_t base = 0;
+    };
     const auto stamp = Events::Shared().Serial();
     const auto imageStamp = Events::GpuWrites().Serial();
-    Shadow::OwnedSpan span;
-    if (!Shadow::ServeOwned(context, key.address, key.bytes, &span) || span.handle == 0u || key.address < span.origin) {
-        reason = "surface memory not resident";
-        counts.refused++;
-        return false;
+    std::vector<Served> served;
+    served.reserve(surfaces.size());
+    for (const auto& surface : surfaces) {
+        auto* vulkan = dynamic_cast<VulkanSurface*>(surface->device.get());
+        if (vulkan == nullptr) {
+            counts.refused++;
+            refused("surface without a Vulkan image");
+            continue;
+        }
+        const auto& key = surface->key;
+        Shadow::OwnedSpan span;
+        if (!Shadow::ServeOwned(context, key.address, key.bytes, &span) || span.handle == 0u || key.address < span.origin) {
+            counts.refused++;
+            refused("surface memory not resident");
+            continue;
+        }
+        served.push_back({&surface, vulkan, reinterpret_cast<VkBuffer>(static_cast<std::uintptr_t>(span.handle)), key.address - span.origin});
     }
+    if (served.empty()) return;
+    VkCommandBuffer commands = VK_NULL_HANDLE;
     try {
         const auto serial = recorder.OpenBatchSerial();
         if (serial != batch) {
             detiler->BeginBatch();
             batch = serial;
         }
-        auto commands = recorder.Commands();
+        commands = recorder.Commands();
         std::vector<std::shared_ptr<void>> kept;
         if (Shadow::RecordOwnedUploads(commands, kept) != 0u) {
             for (auto& object : kept) recorder.Keep(std::move(object));
         }
         Graphics::RecordMemoryBarrier(context, commands, VK_PIPELINE_STAGE_TRANSFER_BIT | VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_ACCESS_TRANSFER_WRITE_BIT | VK_ACCESS_SHADER_WRITE_BIT, VK_ACCESS_SHADER_READ_BIT);
-        imageBarrier(context, commands, vulkan->Image(), vulkan->Initialized() ? VK_IMAGE_LAYOUT_GENERAL : VK_IMAGE_LAYOUT_UNDEFINED, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_ACCESS_SHADER_READ_BIT, VK_ACCESS_SHADER_WRITE_BIT);
-        const auto& resource = vulkan->Resource();
-        const auto& geometry = vulkan->Geometry();
-        const auto elementBytes = Graphics::BytesPerElement(resource.format);
+    } catch (const std::exception& error) {
+        counts.refused += served.size();
+        refused(std::string("detile: ") + error.what());
+        return;
+    }
+    for (const auto& one : served) {
+        try {
+            recordOne(recorder, commands, table, **one.surface, *one.vulkan, one.buffer, one.base, stamp, imageStamp);
+            recorder.Keep(*one.surface);
+        } catch (const std::exception& error) {
+            counts.refused++;
+            refused(std::string("detile: ") + error.what());
+        }
+    }
+}
+
+void SurfaceDetiler::recordOne(Graphics::Recorder& recorder, VkCommandBuffer commands, SurfaceTable& table, Surface& surface, VulkanSurface& vulkan, VkBuffer buffer, std::uint64_t base, std::uint64_t stamp, std::uint64_t imageStamp) {
+    imageBarrier(context, commands, vulkan.Image(), vulkan.Initialized() ? VK_IMAGE_LAYOUT_GENERAL : VK_IMAGE_LAYOUT_UNDEFINED, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_ACCESS_SHADER_READ_BIT, VK_ACCESS_SHADER_WRITE_BIT);
+    const auto& resource = vulkan.Resource();
+    const auto& geometry = vulkan.Geometry();
+    const auto elementBytes = Graphics::BytesPerElement(resource.format);
+    const auto layers = std::min(geometry.layers, std::max(geometry.imageLayers, 1u));
+    if (vulkan.Compressed()) {
+        std::string reason;
+        if (!recordThroughBuffer(recorder, commands, vulkan, buffer, base, layers, reason)) throw std::runtime_error(reason);
+    } else {
         Graphics::DetileWindow window;
         window.pipeBankXor = resource.pipeBankXor;
-        const auto buffer = reinterpret_cast<VkBuffer>(static_cast<std::uintptr_t>(span.handle));
-        const auto base = key.address - span.origin;
-        const auto layers = std::min(geometry.layers, std::max(geometry.imageLayers, 1u));
-        if (vulkan->Compressed()) {
-            if (!recordThroughBuffer(recorder, commands, *vulkan, buffer, base, layers, reason)) {
-                counts.refused++;
-                return false;
-            }
-            recorder.Keep(surface);
-            vulkan->SetInitialized();
-            table.MarkReady(*surface, stamp, imageStamp);
-            counts.surfaces++;
-            counts.bytes += key.bytes;
-            return true;
-        }
         for (std::uint32_t level = 0; level < geometry.mips.size(); ++level) {
             const auto& mip = geometry.mips[level];
             for (std::uint32_t layer = 0; layer < layers; ++layer) {
                 if (!geometry.HasLayer(level, layer)) continue;
-                detiler->DispatchImage(commands, resource.tileMode, elementBytes, buffer, base + geometry.GuestOffset(layer, mip), vulkan->StorageView(level, layer, elementBytes), mip, false, layer, window);
+                detiler->DispatchImage(commands, resource.tileMode, elementBytes, buffer, base + geometry.GuestOffset(layer, mip), vulkan.StorageView(level, layer, elementBytes), mip, false, layer, window);
                 counts.dispatches++;
             }
         }
-        imageBarrier(context, commands, vulkan->Image(), VK_IMAGE_LAYOUT_GENERAL, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_ACCESS_SHADER_WRITE_BIT, VK_ACCESS_SHADER_READ_BIT);
-        recorder.Keep(surface);
-        vulkan->SetInitialized();
-    } catch (const std::exception& error) {
-        reason = std::string("detile: ") + error.what();
-        counts.refused++;
-        return false;
+        imageBarrier(context, commands, vulkan.Image(), VK_IMAGE_LAYOUT_GENERAL, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_ACCESS_SHADER_WRITE_BIT, VK_ACCESS_SHADER_READ_BIT);
     }
-    table.MarkReady(*surface, stamp, imageStamp);
+    vulkan.SetInitialized();
+    table.MarkReady(surface, stamp, imageStamp);
     counts.surfaces++;
-    counts.bytes += key.bytes;
-    return true;
+    counts.bytes += surface.key.bytes;
 }
 
 bool SurfaceDetiler::recordThroughBuffer(Graphics::Recorder& recorder, VkCommandBuffer commands, VulkanSurface& surface, VkBuffer source, std::uint64_t base, std::uint32_t layers, std::string& reason) {
