@@ -1,0 +1,174 @@
+#include "prx/libSceAgcDriver/Unified/include/Programs.hpp"
+#include "prx/libSceAgcDriver/Execution/include/Driver/Diagnostics.hpp"
+#include "prx/libSceAgcDriver/Execution/include/Driver/Driver.hpp"
+#include "prx/libSceAgcDriver/Execution/include/Driver/Shaders/ShaderRegistry.hpp"
+#include "prx/libSceAgcDriver/Execution/include/ShaderMemory.hpp"
+#include "prx/libSceAgcDriver/Graphics/include/Shaders.hpp"
+#include "prx/libSceAgcDriver/Graphics/include/State.hpp"
+#include <algorithm>
+#include <spirv/unified1/spirv.hpp>
+#include <cstdlib>
+#include <exception>
+#include <string_view>
+
+namespace AgcDriver::Unified::Resolve {
+
+namespace {
+
+using Stage = ShaderRecompiler::ShaderStage;
+using Role = ShaderRecompiler::ProgramRole;
+
+bool readOnlyDepthBoundsCompare() {
+    static const bool enabled = [] {
+        const auto* value = std::getenv("APS5_READONLY_DEPTH_BOUNDS_COMPARE");
+        return value != nullptr && std::string_view(value) == "1";
+    }();
+    return enabled;
+}
+
+bool usesImageTables(const ShaderRecompiler::RecompileResult& result) {
+    return std::ranges::any_of(result.bindings, [](const ShaderRecompiler::DescriptorBinding& binding) { return binding.role == ShaderRecompiler::DescriptorRole::ImageTable; });
+}
+
+}
+
+ShaderRecompiler::SpirvTarget HeapTarget(const ShaderRecompiler::SpirvTarget& device) {
+    auto target = device;
+    target.directResources = true;
+    return target;
+}
+
+bool DecodePrograms(const ProgramInputs& inputs, DriverDetail::DrawDecode& decode, std::string& reason) {
+    const auto& queue = inputs.queue;
+    decode.state = Graphics::DecodeState(queue, DriverDetail::VertexWorkgroupRequired(queue, inputs.registry));
+    DriverDetail::DecodeGraphicsPrograms(decode, queue, inputs.registry, false, true);
+    auto& state = decode.state;
+    if (state.stages.mesh || state.stages.tessellation || state.stages.tessellationGeometry) {
+        reason = "mesh or tessellation stages";
+        return false;
+    }
+    if (std::ranges::any_of(decode.roles, [](Role role) { return role == Role::GeometryBack; })) {
+        reason = "geometry stage";
+        return false;
+    }
+    if (state.sampleLocationGrid) {
+        reason = "sample location grid";
+        return false;
+    }
+    if (std::ranges::any_of(decode.programs, [](const DriverDetail::DrawProgram& program) { return program.binary.codeAddress == DriverDetail::DepthCopyPixelProgramAddress(true) || program.binary.codeAddress == DriverDetail::StencilCopyPixelProgramAddress(true); })) {
+        reason = "depth or stencil copy program";
+        return false;
+    }
+    std::span<const std::byte> fragmentHeader;
+    for (const auto& program : decode.programs) {
+        if (program.binary.stage != Stage::Fragment) continue;
+        fragmentHeader = program.binary.header;
+        break;
+    }
+    auto& pixel = decode.pixel;
+    pixel = Graphics::DecodePixelStageInfo(queue.context, Graphics::ExportMappings(state), Graphics::PixelProgramSkipped(queue), fragmentHeader);
+    Graphics::NormalizeUnusedViewportDepth(state, pixel);
+    Graphics::ApplyViewportIndex(inputs.context, state);
+    Graphics::ApplyDepthRemap(inputs.context, state);
+    Graphics::ApplyDepthBoundsEmulation(inputs.context, state, pixel);
+    Graphics::ApplyReadOnlyDepthBoundsComparison(state, pixel, readOnlyDepthBoundsCompare());
+    pixel.targetExportPacking = Graphics::ExportPackings(state);
+    pixel.dualSourceBlend = state.dualSourceBlend;
+    pixel.reversedBlend = state.reversedBlend;
+    pixel.targetMerges = Graphics::ExportTargetMerges(state);
+    pixel.alphaToCoverage = state.alphaToCoverage;
+    pixel.quadPixelMask = Graphics::QuadPixelMask(state);
+    pixel.quadSampleMask = Graphics::QuadSampleMasks(state, pixel.sampleOrder);
+    if (pixel.stencilRefExportEnable && Graphics::StencilReferenceUnused(state)) {
+        const auto& capabilities = inputs.target.supportedCapabilities;
+        if (std::ranges::find(capabilities, static_cast<std::uint32_t>(spv::CapabilityStencilExportEXT)) == capabilities.end()) pixel.stencilRefExportEnable = false;
+    }
+    if (pixel.ancillary) pixel.rasterPrimitive = Graphics::RasterPrimitiveOf(state);
+    if (pixel.ancillary) pixel.layerExported = state.layerExports != 0;
+    pixel.ditheredAlphaToCoverage = state.ditheredAlphaToCoverage;
+    pixel.ditheredAlphaSamples = state.ditheredAlphaSamples;
+    pixel.iteratesSamples = state.perSampleShading;
+    pixel.sampleLocations = Graphics::PixelSampleLocations(state, pixel);
+    return true;
+}
+
+bool BuildPrograms(const ProgramInputs& inputs, const DrawFacts& facts, ProgramSet& out, std::string& reason) try {
+    out.stages.clear();
+    out.memory.clear();
+    if (!DecodePrograms(inputs, out.decode, reason)) return false;
+    const auto& decode = out.decode;
+    const auto& programs = decode.programs;
+    const auto& state = decode.state;
+    auto& memory = out.memory;
+    memory.reserve(2 * programs.size() + 32);
+    DriverDetail::AppendProgramMemory(memory, programs);
+    std::vector<ShaderRecompiler::LinkedProgram> linked;
+    linked.reserve(programs.size());
+    for (std::size_t i = 0; i < programs.size(); ++i) linked.push_back({decode.roles[i], programs[i].binary, programs[i].userDataBase, programs[i].firstUserSgpr, programs[i].userData});
+    std::vector<std::optional<ShaderRecompiler::ShaderVertexStageInfo>> vertexInfos(programs.size());
+    std::vector<Graphics::DecodeRead> reads;
+    for (std::size_t i = 0; i < programs.size(); ++i) {
+        const auto& program = programs[i];
+        if (program.binary.stage == Stage::Fragment) continue;
+        reads.clear();
+        auto info = DriverDetail::DecodeOrderedVertexStageInfo(program.binary.header, program.binary.headerAddress, program.userData, reads, 8u - program.firstUserSgpr);
+        info.paClVsOutCntl = DriverDetail::PositionExportLayout(program.snapshot.get(), program.codeOffset, program.binary.code, DriverDetail::readRegister(inputs.queue.context, 0x207), program.tailContinuation.get()) | state.layerExports | state.viewportExports;
+        info.depthRemapMode = state.depthRemap.mode;
+        Graphics::ApplyPointSize(state, info);
+        vertexInfos[i] = info;
+    }
+    ShaderMemory shaderMemory(memory, nullptr, nullptr, nullptr, &DriverDetail::Driver::QueryPendingSpan);
+    const bool hasFragment = std::ranges::any_of(programs, [](const DriverDetail::DrawProgram& program) { return program.binary.stage == Stage::Fragment; });
+    std::uint32_t pushCursor = 0;
+    for (std::size_t i = 0; i < programs.size(); ++i) {
+        const auto& program = programs[i];
+        const auto stage = program.binary.stage;
+        if (program.snapshot == nullptr) {
+            reason = "program without a snapshot";
+            return false;
+        }
+        pushCursor = Graphics::StagePushOffset(pushCursor, stage, inputs.fixedSlots);
+        if (pushCursor > Graphics::PushBlockBytes(inputs.fixedSlots)) {
+            reason = "push offset past the push block";
+            return false;
+        }
+        const auto budget = Graphics::StagePushBudget(Graphics::StagePushLimit(state.stages, pushCursor, state.depthRemap.mode != 0u), pushCursor, stage, inputs.fixedSlots, hasFragment);
+        ShaderRecompiler::RecompileRequest request{
+            program.binary,
+            {Graphics::StageWaveSize(state.stages, stage), program.firstUserSgpr, program.userData, std::nullopt, stage == Stage::Fragment ? std::optional(decode.pixel) : std::nullopt, vertexInfos[i], memory, DriverDetail::RegisteredFloatMode(*program.snapshot)},
+            inputs.target,
+            {0, 0, pushCursor, budget},
+            ShaderRecompiler::GraphicsCompileContext{program.firstUserSgpr, linked, Graphics::StageMeshConfiguration(state.stages, stage), state.stages.tessellation, {facts.indexAddress, facts.indexCount, facts.indexSize, facts.instanceCount}, std::nullopt},
+        };
+        auto invocation = DriverDetail::InvocationFor(*program.snapshot, program.codeOffset, request, false);
+        const auto capture = DriverDetail::CaptureInvocation(shaderMemory, *program.snapshot, program.codeOffset, request, invocation);
+        memory = shaderMemory.Regions();
+        request.context.memory = memory;
+        auto result = invocation.Materialize(*capture);
+        if (result == nullptr) {
+            reason = "materialize failed";
+            return false;
+        }
+        if (usesImageTables(*result)) {
+            reason = "image tables";
+            return false;
+        }
+        if (result->pushConstants.size() > budget) {
+            reason = "push constants past the stage budget";
+            return false;
+        }
+        const auto source = ShaderRecompiler::PrepareShader(request);
+        if (source == nullptr || source->artifact == nullptr) {
+            reason = "compiled variant not reachable";
+            return false;
+        }
+        out.stages.push_back({stage, program.binary.codeAddress, result->pushConstants.empty() ? 0u : pushCursor, capture, std::move(result), source->artifact});
+        pushCursor += static_cast<std::uint32_t>(out.stages.back().result->pushConstants.size());
+    }
+    return true;
+} catch (const std::exception& error) {
+    reason = error.what();
+    return false;
+}
+
+}

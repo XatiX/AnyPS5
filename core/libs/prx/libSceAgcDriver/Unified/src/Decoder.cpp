@@ -374,7 +374,14 @@ void DecodeState::RetireBefore(const SnapshotIds& ids) {
 }
 
 void DecodeSubmission(const DriverDetail::Submission& submission, DecodeState& state, Sink& sink) {
-    Decoder(submission, state, sink).Run();
+    state.submission = &submission;
+    try {
+        Decoder(submission, state, sink).Run();
+    } catch (...) {
+        state.submission = nullptr;
+        throw;
+    }
+    state.submission = nullptr;
 }
 
 }

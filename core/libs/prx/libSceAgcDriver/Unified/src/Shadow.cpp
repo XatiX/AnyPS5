@@ -8,6 +8,7 @@
 #include "prx/libSceAgcDriver/Execution/include/GuestMemory.hpp"
 #include "prx/libSceAgcDriver/Unified/include/RecordVerify.hpp"
 #include "prx/libSceAgcDriver/Unified/include/RecordDraw.hpp"
+#include "prx/libSceAgcDriver/Unified/include/Resolve.hpp"
 #include <atomic>
 #include "prx/libSceAgcDriver/Execution/include/PerformanceOverlay.hpp"
 #include <chrono>
@@ -42,10 +43,11 @@ void registerUses(std::span<const GuestUse> uses);
 void consumeDecoded(const Operation& operation, const DecodeState& state) {
     if (Record::VerifyActive()) Record::SharedVerifier().NoteDecoded(operation, state);
     if (Record::DrawActive()) Record::SharedHandoff().Offer(operation, state);
+    if (Resolve::Active()) Resolve::Consume(operation, state);
 }
 
 bool recording() {
-    return Record::VerifyActive() || Record::DrawActive();
+    return Record::VerifyActive() || Record::DrawActive() || Resolve::Active();
 }
 
 Front& front() {
@@ -184,6 +186,7 @@ void report() {
         if (now - last < std::chrono::seconds(10)) return;
         last = now;
     }
+    if (Resolve::Active()) std::fputs((Resolve::Line() + "\n").c_str(), stderr);
     if (!Active()) {
         const auto memory = memoryLine() + Record::VerifyLine() + Record::HandoffLine() + Proof::VerdictLine();
         if (!memory.empty()) std::fputs(memory.c_str(), stderr);
@@ -239,6 +242,10 @@ bool Teeing() {
 std::shared_ptr<QueueState> RecordedState(const DriverDetail::Submission& submission, std::size_t packetOffset) {
     if (!Record::DrawActive()) return nullptr;
     return Record::SharedHandoff().Take(submission.queue, submission.serial, packetOffset, std::chrono::milliseconds(100));
+}
+
+void NoteDevice(const std::shared_ptr<VulkanDevice>& device) {
+    Resolve::Attach(device);
 }
 
 void NoteDriverDraw(const QueueState& queue, const DriverDetail::Submission& submission, std::size_t packetOffset) {
@@ -500,6 +507,7 @@ std::shared_ptr<DriverDetail::Submission> Copy(const DriverDetail::Submission& s
     copy->commands = submission.commands;
     copy->conditionalEnds = submission.conditionalEnds;
     copy->registerLists = submission.registerLists;
+    copy->shaders = submission.shaders;
     copy->flipHandles = submission.flipHandles;
     for (const auto& [cursor, request] : submission.flips) copy->flips.emplace(cursor, nullptr);
     return copy;

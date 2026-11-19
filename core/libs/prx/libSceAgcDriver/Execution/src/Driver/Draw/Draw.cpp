@@ -417,6 +417,9 @@ DrawVerdict Driver::draw(QueueState& queue, std::span<const std::uint32_t> packe
         if (device == nullptr) device = std::make_shared<VulkanDevice>();
         localDevice = device;
     }
+#if ANYPS5_UNIFIED
+    Unified::Shadow::NoteDevice(localDevice);
+#endif
     timing.Mark("device_setup");
     phaseTiming.Phase(DrawRowVectors);
 
