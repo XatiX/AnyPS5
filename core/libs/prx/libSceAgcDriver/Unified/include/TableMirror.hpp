@@ -17,6 +17,7 @@ inline constexpr std::size_t MirrorCacheBound = 4096;
 struct Mirror {
     std::uint64_t id = 0;
     std::vector<std::uint32_t> map;
+    std::vector<std::shared_ptr<const void>> owners;
 };
 
 struct MirrorCounts {

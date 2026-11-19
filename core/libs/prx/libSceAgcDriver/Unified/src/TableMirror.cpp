@@ -46,7 +46,8 @@ std::shared_ptr<const Mirror> TableMirror::Build(const std::shared_ptr<const Sha
         return nullptr;
     }
     if (!ElementRequests(*tables, requests, reason)) return nullptr;
-    if (!refill.Fill(requests, slots, reason, uses)) return nullptr;
+    std::vector<std::shared_ptr<const void>> owners;
+    if (!refill.Fill(requests, slots, reason, uses, &owners)) return nullptr;
     counts.elements += requests.size();
     auto found = cache.find(tables.get());
     if (found != cache.end() && found->second.tables.lock() == tables && found->second.slots == slots) {
@@ -60,6 +61,7 @@ std::shared_ptr<const Mirror> TableMirror::Build(const std::shared_ptr<const Sha
     auto mirror = std::make_shared<Mirror>();
     mirror->id = nextId++;
     mirror->map = MirrorMap(tables->map, slots);
+    mirror->owners = std::move(owners);
     counts.built++;
     cache[tables.get()] = {tables, slots, mirror};
     return mirror;

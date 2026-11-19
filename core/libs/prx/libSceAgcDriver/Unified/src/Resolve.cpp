@@ -179,7 +179,7 @@ private:
                 }
             }
             ResolvedStage resolved{std::move(stage), {}};
-            if (!refill->Fill(requests, resolved.slots, reason, &imageUses) || !PatchSlots(*resolved.program.result, resolved.slots, resolved.program.words, reason)) {
+            if (!refill->Fill(requests, resolved.slots, reason, &imageUses, &resolved.owners) ||!PatchSlots(*resolved.program.result, resolved.slots, resolved.program.words, reason)) {
                 refuse(reason);
                 totals.slotNanoseconds += elapsed(slotsStarted);
                 return nullptr;

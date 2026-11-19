@@ -34,6 +34,7 @@ struct ResolvedStage {
     StageProgram program;
     std::vector<std::uint32_t> slots;
     std::shared_ptr<const Tables::Mirror> tableMap;
+    std::vector<std::shared_ptr<const void>> owners;
 };
 
 struct ResolvedDraw {
