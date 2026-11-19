@@ -72,6 +72,45 @@ void testOverflowDropsPending() {
     Expect(counts.dropped == PacketTable<int>::MaxPending && counts.pending == 1, "a full table drops its pending packets and keeps the new one");
 }
 
+void testPassedPacketMissesAtOnce() {
+    PacketTable<int> table;
+    table.Offer(0, 5, 0x40, std::make_shared<const int>(1));
+    const auto start = std::chrono::steady_clock::now();
+    const auto earlier = table.Find(0, 5, 0x20, std::chrono::milliseconds(2000));
+    const auto olderSerial = table.Find(0, 4, 0x80, std::chrono::milliseconds(2000));
+    const auto spent = std::chrono::steady_clock::now() - start;
+    Expect(!earlier.offered && !olderSerial.offered, "a packet before the last offered one of its queue is not found");
+    Expect(spent < std::chrono::milliseconds(500), "a packet the producer already passed misses without waiting");
+    const auto other = table.Find(1, 4, 0x80, std::chrono::milliseconds(0));
+    Expect(!other.offered, "another queue's frontier does not count");
+    const auto counts = table.TakeCounts();
+    Expect(counts.passed == 2 && counts.waited == 1 && counts.missed == 1, "passed packets are counted apart from waits");
+}
+
+void testFindWakesWhenTheProducerPasses() {
+    PacketTable<int> table;
+    std::thread producer([&] {
+        std::this_thread::sleep_for(std::chrono::milliseconds(20));
+        table.Offer(0, 9, 0x100, std::make_shared<const int>(3));
+    });
+    const auto start = std::chrono::steady_clock::now();
+    const auto found = table.Find(0, 9, 0x80, std::chrono::milliseconds(5000));
+    const auto spent = std::chrono::steady_clock::now() - start;
+    producer.join();
+    Expect(!found.offered && spent < std::chrono::milliseconds(2000), "a waiting find gives up once the producer offers a later packet");
+}
+
+void testOverflowEvictsPassedPackets() {
+    PacketTable<int> table;
+    for (std::size_t offset = 0; offset < PacketTable<int>::MaxPending; ++offset) table.Offer(0, 1, offset * 4u, nullptr);
+    static_cast<void>(table.Find(0, 2, 0, std::chrono::milliseconds(0)));
+    table.Offer(0, 2, 4, std::make_shared<const int>(9));
+    const auto counts = table.TakeCounts();
+    Expect(counts.stale == PacketTable<int>::MaxPending && counts.dropped == 0 && counts.pending == 1, "a full table first evicts the packets its consumer already passed");
+    const auto found = table.Find(0, 2, 4, std::chrono::milliseconds(0));
+    Expect(found.value != nullptr && *found.value == 9, "the new packet survives the eviction");
+}
+
 }
 
 int main() {
@@ -80,6 +119,9 @@ int main() {
     testFindWaitsForALateOffer();
     testKeysSeparateQueuesSerialsAndOffsets();
     testOverflowDropsPending();
+    testPassedPacketMissesAtOnce();
+    testFindWakesWhenTheProducerPasses();
+    testOverflowEvictsPassedPackets();
     if (failures != 0) {
         std::fprintf(stderr, "%d failure(s)\n", failures);
         return 1;

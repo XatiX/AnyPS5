@@ -1,6 +1,7 @@
 #ifndef CORE_LIBS_PRX_LIBSCEAGCDRIVER_UNIFIED_INCLUDE_PACKETTABLE_HPP
 #define CORE_LIBS_PRX_LIBSCEAGCDRIVER_UNIFIED_INCLUDE_PACKETTABLE_HPP
 
+#include <algorithm>
 #include <chrono>
 #include <condition_variable>
 #include <cstddef>
@@ -8,6 +9,7 @@
 #include <memory>
 #include <mutex>
 #include <unordered_map>
+#include <utility>
 
 namespace AgcDriver::Unified {
 
@@ -18,7 +20,9 @@ struct PacketTableCounts {
     std::uint64_t refused = 0;
     std::uint64_t waited = 0;
     std::uint64_t missed = 0;
+    std::uint64_t passed = 0;
     std::uint64_t released = 0;
+    std::uint64_t stale = 0;
     std::uint64_t dropped = 0;
     std::uint64_t pending = 0;
 };
@@ -40,12 +44,11 @@ public:
     void Offer(std::uint32_t queueId, std::uint64_t serial, std::size_t packetOffset, std::shared_ptr<const TValue> value) {
         {
             std::lock_guard lock(mutex);
-            if (entries.size() >= MaxPending) {
-                counts.dropped += entries.size();
-                entries.clear();
-            }
+            if (entries.size() >= MaxPending) makeRoom();
             if (value == nullptr) ++counts.refusedOffers;
-            entries.insert_or_assign(KeyOf(queueId, serial, packetOffset), std::move(value));
+            entries.insert_or_assign(KeyOf(queueId, serial, packetOffset), Entry{queueId, {serial, packetOffset}, std::move(value)});
+            auto& frontier = queues[queueId].offered;
+            frontier = std::max(frontier, Position{serial, packetOffset});
             ++counts.offered;
         }
         offeredSignal.notify_all();
@@ -53,19 +56,26 @@ public:
 
     Found Find(std::uint32_t queueId, std::uint64_t serial, std::size_t packetOffset, std::chrono::milliseconds wait) {
         const auto key = KeyOf(queueId, serial, packetOffset);
+        const Position position{serial, packetOffset};
         std::unique_lock lock(mutex);
+        auto& queue = queues[queueId];
+        queue.requested = std::max(queue.requested, position);
         auto found = entries.find(key);
         if (found == entries.end()) {
+            if (queue.offered > position) {
+                ++counts.passed;
+                return {};
+            }
             ++counts.waited;
-            offeredSignal.wait_for(lock, wait, [&] { return (found = entries.find(key)) != entries.end(); });
+            offeredSignal.wait_for(lock, wait, [&] { return (found = entries.find(key)) != entries.end() || queues[queueId].offered > position; });
         }
         if (found == entries.end()) {
             ++counts.missed;
             return {};
         }
-        if (found->second == nullptr) ++counts.refused;
+        if (found->second.value == nullptr) ++counts.refused;
         else ++counts.found;
-        return {true, found->second};
+        return {true, found->second.value};
     }
 
     void Release(std::uint32_t queueId, std::uint64_t serial, std::size_t packetOffset) {
@@ -82,9 +92,38 @@ public:
     }
 
 private:
+    using Position = std::pair<std::uint64_t, std::size_t>;
+
+    struct Entry {
+        std::uint32_t queue = 0;
+        Position position;
+        std::shared_ptr<const TValue> value;
+    };
+
+    struct QueueMarks {
+        Position offered{};
+        Position requested{};
+    };
+
+    void makeRoom() {
+        for (auto it = entries.begin(); it != entries.end();) {
+            const auto marks = queues.find(it->second.queue);
+            if (marks != queues.end() && it->second.position < marks->second.requested) {
+                it = entries.erase(it);
+                ++counts.stale;
+            } else {
+                ++it;
+            }
+        }
+        if (entries.size() < MaxPending) return;
+        counts.dropped += entries.size();
+        entries.clear();
+    }
+
     std::mutex mutex;
     std::condition_variable offeredSignal;
-    std::unordered_map<std::uint64_t, std::shared_ptr<const TValue>> entries;
+    std::unordered_map<std::uint64_t, Entry> entries;
+    std::unordered_map<std::uint32_t, QueueMarks> queues;
     PacketTableCounts counts;
 };
 
