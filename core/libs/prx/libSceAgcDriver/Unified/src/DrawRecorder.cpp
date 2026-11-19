@@ -158,6 +158,8 @@ struct Totals {
     std::uint64_t knownPointers = 0;
     std::uint64_t knownRefused = 0;
     std::uint64_t knownSkipped = 0;
+    std::uint64_t inputsResident = 0;
+    std::uint64_t inputsImported = 0;
     std::map<std::string, std::uint64_t> reasons;
 };
 
@@ -182,6 +184,30 @@ bool overlaps(std::span<const std::pair<std::uint64_t, std::uint64_t>> left, std
 bool servesFaultPages() {
     static const bool serves = std::getenv("APS5_RECODE_NO_FAULT_SERVE") == nullptr;
     return serves;
+}
+
+bool residentDrawInputs() {
+    static const bool resident = std::getenv("APS5_RECODE_IMPORTED_INPUTS") == nullptr;
+    return resident;
+}
+
+struct DrawInput {
+    VkBuffer buffer = VK_NULL_HANDLE;
+    VkDeviceSize offset = 0;
+};
+
+std::optional<DrawInput> drawInput(const Context& context, std::uint64_t address, std::uint64_t bytes, bool& resident) {
+    resident = false;
+    if (residentDrawInputs() && MemoryCore::Get().Pages().GpuOwnedIn(address, bytes).empty()) {
+        Shadow::OwnedSpan span;
+        if (Shadow::ServeOwned(context, address, bytes, &span) && span.handle != 0u) {
+            resident = true;
+            return DrawInput{reinterpret_cast<VkBuffer>(static_cast<std::uintptr_t>(span.handle)), static_cast<VkDeviceSize>(address - span.origin)};
+        }
+    }
+    const auto* import = Graphics::HostImportFor(context, address, static_cast<std::size_t>(bytes));
+    if (import == nullptr) return std::nullopt;
+    return DrawInput{import->buffer, Graphics::HostImportOffset(*import, address)};
 }
 
 constexpr std::uint64_t KnownBufferLimitBytes = 256ull << 20u;
@@ -444,6 +470,7 @@ public:
         line += "; passes " + std::to_string(totals.passesBegun) + " begun, " + std::to_string(totals.passesContinued) + " draws continued, " + std::to_string(totals.passFeedback) + " broken by a target read";
         line += "; residency updates landed " + std::to_string(totals.residencyLands);
         line += "; known buffers " + std::to_string(totals.knownServed) + " served, " + std::to_string(totals.knownMapped) + " mapped (" + std::to_string(totals.knownPaged) + " paged in), " + std::to_string(totals.knownCopied) + " copied, " + std::to_string(totals.knownRefused) + " unresolved, " + std::to_string(totals.knownSkipped) + " skipped (" + std::to_string(totals.knownPointers) + " of them pointers)";
+        line += "; draw inputs " + std::to_string(totals.inputsResident) + " resident, " + std::to_string(totals.inputsImported) + " imported";
         std::snprintf(text, sizeof(text), "; draw phases surfaces %.1f ms, targets %.1f ms, pipelines %.1f ms, owned uploads %.1f ms", static_cast<double>(totals.surfaceNanoseconds) / 1e6, static_cast<double>(totals.targetNanoseconds) / 1e6, static_cast<double>(totals.graphicsPipelineNanoseconds) / 1e6, static_cast<double>(totals.uploadNanoseconds) / 1e6);
         line += text;
         std::snprintf(text, sizeof(text), "; dispatches %llu recorded, %llu to the existing path, %.1f us per dispatch; compute pipelines %zu held, %llu queued, %llu built in %.1f ms, %zu building, %zu failed", static_cast<unsigned long long>(totals.dispatches), static_cast<unsigned long long>(totals.dispatchExisting), totals.dispatches == 0 ? 0.0 : static_cast<double>(totals.dispatchNanoseconds) / 1000.0 / static_cast<double>(totals.dispatches), computePipelines.size(), static_cast<unsigned long long>(totals.pipelinesQueued), static_cast<unsigned long long>(totals.pipelinesBuilt), static_cast<double>(totals.pipelineNanoseconds) / 1e6, buildingPipelines.size(), failedPipelines.size());
@@ -1016,14 +1043,16 @@ private:
                 }
                 const auto address = vertexAddress(attribute);
                 const auto bytes = Graphics::VertexBufferExtent(attribute);
-                const auto* import = Graphics::HostImportFor(context, address, bytes);
-                if (import == nullptr) {
+                bool resident = false;
+                const auto input = drawInput(context, address, bytes, resident);
+                if (!input) {
                     reason = "vertex buffer not imported";
                     return false;
                 }
+                ++(resident ? totals.inputsResident : totals.inputsImported);
                 recorder->NotePendingRead(address, bytes, Graphics::Recorder::ReadKind::DrawInput);
-                vertexBuffers.push_back(import->buffer);
-                vertexOffsets.push_back(Graphics::HostImportOffset(*import, address));
+                vertexBuffers.push_back(input->buffer);
+                vertexOffsets.push_back(input->offset);
             }
         }
         std::vector<VkImageView> views;
@@ -1140,14 +1169,16 @@ private:
             }
             totals.indirect++;
         }
-        const Graphics::HostImport* indexImport = nullptr;
+        std::optional<DrawInput> indexInput;
         if (parameters.indexed) {
             const auto bytes = static_cast<std::size_t>(parameters.indexCount) * parameters.indexSize;
-            indexImport = bytes == 0u ? nullptr : Graphics::HostImportFor(context, parameters.indexAddress, bytes);
-            if (indexImport == nullptr) {
+            bool resident = false;
+            if (bytes != 0u) indexInput = drawInput(context, parameters.indexAddress, bytes, resident);
+            if (!indexInput) {
                 reason = "indices not imported";
                 return false;
             }
+            ++(resident ? totals.inputsResident : totals.inputsImported);
             recorder->NotePendingRead(parameters.indexAddress, bytes, Graphics::Recorder::ReadKind::DrawInput);
         }
 
@@ -1218,7 +1249,7 @@ private:
         pipeline->PushConstants(commands, Graphics::PushConstantStages(shaders), block);
 
         if (!vertexBuffers.empty()) context.Resolved(&Graphics::DeviceFunctions::cmdBindVertexBuffers, "vkCmdBindVertexBuffers")(commands, 0, static_cast<std::uint32_t>(vertexBuffers.size()), vertexBuffers.data(), vertexOffsets.data());
-        if (indexImport != nullptr) context.Resolved(&Graphics::DeviceFunctions::cmdBindIndexBuffer, "vkCmdBindIndexBuffer")(commands, indexImport->buffer, Graphics::HostImportOffset(*indexImport, parameters.indexAddress), parameters.indexSize == 2u ? VK_INDEX_TYPE_UINT16 : VK_INDEX_TYPE_UINT32);
+        if (indexInput) context.Resolved(&Graphics::DeviceFunctions::cmdBindIndexBuffer, "vkCmdBindIndexBuffer")(commands, indexInput->buffer, indexInput->offset, parameters.indexSize == 2u ? VK_INDEX_TYPE_UINT16 : VK_INDEX_TYPE_UINT32);
         noteFaultToken(context, *recorder, commands, draw.stages, FaultStage::graphics, parameters.indirect ? "indirect" : (parameters.indexed ? "indexed" : "draw"), parameters.indexCount, parameters.instanceCount);
         std::uint64_t timedProgram = 0;
         for (const auto& one : draw.stages) {
