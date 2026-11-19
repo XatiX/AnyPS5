@@ -38,6 +38,7 @@ public:
     void NoteDirty(std::span<const DirtyRange> ranges);
     bool Prepare(std::uint64_t address, std::uint64_t size);
     [[nodiscard]] std::optional<DeviceSpan> Translate(std::uint64_t address, std::uint64_t size) const;
+    [[nodiscard]] std::uint64_t TranslateMapped(std::uint64_t address, std::uint64_t size) const;
     std::optional<DeviceSpan> Serve(std::uint64_t address, std::uint64_t size, std::span<const std::pair<std::uint64_t, std::uint64_t>> committed);
     bool ServeFaultPage(std::uint64_t page, std::uint64_t allocation, std::uint64_t allocationBytes, std::span<const std::pair<std::uint64_t, std::uint64_t>> committed);
     void MapImports(std::uint64_t serial, std::shared_ptr<const std::vector<ShaderRecompiler::BdaAbi::Range>> ranges);

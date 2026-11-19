@@ -291,7 +291,7 @@ std::array<std::uint32_t, 4> knownBufferRead(SpirvValueEmitContext& context, con
     anchor.size = Select(state, u64, Binary(state, spv::OpINotEqual, TypeBool(state), anchor.device, BdaConstant(state, 0u)), bound, BdaConstant(state, 0u));
     anchor.offset = BdaConstant(state, 0u);
     const auto relative = Unary(state, spv::OpUConvert, TypeU32(state), Binary(state, spv::OpISub, u64, guest, base));
-    return EmitAnchoredBdaRead(state, instruction, anchor, relative, 0, bits, dwords, used, lookup);
+    return EmitBoundedBdaRead(state, instruction, anchor, relative, bits, dwords, used);
 }
 
 std::uint32_t readKnown(SpirvValueEmitContext& context, const IrValue& instruction, std::uint32_t base, std::uint32_t guest, std::uint32_t bits) {

@@ -634,6 +634,103 @@ std::array<std::uint32_t, 4> EmitAnchoredBdaRead(SpirvEmitterState& state, const
     return values;
 }
 
+std::array<std::uint32_t, 4> EmitBoundedBdaRead(SpirvEmitterState& state, const IrValue& inst, const SpirvEmitterState::BdaAnchor& anchor, std::uint32_t low, std::uint32_t bits, std::uint32_t dwords, std::uint32_t usedDwords) {
+    if (bits != 8u && bits != 16u && bits != 32u) throw std::runtime_error("unsupported bounded BDA read width");
+    if (bits == 32u && (dwords == 0u || dwords > 4u)) throw std::runtime_error("unsupported bounded BDA read dword count");
+    const auto used = bits != 32u ? 1u : usedDwords != 0u ? usedDwords : UsedBdaDwords(inst, dwords);
+    const auto u32 = TypeU32(state);
+    const auto u64 = TypeScalarU64(state);
+    const auto boolean = TypeBool(state);
+    std::array<std::uint32_t, 4> values{};
+    for (auto& value : values) value = ConstantU32(state, 0u);
+    if (used == 0u) return values;
+    std::uint32_t first = 0;
+    std::uint32_t last = 0;
+    std::uint32_t bytes = bits / 8u;
+    if (bits == 32u) {
+        first = static_cast<std::uint32_t>(std::countr_zero(used));
+        last = 31u - static_cast<std::uint32_t>(std::countl_zero(used));
+        bytes = (last - first + 1u) * 4u;
+    }
+    const bool coherent = BdaCoherent(state, inst);
+    std::uint32_t translated = 0;
+    const auto inside = BdaAnchorHolds(state, anchor, low, static_cast<std::int32_t>(first * 4u), bytes, translated);
+    const auto outsideExit = state.currentLabel;
+    const auto insideLabel = state.module.AllocateId();
+    const auto merge = state.module.AllocateId();
+    state.module.AddFunction(spv::OpSelectionMerge, merge, spv::SelectionControlMaskNone);
+    state.module.AddFunction(spv::OpBranchConditional, inside, insideLabel, merge);
+    EmitLabel(state, insideLabel);
+    const auto loadDword = [&](std::uint32_t address, bool atomic) {
+        const auto pointer = state.module.AllocateId();
+        state.module.AddFunction(spv::OpConvertUToPtr, TypePhysicalU32Pointer(state), pointer, address);
+        const auto loaded = state.module.AllocateId();
+        if (atomic) state.module.AddFunction(spv::OpAtomicLoad, u32, loaded, pointer, ConstantU32(state, spv::ScopeDevice), ConstantU32(state, 0u));
+        else state.module.AddFunction(spv::OpLoad, u32, loaded, pointer, BdaAccessMask(coherent), 4u);
+        return loaded;
+    };
+    std::array<std::uint32_t, 4> insideValues = values;
+    if (bits == 32u) {
+        const auto alignedLabel = state.module.AllocateId();
+        const auto unalignedLabel = state.module.AllocateId();
+        const auto alignMerge = state.module.AllocateId();
+        const auto unalignedAddress = BdaAddressUnaligned(state, translated);
+        state.module.AddFunction(spv::OpSelectionMerge, alignMerge, spv::SelectionControlMaskNone);
+        state.module.AddFunction(spv::OpBranchConditional, unalignedAddress, unalignedLabel, alignedLabel);
+        EmitLabel(state, alignedLabel);
+        std::array<std::uint32_t, 4> aligned = values;
+        for (std::uint32_t dword = first; dword <= last; ++dword) {
+            if ((used & (1u << dword)) == 0u) continue;
+            aligned[dword] = loadDword(dword == first ? translated : Binary(state, spv::OpIAdd, u64, translated, BdaConstant(state, (dword - first) * 4u)), coherent);
+        }
+        const auto alignedExit = state.currentLabel;
+        state.module.AddFunction(spv::OpBranch, alignMerge);
+        EmitLabel(state, unalignedLabel);
+        const auto base = Binary(state, spv::OpBitwiseAnd, u64, translated, BdaConstant(state, ~std::uint64_t{3u}));
+        const auto shift = Binary(state, spv::OpShiftLeftLogical, u32, Unary(state, spv::OpUConvert, u32, Binary(state, spv::OpBitwiseAnd, u64, translated, BdaConstant(state, 3u))), ConstantU32(state, 3u));
+        const auto back = Binary(state, spv::OpISub, u32, ConstantU32(state, 32u), shift);
+        std::array<std::uint32_t, 5> words{};
+        for (std::uint32_t index = 0; index <= last - first + 1u; ++index) words[index] = loadDword(index == 0u ? base : Binary(state, spv::OpIAdd, u64, base, BdaConstant(state, index * 4u)), false);
+        std::array<std::uint32_t, 4> unaligned = values;
+        for (std::uint32_t dword = first; dword <= last; ++dword) {
+            if ((used & (1u << dword)) == 0u) continue;
+            const auto index = dword - first;
+            unaligned[dword] = Binary(state, spv::OpBitwiseOr, u32, Binary(state, spv::OpShiftRightLogical, u32, words[index], shift), Binary(state, spv::OpShiftLeftLogical, u32, words[index + 1u], back));
+        }
+        const auto unalignedExit = state.currentLabel;
+        state.module.AddFunction(spv::OpBranch, alignMerge);
+        EmitLabel(state, alignMerge);
+        for (std::uint32_t dword = first; dword <= last; ++dword) {
+            if ((used & (1u << dword)) == 0u) continue;
+            insideValues[dword] = state.module.AllocateId();
+            state.module.AddFunction(spv::OpPhi, u32, insideValues[dword], aligned[dword], alignedExit, unaligned[dword], unalignedExit);
+        }
+    } else {
+        const auto byteType = state.module.Type(spv::OpTypeInt, 8u, 0u);
+        const auto bytePointer = TypePointer(state, spv::StorageClassPhysicalStorageBuffer, byteType);
+        auto value = ConstantU32(state, 0u);
+        for (std::uint32_t byte = 0; byte < bytes; ++byte) {
+            const auto element = byte == 0u ? translated : Binary(state, spv::OpIAdd, u64, translated, BdaConstant(state, byte));
+            const auto pointer = state.module.AllocateId();
+            state.module.AddFunction(spv::OpConvertUToPtr, bytePointer, pointer, element);
+            const auto loaded = state.module.AllocateId();
+            state.module.AddFunction(spv::OpLoad, byteType, loaded, pointer, BdaAccessMask(coherent || bits == 16u), 1u);
+            value = Binary(state, spv::OpBitwiseOr, u32, value, Binary(state, spv::OpShiftLeftLogical, u32, Unary(state, spv::OpUConvert, u32, loaded), ConstantU32(state, byte * 8u)));
+        }
+        insideValues[0] = value;
+    }
+    const auto insideExit = state.currentLabel;
+    state.module.AddFunction(spv::OpBranch, merge);
+    EmitLabel(state, merge);
+    for (std::uint32_t dword = 0; dword < (bits == 32u ? dwords : 1u); ++dword) {
+        if ((used & (1u << dword)) == 0u) continue;
+        const auto merged = state.module.AllocateId();
+        state.module.AddFunction(spv::OpPhi, u32, merged, insideValues[dword], insideExit, values[dword], outsideExit);
+        values[dword] = merged;
+    }
+    return values;
+}
+
 std::uint32_t EmitBdaRead(SpirvValueEmitContext& ctx, const IrValue& inst, std::uint32_t address, std::uint32_t bits) {
     auto& state = ctx.state;
     if (bits != 8u && bits != 16u && bits != 32u) ctx.Fail(inst, "unsupported BDA read width");

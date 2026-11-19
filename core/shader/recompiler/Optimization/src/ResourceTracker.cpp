@@ -2257,7 +2257,8 @@ private:
         }
         memory.gpuDescriptor = true;
         memory.knownBuffer = NoKnownBuffer;
-        if (m_program.Metadata().directResources && access == BufferAccess::Read && ValidateSource(descriptor, badDword)) memory.knownBuffer = AddKnownBuffer(InternSource(descriptor));
+        static const bool knownBuffers = std::getenv("APS5_RECODE_NO_KNOWN_BUFFERS") == nullptr;
+        if (knownBuffers && m_program.Metadata().directResources && access == BufferAccess::Read && ValidateSource(descriptor, badDword)) memory.knownBuffer = AddKnownBuffer(InternSource(descriptor));
         m_info.usesDma = true;
         m_info.bdaWrites = m_info.bdaWrites || access == BufferAccess::Write || access == BufferAccess::Atomic;
         return true;

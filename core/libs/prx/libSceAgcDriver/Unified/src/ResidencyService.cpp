@@ -299,6 +299,21 @@ std::optional<DeviceSpan> ResidencyService::Translate(std::uint64_t address, std
     return ledger->Translate(address, size);
 }
 
+std::uint64_t ResidencyService::TranslateMapped(std::uint64_t address, std::uint64_t size) const {
+    if (!Attached() || size == 0) return 0;
+    std::lock_guard lock(mutex);
+    if (!pages) return 0;
+    const auto device = pages->Lookup(address);
+    if (device == 0) return 0;
+    const auto firstPage = address >> GpuPageBits;
+    const auto lastPage = (address + size - 1) >> GpuPageBits;
+    for (auto page = firstPage + 1; page <= lastPage; ++page) {
+        const auto guest = page << GpuPageBits;
+        if (pages->Lookup(guest) != device + (guest - address)) return 0;
+    }
+    return device;
+}
+
 std::shared_ptr<Graphics::Buffer> ResidencyService::staging(std::size_t bytes) {
     const auto rounded = std::bit_ceil(std::max(bytes, StagingMinBytes));
     std::size_t idle = 0;
