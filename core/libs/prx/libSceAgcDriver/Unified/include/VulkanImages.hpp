@@ -37,6 +37,7 @@ private:
     VkDeviceMemory memory = VK_NULL_HANDLE;
     bool initialized = false;
     bool compressed = false;
+    bool identity = false;
     std::mutex mutex;
     std::map<std::tuple<std::uint32_t, std::uint32_t, std::uint32_t, std::uint32_t, std::uint32_t, std::uint32_t>, VkImageView> views;
     std::map<std::tuple<std::uint32_t, std::uint32_t, std::uint32_t>, VkImageView> storageViews;

@@ -107,25 +107,23 @@ bool SurfaceDetiler::recordThroughBuffer(Graphics::Recorder& recorder, VkCommand
     const auto& geometry = surface.Geometry();
     const auto elementBytes = Graphics::BytesPerElement(resource.format);
     const auto blockWidth = std::max(Graphics::BlockWidth(resource.format), 1u);
-    const auto blockHeight = std::max(Graphics::BlockHeight(resource.format), 1u);
     std::uint64_t total = 0;
     for (const auto& mip : geometry.mips) total = std::max(total, mip.linearOffset + mip.linearSize);
     const auto layerBytes = std::max<std::uint64_t>(geometry.sliceLinearBytes, total);
     std::vector<VkBufferImageCopy> regions;
     for (std::uint32_t level = 0; level < geometry.mips.size(); ++level) {
         const auto& mip = geometry.mips[level];
-        const auto rows = (mip.height + blockHeight - 1u) / blockHeight;
-        if (rows == 0u || mip.linearSize % rows != 0u || (mip.linearSize / rows) % elementBytes != 0u) {
-            reason = "padded linear mip";
+        if (mip.pitchBytes == 0u || mip.pitchBytes % elementBytes != 0u) {
+            reason = "linear mip pitch";
             return false;
         }
-        const auto rowTexels = static_cast<std::uint32_t>(mip.linearSize / rows / elementBytes) * blockWidth;
+        const auto rowTexels = mip.pitchBytes / elementBytes * blockWidth;
         for (std::uint32_t layer = 0; layer < layers; ++layer) {
             if (!geometry.HasLayer(level, layer)) continue;
             VkBufferImageCopy region{};
             region.bufferOffset = static_cast<std::uint64_t>(layer) * layerBytes + mip.linearOffset;
             region.bufferRowLength = rowTexels;
-            region.bufferImageHeight = rows * blockHeight;
+            region.bufferImageHeight = 0u;
             region.imageSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, level, layer, 1u};
             region.imageExtent = {std::max(mip.width, 1u), std::max(mip.height, 1u), 1u};
             regions.push_back(region);

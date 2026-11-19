@@ -28,6 +28,7 @@ std::optional<VkComponentSwizzle> swizzleOf(std::uint32_t select) {
 VulkanSurface::VulkanSurface(const Graphics::Context& context, const Graphics::GuestTextureResource& resource, Graphics::SurfaceGeometry geometry, VkFormat format) : context(context), resource(resource), geometry(std::move(geometry)), format(format) {
     const bool volume = resource.dimension == Graphics::TextureDimension::k3D;
     compressed = Graphics::BlockWidth(resource.format) != 1u;
+    identity = Graphics::IsConvertedTextureFormat(resource.format) && format != VK_FORMAT_B10G11R11_UFLOAT_PACK32;
     VkImageCreateInfo info{VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO};
     info.flags = compressed ? 0u : VK_IMAGE_CREATE_MUTABLE_FORMAT_BIT | VK_IMAGE_CREATE_EXTENDED_USAGE_BIT;
     info.imageType = volume ? VK_IMAGE_TYPE_3D : VK_IMAGE_TYPE_2D;
@@ -92,7 +93,7 @@ std::uint64_t VulkanSurface::View(const ViewKey& view, std::uint32_t kind, std::
     if (const auto found = views.find(key); found != views.end()) return reinterpret_cast<std::uint64_t>(found->second);
     VkComponentMapping components{};
     VkComponentSwizzle* channels[] = {&components.r, &components.g, &components.b, &components.a};
-    for (std::uint32_t channel = 0; channel < 4u; ++channel) {
+    for (std::uint32_t channel = 0; channel < 4u && !identity; ++channel) {
         const auto select = swizzleOf((view.swizzle >> (channel * 4u)) & 0xfu);
         if (!select.has_value()) {
             reason = "invalid image channel selector";
@@ -143,8 +144,8 @@ std::shared_ptr<DeviceSurface> VulkanSurfaceDevice::Create(const SurfaceKey&, st
             reason = "surface dimension";
             return nullptr;
         }
-        if (Graphics::IsConvertedTextureFormat(resource.format)) {
-            reason = "converted surface";
+        if (Graphics::IsRepackedTextureFormat(resource.format)) {
+            reason = "repacked surface";
             return nullptr;
         }
         auto geometry = Graphics::DescribeSurface(resource);
