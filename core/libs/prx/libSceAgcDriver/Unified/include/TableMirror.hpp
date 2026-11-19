@@ -27,6 +27,8 @@ struct MirrorCounts {
     std::uint64_t reused = 0;
     std::uint64_t unchanged = 0;
     std::uint64_t elements = 0;
+    std::uint64_t kept = 0;
+    std::uint64_t inherited = 0;
     std::uint64_t clears = 0;
 };
 
@@ -34,6 +36,7 @@ struct MirrorCounts {
 [[nodiscard]] std::vector<std::uint32_t> MirrorMap(std::span<const std::uint32_t> map, std::span<const std::uint32_t> slots);
 
 [[nodiscard]] std::vector<std::pair<std::uint64_t, std::uint64_t>> CoalescedSpans(std::span<const Heap::ImageUse> uses);
+[[nodiscard]] std::vector<std::pair<std::uint64_t, std::uint64_t>> Outside(std::pair<std::uint64_t, std::uint64_t> span, std::vector<std::pair<std::uint64_t, std::uint64_t>> holes);
 
 class TableMirror {
 public:
@@ -45,7 +48,12 @@ public:
 private:
     struct Cached {
         std::weak_ptr<const ShaderRecompiler::ResolvedImageTables> tables;
+        std::vector<std::uint32_t> map;
+        std::vector<Heap::SlotRequest> requests;
         std::vector<std::uint32_t> slots;
+        std::vector<Heap::Span> memory;
+        std::vector<std::shared_ptr<const void>> owners;
+        std::vector<bool> placeholders;
         std::shared_ptr<const Mirror> mirror;
         std::uint64_t sharedStamp = 0;
         std::uint64_t imagesStamp = 0;
@@ -55,13 +63,14 @@ private:
     };
 
     [[nodiscard]] bool unchanged(const Cached& cached) const;
+    [[nodiscard]] std::vector<std::pair<std::uint64_t, std::uint64_t>> changedSpans(const Cached& cached) const;
+    [[nodiscard]] bool fill(const Cached* base, Cached& out, std::string& reason);
 
     Heap::Refill& refill;
     const Events::ChangeLog& shared;
     const Events::ChangeLog& images;
     std::unordered_map<const void*, Cached> cache;
-    std::vector<Heap::SlotRequest> requests;
-    std::vector<std::uint32_t> slots;
+    std::unordered_map<std::uint64_t, const void*> predecessors;
     std::uint64_t nextId = 1;
     MirrorCounts counts;
 };

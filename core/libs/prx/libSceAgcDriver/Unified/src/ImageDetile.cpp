@@ -65,6 +65,8 @@ bool SurfaceDetiler::Record(Graphics::Recorder& recorder, SurfaceTable& table, c
         const auto& resource = vulkan->Resource();
         const auto& geometry = vulkan->Geometry();
         const auto elementBytes = Graphics::BytesPerElement(resource.format);
+        Graphics::DetileWindow window;
+        window.pipeBankXor = resource.pipeBankXor;
         const auto buffer = reinterpret_cast<VkBuffer>(static_cast<std::uintptr_t>(span.handle));
         const auto base = key.address - span.origin;
         const auto layers = std::min(geometry.layers, std::max(geometry.imageLayers, 1u));
@@ -84,7 +86,7 @@ bool SurfaceDetiler::Record(Graphics::Recorder& recorder, SurfaceTable& table, c
             const auto& mip = geometry.mips[level];
             for (std::uint32_t layer = 0; layer < layers; ++layer) {
                 if (!geometry.HasLayer(level, layer)) continue;
-                detiler->DispatchImage(commands, resource.tileMode, elementBytes, buffer, base + geometry.GuestOffset(layer, mip), vulkan->StorageView(level, layer, elementBytes), mip, false, 0);
+                detiler->DispatchImage(commands, resource.tileMode, elementBytes, buffer, base + geometry.GuestOffset(layer, mip), vulkan->StorageView(level, layer, elementBytes), mip, false, layer, window);
                 counts.dispatches++;
             }
         }
@@ -106,6 +108,8 @@ bool SurfaceDetiler::recordThroughBuffer(Graphics::Recorder& recorder, VkCommand
     const auto& resource = surface.Resource();
     const auto& geometry = surface.Geometry();
     const auto elementBytes = Graphics::BytesPerElement(resource.format);
+    Graphics::DetileWindow window;
+    window.pipeBankXor = resource.pipeBankXor;
     const auto blockWidth = std::max(Graphics::BlockWidth(resource.format), 1u);
     std::uint64_t total = 0;
     for (const auto& mip : geometry.mips) total = std::max(total, mip.linearOffset + mip.linearSize);
@@ -125,7 +129,7 @@ bool SurfaceDetiler::recordThroughBuffer(Graphics::Recorder& recorder, VkCommand
             region.bufferRowLength = rowTexels;
             region.bufferImageHeight = 0u;
             region.imageSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, level, layer, 1u};
-            region.imageExtent = {std::max(mip.width, 1u), std::max(mip.height, 1u), 1u};
+            region.imageExtent = {std::max(resource.width >> level, 1u), std::max(resource.height >> level, 1u), 1u};
             regions.push_back(region);
         }
     }
@@ -135,7 +139,7 @@ bool SurfaceDetiler::recordThroughBuffer(Graphics::Recorder& recorder, VkCommand
         const auto& mip = geometry.mips[level];
         for (std::uint32_t layer = 0; layer < layers; ++layer) {
             if (!geometry.HasLayer(level, layer)) continue;
-            detiler->Dispatch(commands, resource.tileMode, elementBytes, source, base + geometry.GuestOffset(layer, mip), scratch->Handle(), regions[index++].bufferOffset, mip);
+            detiler->Dispatch(commands, resource.tileMode, elementBytes, source, base + geometry.GuestOffset(layer, mip), scratch->Handle(), regions[index++].bufferOffset, mip, false, layer, false, window);
             counts.dispatches++;
         }
     }

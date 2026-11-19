@@ -100,16 +100,52 @@ void testWritesToElementImagesRefill() {
     Expect(uses.size() == 2u && fixture.mirror.Counts().unchanged == 1u, "an unchanged mirror reports the same uses");
     static_cast<void>(fixture.imageLog.Note(0x300000000ull + 2u * Events::RegionBytes, 0x100));
     const auto again = fixture.mirror.Build(tables, reason);
-    Expect(again == first && fixture.mirror.Counts().reused == 1u && fixture.mirror.Counts().elements == 4u, "a write to an element image refills the mirror");
+    Expect(again == first && fixture.mirror.Counts().reused == 1u && fixture.mirror.Counts().elements == 3u && fixture.mirror.Counts().kept == 1u, "a write to an element image refills that element alone");
     static_cast<void>(fixture.shared.Note(0x400000000ull, 0x100));
     static_cast<void>(fixture.mirror.Build(tables, reason));
     Expect(fixture.mirror.Counts().unchanged == 2u, "a write elsewhere keeps the mirror unchanged");
+}
+
+void testNewTablesInheritTheirPredecessor() {
+    Fixture fixture;
+    std::string reason;
+    const auto first = fixture.mirror.Build(Tables({1u, 2u, 3u}), reason);
+    const auto same = fixture.mirror.Build(Tables({1u, 2u, 3u}), reason);
+    Expect(first != nullptr && same == first, "new tables with the same map and elements keep the mirror");
+    Expect(fixture.mirror.Counts().inherited == 1u && fixture.mirror.Counts().kept == 3u && fixture.mirror.Counts().elements == 3u, "their elements keep the predecessor's slots without a refill");
+    const auto changed = fixture.mirror.Build(Tables({1u, 4u, 3u}), reason);
+    Expect(changed != nullptr && changed->id != first->id, "a changed element builds a new mirror");
+    Expect(fixture.mirror.Counts().elements == 4u && fixture.mirror.Counts().kept == 5u, "only the changed element is filled");
+    if (changed == nullptr) return;
+    const auto base = changed->map[Abi::HeaderElementBase];
+    const auto firstBase = first->map[Abi::HeaderElementBase];
+    Expect(changed->map[base] == first->map[firstBase] && changed->map[base + 2u] == first->map[firstBase + 2u] && changed->map[base + 1u] != first->map[firstBase + 1u], "kept elements keep their slots and the new one takes another slot");
+    static_cast<void>(fixture.mirror.Build(Tables({1u, 2u}), reason));
+    Expect(fixture.mirror.Counts().inherited == 2u, "a table with another map does not inherit");
 }
 
 void testSpansCoalesce() {
     const std::vector<ImageUse> uses{{{0x2000u, 0x1000u}, false}, {{0x1000u, 0x1000u}, false}, {{0x8000u, 0x100u}, false}, {{0x2800u, 0x1000u}, false}};
     const auto spans = Tables::CoalescedSpans(uses);
     Expect(spans.size() == 2u && spans[0] == std::pair<std::uint64_t, std::uint64_t>{0x1000u, 0x3800u} && spans[1].first == 0x8000u, "touching and overlapping spans merge in address order");
+}
+
+void testUsesAreCoalescedSpans() {
+    Fixture fixture;
+    const auto tables = Tables({1u, 2u});
+    tables->elements.push_back(Element(1u));
+    tables->elements.back().words[1] = 2u;
+    std::string reason;
+    std::vector<ImageUse> uses;
+    static_cast<void>(fixture.mirror.Build(tables, reason, &uses));
+    Expect(uses.size() == 2u && uses[0].memory.address < uses[1].memory.address && !uses[0].write, "elements over the same memory report one sampled use");
+}
+
+void testOutsideCutsHoles() {
+    const auto pieces = Tables::Outside({0x1000u, 0x5000u}, {{0x4000u, 0x6000u}, {0x2000u, 0x3000u}, {0x8000u, 0x9000u}});
+    Expect(pieces.size() == 2u && pieces[0] == std::pair<std::uint64_t, std::uint64_t>{0x1000u, 0x2000u} && pieces[1] == std::pair<std::uint64_t, std::uint64_t>{0x3000u, 0x4000u}, "holes are cut out of the span in address order");
+    Expect(Tables::Outside({0x1000u, 0x2000u}, {{0x0u, 0x3000u}}).empty(), "a span inside a hole leaves nothing");
+    Expect(Tables::Outside({0x1000u, 0x2000u}, {}).size() == 1u, "a span without holes is kept whole");
 }
 
 void testMirrorRefusesStorageAndSamplers() {
@@ -130,7 +166,10 @@ int main() {
     testMirrorAppendsSlots();
     testMirrorReusedForSameTables();
     testWritesToElementImagesRefill();
+    testNewTablesInheritTheirPredecessor();
     testSpansCoalesce();
+    testUsesAreCoalescedSpans();
+    testOutsideCutsHoles();
     testMirrorRefusesStorageAndSamplers();
     if (failures != 0) return 1;
     std::printf("unified table mirror tests passed\n");
