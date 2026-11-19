@@ -635,6 +635,59 @@ std::array<std::uint32_t, 4> EmitAnchoredBdaRead(SpirvEmitterState& state, const
     return values;
 }
 
+namespace {
+
+bool BdaKnownReadsBranch() {
+    static const bool branch = [] {
+        const char* value = std::getenv("APS5_BDA_KNOWN_BRANCH");
+        return value != nullptr && value[0] == '1';
+    }();
+    return branch;
+}
+
+std::array<std::uint32_t, 4> EmitStraightBdaRead(SpirvEmitterState& state, const SpirvEmitterState::BdaAnchor& anchor, std::uint32_t inside, std::uint32_t translated, std::uint32_t first, std::uint32_t last, std::uint32_t used, std::array<std::uint32_t, 4> values) {
+    const auto u32 = TypeU32(state);
+    const auto u64 = TypeScalarU64(state);
+    const auto address = Select(state, u64, inside, translated, anchor.device);
+    const auto base = Binary(state, spv::OpBitwiseAnd, u64, address, BdaConstant(state, ~std::uint64_t{3u}));
+    const auto misaligned = Unary(state, spv::OpUConvert, u32, Binary(state, spv::OpBitwiseAnd, u64, address, BdaConstant(state, 3u)));
+    const auto shift = Binary(state, spv::OpShiftLeftLogical, u32, misaligned, ConstantU32(state, 3u));
+    const auto back = Binary(state, spv::OpISub, u32, ConstantU32(state, 31u), shift);
+    const auto span = last - first + 1u;
+    std::array<std::uint32_t, 5> words{};
+    const auto word = [&](std::uint32_t index) {
+        if (words[index] != 0u) return words[index];
+        auto element = index == 0u ? base : Binary(state, spv::OpIAdd, u64, base, BdaConstant(state, index * 4u));
+        if (index == span) {
+            const auto previous = span == 1u ? base : Binary(state, spv::OpIAdd, u64, base, BdaConstant(state, (span - 1u) * 4u));
+            element = Select(state, u64, Binary(state, spv::OpINotEqual, TypeBool(state), misaligned, ConstantU32(state, 0u)), element, previous);
+        }
+        const auto pointer = state.module.AllocateId();
+        state.module.AddFunction(spv::OpConvertUToPtr, TypePhysicalU32Pointer(state), pointer, element);
+        words[index] = state.module.AllocateId();
+        state.module.AddFunction(spv::OpLoad, u32, words[index], pointer, BdaAccessMask(false), 4u);
+        return words[index];
+    };
+    for (std::uint32_t dword = first; dword <= last; ++dword) {
+        if ((used & (1u << dword)) == 0u) continue;
+        const auto index = dword - first;
+        const auto lowPart = Binary(state, spv::OpShiftRightLogical, u32, word(index), shift);
+        const auto highPart = Binary(state, spv::OpShiftLeftLogical, u32, Binary(state, spv::OpShiftLeftLogical, u32, word(index + 1u), ConstantU32(state, 1u)), back);
+        values[dword] = Select(state, u32, inside, Binary(state, spv::OpBitwiseOr, u32, lowPart, highPart), ConstantU32(state, 0u));
+    }
+    return values;
+}
+
+}
+
+bool KnownBdaBuffer(const SpirvEmitterState& state, const MemoryInfo& memory) {
+    return memory.knownBuffer < state.program.Metadata().bindings.knownBufferCount && !BdaByteReadsForced() && !BdaKnownReadsBranch();
+}
+
+bool StraightKnownBdaRead(const SpirvEmitterState& state, const IrValue& inst, const MemoryInfo& memory, std::uint32_t bits) {
+    return bits == 32u && KnownBdaBuffer(state, memory) && !BdaCoherent(state, inst);
+}
+
 std::optional<SpirvEmitterState::BdaAnchor> KnownBdaAnchor(SpirvEmitterState& state, const MemoryInfo& memory) {
     const auto& layout = state.program.Metadata().bindings;
     if (memory.knownBuffer >= layout.knownBufferCount || BdaByteReadsForced()) return std::nullopt;
@@ -671,6 +724,7 @@ std::array<std::uint32_t, 4> EmitBoundedBdaRead(SpirvEmitterState& state, const 
     const bool coherent = BdaCoherent(state, inst);
     std::uint32_t translated = 0;
     const auto inside = BdaAnchorHolds(state, anchor, low, static_cast<std::int32_t>(static_cast<std::uint32_t>(immediate) + first * 4u), bytes, translated);
+    if (bits == 32u && !coherent && !BdaKnownReadsBranch()) return EmitStraightBdaRead(state, anchor, inside, translated, first, last, used, values);
     const auto outsideExit = state.currentLabel;
     const auto insideLabel = state.module.AllocateId();
     const auto merge = state.module.AllocateId();

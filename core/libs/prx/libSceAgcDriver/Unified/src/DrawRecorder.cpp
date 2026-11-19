@@ -100,6 +100,8 @@ void noteFaultToken(const Context& context, Graphics::Recorder& recorder, VkComm
 }
 
 constexpr std::uint64_t RingBytes = 64ull << 20u;
+constexpr std::uint64_t RingZeroBytes = 256;
+constexpr std::uint64_t KnownReadableBytes = 32;
 constexpr std::uint32_t PoolSets = 512;
 constexpr std::uint32_t PoolBuffers = 4096;
 constexpr std::uint64_t MapBudgetBytes = 256ull << 20u;
@@ -474,7 +476,8 @@ private:
         alignment = std::max<std::uint64_t>(context.limits.minStorageBufferOffsetAlignment, 16u);
         const auto ringMemory = ResidencyService::ShaderReadMemory(context, RingBytes);
         const VkBufferUsageFlags addressable = context.bufferDeviceAddress ? VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT : 0u;
-        ring = std::make_shared<Graphics::Buffer>(context, RingBytes, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_INDIRECT_BUFFER_BIT | addressable, ringMemory);
+        ring = std::make_shared<Graphics::Buffer>(context, RingBytes + RingZeroBytes, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_INDIRECT_BUFFER_BIT | addressable, ringMemory);
+        std::memset(ring->Bytes().data() + RingBytes, 0, RingZeroBytes);
         ringAddress = addressable != 0u ? ring->DeviceAddress() : 0u;
         space.emplace(RingBytes, alignment);
         std::fprintf(stderr, "[recode-record] ring %llu MiB, alignment %llu, %s memory\n", static_cast<unsigned long long>(RingBytes >> 20u), static_cast<unsigned long long>(alignment), (ringMemory & VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT) != 0 ? "device" : "host");
@@ -659,9 +662,10 @@ private:
 
     template<typename TPut>
     void serveKnownBuffers(const Context& context, const Resolve::ResolvedStage& stage, std::uint64_t serial, std::uint64_t completed, TPut&& put) {
-        if (stage.program.variant == nullptr || stage.program.capture == nullptr) return;
+        if (stage.program.variant == nullptr) return;
+        static const std::vector<ShaderRecompiler::DescriptorValue> none;
         const auto& layout = stage.program.variant->info.bindings;
-        const auto& known = stage.program.capture->snapshot.knownBuffers;
+        const auto& known = stage.program.capture != nullptr ? stage.program.capture->snapshot.knownBuffers : none;
         const auto& infos = stage.program.variant->info.info.knownBuffers;
         for (std::uint32_t index = 0; index < layout.knownBufferCount; ++index) {
             const auto dword = layout.KnownBufferDword() + index * ShaderRecompiler::KnownBufferDwords;
@@ -672,9 +676,10 @@ private:
             };
             const auto [address, bytes] = index < known.size() ? Resolve::KnownBufferSpan(index < infos.size() ? infos[index] : ShaderRecompiler::KnownBuffer{}, known[index]) : std::pair<std::uint64_t, std::uint64_t>{0u, 0u};
             if (index < infos.size() && infos[index].Pointer()) totals.knownPointers++;
+            const auto zero = ringAddress != 0u ? ringAddress + RingBytes : 0u;
             if (address == 0u || bytes == 0u) {
                 totals.knownSkipped++;
-                write(0u, 0u);
+                write(zero, 0u);
                 continue;
             }
             if (const auto copied = copyKnownBuffer(address, bytes, serial, completed); copied != 0u) {
@@ -682,13 +687,15 @@ private:
                 write(copied, bytes);
                 continue;
             }
+            const auto reach = std::max(bytes, KnownReadableBytes);
             Shadow::OwnedSpan span;
-            if (bytes <= KnownBufferLimitBytes && Shadow::ServeOwned(context, address, bytes, &span) && span.address != 0u) {
+            if (bytes <= KnownBufferLimitBytes && ((reach != bytes && Shadow::ServeOwned(context, address, reach, &span)) || Shadow::ServeOwned(context, address, bytes, &span)) && span.address != 0u) {
                 totals.knownServed++;
                 write(span.address, bytes);
                 continue;
             }
-            auto mapped = ResidencyService::Get().TranslateMapped(address, bytes);
+            auto mapped = ResidencyService::Get().TranslateMapped(address, reach);
+            if (mapped == 0u && reach != bytes) mapped = ResidencyService::Get().TranslateMapped(address, bytes);
             if (mapped == 0u && bytes <= KnownBufferLimitBytes && servesFaultPages()) {
                 std::vector<std::uint64_t> pages;
                 for (auto page = address & ~(GpuPageBytes - 1u); page < address + bytes; page += GpuPageBytes) pages.push_back(page);
@@ -702,7 +709,7 @@ private:
                 continue;
             }
             totals.knownRefused++;
-            write(0u, 0u);
+            write(zero, 0u);
         }
     }
 

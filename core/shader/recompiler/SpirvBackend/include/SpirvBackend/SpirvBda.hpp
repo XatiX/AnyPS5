@@ -51,6 +51,8 @@ void EmitBdaAnchorRange(SpirvEmitterState& state, SpirvEmitterState::BdaAnchor& 
 const SpirvEmitterState::BdaAnchor* FindBdaAnchor(const SpirvEmitterState& state, const IrValue& inst);
 std::array<std::uint32_t, 4> EmitAnchoredBdaRead(SpirvEmitterState& state, const IrValue& inst, const SpirvEmitterState::BdaAnchor& anchor, std::uint32_t low, std::int32_t immediate, std::uint32_t bits, std::uint32_t dwords, std::uint32_t usedDwords, const std::function<std::array<std::uint32_t, 4>()>& lookup);
 std::optional<SpirvEmitterState::BdaAnchor> KnownBdaAnchor(SpirvEmitterState& state, const MemoryInfo& memory);
+bool KnownBdaBuffer(const SpirvEmitterState& state, const MemoryInfo& memory);
+bool StraightKnownBdaRead(const SpirvEmitterState& state, const IrValue& inst, const MemoryInfo& memory, std::uint32_t bits);
 std::array<std::uint32_t, 4> EmitBoundedBdaRead(SpirvEmitterState& state, const IrValue& inst, const SpirvEmitterState::BdaAnchor& anchor, std::uint32_t low, std::int32_t immediate, std::uint32_t bits, std::uint32_t dwords, std::uint32_t usedDwords);
 std::uint32_t AddBdaImmediate(SpirvValueEmitContext& ctx, const IrValue& inst, std::uint32_t address, std::int32_t immediate);
 

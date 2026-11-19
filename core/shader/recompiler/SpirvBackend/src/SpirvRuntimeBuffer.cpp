@@ -231,6 +231,7 @@ RuntimeAddress address(SpirvValueEmitContext& context, const IrValue& instructio
     const auto offset = Binary(state, spv::OpIAdd, TypeU32(state), resource.offset != 0u ? resource.offset : context.Arg(instruction, 2u), ConstantU32(state, resource.offset != 0u ? componentOffset : context.Memory(instruction).offset + componentOffset));
     const auto bytesAddress = byteAddress(context, instruction, resource, offset, ConstantU32(state, bytes));
     if (!context.Memory(instruction).gpuDescriptor) return bytesAddress;
+    if (KnownBdaBuffer(state, context.Memory(instruction))) return {Binary(state, spv::OpIAdd, TypeScalarU64(state), resource.base, Unary(state, spv::OpUConvert, TypeScalarU64(state), bytesAddress.guest)), bytesAddress.inBounds};
     return {AddBdaAddress(context, instruction, resource.base, Unary(state, spv::OpUConvert, TypeScalarU64(state), bytesAddress.guest), false), bytesAddress.inBounds};
 }
 
@@ -1097,8 +1098,9 @@ std::uint32_t EmitRuntimeBufferLoad(SpirvValueEmitContext& context, const IrValu
             std::array<std::uint32_t, 4> values{};
             for (std::uint32_t component = 0; component < components; ++component) {
                 const auto access = spanRead ? spanAddresses[component] : address(context, instruction, resource, component * 4u, memory.dataBits / 8u);
-                values[component] = memory.gpuDescriptor ? EmitValueOrZeroIfCondition(state, access.inBounds, [&] { return readKnown(context, instruction, resource.base, access.guest, memory.dataBits); })
-                                                         : readBuffer(context, instruction, access.guest, memory.dataBits, access.inBounds);
+                if (memory.gpuDescriptor && StraightKnownBdaRead(state, instruction, memory, memory.dataBits)) values[component] = Select(state, TypeU32(state), access.inBounds, readKnown(context, instruction, resource.base, access.guest, memory.dataBits), ConstantU32(state, 0u));
+                else values[component] = memory.gpuDescriptor ? EmitValueOrZeroIfCondition(state, access.inBounds, [&] { return readKnown(context, instruction, resource.base, access.guest, memory.dataBits); })
+                                                              : readBuffer(context, instruction, access.guest, memory.dataBits, access.inBounds);
             }
             return composite(state, components, values);
         };
@@ -1180,6 +1182,7 @@ std::uint32_t EmitRuntimeScalarBufferLoad(SpirvValueEmitContext& context, const 
         const auto whole = both(state, equal(state, misalignment, ConstantU32(state, 0u)), equal(state, tail, ConstantU32(state, 0u)));
         return readBuffer(context, instruction, byte, 32u, inBounds, Select(state, TypeBool(state), whole, noCarry, inBounds));
     }
+    if (StraightKnownBdaRead(state, instruction, context.Memory(instruction), 32u)) return Select(state, TypeU32(state), inBounds, readKnown(context, instruction, resource.base, Binary(state, spv::OpIAdd, u64, resource.base, offset), 32u), ConstantU32(state, 0u));
     return EmitValueOrZeroIfCondition(state, inBounds, [&] { return readKnown(context, instruction, resource.base, AddBdaAddress(context, instruction, resource.base, offset, false), 32u); });
 }
 
