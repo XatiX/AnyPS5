@@ -10,6 +10,7 @@
 #include "prx/libSceAgcDriver/Unified/include/Refill.hpp"
 #include "prx/libSceAgcDriver/Unified/include/SlotPatch.hpp"
 #include "prx/libSceAgcDriver/Unified/include/TableMirror.hpp"
+#include "prx/libSceAgcDriver/Unified/include/Targets.hpp"
 #include "prx/libSceAgcDriver/Unified/include/VulkanImages.hpp"
 #include "prx/libSceAgcDriver/Unified/include/VulkanHeap.hpp"
 #include "Optimization/ShaderStageInputInfo.hpp"
@@ -91,6 +92,7 @@ public:
             if (imagesRouted() && surfaces == nullptr) {
                 surfaceDevice = std::make_unique<Images::VulkanSurfaceDevice>(*context);
                 surfaces = std::make_unique<Images::SurfaceTable>(*surfaceDevice, Events::Shared(), Events::Images());
+                targetViews = std::make_unique<Images::TargetViews>(*context);
                 publishedSurfaces.store(surfaces.get(), std::memory_order_release);
             }
             published.store(heap.get(), std::memory_order_release);
@@ -265,6 +267,9 @@ public:
                 line += text;
                 for (const auto& [why, count] : surfaceReasons) line += "; surface " + why + " " + std::to_string(count);
                 surfaceReasons.clear();
+                const auto targetCounts = Images::Targets().TakeCounts();
+                std::snprintf(text, sizeof(text), "; targets %llu noted, %llu read, %llu missed, %llu mismatched, %llu CPU-written", static_cast<unsigned long long>(targetCounts.noted), static_cast<unsigned long long>(targetCounts.hits), static_cast<unsigned long long>(targetCounts.misses), static_cast<unsigned long long>(targetCounts.mismatched), static_cast<unsigned long long>(targetCounts.cpuWritten));
+                line += text;
             }
             const auto reuse = ShaderRecompiler::ResourceMaterializer::TableReuse();
             std::snprintf(text, sizeof(text), " (columns %llu, reused %llu unwritten, %llu compared, %llu words read)", static_cast<unsigned long long>(reuse.columns), static_cast<unsigned long long>(reuse.unwritten), static_cast<unsigned long long>(reuse.compared), static_cast<unsigned long long>(reuse.wordsRead));
@@ -337,9 +342,10 @@ private:
             std::fprintf(stderr, "[recode-resolve] first image lookup\n");
         }
         if (surfaces != nullptr) {
-            bool gpuWritten = false;
-            auto resolved = surfaceImage(request, gpuWritten);
-            if (!gpuWritten) return resolved;
+            bool fallback = false;
+            auto resolved = surfaceImage(request, fallback);
+            if (!fallback) return resolved;
+            if (auto target = targetImage(request)) return target;
         }
         std::shared_ptr<Graphics::Texture> texture;
         {
@@ -359,21 +365,51 @@ private:
         return resolved;
     }
 
-    std::optional<Heap::ResolvedImage> surfaceImage(const Heap::SlotRequest& request, bool& gpuWritten) {
+    void noteSurfaceReason(const std::string& why) {
+        if (seenSurfaceReasons.insert(why).second) std::fprintf(stderr, "[recode-resolve] first surface refusal: %s\n", why.c_str());
+        if (surfaceReasons.size() < 16u || surfaceReasons.contains(why)) surfaceReasons[why]++;
+    }
+
+    std::optional<Heap::ResolvedImage> targetImage(const Heap::SlotRequest& request) {
+        std::string why;
+        try {
+            const auto resource = Graphics::DecodeTextureResource(request.words);
+            const auto bytes = Graphics::SurfaceGuestBytes(resource);
+            auto texture = Images::Targets().Find(resource.baseAddress, bytes, request.words, why);
+            std::shared_ptr<Images::TargetView> view;
+            if (texture != nullptr) view = targetViews->View(texture, request.words, request.kind, why);
+            if (view == nullptr) {
+                if (texture != nullptr) noteSurfaceReason(why);
+                if (texture == nullptr && missedTargets.size() < 12u && missedTargets.insert(resource.baseAddress).second) {
+                    std::fprintf(stderr, "[recode-resolve] first target miss: address 0x%llx format %u %ux%u tile %u dimension %u mips %u (%s)\n", static_cast<unsigned long long>(resource.baseAddress), resource.format, resource.width, resource.height, static_cast<unsigned>(resource.tileMode), static_cast<unsigned>(resource.dimension), resource.mipCount, why.c_str());
+                }
+                return std::nullopt;
+            }
+            Heap::ResolvedImage resolved;
+            resolved.image = {reinterpret_cast<std::uint64_t>(view->View()), static_cast<std::uint32_t>(VK_IMAGE_LAYOUT_GENERAL), view};
+            resolved.memory = {resource.baseAddress, bytes};
+            return resolved;
+        } catch (const std::exception& error) {
+            noteSurfaceReason(std::string("target: ") + error.what());
+            return std::nullopt;
+        }
+    }
+
+    std::optional<Heap::ResolvedImage> surfaceImage(const Heap::SlotRequest& request, bool& fallback) {
         std::string why;
         const auto key = Images::KeyOf(request.words, why);
         std::optional<Images::Found> found;
         std::uint64_t view = 0;
         if (key.has_value()) found = surfaces->Find(key->surface, request.words, why);
         if (found.has_value() && found->gpuWritten) {
-            gpuWritten = true;
+            fallback = true;
             return std::nullopt;
         }
         if (found.has_value()) view = found->surface->device->View(key->view, request.kind, why);
         if (view == 0u) {
             totals.surfaceRefusals++;
-            if (seenSurfaceReasons.insert(why).second) std::fprintf(stderr, "[recode-resolve] first surface refusal: %s\n", why.c_str());
-            if (surfaceReasons.size() < 16u || surfaceReasons.contains(why)) surfaceReasons[why]++;
+            noteSurfaceReason(why);
+            fallback = true;
             return std::nullopt;
         }
         Heap::ResolvedImage resolved;
@@ -408,6 +444,7 @@ private:
     std::unique_ptr<Images::VulkanSurfaceDevice> surfaceDevice;
     std::unique_ptr<Images::SurfaceTable> surfaces;
     std::atomic<Images::SurfaceTable*> publishedSurfaces{nullptr};
+    std::unique_ptr<Images::TargetViews> targetViews;
     std::unique_ptr<Heap::SlotTable> table;
     std::unique_ptr<Heap::Memo> memo;
     std::unique_ptr<Heap::Refill> refill;
@@ -417,6 +454,7 @@ private:
     Totals totals;
     std::set<std::string> seenReasons;
     std::set<std::string> seenSurfaceReasons;
+    std::set<std::uint64_t> missedTargets;
     std::map<std::string, std::uint64_t> surfaceReasons;
     bool firstBuilt = false;
     bool firstImage = false;
