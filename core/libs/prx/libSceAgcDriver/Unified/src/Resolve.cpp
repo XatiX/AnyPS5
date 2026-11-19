@@ -88,7 +88,7 @@ public:
             table = std::make_unique<Heap::SlotTable>(*heap, heap->SampledSlotCount(), heap->SamplerSlotCount(), heap->StorageSlotCount());
             memo = std::make_unique<Heap::Memo>(Events::Shared(), Events::Images());
             refill = std::make_unique<Heap::Refill>(*table, *memo, [this](const Heap::SlotRequest& request) { return image(request); }, [this](const Heap::SlotRequest& request) { return sampler(request); });
-            mirror = std::make_unique<Tables::TableMirror>(*refill);
+            mirror = std::make_unique<Tables::TableMirror>(*refill, Events::Shared(), Events::Images());
             if (imagesRouted() && surfaces == nullptr) {
                 surfaceDevice = std::make_unique<Images::VulkanSurfaceDevice>(*context);
                 surfaces = std::make_unique<Images::SurfaceTable>(*surfaceDevice, Events::Shared(), Events::Images());
@@ -259,7 +259,7 @@ public:
         }
         if (mirror != nullptr) {
             const auto mirrors = mirror->Counts();
-            std::snprintf(text, sizeof(text), "; tables %llu stages, mirrors %llu built, %llu reused, %llu elements, %llu placeholders, %llu reads, %llu target holds", static_cast<unsigned long long>(totals.tableStages), static_cast<unsigned long long>(mirrors.built), static_cast<unsigned long long>(mirrors.reused), static_cast<unsigned long long>(mirrors.elements), static_cast<unsigned long long>(totals.tablePlaceholders), static_cast<unsigned long long>(totals.tableUses), static_cast<unsigned long long>(totals.tableTargetHolds));
+            std::snprintf(text, sizeof(text), "; tables %llu stages, mirrors %llu built, %llu reused, %llu unchanged, %llu elements, %llu placeholders, %llu reads, %llu target holds", static_cast<unsigned long long>(totals.tableStages), static_cast<unsigned long long>(mirrors.built), static_cast<unsigned long long>(mirrors.reused), static_cast<unsigned long long>(mirrors.unchanged),static_cast<unsigned long long>(mirrors.elements), static_cast<unsigned long long>(totals.tablePlaceholders), static_cast<unsigned long long>(totals.tableUses), static_cast<unsigned long long>(totals.tableTargetHolds));
             line += text;
             if (surfaces != nullptr) {
                 const auto surfaceCounts = surfaces->TakeCounts();

@@ -40,7 +40,7 @@ struct Fixture {
                       return ResolvedImage{{0x1000u + request.words[0], 1u, owner}, {0x300000000ull + request.words[0] * Events::RegionBytes, 0x1000}};
                   },
                   [](const SlotRequest&) -> std::optional<ResolvedSampler> { return std::nullopt; }};
-    Tables::TableMirror mirror{refill};
+    Tables::TableMirror mirror{refill, shared, imageLog};
 };
 
 ShaderRecompiler::ImageTableElement Element(std::uint32_t word, ShaderRecompiler::DescriptorBindingKind kind = static_cast<ShaderRecompiler::DescriptorBindingKind>(FirstImageKind)) {
@@ -83,9 +83,33 @@ void testMirrorReusedForSameTables() {
     const auto first = fixture.mirror.Build(tables, reason);
     const auto second = fixture.mirror.Build(tables, reason);
     Expect(first != nullptr && first == second, "the same tables with the same slots reuse the mirror");
-    Expect(fixture.mirror.Counts().built == 1u && fixture.mirror.Counts().reused == 1u, "one build, one reuse");
+    Expect(fixture.mirror.Counts().built == 1u && fixture.mirror.Counts().unchanged == 1u && fixture.mirror.Counts().elements == 2u, "an unchanged mirror is reused without a refill");
     const auto other = fixture.mirror.Build(Tables({3u, 4u}), reason);
     Expect(other != nullptr && other->id != first->id, "different tables build a new mirror");
+}
+
+void testWritesToElementImagesRefill() {
+    Fixture fixture;
+    const auto tables = Tables({1u, 2u});
+    std::string reason;
+    std::vector<ImageUse> uses;
+    const auto first = fixture.mirror.Build(tables, reason, &uses);
+    Expect(first != nullptr && uses.size() == 2u, "a built mirror reports one use per element image");
+    uses.clear();
+    static_cast<void>(fixture.mirror.Build(tables, reason, &uses));
+    Expect(uses.size() == 2u && fixture.mirror.Counts().unchanged == 1u, "an unchanged mirror reports the same uses");
+    static_cast<void>(fixture.imageLog.Note(0x300000000ull + 2u * Events::RegionBytes, 0x100));
+    const auto again = fixture.mirror.Build(tables, reason);
+    Expect(again == first && fixture.mirror.Counts().reused == 1u && fixture.mirror.Counts().elements == 4u, "a write to an element image refills the mirror");
+    static_cast<void>(fixture.shared.Note(0x400000000ull, 0x100));
+    static_cast<void>(fixture.mirror.Build(tables, reason));
+    Expect(fixture.mirror.Counts().unchanged == 2u, "a write elsewhere keeps the mirror unchanged");
+}
+
+void testSpansCoalesce() {
+    const std::vector<ImageUse> uses{{{0x2000u, 0x1000u}, false}, {{0x1000u, 0x1000u}, false}, {{0x8000u, 0x100u}, false}, {{0x2800u, 0x1000u}, false}};
+    const auto spans = Tables::CoalescedSpans(uses);
+    Expect(spans.size() == 2u && spans[0] == std::pair<std::uint64_t, std::uint64_t>{0x1000u, 0x3800u} && spans[1].first == 0x8000u, "touching and overlapping spans merge in address order");
 }
 
 void testMirrorRefusesStorageAndSamplers() {
@@ -105,6 +129,8 @@ void testMirrorRefusesStorageAndSamplers() {
 int main() {
     testMirrorAppendsSlots();
     testMirrorReusedForSameTables();
+    testWritesToElementImagesRefill();
+    testSpansCoalesce();
     testMirrorRefusesStorageAndSamplers();
     if (failures != 0) return 1;
     std::printf("unified table mirror tests passed\n");
