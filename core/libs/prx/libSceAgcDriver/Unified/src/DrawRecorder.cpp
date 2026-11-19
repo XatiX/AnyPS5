@@ -677,6 +677,11 @@ private:
                 write(0u, 0u);
                 continue;
             }
+            if (const auto copied = copyKnownBuffer(address, bytes, serial, completed); copied != 0u) {
+                totals.knownCopied++;
+                write(copied, bytes);
+                continue;
+            }
             Shadow::OwnedSpan span;
             if (bytes <= KnownBufferLimitBytes && Shadow::ServeOwned(context, address, bytes, &span) && span.address != 0u) {
                 totals.knownServed++;
@@ -696,10 +701,8 @@ private:
                 write(mapped, bytes);
                 continue;
             }
-            const auto copied = copyKnownBuffer(address, bytes, serial, completed);
-            if (copied != 0u) totals.knownCopied++;
-            else totals.knownRefused++;
-            write(copied, copied != 0u ? bytes : 0u);
+            totals.knownRefused++;
+            write(0u, 0u);
         }
     }
 
