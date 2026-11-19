@@ -52,6 +52,26 @@ struct ResourceCapture {
 // request with the same code and the same cache key fields (RecompileCacheKey::ContextHash plus
 // the target); the vertex stages' input validation is repeated per capture because it reads V#
 // fields the key does not cover. Null for a request that bypasses the cache (useCache false).
+struct ResultTemplate {
+    static constexpr std::uint32_t NoBinding = ~0u;
+    std::shared_ptr<const RecompileResult> result;
+    std::vector<std::pair<std::uint32_t, std::vector<std::uint32_t>>> buffers;
+    std::vector<std::uint32_t> userWords;
+    std::uint32_t shaderData = NoBinding;
+    std::uint32_t flattenedSrt = NoBinding;
+    bool pushData = false;
+    bool refillable = false;
+    std::uint64_t snapshotKey = 0;
+};
+struct TemplateWords {
+    std::vector<std::byte> pushConstants;
+    std::vector<std::pair<std::uint32_t, std::vector<std::uint32_t>>> bindings;
+    std::uint32_t poisonedSrtReads = 0;
+};
+void RefillTemplate(const ResultTemplate& entry, const ResourceSnapshot& snapshot, TemplateWords& out);
+[[nodiscard]] std::uint64_t ResultTemplateBytes(const ResultTemplate& entry);
+[[nodiscard]] const char* TemplateWordsDifference(const ResultTemplate& entry, const TemplateWords& words, const RecompileResult& full);
+
 struct CompiledVariant;
 struct SourceHandle {
     std::shared_ptr<SourceEntry> source;
@@ -68,6 +88,9 @@ public:
     [[nodiscard]] std::shared_ptr<const RecompileResult> MaterializeIfMemoized(const ResourceCapture& capture, bool* contended = nullptr) const;
     [[nodiscard]] PreparedShaderInvocation Rebound(const RecompileRequest& request) const;
     [[nodiscard]] std::uint64_t SnapshotKey(const ResourceCapture& capture) const;
+    [[nodiscard]] std::uint64_t TemplateKey(const ResourceCapture& capture) const;
+    [[nodiscard]] std::shared_ptr<const ResultTemplate> BuildTemplate(const ResourceCapture& capture) const;
+    [[nodiscard]] std::shared_ptr<const RecompileResult> MaterializeUnshared(const ResourceCapture& capture) const;
 
 private:
     PreparedShaderInvocation(const RecompileRequest& request, const std::shared_ptr<const SourceHandle>& handle);

@@ -272,6 +272,9 @@ function(add_shader_recompiler target runtimeTarget)
             DescriptorBindingForImage
             ImageBindingResourceClass
             ResourceMaterializer::RuntimeImageMode
+            RefillTemplate
+            TemplateWordsDifference
+            ResultTemplateBytes
             ExactF32Arithmetic
             HashBytes
             LayoutBarycentricEmulation

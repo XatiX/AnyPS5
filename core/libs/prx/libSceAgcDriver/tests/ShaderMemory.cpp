@@ -559,6 +559,52 @@ void verifyResultMemoBudgetMasked() {
     require(ResultMemoBytes() == first, std::string("result memo budget masked: the trim left a masked entry to patch from (" + std::to_string(ResultMemoBytes()) + " bytes after one compile, " + std::to_string(first) + " for a full one)").c_str());
 }
 
+ShaderRecompiler::RecompileRequest resultTemplateRequest(std::span<const std::uint32_t> color) {
+    using namespace ShaderRecompiler;
+    auto request = FrontendRequest(resultMemoPixelCode(), color);
+    request.shader.stage = ShaderStage::Fragment;
+    request.context.compute.reset();
+    request.context.pixel = ShaderPixelStageInfo{};
+    request.context.pixel->wave32 = true;
+    request.context.pixel->targetOutputMode[0] = 9u;
+    request.context.waveSize = 32u;
+    request.useCache = true;
+    return request;
+}
+
+void verifyResultTemplates() {
+    using namespace ShaderRecompiler;
+    const std::array<std::uint32_t, 1> first{1u};
+    const std::array<std::uint32_t, 1> second{7u};
+    const auto firstRequest = resultTemplateRequest(first);
+    const auto secondRequest = resultTemplateRequest(second);
+    const auto handle = PrepareShader(firstRequest);
+    require(handle != nullptr, "result templates: the pixel shader was not prepared");
+    const auto firstInvocation = PreparedShaderInvocation::TryCreate(firstRequest, handle);
+    const auto secondInvocation = PreparedShaderInvocation::TryCreate(secondRequest, handle);
+    require(firstInvocation.has_value() && secondInvocation.has_value(), "result templates: a request of the same shader did not match its prepared handle");
+    const auto firstCapture = firstInvocation->Capture(SrtRuntime{.userData = first});
+    const auto secondCapture = secondInvocation->Capture(SrtRuntime{.userData = second});
+    require(firstInvocation->TemplateKey(*firstCapture) == secondInvocation->TemplateKey(*secondCapture), "result templates: a user data word changed the template key");
+    require(firstInvocation->SnapshotKey(*firstCapture) != secondInvocation->SnapshotKey(*secondCapture), "result templates: a user data word left the snapshot key unchanged");
+    const auto shape = firstInvocation->BuildTemplate(*firstCapture);
+    require(shape != nullptr && shape->result != nullptr && shape->refillable, "result templates: the template of a push data shader is not refillable");
+    require(shape->snapshotKey == firstInvocation->SnapshotKey(*firstCapture), "result templates: the template does not record its snapshot key");
+    require(ResultTemplateBytes(*shape) > sizeof(ResultTemplate), "result templates: the template size leaves out its result");
+    const auto full = secondInvocation->MaterializeUnshared(*secondCapture);
+    TemplateWords stale;
+    stale.pushConstants = shape->result->pushConstants;
+    stale.poisonedSrtReads = shape->result->poisonedSrtReads;
+    require(TemplateWordsDifference(*shape, stale, *full) != nullptr, "result templates: the unrefilled template already matched another snapshot");
+    TemplateWords words;
+    RefillTemplate(*shape, secondCapture->snapshot, words);
+    const auto* difference = TemplateWordsDifference(*shape, words, *full);
+    require(difference == nullptr, (std::string("result templates: the refilled template differs from a full materialize in ") + (difference != nullptr ? difference : "")).c_str());
+    TemplateWords own;
+    RefillTemplate(*shape, firstCapture->snapshot, own);
+    require(TemplateWordsDifference(*shape, own, *firstInvocation->MaterializeUnshared(*firstCapture)) == nullptr, "result templates: refilling the template's own snapshot changed it");
+}
+
 void verifyResultMemoBudget() {
     using namespace ShaderRecompiler;
     const auto compile = [](std::uint32_t value) { return compileResultMemoPixel(value); };
@@ -13282,6 +13328,11 @@ int main(int argc, char** argv) {
         if (argc == 2 && std::string_view(argv[1]) == "--result-memo-budget-masked") {
             verifyResultMemoBudgetMasked();
             std::cout << "The result memo budget counts and trims the masked table's entries\n";
+            return 0;
+        }
+        if (argc == 2 && std::string_view(argv[1]) == "--result-templates") {
+            verifyResultTemplates();
+            std::cout << "A result template refilled with another snapshot matches a full materialize\n";
             return 0;
         }
         if (argc == 2 && (std::string_view(argv[1]) == "--region-merge" || std::string_view(argv[1]) == "--region-merge-bench")) {
