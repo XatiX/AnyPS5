@@ -60,6 +60,7 @@ private:
     std::unique_ptr<ResidentUploads> uploads;
     std::unique_ptr<GpuPageTable> pages;
     std::shared_ptr<Graphics::Buffer> pageBuffer;
+    std::shared_ptr<Graphics::Buffer> nullPage;
     std::uint64_t pageUpdates = 0;
     std::uint64_t pageUpdateBytes = 0;
     std::uint64_t pageLeavesDropped = 0;

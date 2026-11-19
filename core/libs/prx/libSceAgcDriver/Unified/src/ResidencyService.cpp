@@ -68,6 +68,11 @@ bool ResidencyService::Attach(const Graphics::Context& graphics) {
         const Abi::Header header{Abi::PageTableVersion, 0, sizeof(std::uint64_t), 0};
         std::memcpy(bytes.data(), &header, sizeof(header));
         ledger->SetPageTable(pages.get());
+        if (std::getenv("APS5_RECODE_NO_NULL_PAGE") == nullptr) {
+            nullPage = std::make_shared<Graphics::Buffer>(*context, GpuPageBytes, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT);
+            std::memset(nullPage->Bytes().data(), 0, nullPage->Bytes().size());
+            pages->Map(0, GpuPageBytes, nullPage->DeviceAddress(), GpuPageRead);
+        }
     }
     for (const auto& [address, size] : queued) ledger->Add(address, size);
     queued.clear();
