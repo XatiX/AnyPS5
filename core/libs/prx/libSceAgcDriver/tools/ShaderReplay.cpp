@@ -62,6 +62,7 @@ bool g_shaderInt16 = false;
 bool g_code = false;
 bool g_float16WidenNans = false;
 bool g_float16NarrowNans = false;
+bool g_directResources = false;
 
 bool OutputSpirv(const char* path, std::span<const std::uint32_t> spirv) {
     if (g_spirv) {
@@ -100,6 +101,7 @@ bool Replay(const char* path) {
     if (g_ldsLockFences) request.request.target.ldsLockFences = true;
     if (g_deviceAtomicWorkgroupMemoryBarriers) request.request.target.deviceAtomicWorkgroupMemoryBarriers = true;
     if (g_f16HostNans) request.request.target.float16HostNans = true;
+    if (g_directResources) request.request.target.directResources = true;
     if (g_shaderFma) {
         request.supportedCapabilities.push_back(spv::CapabilityFMAKHR);
         request.supportedExtensions.push_back("SPV_KHR_fma");
@@ -249,7 +251,7 @@ bool Replay(const char* path) {
 
 int main(int argc, char** argv) {
     if (argc < 2) {
-        std::fprintf(stderr, "usage: agc_shader_replay [--dis] [--asm] [--cfg] [--mem] [--spv] [--prepare] [--materialize] [--code] [--maintenance8] [--robust2] [--wave-lds-memory-barriers] [--device-scope-lds-memory-barriers] [--lds-lock-fences] [--device-atomic-workgroup-memory-barriers] [--shader-fma] [--shader-int16] [--f16-widen-nans] [--f16-narrow-nans] [--f16-host-nans] <shader.req>...\n  the driver writes shader_<address>.req files when APS5_DUMP_SHADERS is set; shader_<address>.prepare.req holds a request whose preparation failed before any resource capture, so replay it with --prepare\n");
+        std::fprintf(stderr, "usage: agc_shader_replay [--dis] [--asm] [--cfg] [--mem] [--spv] [--prepare] [--materialize] [--code] [--maintenance8] [--robust2] [--wave-lds-memory-barriers] [--device-scope-lds-memory-barriers] [--lds-lock-fences] [--device-atomic-workgroup-memory-barriers] [--shader-fma] [--shader-int16] [--f16-widen-nans] [--f16-narrow-nans] [--f16-host-nans] [--direct] <shader.req>...\n  the driver writes shader_<address>.req files when APS5_DUMP_SHADERS is set; shader_<address>.prepare.req holds a request whose preparation failed before any resource capture, so replay it with --prepare\n");
         return 2;
     }
     int failures = 0;
@@ -332,6 +334,10 @@ int main(int argc, char** argv) {
         }
         if (std::string(argv[i]) == "--spv") {
             g_spirv = true;
+            continue;
+        }
+        if (std::string(argv[i]) == "--direct") {
+            g_directResources = true;
             continue;
         }
         try {
