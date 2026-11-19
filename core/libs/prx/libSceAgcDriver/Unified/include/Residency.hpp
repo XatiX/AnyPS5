@@ -14,6 +14,7 @@ namespace AgcDriver::Unified {
 inline constexpr std::uint64_t ChunkBytes = 0x10000;
 inline constexpr std::uint64_t PoolBytes = 0x10000000;
 inline constexpr std::uint32_t PoolChunks = static_cast<std::uint32_t>(PoolBytes / ChunkBytes);
+inline constexpr std::uint64_t RetireFrames = 4;
 
 struct Chunk {
     std::uint32_t pool = 0;
@@ -62,6 +63,8 @@ struct ResidencyCounts {
     std::uint64_t evicted = 0;
     std::uint64_t refused = 0;
     std::uint64_t sharedPages = 0;
+    std::uint64_t retired = 0;
+    std::uint64_t removals = 0;
 };
 
 class GpuPageTable;
@@ -82,6 +85,8 @@ public:
     void Touch(std::uint64_t address, std::uint64_t frame);
     std::size_t RemoveUnboundInside(std::uint64_t address, std::uint64_t size);
     std::vector<GuestSpan> Evict(std::uint64_t frame);
+    void Retire(std::uint64_t frame);
+    [[nodiscard]] std::uint64_t Removals() const;
     void SetBudget(std::uint64_t bytes);
     void SetPageTable(GpuPageTable* table);
     [[nodiscard]] ResidencyCounts Counts() const;
@@ -96,6 +101,10 @@ private:
         std::vector<std::optional<Chunk>> chunks;
     };
     using Ranges = std::map<std::uint64_t, Range>;
+    struct Retired {
+        std::uint64_t handle = 0;
+        std::uint64_t frame = 0;
+    };
 
     Ranges::iterator rangeOf(std::uint64_t address);
     Ranges::const_iterator rangeOf(std::uint64_t address) const;
@@ -104,6 +113,7 @@ private:
     std::uint64_t unbind(Range& range);
     void mapChunk(const Range& range, std::size_t index);
     void unmapChunk(const Range& range, std::size_t index);
+    void retire(const Range& range);
 
     ResidencyDevice& device;
     GpuPageTable* pageTable = nullptr;
@@ -117,6 +127,9 @@ private:
     std::uint64_t boundCount = 0;
     std::uint64_t evictedCount = 0;
     std::uint64_t refusedCount = 0;
+    std::vector<Retired> retired;
+    std::uint64_t retireFrame = 0;
+    std::uint64_t removals = 0;
 };
 
 }

@@ -14,6 +14,8 @@ Residency::~Residency() {
         device.DestroyBuffer(range.buffer.handle);
     }
     ranges.clear();
+    for (const auto& old : retired) device.DestroyBuffer(old.handle);
+    retired.clear();
     for (std::uint32_t pool = 0; pool < pools; ++pool) device.DestroyPool(pool);
 }
 
@@ -59,8 +61,28 @@ void Residency::Remove(std::uint64_t address) {
     const auto it = rangeOf(address);
     if (it == ranges.end()) return;
     unbind(it->second);
-    device.DestroyBuffer(it->second.buffer.handle);
+    retire(it->second);
     ranges.erase(it);
+}
+
+void Residency::retire(const Range& range) {
+    retired.push_back({range.buffer.handle, retireFrame});
+    ++removals;
+}
+
+void Residency::Retire(std::uint64_t frame) {
+    std::lock_guard lock(mutex);
+    retireFrame = std::max(retireFrame, frame);
+    std::erase_if(retired, [&](const Retired& old) {
+        if (retireFrame < old.frame + RetireFrames) return false;
+        device.DestroyBuffer(old.handle);
+        return true;
+    });
+}
+
+std::uint64_t Residency::Removals() const {
+    std::lock_guard lock(mutex);
+    return removals;
 }
 
 bool Residency::Owns(std::uint64_t address, std::uint64_t size) const {
@@ -185,7 +207,7 @@ std::size_t Residency::RemoveUnboundInside(std::uint64_t address, std::uint64_t 
             ++it;
             continue;
         }
-        device.DestroyBuffer(it->second.buffer.handle);
+        retire(it->second);
         it = ranges.erase(it);
         ++removed;
     }
@@ -244,7 +266,7 @@ void Residency::SetPageTable(GpuPageTable* table) {
 
 ResidencyCounts Residency::Counts() const {
     std::lock_guard lock(mutex);
-    return {ranges.size(), pools, boundBytes, budget, boundCount, evictedCount, refusedCount, sharedPages};
+    return {ranges.size(), pools, boundBytes, budget, boundCount, evictedCount, refusedCount, sharedPages, retired.size(), removals};
 }
 
 }

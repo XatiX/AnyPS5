@@ -192,6 +192,24 @@ void testServedRangeReplacesUnboundRanges() {
     Expect(evicted.size() == 1 && evicted[0].address == 0x80000000, "a touched range is kept over an older one");
 }
 
+void testRemovedBuffersOutliveInFlightFrames() {
+    FakeDevice device;
+    Residency residency(device, 0);
+    residency.Retire(10);
+    residency.Add(0x70010000, 0x1000);
+    residency.Add(0x90000000, ChunkBytes);
+    Expect(residency.RemoveUnboundInside(0x70000000, 0x100000) == 1, "an unbound range inside is removed");
+    residency.Remove(0x90000000);
+    Expect(device.buffers.size() == 2 && residency.Counts().retired == 2 && residency.Removals() == 2, "removed buffers stay alive for work already recorded");
+    residency.Retire(10 + RetireFrames - 1);
+    Expect(device.buffers.size() == 2, "they outlive the frames still in flight");
+    residency.Retire(10 + RetireFrames);
+    Expect(device.buffers.empty() && residency.Counts().retired == 0, "they are destroyed once those frames are done");
+    residency.Add(0x70010000, 0x1000);
+    residency.Remove(0x70010000);
+    Expect(device.buffers.size() == 1, "a buffer retired at the newest frame waits again");
+}
+
 std::vector<std::pair<std::uint64_t, std::uint64_t>> committedHalf(std::uint64_t address, std::size_t bytes, bool) {
     return {{address, address + bytes / 2}};
 }
@@ -244,6 +262,7 @@ int main() {
     testEvictionTakesTheOldestRange();
     testRemoveReturnsChunks();
     testFailedBindKeepsChunksFree();
+    testRemovedBuffersOutliveInFlightFrames();
     if (failures != 0) {
         std::fprintf(stderr, "%d failure(s)\n", failures);
         return 1;

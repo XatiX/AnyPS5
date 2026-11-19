@@ -47,6 +47,7 @@ public:
     std::size_t Record(VkCommandBuffer commands, std::vector<std::shared_ptr<void>>& kept);
     void AdvanceFrame();
     [[nodiscard]] std::uint64_t Frame() const { return frame.load(std::memory_order_relaxed); }
+    [[nodiscard]] std::uint64_t Removals() const;
     [[nodiscard]] std::string Line() const;
 
 private:

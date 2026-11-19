@@ -403,13 +403,15 @@ bool ServeOwned(const Graphics::Context& context, std::uint64_t address, std::ui
     struct Served {
         std::uint64_t last = 0;
         std::uint64_t frame = 0;
+        std::uint64_t removals = 0;
         OwnedSpan span;
     };
     static std::mutex servedMutex;
     static auto& served = *new std::map<std::uint64_t, Served>();
     const auto frame = service.Frame();
+    const auto removals = service.Removals();
     std::lock_guard lock(servedMutex);
-    if (const auto found = served.find(first); found != served.end() && found->second.last == last && found->second.frame == frame) {
+    if (const auto found = served.find(first); found != served.end() && found->second.last == last && found->second.frame == frame && found->second.removals == removals) {
         *span = found->second.span;
         span->address += address - first;
         return true;
@@ -428,7 +430,7 @@ bool ServeOwned(const Graphics::Context& context, std::uint64_t address, std::ui
         return false;
     }
     const OwnedSpan whole{base->handle, base->address, first - base->offset};
-    served[first] = {last, frame, whole};
+    served[first] = {last, frame, service.Removals(), whole};
     *span = whole;
     span->address += address - first;
     return true;
