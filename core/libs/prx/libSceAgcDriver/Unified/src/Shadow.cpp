@@ -487,7 +487,7 @@ void LandGpuWrites(GuestRanges ranges) {
     if (!GuestMemory::GpuMutex().HeldByThisThread()) gpu.lock();
     const auto pieces = ResidencyService::Get().ReadBack(ranges);
     auto& core = MemoryCore::Get();
-    for (const auto& piece : pieces) core.LandGpuWrite(piece.guest, piece.bytes);
+    for (const auto& piece : pieces) core.LandGpuWrite(piece.guest, piece.bytes, GuestMemory::OwnStoreTarget(piece.guest, piece.bytes.size()));
 }
 
 bool OwnedUploadsPending() {

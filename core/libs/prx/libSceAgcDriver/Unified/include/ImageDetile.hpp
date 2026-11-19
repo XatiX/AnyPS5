@@ -40,7 +40,7 @@ private:
     void recordOne(Graphics::Recorder& recorder, VkCommandBuffer commands, SurfaceTable& table, Surface& surface, VulkanSurface& vulkan, VkBuffer buffer, std::uint64_t base, std::uint64_t stamp, std::uint64_t imageStamp);
     bool recordThroughBuffer(Graphics::Recorder& recorder, VkCommandBuffer commands, VulkanSurface& surface, VkBuffer source, std::uint64_t base, std::uint32_t layers, std::string& reason);
 
-    const Graphics::Context& context;
+    const Graphics::Context context;
     std::unique_ptr<Graphics::TextureDetiler> detiler;
     std::uint64_t batch = 0;
     DetileCounts counts;
