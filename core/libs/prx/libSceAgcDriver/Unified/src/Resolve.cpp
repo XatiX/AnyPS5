@@ -42,6 +42,7 @@ struct Totals {
     std::uint64_t placeholderDraws = 0;
     std::uint64_t templateMismatches = 0;
     const char* templateMismatch = nullptr;
+    Bindings::SourceCounts sources;
     std::map<std::string, std::uint64_t> reasons;
     std::array<std::uint64_t, PhaseCount> phases{};
 };
@@ -154,6 +155,16 @@ private:
             totals.slots += resolved.slots.size();
             draw.stages.push_back(std::move(resolved));
         }
+        std::vector<Bindings::StageInput> inputsOfLayout;
+        inputsOfLayout.reserve(draw.stages.size());
+        for (const auto& stage : draw.stages) inputsOfLayout.push_back({stage.program.stage, stage.program.result.get()});
+        if (!Bindings::Describe(inputsOfLayout, draw.layout, reason)) {
+            refuse(reason);
+            totals.slotNanoseconds += elapsed(slotsStarted);
+            return nullptr;
+        }
+        Bindings::CountSources(draw.layout, totals.sources);
+        draw.state = std::make_shared<const Graphics::State>(programs.decode.state);
         totals.bufferUses += draw.uses.size() - beforeBuffers;
         totals.imageUses += imageUses.size();
         for (const auto& use : imageUses) draw.uses.push_back({use.memory.address, use.memory.bytes, use.write});
@@ -191,6 +202,8 @@ public:
         std::snprintf(text, sizeof(text), "; access %.1f ranges per resolved draw, %llu incomplete (%llu indirect, %llu placeholder)", totals.resolved == 0 ? 0.0 : static_cast<double>(totals.uses) / static_cast<double>(totals.resolved), static_cast<unsigned long long>(totals.incomplete), static_cast<unsigned long long>(totals.indirect), static_cast<unsigned long long>(totals.placeholderDraws));
         line += text;
         std::snprintf(text, sizeof(text), " [targets %llu, buffers %llu, images %llu]", static_cast<unsigned long long>(totals.targetUses), static_cast<unsigned long long>(totals.bufferUses), static_cast<unsigned long long>(totals.imageUses));
+        line += text;
+        std::snprintf(text, sizeof(text), "; bindings words %llu, guest %llu, page table %llu, fault %llu, gds %llu", static_cast<unsigned long long>(totals.sources.words), static_cast<unsigned long long>(totals.sources.guest), static_cast<unsigned long long>(totals.sources.pageTable), static_cast<unsigned long long>(totals.sources.fault), static_cast<unsigned long long>(totals.sources.gds));
         line += text;
         const auto shapes = templates.TakeCounts();
         std::snprintf(text, sizeof(text), "; templates %llu hits, %llu builds (%llu stale), %llu evicted, %zu held, %.1f MiB", static_cast<unsigned long long>(shapes.hits), static_cast<unsigned long long>(shapes.builds), static_cast<unsigned long long>(shapes.rebuilds), static_cast<unsigned long long>(shapes.evictions), templates.Size(), static_cast<double>(templates.HeldBytes()) / 1048576.0);

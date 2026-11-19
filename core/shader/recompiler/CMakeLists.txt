@@ -275,6 +275,7 @@ function(add_shader_recompiler target runtimeTarget)
             RefillTemplate
             TemplateWordsDifference
             ResultTemplateBytes
+            DescriptorRole
             ExactF32Arithmetic
             HashBytes
             LayoutBarycentricEmulation
