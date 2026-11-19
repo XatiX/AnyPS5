@@ -50,12 +50,8 @@ void reportLargeTemplate(const ShaderRecompiler::ResultTemplate& shape) {
     std::fprintf(stderr, "[recode-resolve] first large template: %llu bytes; %zu bindings, descriptor words %llu bytes (largest %llu words), push %zu, table poison %llu, table ranges %llu, table read ranges %llu, vertex patches %llu, runtime images %llu, fragment parameters %llu, vertex attributes %llu\n", static_cast<unsigned long long>(bytes), result.bindings.size(), static_cast<unsigned long long>(descriptors), static_cast<unsigned long long>(largestBinding), result.pushConstants.size(), static_cast<unsigned long long>(capacityBytes(result.imageTablePoison)), static_cast<unsigned long long>(capacityBytes(result.imageTableRanges)), static_cast<unsigned long long>(readRanges), static_cast<unsigned long long>(capacityBytes(result.vertexInputPatches)), static_cast<unsigned long long>(capacityBytes(result.runtimeImageResources)), static_cast<unsigned long long>(capacityBytes(result.fragmentParameters)), static_cast<unsigned long long>(capacityBytes(result.vertexAttributes)));
 }
 
-bool usesImageTables(const ShaderRecompiler::RecompileResult& result) {
-    return std::ranges::any_of(result.bindings, [](const ShaderRecompiler::DescriptorBinding& binding) { return binding.role == ShaderRecompiler::DescriptorRole::ImageTable; });
-}
-
-bool usesImageTables(const ShaderRecompiler::ShaderInfo& info) {
-    return std::ranges::any_of(info.images, [](const auto& image) { return image.table != ShaderRecompiler::NoTable; }) || std::ranges::any_of(info.samplers, [](const auto& sampler) { return sampler.table != ShaderRecompiler::NoTable; });
+bool usesSamplerTables(const ShaderRecompiler::ShaderInfo& info) {
+    return std::ranges::any_of(info.samplers, [](const auto& sampler) { return sampler.table != ShaderRecompiler::NoTable; });
 }
 
 }
@@ -184,8 +180,8 @@ bool BuildPrograms(const ProgramInputs& inputs, const DrawFacts& facts, ProgramS
             reason = "compiled variant not reachable";
             return false;
         }
-        if (usesImageTables(source->artifact->info.info)) {
-            reason = "image tables";
+        if (usesSamplerTables(source->artifact->info.info)) {
+            reason = "sampler tables";
             return false;
         }
         auto invocation = DriverDetail::InvocationFor(*program.snapshot, program.codeOffset, request, false);
@@ -229,8 +225,8 @@ bool BuildPrograms(const ProgramInputs& inputs, const DrawFacts& facts, ProgramS
             reason = "materialize failed";
             return false;
         }
-        if (usesImageTables(*result)) {
-            reason = "image tables";
+        if (!capture->snapshot.tables.nested.empty()) {
+            reason = "nested image tables";
             return false;
         }
         if (result->pushConstants.size() > budget) {

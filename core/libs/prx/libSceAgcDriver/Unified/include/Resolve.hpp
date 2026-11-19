@@ -20,11 +20,16 @@ namespace AgcDriver::Unified::Heap {
 class VulkanHeapDevice;
 }
 
+namespace AgcDriver::Unified::Tables {
+struct Mirror;
+}
+
 namespace AgcDriver::Unified::Resolve {
 
 struct ResolvedStage {
     StageProgram program;
     std::vector<std::uint32_t> slots;
+    std::shared_ptr<const Tables::Mirror> tableMap;
 };
 
 struct ResolvedDraw {

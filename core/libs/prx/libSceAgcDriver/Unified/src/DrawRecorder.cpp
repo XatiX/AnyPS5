@@ -12,6 +12,7 @@
 #include "prx/libSceAgcDriver/Graphics/include/VertexInput.hpp"
 #include "prx/libSceAgcDriver/Unified/include/DataRing.hpp"
 #include "prx/libSceAgcDriver/Unified/include/ResidencyService.hpp"
+#include "prx/libSceAgcDriver/Unified/include/TableMirror.hpp"
 #include "prx/libSceAgcDriver/Unified/include/VulkanHeap.hpp"
 #include "BdaAbi.hpp"
 #include "RuntimeAbi.hpp"
@@ -37,6 +38,12 @@ using Graphics::Context;
 constexpr std::uint64_t RingBytes = 64ull << 20u;
 constexpr std::uint32_t PoolSets = 512;
 constexpr std::uint32_t PoolBuffers = 4096;
+constexpr std::uint64_t MapBudgetBytes = 256ull << 20u;
+
+struct MapBuffer {
+    std::shared_ptr<Graphics::Buffer> buffer;
+    std::uint64_t serial = 0;
+};
 
 struct Totals {
     std::uint64_t recorded = 0;
@@ -46,6 +53,10 @@ struct Totals {
     std::uint64_t indirect = 0;
     std::uint64_t snapshotArguments = 0;
     std::uint64_t pools = 0;
+    std::uint64_t mapHits = 0;
+    std::uint64_t mapUploads = 0;
+    std::uint64_t mapUploadBytes = 0;
+    std::uint64_t mapRetired = 0;
     std::uint64_t nanoseconds = 0;
     std::map<std::string, std::uint64_t> reasons;
 };
@@ -113,6 +124,10 @@ bool precheck(const Resolve::ResolvedDraw& draw, const Pm4::DrawParameters& para
         }
         if (binding.source == Bindings::Source::Guest || binding.source == Bindings::Source::Gds) {
             reason = "guest or GDS buffer binding";
+            return false;
+        }
+        if (binding.source == Bindings::Source::TableMap && draw.stages.at(binding.stage).tableMap == nullptr) {
+            reason = "table map without a mirror";
             return false;
         }
     }
@@ -190,6 +205,8 @@ public:
         std::snprintf(text, sizeof(text), "[recode-record] %llu recorded, %llu dropped, %llu to the existing path, %.1f us per draw; %llu indirect (%llu argument snapshots); ring %llu allocations, %.1f MiB, %llu wraps, %llu full; %llu descriptor pools", static_cast<unsigned long long>(totals.recorded), static_cast<unsigned long long>(totals.refused), static_cast<unsigned long long>(totals.existing), draws == 0 ? 0.0 : static_cast<double>(totals.nanoseconds) / 1000.0 / static_cast<double>(draws), static_cast<unsigned long long>(totals.indirect), static_cast<unsigned long long>(totals.snapshotArguments), static_cast<unsigned long long>(ring.allocations), static_cast<double>(ring.bytes) / 1048576.0, static_cast<unsigned long long>(ring.wraps), static_cast<unsigned long long>(ring.full), static_cast<unsigned long long>(totals.pools));
         std::string line = text;
         line += "; linear target stores " + std::to_string(totals.linearStores);
+        std::snprintf(text, sizeof(text), "; table maps %llu hits, %llu uploads (%.1f MiB), %llu retired, %zu held (%.1f MiB)", static_cast<unsigned long long>(totals.mapHits), static_cast<unsigned long long>(totals.mapUploads), static_cast<double>(totals.mapUploadBytes) / 1048576.0, static_cast<unsigned long long>(totals.mapRetired), maps.size(), static_cast<double>(mapBytes) / 1048576.0);
+        line += text;
         if (fault != nullptr) {
             const auto bytes = fault->Bytes();
             line += std::ranges::any_of(bytes, [](std::byte value) { return value != std::byte{0}; }) ? "; fault buffer written" : "; fault buffer clean";
@@ -223,6 +240,33 @@ private:
         auto key = "dropped: " + reason.substr(0, 50);
         if (seen.insert(key).second) std::fprintf(stderr, "[recode-record] first drop: %s\n", reason.c_str());
         if (totals.reasons.size() < 24u || totals.reasons.contains(key)) totals.reasons[key]++;
+    }
+
+    std::shared_ptr<Graphics::Buffer> mapBuffer(const Context& context, const Tables::Mirror& mirror, std::uint64_t serial, std::uint64_t completed) {
+        if (const auto found = maps.find(mirror.id); found != maps.end()) {
+            found->second.serial = serial;
+            totals.mapHits++;
+            return found->second.buffer;
+        }
+        if (mapBytes > MapBudgetBytes) {
+            for (auto at = maps.begin(); at != maps.end() && mapBytes > MapBudgetBytes / 2u;) {
+                if (at->second.serial > completed) {
+                    ++at;
+                    continue;
+                }
+                mapBytes -= at->second.buffer->Bytes().size();
+                at = maps.erase(at);
+                totals.mapRetired++;
+            }
+        }
+        const auto bytes = std::max<std::size_t>(mirror.map.size() * sizeof(std::uint32_t), 16u);
+        auto buffer = std::make_shared<Graphics::Buffer>(context, bytes, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT);
+        std::memcpy(buffer->Bytes().data(), mirror.map.data(), mirror.map.size() * sizeof(std::uint32_t));
+        mapBytes += buffer->Bytes().size();
+        maps[mirror.id] = {buffer, serial};
+        totals.mapUploads++;
+        totals.mapUploadBytes += bytes;
+        return buffer;
     }
 
     std::optional<std::uint64_t> ringWrite(std::span<const std::byte> bytes, std::uint64_t serial, std::uint64_t completed) {
@@ -412,6 +456,15 @@ private:
                         info = {pageTable->Handle(), 0, VK_WHOLE_SIZE};
                         break;
                     case Bindings::Source::Fault: info = {fault->Handle(), 0, VK_WHOLE_SIZE}; break;
+                    case Bindings::Source::TableMap: {
+                        const auto& mirror = draw.stages.at(binding.stage).tableMap;
+                        if (mirror == nullptr) {
+                            reason = "table map without a mirror";
+                            return false;
+                        }
+                        info = {mapBuffer(context, *mirror, serial, completed)->Handle(), 0, VK_WHOLE_SIZE};
+                        break;
+                    }
                     default: reason = "guest or GDS buffer binding"; return false;
                 }
                 infos.push_back(info);
@@ -577,6 +630,8 @@ private:
     std::deque<std::pair<VkDescriptorPool, std::uint64_t>> pools;
     std::vector<VkDescriptorPool> spare;
     std::map<std::pair<std::uint64_t, std::uint64_t>, std::uint32_t> outputs;
+    std::map<std::uint64_t, MapBuffer> maps;
+    std::uint64_t mapBytes = 0;
     std::set<std::string> seen;
     Totals totals;
 };

@@ -16,6 +16,7 @@ enum class Source : std::uint8_t {
     PageTable,
     Fault,
     Gds,
+    TableMap,
 };
 
 struct StageInput {
@@ -45,6 +46,7 @@ struct SourceCounts {
     std::uint64_t pageTable = 0;
     std::uint64_t fault = 0;
     std::uint64_t gds = 0;
+    std::uint64_t tableMap = 0;
 };
 
 [[nodiscard]] std::uint32_t StageBit(ShaderRecompiler::ShaderStage stage);

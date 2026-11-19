@@ -59,6 +59,21 @@ void testImagesOutsideTheHeapAreRefused() {
     Expect(!Bindings::Describe(stages, layout, reason) && reason.find("outside the heap") != std::string::npos, "an image table binding is refused");
 }
 
+void testHeapTablesBindOnlyTheirMap() {
+    ShaderRecompiler::RecompileResult fragment;
+    fragment.directHeap = true;
+    fragment.bindings.push_back(bindingOf(DescriptorRole::ImageTable, 0, 2));
+    fragment.bindings.push_back(bindingOf(DescriptorRole::ImageTableMap, 0, 3));
+    const Bindings::StageInput stages[] = {{ShaderStage::Fragment, &fragment}};
+    Bindings::Layout layout;
+    std::string reason;
+    Expect(Bindings::Describe(stages, layout, reason), "a heap-mode table stage is described");
+    Expect(layout.bindings.size() == 1 && layout.bindings[0].binding == 3 && layout.bindings[0].source == Bindings::Source::TableMap, "only the table map is bound per draw");
+    Bindings::SourceCounts counts;
+    Bindings::CountSources(layout, counts);
+    Expect(counts.tableMap == 1, "the table map is counted");
+}
+
 void testSharedBindingIsRefused() {
     ShaderRecompiler::RecompileResult vertex;
     vertex.bindings.push_back(bindingOf(DescriptorRole::ShaderData, 0, 3));
@@ -90,6 +105,7 @@ int main() {
     testOutputLocationsComeFromOutputVariables();
     testBuffersOfTwoStagesAreDescribedInOrder();
     testImagesOutsideTheHeapAreRefused();
+    testHeapTablesBindOnlyTheirMap();
     testSharedBindingIsRefused();
     if (failures != 0) {
         std::fprintf(stderr, "%d failure(s)\n", failures);

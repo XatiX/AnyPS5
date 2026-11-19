@@ -9,6 +9,7 @@
 #include "prx/libSceAgcDriver/Unified/include/Events.hpp"
 #include "prx/libSceAgcDriver/Unified/include/Refill.hpp"
 #include "prx/libSceAgcDriver/Unified/include/SlotPatch.hpp"
+#include "prx/libSceAgcDriver/Unified/include/TableMirror.hpp"
 #include "prx/libSceAgcDriver/Unified/include/VulkanHeap.hpp"
 #include "Optimization/ShaderStageInputInfo.hpp"
 #include <atomic>
@@ -41,6 +42,10 @@ struct Totals {
     std::uint64_t bufferUses = 0;
     std::uint64_t imageUses = 0;
     std::uint64_t placeholderDraws = 0;
+    std::uint64_t tableStages = 0;
+    std::uint64_t tableUses = 0;
+    std::uint64_t tableTargetHolds = 0;
+    std::uint64_t tablePlaceholders = 0;
     std::uint64_t templateMismatches = 0;
     const char* templateMismatch = nullptr;
     Bindings::SourceCounts sources;
@@ -58,6 +63,7 @@ public:
         target = HeapTarget(device->Target());
         fixedSlots = device->GraphicsPipelineLibraries();
         published.store(nullptr, std::memory_order_release);
+        mirror.reset();
         heap.reset();
         table.reset();
         memo.reset();
@@ -71,10 +77,12 @@ public:
             table = std::make_unique<Heap::SlotTable>(*heap, heap->SampledSlotCount(), heap->SamplerSlotCount(), heap->StorageSlotCount());
             memo = std::make_unique<Heap::Memo>(Events::Shared(), Events::Images());
             refill = std::make_unique<Heap::Refill>(*table, *memo, [this](const Heap::SlotRequest& request) { return image(request); }, [this](const Heap::SlotRequest& request) { return sampler(request); });
+            mirror = std::make_unique<Tables::TableMirror>(*refill);
             published.store(heap.get(), std::memory_order_release);
             std::fprintf(stderr, "[recode-resolve] descriptor heap: %u sampled, %u storage, %u sampler slots\n", heap->SampledSlotCount(), heap->StorageSlotCount(), heap->SamplerSlotCount());
         } catch (const std::exception& error) {
             std::fprintf(stderr, "[recode-resolve] descriptor heap unavailable: %s\n", error.what());
+            mirror.reset();
             heap.reset();
             table.reset();
             memo.reset();
@@ -139,6 +147,8 @@ private:
         const auto beforeBuffers = draw.uses.size();
         const auto placeholdersBefore = refill->Counts().placeholders;
         std::vector<Heap::ImageUse> imageUses;
+        std::vector<Heap::ImageUse> tableUses;
+        std::uint64_t tablePlaceholdersHere = 0;
         for (auto& stage : programs.stages) {
             bufferUses(*stage.variant, stage.capture->snapshot, draw.uses);
             std::vector<Heap::SlotRequest> requests;
@@ -157,8 +167,40 @@ private:
                 return nullptr;
             }
             totals.slots += resolved.slots.size();
+            if (std::ranges::any_of(resolved.program.result->bindings, [](const ShaderRecompiler::DescriptorBinding& binding) { return binding.role == ShaderRecompiler::DescriptorRole::ImageTableMap; })) {
+                if (!resolved.program.result->directHeap) {
+                    refuse("image tables outside heap mode");
+                    totals.slotNanoseconds += elapsed(slotsStarted);
+                    return nullptr;
+                }
+                std::shared_ptr<const ShaderRecompiler::ResolvedImageTables> tables;
+                try {
+                    tables = ShaderRecompiler::ResourceMaterializer::ResolveImageTablesShared(resolved.program.variant->info.info, resolved.program.capture->snapshot, resolved.program.variant->artifact.variantId);
+                } catch (const std::exception& error) {
+                    reason = std::string("image tables: ") + error.what();
+                }
+                const auto tablePlaceholders = refill->Counts().placeholders;
+                if (tables != nullptr) resolved.tableMap = mirror->Build(tables, reason, &tableUses);
+                if (resolved.tableMap == nullptr) {
+                    refuse(reason);
+                    totals.slotNanoseconds += elapsed(slotsStarted);
+                    return nullptr;
+                }
+                tablePlaceholdersHere += refill->Counts().placeholders - tablePlaceholders;
+                totals.tableStages++;
+            }
             draw.stages.push_back(std::move(resolved));
         }
+        for (const auto& use : tableUses) {
+            const bool target = std::any_of(draw.uses.begin() + static_cast<std::ptrdiff_t>(beforeTargets), draw.uses.begin() + static_cast<std::ptrdiff_t>(beforeBuffers),[&](const GuestUse& held) { return use.memory.address < held.address + held.size && held.address < use.memory.address + use.memory.bytes; });
+            if (target) {
+                totals.tableTargetHolds++;
+                continue;
+            }
+            draw.uses.push_back({use.memory.address, use.memory.bytes, use.write});
+            totals.tableUses++;
+        }
+        totals.tablePlaceholders += tablePlaceholdersHere;
         std::vector<Bindings::StageInput> inputsOfLayout;
         inputsOfLayout.reserve(draw.stages.size());
         for (const auto& stage : draw.stages) inputsOfLayout.push_back({stage.program.stage, stage.program.result.get()});
@@ -172,7 +214,7 @@ private:
         totals.bufferUses += draw.uses.size() - beforeBuffers;
         totals.imageUses += imageUses.size();
         for (const auto& use : imageUses) draw.uses.push_back({use.memory.address, use.memory.bytes, use.write});
-        if (refill->Counts().placeholders != placeholdersBefore) {
+        if (refill->Counts().placeholders - placeholdersBefore != tablePlaceholdersHere) {
             draw.complete = false;
             totals.placeholderDraws++;
         }
@@ -197,6 +239,11 @@ public:
             std::snprintf(text, sizeof(text), "; memo %llu hits, %llu lookups, %llu placeholders; heap %llu writes, %llu recycled, %llu full", static_cast<unsigned long long>(refills.memoHits), static_cast<unsigned long long>(refills.lookups), static_cast<unsigned long long>(refills.placeholders), static_cast<unsigned long long>(slotCounts.writes), static_cast<unsigned long long>(slotCounts.recycled), static_cast<unsigned long long>(slotCounts.full));
             line += text;
         }
+        if (mirror != nullptr) {
+            const auto mirrors = mirror->Counts();
+            std::snprintf(text, sizeof(text), "; tables %llu stages, mirrors %llu built, %llu reused, %llu elements, %llu placeholders, %llu reads, %llu target holds", static_cast<unsigned long long>(totals.tableStages), static_cast<unsigned long long>(mirrors.built), static_cast<unsigned long long>(mirrors.reused), static_cast<unsigned long long>(mirrors.elements), static_cast<unsigned long long>(totals.tablePlaceholders), static_cast<unsigned long long>(totals.tableUses), static_cast<unsigned long long>(totals.tableTargetHolds));
+            line += text;
+        }
         std::snprintf(text, sizeof(text), "; per draw: decode %.1f, prepare %.1f, capture %.1f, materialize %.1f, variant %.1f us", perDraw(totals.phases[PhaseDecode]), perDraw(totals.phases[PhasePrepare]), perDraw(totals.phases[PhaseCapture]), perDraw(totals.phases[PhaseMaterialize]), perDraw(totals.phases[PhaseVariant]));
         line += text;
         line += "; gpu lock busy " + std::to_string(totals.lockBusy);
@@ -207,7 +254,7 @@ public:
         line += text;
         std::snprintf(text, sizeof(text), " [targets %llu, buffers %llu, images %llu]", static_cast<unsigned long long>(totals.targetUses), static_cast<unsigned long long>(totals.bufferUses), static_cast<unsigned long long>(totals.imageUses));
         line += text;
-        std::snprintf(text, sizeof(text), "; bindings words %llu, guest %llu, page table %llu, fault %llu, gds %llu", static_cast<unsigned long long>(totals.sources.words), static_cast<unsigned long long>(totals.sources.guest), static_cast<unsigned long long>(totals.sources.pageTable), static_cast<unsigned long long>(totals.sources.fault), static_cast<unsigned long long>(totals.sources.gds));
+        std::snprintf(text, sizeof(text), "; bindings words %llu, guest %llu, page table %llu, fault %llu, gds %llu, table map %llu", static_cast<unsigned long long>(totals.sources.words), static_cast<unsigned long long>(totals.sources.guest), static_cast<unsigned long long>(totals.sources.pageTable), static_cast<unsigned long long>(totals.sources.fault), static_cast<unsigned long long>(totals.sources.gds), static_cast<unsigned long long>(totals.sources.tableMap));
         line += text;
         const auto shapes = templates.TakeCounts();
         std::snprintf(text, sizeof(text), "; templates %llu hits, %llu builds (%llu stale), %llu evicted, %zu held, %.1f MiB", static_cast<unsigned long long>(shapes.hits), static_cast<unsigned long long>(shapes.builds), static_cast<unsigned long long>(shapes.rebuilds), static_cast<unsigned long long>(shapes.evictions), templates.Size(), static_cast<double>(templates.HeldBytes()) / 1048576.0);
@@ -307,6 +354,7 @@ private:
     std::unique_ptr<Heap::SlotTable> table;
     std::unique_ptr<Heap::Memo> memo;
     std::unique_ptr<Heap::Refill> refill;
+    std::unique_ptr<Tables::TableMirror> mirror;
     TemplateTable templates{templateBudget()};
     PacketTable<ResolvedDraw> handoff;
     Totals totals;
