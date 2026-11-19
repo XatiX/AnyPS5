@@ -80,14 +80,15 @@ std::size_t Memo::KeyHash::operator()(const DescriptorKey& key) const {
 
 Memo::Memo(const Events::ChangeLog& shared, const Events::ChangeLog& images, std::size_t bound) : shared(shared), images(images), bound(bound == 0u ? 1u : bound) {}
 
-std::optional<std::uint32_t> Memo::Find(const DescriptorKey& key, Span* image) {
+std::optional<std::uint32_t> Memo::Find(const DescriptorKey& key, Span* image, std::shared_ptr<const void>* owner) {
     const auto found = entries.find(key);
     if (found == entries.end()) {
         counts.misses++;
         return std::nullopt;
     }
     const auto& entry = found->second;
-    if (entry.owner.expired()) {
+    auto strong = entry.owner.lock();
+    if (strong == nullptr) {
         counts.expired++;
         counts.misses++;
         entries.erase(found);
@@ -103,6 +104,7 @@ std::optional<std::uint32_t> Memo::Find(const DescriptorKey& key, Span* image) {
     }
     counts.hits++;
     if (image != nullptr) *image = entry.image;
+    if (owner != nullptr) *owner = std::move(strong);
     return entry.slot;
 }
 

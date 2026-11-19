@@ -143,9 +143,15 @@ ChangeLog& Images() {
     return log;
 }
 
+ChangeLog& GpuWrites() {
+    static ChangeLog& log = *new ChangeLog();
+    return log;
+}
+
 void NoteImage(std::uint64_t address, std::uint64_t bytes, std::uintptr_t owner) {
     Shared().Note(address, bytes, owner);
     Images().Note(address, bytes, owner);
+    if (owner != ImageSetOwner) GpuWrites().Note(address, bytes, owner);
 }
 
 void NoteRanges(std::span<const std::pair<std::uint64_t, std::uint64_t>> ranges, std::uintptr_t owner) {

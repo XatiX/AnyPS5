@@ -55,9 +55,13 @@ std::size_t SurfaceTable::KeyHash::operator()(const SurfaceKey& key) const {
 std::optional<Found> SurfaceTable::Find(const SurfaceKey& key, std::span<const std::uint32_t, 8> words, std::string& reason) {
     std::lock_guard lock(mutex);
     counts.lookups++;
+    if (gpuWrites.ChangedSince(key.address, key.bytes, 0)) {
+        counts.gpuWritten++;
+        return Found{nullptr, false, true};
+    }
     if (const auto found = surfaces.find(key); found != surfaces.end()) {
         auto& surface = found->second;
-        if (surface->state == State::Ready && (shared.ChangedSince(key.address, key.bytes, surface->stamp) || images.ChangedSince(key.address, key.bytes, surface->imageStamp))) {
+        if (surface->state == State::Ready && (shared.ChangedSince(key.address, key.bytes, surface->stamp, Events::ImageSetOwner) || gpuWrites.ChangedSince(key.address, key.bytes, surface->imageStamp))) {
             surface->state = State::Stale;
             work.push_back(surface);
             counts.stale++;

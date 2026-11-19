@@ -12,9 +12,11 @@
 #include "prx/libSceAgcDriver/Graphics/include/VertexInput.hpp"
 #include "prx/libSceAgcDriver/Unified/include/DataRing.hpp"
 #include "prx/libSceAgcDriver/Unified/include/Events.hpp"
+#include "prx/libSceAgcDriver/Unified/include/ImageDetile.hpp"
 #include "prx/libSceAgcDriver/Unified/include/ResidencyService.hpp"
 #include "prx/libSceAgcDriver/Unified/include/Shadow.hpp"
 #include "prx/libSceAgcDriver/Unified/include/TableMirror.hpp"
+#include "prx/libSceAgcDriver/Unified/include/Targets.hpp"
 #include "prx/libSceAgcDriver/Unified/include/VulkanHeap.hpp"
 #include "BdaAbi.hpp"
 #include "RuntimeAbi.hpp"
@@ -64,7 +66,10 @@ struct Totals {
     std::uint64_t mapUploads = 0;
     std::uint64_t mapUploadBytes = 0;
     std::uint64_t mapRetired = 0;
+    std::uint64_t surfaceFailures = 0;
     std::uint64_t faultReads = 0;
+    std::uint64_t batchMoves = 0;
+    std::uint64_t residencyLands = 0;
     std::uint64_t faults = 0;
     std::uint64_t unmappedFaults = 0;
     std::uint64_t faultPages = 0;
@@ -121,8 +126,16 @@ bool precheck(const Resolve::ResolvedDraw& draw, const Pm4::DrawParameters& para
         }
     }
     for (const auto& color : state.colors) {
-        if (color.samples > 1u || color.mipTail || color.layers != 1u) {
-            reason = "color target shape";
+        if (color.samples > 1u) {
+            reason = "multisampled color target";
+            return false;
+        }
+        if (color.mipTail) {
+            reason = "color target in a mip tail";
+            return false;
+        }
+        if (color.layers != 1u) {
+            reason = "layered color target";
             return false;
         }
     }
@@ -218,6 +231,8 @@ public:
         std::snprintf(text, sizeof(text), "[recode-record] %llu recorded, %llu dropped, %llu to the existing path, %.1f us per draw; %llu indirect (%llu argument snapshots); ring %llu allocations, %.1f MiB, %llu wraps, %llu full; %llu descriptor pools", static_cast<unsigned long long>(totals.recorded), static_cast<unsigned long long>(totals.refused), static_cast<unsigned long long>(totals.existing), draws == 0 ? 0.0 : static_cast<double>(totals.nanoseconds) / 1000.0 / static_cast<double>(draws), static_cast<unsigned long long>(totals.indirect), static_cast<unsigned long long>(totals.snapshotArguments), static_cast<unsigned long long>(ring.allocations), static_cast<double>(ring.bytes) / 1048576.0, static_cast<unsigned long long>(ring.wraps), static_cast<unsigned long long>(ring.full), static_cast<unsigned long long>(totals.pools));
         std::string line = text;
         line += "; linear target stores " + std::to_string(totals.linearStores);
+        line += "; batch moved before the pass " + std::to_string(totals.batchMoves);
+        line += "; residency updates landed " + std::to_string(totals.residencyLands);
         std::snprintf(text, sizeof(text), "; table maps %llu hits, %llu uploads (%.1f MiB), %llu retired, %zu held (%.1f MiB)", static_cast<unsigned long long>(totals.mapHits), static_cast<unsigned long long>(totals.mapUploads), static_cast<double>(totals.mapUploadBytes) / 1048576.0, static_cast<unsigned long long>(totals.mapRetired), maps.size(), static_cast<double>(mapBytes) / 1048576.0);
         line += text;
         std::snprintf(text, sizeof(text), "; fault buffers %zu in flight, %llu read: %llu faults (%llu unmapped), %llu fault pages served, %llu written ranges landed, %llu written overflows", faults.size(), static_cast<unsigned long long>(totals.faultReads), static_cast<unsigned long long>(totals.faults), static_cast<unsigned long long>(totals.unmappedFaults), static_cast<unsigned long long>(totals.faultPages), static_cast<unsigned long long>(totals.writtenRanges), static_cast<unsigned long long>(totals.writtenOverflows));
@@ -255,6 +270,22 @@ private:
         auto key = "dropped: " + reason.substr(0, 50);
         if (seen.insert(key).second) std::fprintf(stderr, "[recode-record] first drop: %s\n", reason.c_str());
         if (totals.reasons.size() < 24u || totals.reasons.contains(key)) totals.reasons[key]++;
+    }
+
+    void drainSurfaces(const Context& context, Graphics::Recorder& recorder) {
+        auto* table = Resolve::Surfaces();
+        if (table == nullptr) return;
+        auto work = table->TakeWork();
+        if (work.empty()) return;
+        if (surfaceDetiler == nullptr) surfaceDetiler = std::make_unique<Images::SurfaceDetiler>(context);
+        for (const auto& surface : work) {
+            std::string why;
+            if (surfaceDetiler->Record(recorder, *table, surface, why)) continue;
+            totals.surfaceFailures++;
+            auto key = "surface: " + why.substr(0, 50);
+            if (seen.insert(key).second) std::fprintf(stderr, "[recode-record] first surface failure: %s\n", why.c_str());
+            if (totals.reasons.size() < 24u || totals.reasons.contains(key)) totals.reasons[key]++;
+        }
     }
 
     void readFaults(Graphics::Buffer& buffer) {
@@ -427,6 +458,7 @@ private:
             return false;
         }
         if (!attach(context, reason) || !precheck(draw, parameters, nullptr, reason)) return false;
+        drainSurfaces(context, *recorder);
         const auto& state = *draw.state;
         std::vector<Graphics::CompiledShader> shaders;
         for (const auto& stage : draw.stages) shaders.push_back({stage.program.stage, stage.program.result.get(), stage.program.pushOffset});
@@ -468,6 +500,7 @@ private:
                 return false;
             }
             views.push_back(resident->AttachmentView(color.format, color.mip, color.depthSlice, color.layers, color.arraySlice));
+            Images::Targets().Note(resident);
             owners.push_back(resident);
             residents.push_back(std::move(resident));
         }
@@ -489,6 +522,7 @@ private:
         auto framebuffer = pipeline->AcquireFramebuffer(views, owners, state.renderExtent, state.renderLayers);
         const auto masked = maskedOutputs(state, fragmentOutputs(shaders));
 
+        recorder->OpenBatch();
         const auto serial = recorder->OpenBatchSerial();
         const auto completed = recorder->CompletedThrough();
         std::array<VkDescriptorSet, 2> descriptorSets{};
@@ -620,6 +654,11 @@ private:
             recorder->NotePendingRead(parameters.indexAddress, bytes, Graphics::Recorder::ReadKind::DrawInput);
         }
 
+        if (Shadow::OwnedUploadsPending()) {
+            std::vector<std::shared_ptr<void>> kept;
+            if (Shadow::RecordOwnedUploads(recorder->Commands(), kept) != 0u) totals.residencyLands++;
+            for (auto& object : kept) recorder->Keep(std::move(object));
+        }
         if (recorder->HasQueuedKeyStores()) recorder->FlushKeyStores();
         if (recorder->HasQueuedStores()) recorder->FlushStores();
         const auto key = Graphics::DrawRenderPassKey(context, state, views);
@@ -628,6 +667,7 @@ private:
         access.anyWrites = true;
         const bool fenced = state.depth.has_value();
         const auto start = recorder->StartDrawPass(key, true, fenced, access);
+        if (recorder->OpenBatchSerial() != serial) totals.batchMoves++;
         const auto commands = start.commands;
         auto& recording = recorder->GraphicsState();
         recorder->PrepareSampleSlot();
@@ -671,6 +711,10 @@ private:
         recorder->LeaveRenderPassOpen(key, 0, fenced, access);
         recorder->Keep(pipeline);
         recorder->Keep(framebuffer);
+        for (const auto& stage : draw.stages) {
+            for (const auto& owner : stage.owners) recorder->Keep(std::const_pointer_cast<void>(owner));
+            if (stage.tableMap != nullptr) recorder->Keep(std::const_pointer_cast<Tables::Mirror>(stage.tableMap));
+        }
         if (pageTable != nullptr) recorder->Keep(pageTable);
         std::vector<bool> storeNow(residents.size(), false);
         for (std::size_t index = 0; index < residents.size(); ++index) {
@@ -703,6 +747,7 @@ private:
     std::uint64_t mapBytes = 0;
     std::set<std::string> seen;
     std::set<std::uint32_t> seenFaults;
+    std::unique_ptr<Images::SurfaceDetiler> surfaceDetiler;
     Totals totals;
 };
 

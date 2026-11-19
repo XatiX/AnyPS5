@@ -25,6 +25,7 @@ public:
     [[nodiscard]] const Graphics::GuestTextureResource& Resource() const { return resource; }
     [[nodiscard]] const Graphics::SurfaceGeometry& Geometry() const { return geometry; }
     [[nodiscard]] bool Initialized() const { return initialized; }
+    [[nodiscard]] bool Compressed() const { return compressed; }
     void SetInitialized() { initialized = true; }
 
 private:
@@ -35,6 +36,8 @@ private:
     VkImage image = VK_NULL_HANDLE;
     VkDeviceMemory memory = VK_NULL_HANDLE;
     bool initialized = false;
+    bool compressed = false;
+    bool identity = false;
     std::mutex mutex;
     std::map<std::tuple<std::uint32_t, std::uint32_t, std::uint32_t, std::uint32_t, std::uint32_t, std::uint32_t>, VkImageView> views;
     std::map<std::tuple<std::uint32_t, std::uint32_t, std::uint32_t>, VkImageView> storageViews;

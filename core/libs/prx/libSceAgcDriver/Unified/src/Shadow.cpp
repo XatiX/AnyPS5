@@ -476,6 +476,10 @@ void ServeFaultPages(std::span<const std::uint64_t> pages) {
     }
 }
 
+void ForgetImport(std::uint64_t base, std::uint64_t bytes, std::uint64_t deviceBegin, std::uint64_t deviceEnd) {
+    ResidencyService::Get().ForgetImport(base, bytes, deviceBegin, deviceEnd);
+}
+
 void LandGpuWrites(GuestRanges ranges) {
     static const bool ahead = std::getenv("APS5_RECODE_NO_READBACK_AHEAD") == nullptr;
     if (!ahead || ranges.empty() || !ServesOwned()) return;

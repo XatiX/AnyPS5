@@ -42,7 +42,7 @@ bool SurfaceDetiler::Record(Graphics::Recorder& recorder, SurfaceTable& table, c
     }
     const auto& key = surface->key;
     const auto stamp = Events::Shared().Serial();
-    const auto imageStamp = Events::Images().Serial();
+    const auto imageStamp = Events::GpuWrites().Serial();
     Shadow::OwnedSpan span;
     if (!Shadow::ServeOwned(context, key.address, key.bytes, &span) || span.handle == 0u || key.address < span.origin) {
         reason = "surface memory not resident";
@@ -68,6 +68,18 @@ bool SurfaceDetiler::Record(Graphics::Recorder& recorder, SurfaceTable& table, c
         const auto buffer = reinterpret_cast<VkBuffer>(static_cast<std::uintptr_t>(span.handle));
         const auto base = key.address - span.origin;
         const auto layers = std::min(geometry.layers, std::max(geometry.imageLayers, 1u));
+        if (vulkan->Compressed()) {
+            if (!recordThroughBuffer(recorder, commands, *vulkan, buffer, base, layers, reason)) {
+                counts.refused++;
+                return false;
+            }
+            recorder.Keep(surface);
+            vulkan->SetInitialized();
+            table.MarkReady(*surface, stamp, imageStamp);
+            counts.surfaces++;
+            counts.bytes += key.bytes;
+            return true;
+        }
         for (std::uint32_t level = 0; level < geometry.mips.size(); ++level) {
             const auto& mip = geometry.mips[level];
             for (std::uint32_t layer = 0; layer < layers; ++layer) {
@@ -87,6 +99,51 @@ bool SurfaceDetiler::Record(Graphics::Recorder& recorder, SurfaceTable& table, c
     table.MarkReady(*surface, stamp, imageStamp);
     counts.surfaces++;
     counts.bytes += key.bytes;
+    return true;
+}
+
+bool SurfaceDetiler::recordThroughBuffer(Graphics::Recorder& recorder, VkCommandBuffer commands, VulkanSurface& surface, VkBuffer source, std::uint64_t base, std::uint32_t layers, std::string& reason) {
+    const auto& resource = surface.Resource();
+    const auto& geometry = surface.Geometry();
+    const auto elementBytes = Graphics::BytesPerElement(resource.format);
+    const auto blockWidth = std::max(Graphics::BlockWidth(resource.format), 1u);
+    std::uint64_t total = 0;
+    for (const auto& mip : geometry.mips) total = std::max(total, mip.linearOffset + mip.linearSize);
+    const auto layerBytes = std::max<std::uint64_t>(geometry.sliceLinearBytes, total);
+    std::vector<VkBufferImageCopy> regions;
+    for (std::uint32_t level = 0; level < geometry.mips.size(); ++level) {
+        const auto& mip = geometry.mips[level];
+        if (mip.pitchBytes == 0u || mip.pitchBytes % elementBytes != 0u) {
+            reason = "linear mip pitch";
+            return false;
+        }
+        const auto rowTexels = mip.pitchBytes / elementBytes * blockWidth;
+        for (std::uint32_t layer = 0; layer < layers; ++layer) {
+            if (!geometry.HasLayer(level, layer)) continue;
+            VkBufferImageCopy region{};
+            region.bufferOffset = static_cast<std::uint64_t>(layer) * layerBytes + mip.linearOffset;
+            region.bufferRowLength = rowTexels;
+            region.bufferImageHeight = 0u;
+            region.imageSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, level, layer, 1u};
+            region.imageExtent = {std::max(mip.width, 1u), std::max(mip.height, 1u), 1u};
+            regions.push_back(region);
+        }
+    }
+    auto scratch = std::make_shared<Graphics::DeviceBuffer>(context, static_cast<std::size_t>(layerBytes * layers), VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_SRC_BIT);
+    std::size_t index = 0;
+    for (std::uint32_t level = 0; level < geometry.mips.size(); ++level) {
+        const auto& mip = geometry.mips[level];
+        for (std::uint32_t layer = 0; layer < layers; ++layer) {
+            if (!geometry.HasLayer(level, layer)) continue;
+            detiler->Dispatch(commands, resource.tileMode, elementBytes, source, base + geometry.GuestOffset(layer, mip), scratch->Handle(), regions[index++].bufferOffset, mip);
+            counts.dispatches++;
+        }
+    }
+    Graphics::RecordMemoryBarrier(context, commands, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_ACCESS_SHADER_WRITE_BIT, VK_ACCESS_TRANSFER_READ_BIT);
+    imageBarrier(context, commands, surface.Image(), surface.Initialized() ? VK_IMAGE_LAYOUT_GENERAL : VK_IMAGE_LAYOUT_UNDEFINED, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_ACCESS_SHADER_READ_BIT, VK_ACCESS_TRANSFER_WRITE_BIT);
+    context.Resolved(&Graphics::DeviceFunctions::cmdCopyBufferToImage, "vkCmdCopyBufferToImage")(commands, scratch->Handle(), surface.Image(), VK_IMAGE_LAYOUT_GENERAL, static_cast<std::uint32_t>(regions.size()), regions.data());
+    imageBarrier(context, commands, surface.Image(), VK_IMAGE_LAYOUT_GENERAL, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_ACCESS_TRANSFER_WRITE_BIT, VK_ACCESS_SHADER_READ_BIT);
+    recorder.Keep(scratch);
     return true;
 }
 

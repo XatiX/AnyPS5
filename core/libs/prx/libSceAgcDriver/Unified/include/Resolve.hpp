@@ -24,12 +24,17 @@ namespace AgcDriver::Unified::Tables {
 struct Mirror;
 }
 
+namespace AgcDriver::Unified::Images {
+class SurfaceTable;
+}
+
 namespace AgcDriver::Unified::Resolve {
 
 struct ResolvedStage {
     StageProgram program;
     std::vector<std::uint32_t> slots;
     std::shared_ptr<const Tables::Mirror> tableMap;
+    std::vector<std::shared_ptr<const void>> owners;
 };
 
 struct ResolvedDraw {
@@ -47,6 +52,7 @@ void Consume(const Operation& operation, const DecodeState& state);
 [[nodiscard]] std::string Line();
 [[nodiscard]] PacketTable<ResolvedDraw>& ResolvedDraws();
 [[nodiscard]] const Heap::VulkanHeapDevice* HeapDevice();
+[[nodiscard]] Images::SurfaceTable* Surfaces();
 
 }
 

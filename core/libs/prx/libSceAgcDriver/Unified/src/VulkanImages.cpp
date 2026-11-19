@@ -27,8 +27,10 @@ std::optional<VkComponentSwizzle> swizzleOf(std::uint32_t select) {
 
 VulkanSurface::VulkanSurface(const Graphics::Context& context, const Graphics::GuestTextureResource& resource, Graphics::SurfaceGeometry geometry, VkFormat format) : context(context), resource(resource), geometry(std::move(geometry)), format(format) {
     const bool volume = resource.dimension == Graphics::TextureDimension::k3D;
+    compressed = Graphics::BlockWidth(resource.format) != 1u;
+    identity = Graphics::IsConvertedTextureFormat(resource.format) && format != VK_FORMAT_B10G11R11_UFLOAT_PACK32;
     VkImageCreateInfo info{VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO};
-    info.flags = VK_IMAGE_CREATE_MUTABLE_FORMAT_BIT | VK_IMAGE_CREATE_EXTENDED_USAGE_BIT;
+    info.flags = compressed ? 0u : VK_IMAGE_CREATE_MUTABLE_FORMAT_BIT | VK_IMAGE_CREATE_EXTENDED_USAGE_BIT;
     info.imageType = volume ? VK_IMAGE_TYPE_3D : VK_IMAGE_TYPE_2D;
     info.format = format;
     info.extent = {std::max(resource.width, 1u), std::max(resource.height, 1u), volume ? std::max(this->geometry.imageDepth, 1u) : 1u};
@@ -36,7 +38,7 @@ VulkanSurface::VulkanSurface(const Graphics::Context& context, const Graphics::G
     info.arrayLayers = volume ? 1u : std::max(this->geometry.imageLayers, 1u);
     info.samples = VK_SAMPLE_COUNT_1_BIT;
     info.tiling = VK_IMAGE_TILING_OPTIMAL;
-    info.usage = VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_STORAGE_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT;
+    info.usage = VK_IMAGE_USAGE_SAMPLED_BIT | (compressed ? 0u : VK_IMAGE_USAGE_STORAGE_BIT) | VK_IMAGE_USAGE_TRANSFER_DST_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT;
     info.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
     info.initialLayout = VK_IMAGE_LAYOUT_UNDEFINED;
     Graphics::Check(context.Function<PFN_vkCreateImage>("vkCreateImage")(context.device, &info, nullptr, &image), "vkCreateImage recode surface");
@@ -91,7 +93,7 @@ std::uint64_t VulkanSurface::View(const ViewKey& view, std::uint32_t kind, std::
     if (const auto found = views.find(key); found != views.end()) return reinterpret_cast<std::uint64_t>(found->second);
     VkComponentMapping components{};
     VkComponentSwizzle* channels[] = {&components.r, &components.g, &components.b, &components.a};
-    for (std::uint32_t channel = 0; channel < 4u; ++channel) {
+    for (std::uint32_t channel = 0; channel < 4u && !identity; ++channel) {
         const auto select = swizzleOf((view.swizzle >> (channel * 4u)) & 0xfu);
         if (!select.has_value()) {
             reason = "invalid image channel selector";
@@ -102,7 +104,7 @@ std::uint64_t VulkanSurface::View(const ViewKey& view, std::uint32_t kind, std::
     VkImageViewUsageCreateInfo usage{VK_STRUCTURE_TYPE_IMAGE_VIEW_USAGE_CREATE_INFO};
     usage.usage = VK_IMAGE_USAGE_SAMPLED_BIT;
     VkImageViewCreateInfo info{VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO};
-    info.pNext = &usage;
+    info.pNext = compressed ? nullptr : &usage;
     info.image = image;
     info.viewType = type;
     info.format = format;
@@ -142,8 +144,8 @@ std::shared_ptr<DeviceSurface> VulkanSurfaceDevice::Create(const SurfaceKey&, st
             reason = "surface dimension";
             return nullptr;
         }
-        if (Graphics::IsConvertedTextureFormat(resource.format) || Graphics::BlockWidth(resource.format) != 1u) {
-            reason = "converted or block-compressed surface";
+        if (Graphics::IsRepackedTextureFormat(resource.format)) {
+            reason = "repacked surface";
             return nullptr;
         }
         auto geometry = Graphics::DescribeSurface(resource);

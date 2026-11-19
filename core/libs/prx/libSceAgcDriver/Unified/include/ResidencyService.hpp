@@ -40,6 +40,7 @@ public:
     std::optional<DeviceSpan> Serve(std::uint64_t address, std::uint64_t size, std::span<const std::pair<std::uint64_t, std::uint64_t>> committed);
     bool ServeFaultPage(std::uint64_t page, std::uint64_t allocation, std::uint64_t allocationBytes, std::span<const std::pair<std::uint64_t, std::uint64_t>> committed);
     void MapImports(std::uint64_t serial, std::shared_ptr<const std::vector<ShaderRecompiler::BdaAbi::Range>> ranges);
+    void ForgetImport(std::uint64_t base, std::uint64_t bytes, std::uint64_t deviceBegin, std::uint64_t deviceEnd);
     [[nodiscard]] std::shared_ptr<Graphics::Buffer> PageTableBuffer() const;
     std::vector<PendingUpload> ReadBack(std::span<const std::pair<std::uint64_t, std::uint64_t>> ranges);
     [[nodiscard]] bool Pending() const;
@@ -72,6 +73,7 @@ private:
     std::deque<std::shared_ptr<const std::vector<ShaderRecompiler::BdaAbi::Range>>> importSpaces;
     std::uint64_t importSerial = 0;
     std::uint64_t importMaps = 0;
+    std::uint64_t importPagesForgotten = 0;
     std::uint64_t faultPagesMapped = 0;
     std::uint64_t serveRefusals = 0;
     std::atomic<std::uint64_t> frame{1};

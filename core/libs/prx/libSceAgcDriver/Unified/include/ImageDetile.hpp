@@ -13,6 +13,8 @@ class TextureDetiler;
 
 namespace AgcDriver::Unified::Images {
 
+class VulkanSurface;
+
 struct DetileCounts {
     std::uint64_t surfaces = 0;
     std::uint64_t dispatches = 0;
@@ -31,6 +33,8 @@ public:
     [[nodiscard]] DetileCounts TakeCounts();
 
 private:
+    bool recordThroughBuffer(Graphics::Recorder& recorder, VkCommandBuffer commands, VulkanSurface& surface, VkBuffer source, std::uint64_t base, std::uint32_t layers, std::string& reason);
+
     const Graphics::Context& context;
     std::unique_ptr<Graphics::TextureDetiler> detiler;
     std::uint64_t batch = 0;

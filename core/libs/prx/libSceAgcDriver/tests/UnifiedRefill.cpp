@@ -121,6 +121,19 @@ void testExpiredTextureTakesANewLookup() {
     Expect(fixture.imageLookups == lookups + 1u, "an expired texture is looked up again");
 }
 
+void testFillHandsBackImageOwners() {
+    Fixture fixture;
+    const std::vector<SlotRequest> requests{Image(5u), Sampler(1u), Image(6u)};
+    std::vector<std::uint32_t> slots;
+    std::vector<std::shared_ptr<const void>> owners;
+    std::string reason;
+    Expect(fixture.refill.Fill(requests, slots, reason, nullptr, &owners) && owners.size() == 2u && owners[0] == fixture.textures[5u] && owners[1] == fixture.textures[6u], "a fill hands back the owner of each image");
+    owners.clear();
+    Expect(fixture.refill.Fill(requests, slots, reason, nullptr, &owners) && fixture.imageLookups == 2u && owners.size() == 2u && owners[0] == fixture.textures[5u], "memo hits hand back the owners too");
+    fixture.textures.clear();
+    Expect(owners[0].use_count() == 1 && fixture.refill.Fill(requests, slots, reason) && fixture.imageLookups == 2u, "a held owner keeps the memo entry alive after the lookup drops it");
+}
+
 void testFullHeapFailsTheFill() {
     Fixture fixture;
     std::vector<SlotRequest> requests;
@@ -137,6 +150,7 @@ int main() {
     testRefillUsesTheMemoUntilTheImageChanges();
     testFillReportsImageMemory();
     testExpiredTextureTakesANewLookup();
+    testFillHandsBackImageOwners();
     testFullHeapFailsTheFill();
     if (failures != 0) {
         std::fprintf(stderr, "%d failure(s)\n", failures);

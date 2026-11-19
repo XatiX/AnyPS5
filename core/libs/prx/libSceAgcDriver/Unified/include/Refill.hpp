@@ -39,11 +39,11 @@ class Refill {
 public:
     Refill(SlotTable& table, Memo& memo, ImageLookup images, SamplerLookup samplers);
 
-    [[nodiscard]] bool Fill(std::span<const SlotRequest> requests, std::vector<std::uint32_t>& slots, std::string& reason, std::vector<ImageUse>* uses = nullptr);
+    [[nodiscard]] bool Fill(std::span<const SlotRequest> requests, std::vector<std::uint32_t>& slots, std::string& reason, std::vector<ImageUse>* uses = nullptr, std::vector<std::shared_ptr<const void>>* owners = nullptr);
     [[nodiscard]] RefillCounts Counts() const { return counts; }
 
 private:
-    [[nodiscard]] std::uint32_t image(const SlotRequest& request, std::string& reason, Span& memory);
+    [[nodiscard]] std::uint32_t image(const SlotRequest& request, std::string& reason, Span& memory, std::shared_ptr<const void>& owner);
     [[nodiscard]] std::uint32_t sampler(const SlotRequest& request, std::string& reason);
 
     SlotTable& table;
