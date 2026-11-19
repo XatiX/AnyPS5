@@ -21,6 +21,8 @@ struct ProgramInputs {
     bool fixedSlots = false;
     TemplateTable* templates = nullptr;
     bool verifyTemplates = false;
+    const ShaderRecompiler::SpirvTarget* computeWave32 = nullptr;
+    const ShaderRecompiler::SpirvTarget* computeWave64 = nullptr;
 };
 
 struct StageProgram {
@@ -56,6 +58,7 @@ struct ProgramSet {
 [[nodiscard]] ShaderRecompiler::SpirvTarget HeapTarget(const ShaderRecompiler::SpirvTarget& device);
 [[nodiscard]] bool DecodePrograms(const ProgramInputs& inputs, DriverDetail::DrawDecode& decode, std::string& reason);
 [[nodiscard]] bool BuildPrograms(const ProgramInputs& inputs, const DrawFacts& facts, ProgramSet& out, std::string& reason);
+[[nodiscard]] bool BuildComputeProgram(const ProgramInputs& inputs, const DispatchFacts& facts, ProgramSet& out, std::string& reason);
 
 }
 
