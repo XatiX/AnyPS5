@@ -45,6 +45,7 @@ bool ServesOwned();
 bool ServeOwned(const Graphics::Context& context, std::uint64_t address, std::uint64_t size, OwnedSpan* span);
 void ServeFaultPages(std::span<const std::uint64_t> pages);
 void LandGpuWrites(GuestRanges ranges);
+void ForgetImport(std::uint64_t base, std::uint64_t bytes, std::uint64_t deviceBegin, std::uint64_t deviceEnd);
 bool OwnedUploadsPending();
 std::size_t RecordOwnedUploads(VkCommandBuffer commands, std::vector<std::shared_ptr<void>>& kept);
 

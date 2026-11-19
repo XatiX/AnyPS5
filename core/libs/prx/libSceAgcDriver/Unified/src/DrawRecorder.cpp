@@ -69,6 +69,7 @@ struct Totals {
     std::uint64_t surfaceFailures = 0;
     std::uint64_t faultReads = 0;
     std::uint64_t batchMoves = 0;
+    std::uint64_t residencyLands = 0;
     std::uint64_t faults = 0;
     std::uint64_t unmappedFaults = 0;
     std::uint64_t faultPages = 0;
@@ -231,6 +232,7 @@ public:
         std::string line = text;
         line += "; linear target stores " + std::to_string(totals.linearStores);
         line += "; batch moved before the pass " + std::to_string(totals.batchMoves);
+        line += "; residency updates landed " + std::to_string(totals.residencyLands);
         std::snprintf(text, sizeof(text), "; table maps %llu hits, %llu uploads (%.1f MiB), %llu retired, %zu held (%.1f MiB)", static_cast<unsigned long long>(totals.mapHits), static_cast<unsigned long long>(totals.mapUploads), static_cast<double>(totals.mapUploadBytes) / 1048576.0, static_cast<unsigned long long>(totals.mapRetired), maps.size(), static_cast<double>(mapBytes) / 1048576.0);
         line += text;
         std::snprintf(text, sizeof(text), "; fault buffers %zu in flight, %llu read: %llu faults (%llu unmapped), %llu fault pages served, %llu written ranges landed, %llu written overflows", faults.size(), static_cast<unsigned long long>(totals.faultReads), static_cast<unsigned long long>(totals.faults), static_cast<unsigned long long>(totals.unmappedFaults), static_cast<unsigned long long>(totals.faultPages), static_cast<unsigned long long>(totals.writtenRanges), static_cast<unsigned long long>(totals.writtenOverflows));
@@ -652,6 +654,11 @@ private:
             recorder->NotePendingRead(parameters.indexAddress, bytes, Graphics::Recorder::ReadKind::DrawInput);
         }
 
+        if (Shadow::OwnedUploadsPending()) {
+            std::vector<std::shared_ptr<void>> kept;
+            if (Shadow::RecordOwnedUploads(recorder->Commands(), kept) != 0u) totals.residencyLands++;
+            for (auto& object : kept) recorder->Keep(std::move(object));
+        }
         if (recorder->HasQueuedKeyStores()) recorder->FlushKeyStores();
         if (recorder->HasQueuedStores()) recorder->FlushStores();
         const auto key = Graphics::DrawRenderPassKey(context, state, views);
