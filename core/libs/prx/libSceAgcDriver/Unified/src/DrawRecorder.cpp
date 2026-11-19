@@ -93,6 +93,11 @@ std::uint64_t elapsed(std::chrono::steady_clock::time_point from) {
     return static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - from).count());
 }
 
+bool servesFaultPages() {
+    static const bool serves = std::getenv("APS5_RECODE_NO_FAULT_SERVE") == nullptr;
+    return serves;
+}
+
 bool writesStencil(const Graphics::State& state) {
     const auto keeps = [](const VkStencilOpState& face) {
         return face.writeMask == 0u || (face.failOp == VK_STENCIL_OP_KEEP && face.passOp == VK_STENCIL_OP_KEEP && face.depthFailOp == VK_STENCIL_OP_KEEP);
@@ -431,6 +436,7 @@ private:
             std::vector<std::uint64_t> pages;
             if (Abi::ForEachFaultPage(words, [&](std::uint64_t page) { pages.push_back(page); }) && !pages.empty()) {
                 totals.faultPages += pages.size();
+                if (servesFaultPages()) Shadow::ServeFaultPages(pages);
             }
         }
         std::memset(bytes.data(), 0, bytes.size());
