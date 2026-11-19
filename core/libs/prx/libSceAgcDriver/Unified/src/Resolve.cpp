@@ -93,9 +93,11 @@ struct Totals {
 class Resolver {
 public:
     void Attach(const std::shared_ptr<VulkanDevice>& device) {
+        if (device == nullptr || device.get() == attachedDevice.load(std::memory_order_acquire)) return;
         std::lock_guard lock(mutex);
-        if (device == nullptr || device.get() == attached.get()) return;
+        if (device.get() == attached.get()) return;
         attached = device;
+        attachedDevice.store(device.get(), std::memory_order_release);
         context = std::make_unique<Graphics::Context>(device->graphicsContext());
         target = HeapTarget(device->Target());
         computeWave32 = HeapTarget(device->ComputeTarget(32u));
@@ -582,6 +584,7 @@ private:
 
     std::mutex mutex;
     std::shared_ptr<VulkanDevice> attached;
+    std::atomic<const VulkanDevice*> attachedDevice{nullptr};
     std::unique_ptr<Graphics::Context> context;
     ShaderRecompiler::SpirvTarget target;
     ShaderRecompiler::SpirvTarget computeWave32;
