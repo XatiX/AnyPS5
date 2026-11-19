@@ -20,6 +20,7 @@
 #include "prx/libSceAgcDriver/Unified/include/TableMirror.hpp"
 #include "prx/libSceAgcDriver/Unified/include/Targets.hpp"
 #include "prx/libSceAgcDriver/Unified/include/VulkanHeap.hpp"
+#include "Optimization/ShaderStageInputInfo.hpp"
 #include "BdaAbi.hpp"
 #include "RuntimeAbi.hpp"
 #include <algorithm>
@@ -146,6 +147,9 @@ struct Totals {
     std::uint64_t targetNanoseconds = 0;
     std::uint64_t graphicsPipelineNanoseconds = 0;
     std::uint64_t uploadNanoseconds = 0;
+    std::uint64_t knownServed = 0;
+    std::uint64_t knownRefused = 0;
+    std::uint64_t knownSkipped = 0;
     std::map<std::string, std::uint64_t> reasons;
 };
 
@@ -170,6 +174,18 @@ bool overlaps(std::span<const std::pair<std::uint64_t, std::uint64_t>> left, std
 bool servesFaultPages() {
     static const bool serves = std::getenv("APS5_RECODE_NO_FAULT_SERVE") == nullptr;
     return serves;
+}
+
+constexpr std::uint64_t KnownBufferLimitBytes = 256ull << 20u;
+
+bool servesKnownBuffers() {
+    static const bool serves = std::getenv("APS5_RECODE_NO_KNOWN_BUFFERS") == nullptr;
+    return serves;
+}
+
+bool shaderDataBinding(const Resolve::ResolvedStage& stage, std::uint32_t index) {
+    const auto& bindings = stage.program.result->bindings;
+    return index < bindings.size() && bindings[index].role == ShaderRecompiler::DescriptorRole::ShaderData;
 }
 
 bool writesStencil(const Graphics::State& state) {
@@ -423,6 +439,7 @@ public:
         line += "; batch moved before the pass " + std::to_string(totals.batchMoves);
         line += "; passes " + std::to_string(totals.passesBegun) + " begun, " + std::to_string(totals.passesContinued) + " draws continued, " + std::to_string(totals.passFeedback) + " broken by a target read";
         line += "; residency updates landed " + std::to_string(totals.residencyLands);
+        line += "; known buffers " + std::to_string(totals.knownServed) + " served, " + std::to_string(totals.knownRefused) + " refused, " + std::to_string(totals.knownSkipped) + " skipped";
         std::snprintf(text, sizeof(text), "; draw phases surfaces %.1f ms, targets %.1f ms, pipelines %.1f ms, owned uploads %.1f ms", static_cast<double>(totals.surfaceNanoseconds) / 1e6, static_cast<double>(totals.targetNanoseconds) / 1e6, static_cast<double>(totals.graphicsPipelineNanoseconds) / 1e6, static_cast<double>(totals.uploadNanoseconds) / 1e6);
         line += text;
         std::snprintf(text, sizeof(text), "; dispatches %llu recorded, %llu to the existing path, %.1f us per dispatch; compute pipelines %zu held, %llu queued, %llu built in %.1f ms, %zu building, %zu failed", static_cast<unsigned long long>(totals.dispatches), static_cast<unsigned long long>(totals.dispatchExisting), totals.dispatches == 0 ? 0.0 : static_cast<double>(totals.dispatchNanoseconds) / 1000.0 / static_cast<double>(totals.dispatches), computePipelines.size(), static_cast<unsigned long long>(totals.pipelinesQueued), static_cast<unsigned long long>(totals.pipelinesBuilt), static_cast<double>(totals.pipelineNanoseconds) / 1e6, buildingPipelines.size(), failedPipelines.size());
@@ -635,6 +652,45 @@ private:
         return set;
     }
 
+    template<typename TPut>
+    void serveKnownBuffers(const Context& context, const Resolve::ResolvedStage& stage, TPut&& put) {
+        if (!servesKnownBuffers() || stage.program.variant == nullptr || stage.program.capture == nullptr) return;
+        const auto& layout = stage.program.variant->info.bindings;
+        const auto& known = stage.program.capture->snapshot.knownBuffers;
+        for (std::uint32_t index = 0; index < layout.knownBufferCount && index < known.size(); ++index) {
+            const auto& value = known[index];
+            if (value.dwordCount < 4u) {
+                totals.knownSkipped++;
+                continue;
+            }
+            const ShaderRecompiler::ShaderBufferResource descriptor{{value.dwords[0], value.dwords[1] & ~0x40000000u, value.dwords[2], value.dwords[3]}};
+            const auto address = descriptor.Base48();
+            const auto bytes = descriptor.GetSize();
+            if (address == 0u || bytes == 0u || bytes > KnownBufferLimitBytes) {
+                totals.knownSkipped++;
+                continue;
+            }
+            Shadow::OwnedSpan span;
+            if (!Shadow::ServeOwned(context, address, bytes, &span) || span.address == 0u) {
+                totals.knownRefused++;
+                continue;
+            }
+            const auto dword = layout.KnownBufferDword() + index * ShaderRecompiler::KnownBufferDwords;
+            put(dword, static_cast<std::uint32_t>(span.address));
+            put(dword + 1u, static_cast<std::uint32_t>(span.address >> 32u));
+            put(dword + 2u, static_cast<std::uint32_t>(bytes));
+            totals.knownServed++;
+        }
+    }
+
+    void servePushKnownBuffers(const Context& context, const Resolve::ResolvedStage& stage, std::span<std::byte> block) {
+        if (stage.program.variant == nullptr || !stage.program.variant->info.bindings.UsesPushData()) return;
+        serveKnownBuffers(context, stage, [&](std::uint32_t dword, std::uint32_t value) {
+            const auto offset = static_cast<std::size_t>(dword) * sizeof(std::uint32_t);
+            if (offset + sizeof(value) <= block.size()) std::memcpy(block.data() + offset, &value, sizeof(value));
+        });
+    }
+
     bool writeSet(const Context& context, const Resolve::ResolvedDraw& draw, std::uint32_t set, VkDescriptorSet target, std::uint64_t serial, std::uint64_t completed, std::shared_ptr<Graphics::Buffer>& pageTable, std::string& reason) {
         std::vector<VkDescriptorBufferInfo> infos;
         std::vector<VkWriteDescriptorSet> writes;
@@ -644,9 +700,18 @@ private:
             VkDescriptorBufferInfo info{};
             switch (binding.source) {
                 case Bindings::Source::Words: {
-                    const auto words = wordsOf(draw.stages.at(binding.stage), binding.index);
-                    std::vector<std::byte> bytes(std::max<std::size_t>(words.size_bytes(), 16u));
+                    const auto& stage = draw.stages.at(binding.stage);
+                    const auto words = wordsOf(stage, binding.index);
+                    const bool shaderData = shaderDataBinding(stage, binding.index) && stage.program.variant != nullptr;
+                    const auto dataBytes = shaderData ? static_cast<std::size_t>(stage.program.variant->info.bindings.ShaderDataDwords()) * sizeof(std::uint32_t) : 0u;
+                    std::vector<std::byte> bytes(std::max<std::size_t>({words.size_bytes(), dataBytes, 16u}));
                     std::memcpy(bytes.data(), words.data(), words.size_bytes());
+                    if (shaderData) {
+                        serveKnownBuffers(context, stage, [&](std::uint32_t dword, std::uint32_t value) {
+                            const auto offset = static_cast<std::size_t>(dword) * sizeof(std::uint32_t);
+                            if (offset + sizeof(value) <= bytes.size()) std::memcpy(bytes.data() + offset, &value, sizeof(value));
+                        });
+                    }
                     const auto offset = ringWrite(bytes, serial, completed);
                     if (!offset.has_value()) {
                         reason = "ring full";
@@ -835,6 +900,7 @@ private:
         std::array<std::byte, Graphics::ComputePushConstantBytes> block{};
         const auto& push = stage.program.words.pushConstants;
         if (!push.empty()) std::memcpy(block.data(), push.data(), push.size());
+        servePushKnownBuffers(context, stage, block);
 
         if (Shadow::OwnedUploadsPending()) {
             std::vector<std::shared_ptr<void>> kept;
@@ -979,6 +1045,7 @@ private:
                 return false;
             }
             std::memcpy(block.data() + shaders[index].pushConstantOffset, push.data(), push.size());
+            servePushKnownBuffers(context, draw.stages[index], std::span(block).subspan(shaders[index].pushConstantOffset));
         }
 
         VkBuffer argumentBuffer = VK_NULL_HANDLE;

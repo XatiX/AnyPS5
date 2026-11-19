@@ -3837,6 +3837,13 @@ void verifyImageTableKeys() {
         word += count == 0u ? 1u : count;
     }
     require(heapTables != 0u, "image table heap mode: no table image array sits in the heap set");
+    const auto materialV = TableV(guest.materials.data(), 16u, 3u);
+    const auto& known = heap.capture->snapshot.knownBuffers;
+    require(known.size() == 1u && known[0].dwordCount == 4u && std::equal(materialV.begin(), materialV.end(), known[0].dwords.begin()), "known buffers: the material V# read through s_buffer_load is not the heap-mode snapshot's one known buffer");
+    const auto plain = CompileTable(TableRequest(TableMaterialCode, userData));
+    require(plain.capture->snapshot.knownBuffers.empty(), "known buffers: the default compile lists known buffers");
+    const auto* heapData = TableBinding(heapResult, DescriptorRole::ShaderData);
+    require(heapData == nullptr || heapData->guestDescriptor.size() >= KnownBufferDwords, "known buffers: the shader data has no room for the known buffer's address words");
 #if ANYPS5_ENABLE_SPIRV_TOOLS
     static_cast<void>(ValidateAndOptimizeSpirv(heapResult.spirv, heapRequest.target.vulkanVersion, heapRequest.target.spirvVersion));
 #endif

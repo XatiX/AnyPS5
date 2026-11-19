@@ -143,7 +143,7 @@ constexpr std::size_t fieldCount() {
     }
 }
 
-static_assert(fieldCount<ShaderInfo>() == 24, "ShaderInfo changed: update the info encoder");
+static_assert(fieldCount<ShaderInfo>() == 25,"ShaderInfo changed: update the info encoder");
 static_assert(fieldCount<BufferResource>() == 12, "BufferResource changed: update the info encoder");
 static_assert(fieldCount<ImageResource>() == 51, "ImageResource changed: update the info encoder");
 static_assert(fieldCount<SamplerResource>() == 8, "SamplerResource changed: update the info encoder");
@@ -152,7 +152,7 @@ static_assert(fieldCount<StageInput>() == 5, "StageInput changed: update the inf
 static_assert(fieldCount<StageOutput>() == 4, "StageOutput changed: update the info encoder");
 static_assert(fieldCount<IrResourcePlan>() == 25, "IrResourcePlan changed: update EncodePlan and DecodePlan");
 static_assert(fieldCount<GuestRegister>() == 2, "GuestRegister changed: update the plan value encoder");
-static_assert(fieldCount<MemoryInfo>() == 32, "MemoryInfo changed: update the plan encoder");
+static_assert(fieldCount<MemoryInfo>() == 33,"MemoryInfo changed: update the plan encoder");
 static_assert(fieldCount<DescriptorSource>() == 4, "DescriptorSource changed: update the plan encoder");
 static_assert(fieldCount<TableColumn>() == 19, "TableColumn changed: update the plan encoder");
 static_assert(fieldCount<KeyDomain>() == 4, "KeyDomain changed: update the plan encoder");
@@ -749,6 +749,7 @@ void encodeLayout(Writer& writer, const IrBindingLayout& layout) {
     writer.Value(layout.runtimeImageCount);
     writer.Value(layout.runtimeStateDwords);
     writer.Value(layout.directSlotCount);
+    writer.Value(layout.knownBufferCount);
     writer.Values(std::span<const std::uint32_t>(layout.userDataRegisters));
     writer.List(layout.descriptors, [](Writer& out, const IrDescriptorBinding& descriptor) {
         out.Value(descriptor.kind);
@@ -765,6 +766,7 @@ void decodeLayout(Reader& reader, IrBindingLayout& layout) {
     reader.Value(layout.runtimeImageCount);
     reader.Value(layout.runtimeStateDwords);
     reader.Value(layout.directSlotCount);
+    reader.Value(layout.knownBufferCount);
     reader.Values(layout.userDataRegisters);
     reader.List(layout.descriptors, 12, [](Reader& in, IrDescriptorBinding& descriptor) {
         in.Value(descriptor.kind);
@@ -789,6 +791,7 @@ void encodeShaderInfo(Writer& writer, const ShaderInfo& info) {
         out.Value(buffer.scalar);
         out.Value(buffer.typedAlignment);
     });
+    writer.Values(std::span<const std::uint32_t>(info.knownBuffers));
     writer.List(info.images, [](Writer& out, const ImageResource& image) {
         out.Value(image.source);
         out.Value(image.firstUsePc);
@@ -906,6 +909,7 @@ void decodeShaderInfo(Reader& reader, ShaderInfo& info) {
         in.Value(buffer.scalar);
         in.Value(buffer.typedAlignment);
     });
+    reader.Values(info.knownBuffers);
     reader.List(info.images, 77, [](Reader& in, ImageResource& image) {
         in.Value(image.source);
         in.Value(image.firstUsePc);
@@ -1077,6 +1081,7 @@ void encodeMemoryInfo(Writer& out, const MemoryInfo& memory) {
     out.Value(memory.planningOnly);
     out.Value(memory.coherent);
     out.Value(memory.gpuDescriptor);
+    out.Value(memory.knownBuffer);
     out.Value(memory.flushDenormals);
     out.Value(memory.flushDenormalResults);
     out.Value(memory.descriptorWebArm);
@@ -1112,6 +1117,7 @@ void decodeMemoryInfo(Reader& in, MemoryInfo& memory) {
     in.Value(memory.planningOnly);
     in.Value(memory.coherent);
     in.Value(memory.gpuDescriptor);
+    in.Value(memory.knownBuffer);
     in.Value(memory.flushDenormals);
     in.Value(memory.flushDenormalResults);
     in.Value(memory.descriptorWebArm);
@@ -1411,6 +1417,7 @@ bool decodePlan(Reader& reader, IrResourcePlan& plan) {
         if (parent.has_value() && (column.buffer || column.sampler || column.address || column.indirect || !parent->buffer || !parent->indirect || plan.descriptorSources[parent->heapSource].tableColumn.has_value())) return false;
     }
     if (!std::ranges::all_of(plan.info.buffers, [&](const BufferResource& buffer) { return knownSource(buffer.source); })) return false;
+    if (!std::ranges::all_of(plan.info.knownBuffers, knownSource)) return false;
     if (!std::ranges::all_of(plan.info.images, [&](const ImageResource& image) { return knownSource(image.source); })) return false;
     if (!std::ranges::all_of(plan.info.samplers, [&](const SamplerResource& sampler) { return knownSource(sampler.source); })) return false;
     const bool blocksValid = std::ranges::all_of(plan.controlFlow, [&](const ResourceBlock& block) {

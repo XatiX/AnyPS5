@@ -170,6 +170,7 @@ BindingAllocationResult BindingAllocator::Allocate(IrProgram& program, const Bin
             if (binding.kind == DescriptorBindingKind::Samplers || ImageBindingResourceClass(binding.kind) != ImageResourceClass::None) slots += static_cast<std::uint32_t>(binding.resources.size());
         }
         next.directSlotCount = slots;
+        next.knownBufferCount = static_cast<std::uint32_t>(info.knownBuffers.size());
         next.pushDataStartDword = next.runtimeImageCount == 0u && next.ShaderDataDwords() != 0u && next.ShaderDataDwords() <= dataSize ? layout.pushConstantOffsetBytes / 4u : PushData::NoStart;
         if (stencilReplay) {
             const auto offset = next.UsesPushData() ? next.ShaderDataDwords() : 0u;

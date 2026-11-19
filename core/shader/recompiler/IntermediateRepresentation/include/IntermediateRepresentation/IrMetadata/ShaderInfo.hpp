@@ -17,6 +17,7 @@ struct ShaderInfo {
     static constexpr std::uint32_t MaxSampledPairs = 256;
 
     std::vector<BufferResource> buffers;
+    std::vector<std::uint32_t> knownBuffers;
     std::vector<ImageResource> images;
     std::vector<std::vector<ImageResource>> runtimeImageModes;
     std::vector<SamplerResource> samplers;

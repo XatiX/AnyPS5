@@ -428,6 +428,14 @@ private:
             if (address == 0u || bytes == 0u) continue;
             uses.push_back({address, bytes, buffers[index].written || buffers[index].atomic});
         }
+        for (const auto& value : snapshot.knownBuffers) {
+            if (value.dwordCount < 4u) continue;
+            const ShaderRecompiler::ShaderBufferResource descriptor{{value.dwords[0], value.dwords[1] & ~0x40000000u, value.dwords[2], value.dwords[3]}};
+            const auto address = descriptor.Base48();
+            const auto bytes = static_cast<std::uint64_t>(descriptor.GetSize());
+            if (address == 0u || bytes == 0u) continue;
+            uses.push_back({address, bytes, false});
+        }
     }
 
     static bool verifyTemplates() {
