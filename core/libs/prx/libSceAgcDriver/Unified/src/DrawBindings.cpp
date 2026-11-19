@@ -63,6 +63,28 @@ bool Describe(std::span<const StageInput> stages, Layout& out, std::string& reas
     return true;
 }
 
+std::uint32_t OutputLocations(std::span<const std::uint32_t> spirv) {
+    constexpr std::uint32_t opDecorate = 71;
+    constexpr std::uint32_t opVariable = 59;
+    constexpr std::uint32_t decorationLocation = 30;
+    constexpr std::uint32_t storageOutput = 3;
+    std::vector<std::pair<std::uint32_t, std::uint32_t>> locations;
+    std::vector<std::uint32_t> outputs;
+    for (std::size_t word = 5; word < spirv.size();) {
+        const auto count = spirv[word] >> 16u;
+        const auto opcode = spirv[word] & 0xffffu;
+        if (count == 0u || word + count > spirv.size()) break;
+        if (opcode == opDecorate && count >= 4u && spirv[word + 2] == decorationLocation) locations.emplace_back(spirv[word + 1], spirv[word + 3]);
+        if (opcode == opVariable && count >= 4u && spirv[word + 3] == storageOutput) outputs.push_back(spirv[word + 2]);
+        word += count;
+    }
+    std::uint32_t mask = 0;
+    for (const auto& [id, location] : locations) {
+        if (location < 32u && std::ranges::find(outputs, id) != outputs.end()) mask |= 1u << location;
+    }
+    return mask;
+}
+
 void CountSources(const Layout& layout, SourceCounts& counts) {
     for (const auto& binding : layout.bindings) {
         switch (binding.source) {

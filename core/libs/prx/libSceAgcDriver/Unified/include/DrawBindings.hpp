@@ -50,6 +50,7 @@ struct SourceCounts {
 [[nodiscard]] std::uint32_t StageBit(ShaderRecompiler::ShaderStage stage);
 bool Describe(std::span<const StageInput> stages, Layout& out, std::string& reason);
 void CountSources(const Layout& layout, SourceCounts& counts);
+[[nodiscard]] std::uint32_t OutputLocations(std::span<const std::uint32_t> spirv);
 
 }
 

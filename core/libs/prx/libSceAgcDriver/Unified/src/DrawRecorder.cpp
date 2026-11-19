@@ -42,6 +42,7 @@ struct Totals {
     std::uint64_t recorded = 0;
     std::uint64_t refused = 0;
     std::uint64_t existing = 0;
+    std::uint64_t linearStores = 0;
     std::uint64_t indirect = 0;
     std::uint64_t snapshotArguments = 0;
     std::uint64_t pools = 0;
@@ -78,6 +79,10 @@ std::uint64_t vertexAddress(const ShaderRecompiler::VertexAttribute& attribute) 
 bool precheck(const Resolve::ResolvedDraw& draw, const Pm4::DrawParameters& parameters, std::vector<std::pair<std::uint64_t, std::uint64_t>>* reads, std::string& reason) {
     if (draw.state == nullptr || draw.stages.empty()) {
         reason = "no state or stages";
+        return false;
+    }
+    if (!draw.complete) {
+        reason = "placeholder images";
         return false;
     }
     const auto& state = *draw.state;
@@ -184,6 +189,7 @@ public:
         const auto ring = space.has_value() ? space->TakeCounts() : RingCounts{};
         std::snprintf(text, sizeof(text), "[recode-record] %llu recorded, %llu dropped, %llu to the existing path, %.1f us per draw; %llu indirect (%llu argument snapshots); ring %llu allocations, %.1f MiB, %llu wraps, %llu full; %llu descriptor pools", static_cast<unsigned long long>(totals.recorded), static_cast<unsigned long long>(totals.refused), static_cast<unsigned long long>(totals.existing), draws == 0 ? 0.0 : static_cast<double>(totals.nanoseconds) / 1000.0 / static_cast<double>(draws), static_cast<unsigned long long>(totals.indirect), static_cast<unsigned long long>(totals.snapshotArguments), static_cast<unsigned long long>(ring.allocations), static_cast<double>(ring.bytes) / 1048576.0, static_cast<unsigned long long>(ring.wraps), static_cast<unsigned long long>(ring.full), static_cast<unsigned long long>(totals.pools));
         std::string line = text;
+        line += "; linear target stores " + std::to_string(totals.linearStores);
         if (fault != nullptr) {
             const auto bytes = fault->Bytes();
             line += std::ranges::any_of(bytes, [](std::byte value) { return value != std::byte{0}; }) ? "; fault buffer written" : "; fault buffer clean";
@@ -289,19 +295,16 @@ private:
         return set;
     }
 
-    std::uint32_t fragmentOutputs(const Context& context, std::span<const Graphics::CompiledShader> shaders, const Graphics::State& state) {
-        std::vector<std::uint64_t> key;
-        for (const auto& shader : shaders) {
-            const auto hash = shader.program->spirv.ContentHash();
-            key.push_back(static_cast<std::uint64_t>(shader.stage));
-            key.push_back(std::hash<std::string_view>{}(std::string_view(reinterpret_cast<const char*>(&hash), sizeof(hash))));
-        }
-        if (const auto found = outputs.find(key); found != outputs.end()) return found->second;
+    std::uint32_t fragmentOutputs(std::span<const Graphics::CompiledShader> shaders) {
         std::uint32_t mask = 0;
-        for (const auto location : Graphics::ValidateShaders(shaders, state, context.subgroup, context.fragmentShaderBarycentric, context.descriptorIndexing, context.imageInt64Atomics, context.geometryShader, context.sampleRateShading, context.bufferInt64Atomics, context.shaderClipDistance, context.shaderCullDistance, context.viewportIndexLayer, context.runtimeDescriptorArray, context.demoteToHelperInvocation, context.shaderTerminateInvocation, context.meshShader, context.shaderResourceMinLod, context.fmaFloat16)) {
-            if (location < 32u) mask |= 1u << location;
+        for (const auto& shader : shaders) {
+            if (shader.stage != ShaderRecompiler::ShaderStage::Fragment) continue;
+            const auto hash = shader.program->spirv.ContentHash();
+            const std::pair key{hash.low, hash.high};
+            auto found = outputs.find(key);
+            if (found == outputs.end()) found = outputs.emplace(key, Bindings::OutputLocations(shader.program->spirv.Words())).first;
+            mask |= found->second;
         }
-        outputs.emplace(std::move(key), mask);
         return mask;
     }
 
@@ -373,7 +376,7 @@ private:
             return false;
         }
         auto framebuffer = pipeline->AcquireFramebuffer(views, owners, state.renderExtent, state.renderLayers);
-        const auto masked = maskedOutputs(state, fragmentOutputs(context, shaders, state));
+        const auto masked = maskedOutputs(state, fragmentOutputs(shaders));
 
         const auto serial = recorder->OpenBatchSerial();
         const auto completed = recorder->CompletedThrough();
@@ -549,10 +552,18 @@ private:
         recorder->Keep(pipeline);
         recorder->Keep(framebuffer);
         if (pageTable != nullptr) recorder->Keep(pageTable);
+        std::vector<bool> storeNow(residents.size(), false);
         for (std::size_t index = 0; index < residents.size(); ++index) {
-            residents[index]->MarkSliceDirty(state.colors[index].arraySlice, state.colors[index].layers);
-            recorder->Keep(residents[index]);
+            auto& resident = residents[index];
+            if (!resident->Cached()) recorder->KeepBytes(resident.get(), static_cast<std::size_t>(resident->BudgetBytes()));
+            if (resident->Descriptor().tileMode == Graphics::TextureTileMode::kLinear) storeNow[index] = !resident->MarkDrawn(state.colors[index].arraySlice, 1u, state.scissor) || !resident->Cached();
+            else resident->MarkSliceDirty(state.colors[index].arraySlice, 1u);
+            recorder->Keep(resident);
         }
+        for (std::size_t index = 0; index < residents.size(); ++index) {
+            if (storeNow[index]) Graphics::StorageTexture::FlushPending(residents[index]->Descriptor().baseAddress, static_cast<std::size_t>(residents[index]->GuestBytes()), nullptr, "linear target");
+        }
+        totals.linearStores += static_cast<std::uint64_t>(std::ranges::count(storeNow, true));
         return true;
     }
 
@@ -565,7 +576,7 @@ private:
     std::map<std::vector<std::uint32_t>, VkDescriptorSetLayout> layouts;
     std::deque<std::pair<VkDescriptorPool, std::uint64_t>> pools;
     std::vector<VkDescriptorPool> spare;
-    std::map<std::vector<std::uint64_t>, std::uint32_t> outputs;
+    std::map<std::pair<std::uint64_t, std::uint64_t>, std::uint32_t> outputs;
     std::set<std::string> seen;
     Totals totals;
 };

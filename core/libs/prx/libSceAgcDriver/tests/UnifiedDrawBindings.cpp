@@ -70,9 +70,24 @@ void testSharedBindingIsRefused() {
     Expect(!Bindings::Describe(stages, layout, reason) && reason.find("shared") != std::string::npos, "two stages on one binding are refused");
 }
 
+void testOutputLocationsComeFromOutputVariables() {
+    const std::vector<std::uint32_t> spirv{
+        0x07230203u, 0x00010000u, 0u, 20u, 0u,
+        (4u << 16u) | 71u, 10u, 30u, 0u,
+        (4u << 16u) | 71u, 11u, 30u, 2u,
+        (4u << 16u) | 71u, 12u, 30u, 5u,
+        (4u << 16u) | 59u, 1u, 10u, 3u,
+        (4u << 16u) | 59u, 1u, 11u, 3u,
+        (4u << 16u) | 59u, 1u, 12u, 1u,
+    };
+    Expect(Bindings::OutputLocations(spirv) == 0b101u, "output variables give their locations, inputs do not");
+    Expect(Bindings::OutputLocations({}) == 0u, "an empty module has no outputs");
+}
+
 }
 
 int main() {
+    testOutputLocationsComeFromOutputVariables();
     testBuffersOfTwoStagesAreDescribedInOrder();
     testImagesOutsideTheHeapAreRefused();
     testSharedBindingIsRefused();
