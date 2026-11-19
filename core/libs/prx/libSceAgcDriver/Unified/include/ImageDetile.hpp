@@ -3,7 +3,9 @@
 
 #include "prx/libSceAgcDriver/Graphics/include/Context.hpp"
 #include "prx/libSceAgcDriver/Unified/include/Images.hpp"
+#include <functional>
 #include <memory>
+#include <span>
 #include <string>
 
 namespace AgcDriver::Graphics {
@@ -29,10 +31,13 @@ public:
     SurfaceDetiler(const SurfaceDetiler&) = delete;
     SurfaceDetiler& operator=(const SurfaceDetiler&) = delete;
 
-    [[nodiscard]] bool Record(Graphics::Recorder& recorder, SurfaceTable& table, const std::shared_ptr<Surface>& surface, std::string& reason);
+    using Refused = std::function<void(const std::string&)>;
+
+    void Record(Graphics::Recorder& recorder, SurfaceTable& table, std::span<const std::shared_ptr<Surface>> surfaces, const Refused& refused);
     [[nodiscard]] DetileCounts TakeCounts();
 
 private:
+    void recordOne(Graphics::Recorder& recorder, VkCommandBuffer commands, SurfaceTable& table, Surface& surface, VulkanSurface& vulkan, VkBuffer buffer, std::uint64_t base, std::uint64_t stamp, std::uint64_t imageStamp);
     bool recordThroughBuffer(Graphics::Recorder& recorder, VkCommandBuffer commands, VulkanSurface& surface, VkBuffer source, std::uint64_t base, std::uint32_t layers, std::string& reason);
 
     const Graphics::Context& context;

@@ -278,14 +278,12 @@ private:
         auto work = table->TakeWork();
         if (work.empty()) return;
         if (surfaceDetiler == nullptr) surfaceDetiler = std::make_unique<Images::SurfaceDetiler>(context);
-        for (const auto& surface : work) {
-            std::string why;
-            if (surfaceDetiler->Record(recorder, *table, surface, why)) continue;
+        surfaceDetiler->Record(recorder, *table, work, [&](const std::string& why) {
             totals.surfaceFailures++;
             auto key = "surface: " + why.substr(0, 50);
             if (seen.insert(key).second) std::fprintf(stderr, "[recode-record] first surface failure: %s\n", why.c_str());
             if (totals.reasons.size() < 24u || totals.reasons.contains(key)) totals.reasons[key]++;
-        }
+        });
     }
 
     void readFaults(Graphics::Buffer& buffer) {
