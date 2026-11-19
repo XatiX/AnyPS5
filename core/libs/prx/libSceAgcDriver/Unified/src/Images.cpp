@@ -52,7 +52,7 @@ std::size_t SurfaceTable::KeyHash::operator()(const SurfaceKey& key) const {
     return static_cast<std::size_t>(hash);
 }
 
-std::optional<Found> SurfaceTable::Find(const SurfaceKey& key, std::string& reason) {
+std::optional<Found> SurfaceTable::Find(const SurfaceKey& key, std::span<const std::uint32_t, 8> words, std::string& reason) {
     std::lock_guard lock(mutex);
     counts.lookups++;
     if (const auto found = surfaces.find(key); found != surfaces.end()) {
@@ -66,7 +66,7 @@ std::optional<Found> SurfaceTable::Find(const SurfaceKey& key, std::string& reas
         else counts.pending++;
         return Found{surface, surface->state == State::Ready};
     }
-    auto created = device.Create(key, reason);
+    auto created = device.Create(key, words, reason);
     if (created == nullptr) {
         counts.refused++;
         return std::nullopt;

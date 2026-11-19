@@ -50,14 +50,14 @@ enum class State : std::uint8_t { Pending, Ready, Stale };
 class DeviceSurface {
 public:
     virtual ~DeviceSurface() = default;
-    [[nodiscard]] virtual std::uint64_t View(const ViewKey& view) = 0;
+    [[nodiscard]] virtual std::uint64_t View(const ViewKey& view, std::uint32_t kind, std::string& reason) = 0;
     [[nodiscard]] virtual std::uint32_t Layout() const = 0;
 };
 
 class SurfaceDevice {
 public:
     virtual ~SurfaceDevice() = default;
-    [[nodiscard]] virtual std::shared_ptr<DeviceSurface> Create(const SurfaceKey& key, std::string& reason) = 0;
+    [[nodiscard]] virtual std::shared_ptr<DeviceSurface> Create(const SurfaceKey& key, std::span<const std::uint32_t, 8> words, std::string& reason) = 0;
 };
 
 struct Surface {
@@ -87,7 +87,7 @@ class SurfaceTable {
 public:
     SurfaceTable(SurfaceDevice& device, const Events::ChangeLog& shared, const Events::ChangeLog& images) : device(device), shared(shared), images(images) {}
 
-    [[nodiscard]] std::optional<Found> Find(const SurfaceKey& key, std::string& reason);
+    [[nodiscard]] std::optional<Found> Find(const SurfaceKey& key, std::span<const std::uint32_t, 8> words, std::string& reason);
     [[nodiscard]] std::vector<std::shared_ptr<Surface>> TakeWork();
     void MarkReady(Surface& surface, std::uint64_t stamp, std::uint64_t imageStamp);
     void Requeue(const std::shared_ptr<Surface>& surface);
