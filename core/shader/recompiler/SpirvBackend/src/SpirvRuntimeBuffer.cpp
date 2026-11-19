@@ -279,19 +279,11 @@ std::uint32_t directWordIndex(SpirvEmitterState& state, const MemoryResourceAcce
 std::array<std::uint32_t, 4> knownBufferRead(SpirvValueEmitContext& context, const IrValue& instruction, std::uint32_t base, std::uint32_t guest, std::uint32_t bits, std::uint32_t dwords, std::uint32_t used, const std::function<std::array<std::uint32_t, 4>()>& lookup) {
     auto& state = context.state;
     const auto& memory = context.Memory(instruction);
-    const auto& layout = state.program.Metadata().bindings;
-    if (!memory.gpuDescriptor || memory.knownBuffer >= layout.knownBufferCount || BdaByteReadsForced()) return lookup();
-    const auto u64 = TypeScalarU64(state);
-    const auto first = layout.KnownBufferDword() + memory.knownBuffer * KnownBufferDwords;
-    const auto low = Unary(state, spv::OpUConvert, u64, EmitShaderDataDwordLoad(state, first));
-    const auto high = Unary(state, spv::OpUConvert, u64, EmitShaderDataDwordLoad(state, first + 1u));
-    SpirvEmitterState::BdaAnchor anchor;
-    anchor.device = Binary(state, spv::OpBitwiseOr, u64, low, Binary(state, spv::OpShiftLeftLogical, u64, high, BdaConstant(state, 32u)));
-    const auto bound = Unary(state, spv::OpUConvert, u64, EmitShaderDataDwordLoad(state, first + 2u));
-    anchor.size = Select(state, u64, Binary(state, spv::OpINotEqual, TypeBool(state), anchor.device, BdaConstant(state, 0u)), bound, BdaConstant(state, 0u));
-    anchor.offset = BdaConstant(state, 0u);
-    const auto relative = Unary(state, spv::OpUConvert, TypeU32(state), Binary(state, spv::OpISub, u64, guest, base));
-    return EmitBoundedBdaRead(state, instruction, anchor, relative, bits, dwords, used);
+    if (!memory.gpuDescriptor) return lookup();
+    const auto anchor = KnownBdaAnchor(state, memory);
+    if (!anchor) return lookup();
+    const auto relative = Unary(state, spv::OpUConvert, TypeU32(state), Binary(state, spv::OpISub, TypeScalarU64(state), guest, base));
+    return EmitBoundedBdaRead(state, instruction, *anchor, relative, 0, bits, dwords, used);
 }
 
 std::uint32_t readKnown(SpirvValueEmitContext& context, const IrValue& instruction, std::uint32_t base, std::uint32_t guest, std::uint32_t bits) {

@@ -1660,7 +1660,7 @@ void materializeSnapshot(const IrResourcePlan& plan, const SrtRuntime& runtime, 
     }
     snapshot.knownBuffers.assign(values.begin() + cursor, values.begin() + cursor + plan.info.knownBuffers.size());
     for (std::size_t index = 0; index < snapshot.knownBuffers.size(); ++index) {
-        const auto source = plan.info.knownBuffers[index];
+        const auto source = plan.info.knownBuffers[index].source;
         if (source < activeSources.size() && activeSources[source] == 0u) snapshot.knownBuffers[index] = DescriptorValue{};
     }
 }
@@ -2942,7 +2942,7 @@ IrResourcePlan ResourceMaterializer::ExtractPlan(const IrProgram& program) const
             addSource(sampler.source);
         }
     }
-    for (const auto source : plan.info.knownBuffers) addSource(source);
+    for (const auto& known : plan.info.knownBuffers) addSource(known.source);
     plan.pureFlatSlots = Detail::ComputePureFlatSlots(plan);
     plan.guardedSrtSlots = Detail::ComputeGuardedFlatSlots(plan);
     ownPlanValues(plan);

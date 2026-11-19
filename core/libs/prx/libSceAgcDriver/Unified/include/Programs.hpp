@@ -9,6 +9,7 @@
 #include <array>
 #include <memory>
 #include <string>
+#include <utility>
 #include <vector>
 
 namespace AgcDriver::Unified::Resolve {
@@ -56,6 +57,7 @@ struct ProgramSet {
 };
 
 [[nodiscard]] ShaderRecompiler::SpirvTarget HeapTarget(const ShaderRecompiler::SpirvTarget& device);
+[[nodiscard]] std::pair<std::uint64_t, std::uint64_t> KnownBufferSpan(const ShaderRecompiler::KnownBuffer& known, const ShaderRecompiler::DescriptorValue& value);
 [[nodiscard]] bool DecodePrograms(const ProgramInputs& inputs, DriverDetail::DrawDecode& decode, std::string& reason);
 [[nodiscard]] bool BuildPrograms(const ProgramInputs& inputs, const DrawFacts& facts, ProgramSet& out, std::string& reason);
 [[nodiscard]] bool BuildComputeProgram(const ProgramInputs& inputs, const DispatchFacts& facts, ProgramSet& out, std::string& reason);

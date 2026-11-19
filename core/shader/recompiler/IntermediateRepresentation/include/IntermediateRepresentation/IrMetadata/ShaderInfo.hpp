@@ -9,6 +9,14 @@
 
 namespace ShaderRecompiler {
 
+struct KnownBuffer {
+    std::uint32_t source = 0;
+    std::uint32_t pointerBytes = 0;
+
+    [[nodiscard]] bool Pointer() const { return pointerBytes != 0u; }
+    bool operator==(const KnownBuffer& other) const = default;
+};
+
 struct ShaderInfo {
     std::uint32_t scratchDwords = 0;
     std::uint32_t sharedMemoryBytes = 0;
@@ -17,7 +25,7 @@ struct ShaderInfo {
     static constexpr std::uint32_t MaxSampledPairs = 256;
 
     std::vector<BufferResource> buffers;
-    std::vector<std::uint32_t> knownBuffers;
+    std::vector<KnownBuffer> knownBuffers;
     std::vector<ImageResource> images;
     std::vector<std::vector<ImageResource>> runtimeImageModes;
     std::vector<SamplerResource> samplers;

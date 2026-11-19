@@ -791,7 +791,10 @@ void encodeShaderInfo(Writer& writer, const ShaderInfo& info) {
         out.Value(buffer.scalar);
         out.Value(buffer.typedAlignment);
     });
-    writer.Values(std::span<const std::uint32_t>(info.knownBuffers));
+    writer.List(info.knownBuffers, [](Writer& out, const KnownBuffer& known) {
+        out.Value(known.source);
+        out.Value(known.pointerBytes);
+    });
     writer.List(info.images, [](Writer& out, const ImageResource& image) {
         out.Value(image.source);
         out.Value(image.firstUsePc);
@@ -909,7 +912,10 @@ void decodeShaderInfo(Reader& reader, ShaderInfo& info) {
         in.Value(buffer.scalar);
         in.Value(buffer.typedAlignment);
     });
-    reader.Values(info.knownBuffers);
+    reader.List(info.knownBuffers, 8, [](Reader& in, KnownBuffer& known) {
+        in.Value(known.source);
+        in.Value(known.pointerBytes);
+    });
     reader.List(info.images, 77, [](Reader& in, ImageResource& image) {
         in.Value(image.source);
         in.Value(image.firstUsePc);
@@ -1417,7 +1423,7 @@ bool decodePlan(Reader& reader, IrResourcePlan& plan) {
         if (parent.has_value() && (column.buffer || column.sampler || column.address || column.indirect || !parent->buffer || !parent->indirect || plan.descriptorSources[parent->heapSource].tableColumn.has_value())) return false;
     }
     if (!std::ranges::all_of(plan.info.buffers, [&](const BufferResource& buffer) { return knownSource(buffer.source); })) return false;
-    if (!std::ranges::all_of(plan.info.knownBuffers, knownSource)) return false;
+    if (!std::ranges::all_of(plan.info.knownBuffers, [&](const KnownBuffer& known) { return knownSource(known.source); })) return false;
     if (!std::ranges::all_of(plan.info.images, [&](const ImageResource& image) { return knownSource(image.source); })) return false;
     if (!std::ranges::all_of(plan.info.samplers, [&](const SamplerResource& sampler) { return knownSource(sampler.source); })) return false;
     const bool blocksValid = std::ranges::all_of(plan.controlFlow, [&](const ResourceBlock& block) {

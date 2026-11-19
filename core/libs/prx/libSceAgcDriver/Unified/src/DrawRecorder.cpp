@@ -153,6 +153,7 @@ struct Totals {
     std::uint64_t knownMapped = 0;
     std::uint64_t knownPaged = 0;
     std::uint64_t knownCopied = 0;
+    std::uint64_t knownPointers = 0;
     std::uint64_t knownRefused = 0;
     std::uint64_t knownSkipped = 0;
     std::map<std::string, std::uint64_t> reasons;
@@ -440,7 +441,7 @@ public:
         line += "; batch moved before the pass " + std::to_string(totals.batchMoves);
         line += "; passes " + std::to_string(totals.passesBegun) + " begun, " + std::to_string(totals.passesContinued) + " draws continued, " + std::to_string(totals.passFeedback) + " broken by a target read";
         line += "; residency updates landed " + std::to_string(totals.residencyLands);
-        line += "; known buffers " + std::to_string(totals.knownServed) + " served, " + std::to_string(totals.knownMapped) + " mapped (" + std::to_string(totals.knownPaged) + " paged in), " + std::to_string(totals.knownCopied) + " copied, " + std::to_string(totals.knownRefused) + " unresolved, " + std::to_string(totals.knownSkipped) + " skipped";
+        line += "; known buffers " + std::to_string(totals.knownServed) + " served, " + std::to_string(totals.knownMapped) + " mapped (" + std::to_string(totals.knownPaged) + " paged in), " + std::to_string(totals.knownCopied) + " copied, " + std::to_string(totals.knownRefused) + " unresolved, " + std::to_string(totals.knownSkipped) + " skipped (" + std::to_string(totals.knownPointers) + " of them pointers)";
         std::snprintf(text, sizeof(text), "; draw phases surfaces %.1f ms, targets %.1f ms, pipelines %.1f ms, owned uploads %.1f ms", static_cast<double>(totals.surfaceNanoseconds) / 1e6, static_cast<double>(totals.targetNanoseconds) / 1e6, static_cast<double>(totals.graphicsPipelineNanoseconds) / 1e6, static_cast<double>(totals.uploadNanoseconds) / 1e6);
         line += text;
         std::snprintf(text, sizeof(text), "; dispatches %llu recorded, %llu to the existing path, %.1f us per dispatch; compute pipelines %zu held, %llu queued, %llu built in %.1f ms, %zu building, %zu failed", static_cast<unsigned long long>(totals.dispatches), static_cast<unsigned long long>(totals.dispatchExisting), totals.dispatches == 0 ? 0.0 : static_cast<double>(totals.dispatchNanoseconds) / 1000.0 / static_cast<double>(totals.dispatches), computePipelines.size(), static_cast<unsigned long long>(totals.pipelinesQueued), static_cast<unsigned long long>(totals.pipelinesBuilt), static_cast<double>(totals.pipelineNanoseconds) / 1e6, buildingPipelines.size(), failedPipelines.size());
@@ -661,6 +662,7 @@ private:
         if (stage.program.variant == nullptr || stage.program.capture == nullptr) return;
         const auto& layout = stage.program.variant->info.bindings;
         const auto& known = stage.program.capture->snapshot.knownBuffers;
+        const auto& infos = stage.program.variant->info.info.knownBuffers;
         for (std::uint32_t index = 0; index < layout.knownBufferCount; ++index) {
             const auto dword = layout.KnownBufferDword() + index * ShaderRecompiler::KnownBufferDwords;
             const auto write = [&](std::uint64_t device, std::uint64_t bytes) {
@@ -668,15 +670,8 @@ private:
                 put(dword + 1u, static_cast<std::uint32_t>(device >> 32u));
                 put(dword + 2u, static_cast<std::uint32_t>(std::min<std::uint64_t>(bytes, 0xffffffffu)));
             };
-            if (index >= known.size() || known[index].dwordCount < 4u) {
-                totals.knownSkipped++;
-                write(0u, 0u);
-                continue;
-            }
-            const auto& value = known[index];
-            const ShaderRecompiler::ShaderBufferResource descriptor{{value.dwords[0], value.dwords[1] & ~0x40000000u, value.dwords[2], value.dwords[3]}};
-            const auto address = descriptor.Base48();
-            const auto bytes = descriptor.GetSize();
+            const auto [address, bytes] = index < known.size() ? Resolve::KnownBufferSpan(index < infos.size() ? infos[index] : ShaderRecompiler::KnownBuffer{}, known[index]) : std::pair<std::uint64_t, std::uint64_t>{0u, 0u};
+            if (index < infos.size() && infos[index].Pointer()) totals.knownPointers++;
             if (address == 0u || bytes == 0u) {
                 totals.knownSkipped++;
                 write(0u, 0u);

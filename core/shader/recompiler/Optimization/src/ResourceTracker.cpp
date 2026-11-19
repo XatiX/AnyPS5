@@ -40,6 +40,7 @@ bool bdaTraceEnabled() {
     return enabled;
 }
 constexpr unsigned bdaTraceLimit = 8;
+constexpr std::uint32_t knownPointerLimitBytes = 64u << 10u;
 
 std::string formatHex32(std::uint32_t value) {
     static constexpr char digits[] = "0123456789abcdef";
@@ -2264,12 +2265,34 @@ private:
         return true;
     }
 
-    std::uint32_t AddKnownBuffer(std::uint32_t source) {
-        const auto found = std::ranges::find(m_info.knownBuffers, source);
-        if (found != m_info.knownBuffers.end()) return static_cast<std::uint32_t>(found - m_info.knownBuffers.begin());
+    std::uint32_t AddKnownBuffer(std::uint32_t source, std::uint32_t pointerBytes = 0u) {
+        const auto found = std::ranges::find_if(m_info.knownBuffers, [&](const KnownBuffer& known) { return known.source == source && known.Pointer() == (pointerBytes != 0u); });
+        if (found != m_info.knownBuffers.end()) {
+            found->pointerBytes = std::max(found->pointerBytes, pointerBytes);
+            return static_cast<std::uint32_t>(found - m_info.knownBuffers.begin());
+        }
         if (m_info.knownBuffers.size() >= RuntimeAbi::BufferCapacity) return NoKnownBuffer;
-        m_info.knownBuffers.push_back(source);
+        m_info.knownBuffers.push_back({source, pointerBytes});
         return static_cast<std::uint32_t>(m_info.knownBuffers.size() - 1u);
+    }
+
+    void TakeKnownPointer(IrValue& inst, std::uint32_t memoryIndex) {
+        static const bool knownBuffers = std::getenv("APS5_RECODE_NO_KNOWN_BUFFERS") == nullptr;
+        auto& memory = m_program.Resources().memoryInfo[memoryIndex];
+        memory.knownBuffer = NoKnownBuffer;
+        if (!knownBuffers || !m_program.Metadata().directResources || memory.addressIsFull) return;
+        if ((memory.kind != ResourceKind::ScalarAddress && memory.kind != ResourceKind::Global) || inst.ArgumentCount() < 2u) return;
+        const IrValue* handle = inst.Argument(0)->Resolve();
+        const IrValue* low = inst.Argument(1)->Resolve();
+        if (handle->Opcode() != IrOpcode::GetAddressResource || handle->ArgumentCount() != 2u || !low->HasImmediate() || low->Type() != IrType::U32) return;
+        const auto first = static_cast<std::int64_t>(low->ImmediateU32()) + static_cast<std::int64_t>(static_cast<std::int32_t>(memory.offset));
+        const auto bytes = static_cast<std::int64_t>(memory.dataBits / 8u) * std::max<std::int64_t>(memory.dataDwords, 1);
+        if (first < 0 || bytes <= 0 || first + bytes > static_cast<std::int64_t>(knownPointerLimitBytes)) return;
+        DescriptorSource descriptor;
+        MakeSource(*handle, 2u, false, false, descriptor);
+        std::uint32_t badDword = 0;
+        if (!ValidateSource(descriptor, badDword)) return;
+        memory.knownBuffer = AddKnownBuffer(InternSource(descriptor), static_cast<std::uint32_t>(first + bytes));
     }
 
     void ValidateAddressHandle(IrValue* value) const {
@@ -2530,6 +2553,7 @@ private:
                 const bool immediateOffset = offset != nullptr && offset->HasImmediate();
                 std::fprintf(stderr, "[bda] %s at pc 0x%08x: %s access, offset %s%s\n", std::string(IrOpcodeName(op)).c_str(), flags.pc, kind, immediateOffset ? "immediate" : "dynamic", memory.kind == ResourceKind::ScalarAddress && !immediateOffset ? " (a register offset is not planned by the SRT walker)" : "");
             }
+            if (addressInfo.access == AddressAccess::Read && !memory.planningOnly) TakeKnownPointer(inst, flags.index);
             m_info.usesDma = true;
             m_info.bdaWrites = m_info.bdaWrites || addressInfo.access == AddressAccess::Write || addressInfo.access == AddressAccess::Atomic;
             return;

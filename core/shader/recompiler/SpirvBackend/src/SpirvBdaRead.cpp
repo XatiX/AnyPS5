@@ -439,6 +439,7 @@ std::optional<std::pair<std::uint32_t, std::uint32_t>> UserDataBase(const SpirvE
     const auto& info = memory[index];
     if (info.kind != ResourceKind::ScalarAddress && info.kind != ResourceKind::Flat && info.kind != ResourceKind::Global) return std::nullopt;
     if (info.planningOnly || info.addressIsFull || RoutesApertures(state, info)) return std::nullopt;
+    if (info.knownBuffer < state.program.Metadata().bindings.knownBufferCount && !BdaByteReadsForced()) return std::nullopt;
     const IrValue* handle = inst.Argument(0) != nullptr ? inst.Argument(0)->Resolve() : nullptr;
     if (handle == nullptr || handle->Opcode() != IrOpcode::GetAddressResource || handle->ArgumentCount() != 2u) return std::nullopt;
     const auto userData = [](const IrValue* value) -> std::optional<std::uint32_t> {
@@ -634,7 +635,22 @@ std::array<std::uint32_t, 4> EmitAnchoredBdaRead(SpirvEmitterState& state, const
     return values;
 }
 
-std::array<std::uint32_t, 4> EmitBoundedBdaRead(SpirvEmitterState& state, const IrValue& inst, const SpirvEmitterState::BdaAnchor& anchor, std::uint32_t low, std::uint32_t bits, std::uint32_t dwords, std::uint32_t usedDwords) {
+std::optional<SpirvEmitterState::BdaAnchor> KnownBdaAnchor(SpirvEmitterState& state, const MemoryInfo& memory) {
+    const auto& layout = state.program.Metadata().bindings;
+    if (memory.knownBuffer >= layout.knownBufferCount || BdaByteReadsForced()) return std::nullopt;
+    const auto u64 = TypeScalarU64(state);
+    const auto first = layout.KnownBufferDword() + memory.knownBuffer * KnownBufferDwords;
+    const auto low = Unary(state, spv::OpUConvert, u64, EmitShaderDataDwordLoad(state, first));
+    const auto high = Unary(state, spv::OpUConvert, u64, EmitShaderDataDwordLoad(state, first + 1u));
+    SpirvEmitterState::BdaAnchor anchor;
+    anchor.device = Binary(state, spv::OpBitwiseOr, u64, low, Binary(state, spv::OpShiftLeftLogical, u64, high, BdaConstant(state, 32u)));
+    const auto bound = Unary(state, spv::OpUConvert, u64, EmitShaderDataDwordLoad(state, first + 2u));
+    anchor.size = Select(state, u64, Binary(state, spv::OpINotEqual, TypeBool(state), anchor.device, BdaConstant(state, 0u)), bound, BdaConstant(state, 0u));
+    anchor.offset = BdaConstant(state, 0u);
+    return anchor;
+}
+
+std::array<std::uint32_t, 4> EmitBoundedBdaRead(SpirvEmitterState& state, const IrValue& inst, const SpirvEmitterState::BdaAnchor& anchor, std::uint32_t low, std::int32_t immediate, std::uint32_t bits, std::uint32_t dwords, std::uint32_t usedDwords) {
     if (bits != 8u && bits != 16u && bits != 32u) throw std::runtime_error("unsupported bounded BDA read width");
     if (bits == 32u && (dwords == 0u || dwords > 4u)) throw std::runtime_error("unsupported bounded BDA read dword count");
     const auto used = bits != 32u ? 1u : usedDwords != 0u ? usedDwords : UsedBdaDwords(inst, dwords);
@@ -654,7 +670,7 @@ std::array<std::uint32_t, 4> EmitBoundedBdaRead(SpirvEmitterState& state, const 
     }
     const bool coherent = BdaCoherent(state, inst);
     std::uint32_t translated = 0;
-    const auto inside = BdaAnchorHolds(state, anchor, low, static_cast<std::int32_t>(first * 4u), bytes, translated);
+    const auto inside = BdaAnchorHolds(state, anchor, low, static_cast<std::int32_t>(static_cast<std::uint32_t>(immediate) + first * 4u), bytes, translated);
     const auto outsideExit = state.currentLabel;
     const auto insideLabel = state.module.AllocateId();
     const auto merge = state.module.AllocateId();
