@@ -99,9 +99,23 @@ void testRefusals() {
     Expect(!KeyOf(empty, reason).has_value(), "an empty T# has no key");
 }
 
+void testGpuWrittenSurfacesAreLeftToTheExistingCache() {
+    FakeDevice device;
+    Events::ChangeLog shared;
+    Events::ChangeLog images;
+    SurfaceTable table(device, shared, images);
+    std::string reason;
+    const auto key = Key(0x600000000ull);
+    static_cast<void>(images.Note(key.address, 0x1000));
+    const auto found = table.Find(key, words, reason);
+    Expect(found.has_value() && found->gpuWritten && found->surface == nullptr && device.created == 0u, "a GPU-written surface is not created");
+    Expect(table.TakeCounts().gpuWritten == 1u, "the GPU-written lookup is counted");
+}
+
 }
 
 int main() {
+    testGpuWrittenSurfacesAreLeftToTheExistingCache();
     testSurfacesAreSharedAndQueued();
     testWritesMakeSurfacesStale();
     testRefusals();

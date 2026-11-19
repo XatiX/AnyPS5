@@ -71,6 +71,7 @@ struct Surface {
 struct Found {
     std::shared_ptr<Surface> surface;
     bool ready = false;
+    bool gpuWritten = false;
 };
 
 struct TableCounts {
@@ -81,6 +82,7 @@ struct TableCounts {
     std::uint64_t stale = 0;
     std::uint64_t refused = 0;
     std::uint64_t detiled = 0;
+    std::uint64_t gpuWritten = 0;
 };
 
 class SurfaceTable {

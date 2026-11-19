@@ -12,6 +12,7 @@
 #include "prx/libSceAgcDriver/Graphics/include/VertexInput.hpp"
 #include "prx/libSceAgcDriver/Unified/include/DataRing.hpp"
 #include "prx/libSceAgcDriver/Unified/include/Events.hpp"
+#include "prx/libSceAgcDriver/Unified/include/ImageDetile.hpp"
 #include "prx/libSceAgcDriver/Unified/include/ResidencyService.hpp"
 #include "prx/libSceAgcDriver/Unified/include/Shadow.hpp"
 #include "prx/libSceAgcDriver/Unified/include/TableMirror.hpp"
@@ -64,6 +65,7 @@ struct Totals {
     std::uint64_t mapUploads = 0;
     std::uint64_t mapUploadBytes = 0;
     std::uint64_t mapRetired = 0;
+    std::uint64_t surfaceFailures = 0;
     std::uint64_t faultReads = 0;
     std::uint64_t faults = 0;
     std::uint64_t unmappedFaults = 0;
@@ -257,6 +259,22 @@ private:
         if (totals.reasons.size() < 24u || totals.reasons.contains(key)) totals.reasons[key]++;
     }
 
+    void drainSurfaces(const Context& context, Graphics::Recorder& recorder) {
+        auto* table = Resolve::Surfaces();
+        if (table == nullptr) return;
+        auto work = table->TakeWork();
+        if (work.empty()) return;
+        if (surfaceDetiler == nullptr) surfaceDetiler = std::make_unique<Images::SurfaceDetiler>(context);
+        for (const auto& surface : work) {
+            std::string why;
+            if (surfaceDetiler->Record(recorder, *table, surface, why)) continue;
+            totals.surfaceFailures++;
+            auto key = "surface: " + why.substr(0, 50);
+            if (seen.insert(key).second) std::fprintf(stderr, "[recode-record] first surface failure: %s\n", why.c_str());
+            if (totals.reasons.size() < 24u || totals.reasons.contains(key)) totals.reasons[key]++;
+        }
+    }
+
     void readFaults(Graphics::Buffer& buffer) {
         namespace Abi = ShaderRecompiler::BdaAbi;
         auto bytes = buffer.Bytes();
@@ -427,6 +445,7 @@ private:
             return false;
         }
         if (!attach(context, reason) || !precheck(draw, parameters, nullptr, reason)) return false;
+        drainSurfaces(context, *recorder);
         const auto& state = *draw.state;
         std::vector<Graphics::CompiledShader> shaders;
         for (const auto& stage : draw.stages) shaders.push_back({stage.program.stage, stage.program.result.get(), stage.program.pushOffset});
@@ -703,6 +722,7 @@ private:
     std::uint64_t mapBytes = 0;
     std::set<std::string> seen;
     std::set<std::uint32_t> seenFaults;
+    std::unique_ptr<Images::SurfaceDetiler> surfaceDetiler;
     Totals totals;
 };
 
