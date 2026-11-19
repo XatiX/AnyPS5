@@ -6,6 +6,8 @@
 
 namespace ShaderRecompiler {
 
+inline constexpr std::uint32_t NoKnownBuffer = 0xffffffffu;
+
 enum class ResourceKind {
     None,
     ScalarBuffer,
@@ -50,6 +52,7 @@ struct MemoryInfo {
     bool planningOnly = false;
     bool coherent = false;
     bool gpuDescriptor = false;
+    std::uint32_t knownBuffer = NoKnownBuffer;
     bool flushDenormals = false;
     bool flushDenormalResults = false;
     bool descriptorWebArm = false;

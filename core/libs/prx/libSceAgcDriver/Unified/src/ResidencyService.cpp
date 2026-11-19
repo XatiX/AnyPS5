@@ -46,6 +46,19 @@ bool ResidencyService::PageTableEnabled() {
     return enabled;
 }
 
+VkMemoryPropertyFlags ResidencyService::ShaderReadMemory(const Graphics::Context& context, VkDeviceSize bytes) {
+    constexpr VkMemoryPropertyFlags host = VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT;
+    constexpr VkMemoryPropertyFlags device = host | VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT;
+    static const bool hostOnly = std::getenv("APS5_RECODE_HOST_SHADER_DATA") != nullptr;
+    if (hostOnly) return host;
+    for (std::uint32_t i = 0; i < context.memory.memoryTypeCount; ++i) {
+        const auto& type = context.memory.memoryTypes[i];
+        const auto& heap = context.memory.memoryHeaps[type.heapIndex];
+        if ((type.propertyFlags & device) == device && (heap.flags & VK_MEMORY_HEAP_DEVICE_LOCAL_BIT) != 0 && heap.size >= bytes * 4u) return device;
+    }
+    return host;
+}
+
 bool ResidencyService::Attach(const Graphics::Context& graphics) {
     if (attached.load(std::memory_order_acquire)) return true;
     if (refused.load(std::memory_order_acquire) || !Enabled()) return false;
@@ -62,14 +75,14 @@ bool ResidencyService::Attach(const Graphics::Context& graphics) {
     uploads = std::make_unique<ResidentUploads>(*ledger, GuestMemory::CommittedRanges);
     if (PageTableEnabled()) {
         pages = std::make_unique<GpuPageTable>();
-        pageBuffer = std::make_shared<Graphics::Buffer>(*context, Abi::PageTableBytes(PageTableLeafCapacity), VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT);
+        pageBuffer = std::make_shared<Graphics::Buffer>(*context, Abi::PageTableBytes(PageTableLeafCapacity), VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT, ShaderReadMemory(*context, Abi::PageTableBytes(PageTableLeafCapacity)));
         auto bytes = pageBuffer->Bytes();
         std::memset(bytes.data(), 0, bytes.size());
         const Abi::Header header{Abi::PageTableVersion, 0, sizeof(std::uint64_t), 0};
         std::memcpy(bytes.data(), &header, sizeof(header));
         ledger->SetPageTable(pages.get());
         if (std::getenv("APS5_RECODE_NO_NULL_PAGE") == nullptr) {
-            nullPage = std::make_shared<Graphics::Buffer>(*context, GpuPageBytes, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT);
+            nullPage = std::make_shared<Graphics::Buffer>(*context, GpuPageBytes, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT, ShaderReadMemory(*context, GpuPageBytes));
             std::memset(nullPage->Bytes().data(), 0, nullPage->Bytes().size());
             pages->Map(0, GpuPageBytes, nullPage->DeviceAddress(), GpuPageRead);
         }

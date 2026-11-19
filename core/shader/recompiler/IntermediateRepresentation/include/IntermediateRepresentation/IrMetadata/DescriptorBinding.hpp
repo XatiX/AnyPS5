@@ -13,6 +13,7 @@ inline constexpr std::uint32_t FirstImageBinding = RuntimeAbi::FirstImageBinding
 inline constexpr std::uint32_t FirstComparisonImageBinding = RuntimeAbi::FirstComparisonImageBinding;
 inline constexpr std::uint32_t FirstStorageImageBinding = RuntimeAbi::FirstStorageImageBinding;
 inline constexpr std::uint32_t ImageBindingCount = RuntimeAbi::ImageBindingCount;
+inline constexpr std::uint32_t KnownBufferDwords = 4;
 
 using DescriptorBindingKind = RuntimeAbi::Binding;
 
@@ -46,6 +47,7 @@ struct IrBindingLayout {
     std::uint32_t runtimeImageCount = 0;
     std::uint32_t runtimeStateDwords = 0;
     std::uint32_t directSlotCount = 0;
+    std::uint32_t knownBufferCount = 0;
     std::vector<std::uint32_t> userDataRegisters;
     std::vector<IrDescriptorBinding> descriptors;
 
@@ -61,8 +63,11 @@ struct IrBindingLayout {
     [[nodiscard]] std::uint32_t DirectSlotDword() const {
         return RuntimeStateDword() + runtimeStateDwords;
     }
-    [[nodiscard]] std::uint32_t ShaderDataDwords() const {
+    [[nodiscard]] std::uint32_t KnownBufferDword() const {
         return DirectSlotDword() + directSlotCount;
+    }
+    [[nodiscard]] std::uint32_t ShaderDataDwords() const {
+        return KnownBufferDword() + knownBufferCount * KnownBufferDwords;
     }
     [[nodiscard]] bool UsesPushData() const {
         return pushDataStartDword != PushData::NoStart;

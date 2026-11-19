@@ -160,6 +160,7 @@ class Tracker {
 public:
     explicit Tracker(IrProgram& program) : m_program(program), m_info(program.Resources().info), m_builder(program) {
         m_info.buffers.clear();
+        m_info.knownBuffers.clear();
         m_info.images.clear();
         m_info.samplers.clear();
         m_info.sampledPairs.clear();
@@ -2255,9 +2256,19 @@ private:
             return true;
         }
         memory.gpuDescriptor = true;
+        memory.knownBuffer = NoKnownBuffer;
+        if (m_program.Metadata().directResources && access == BufferAccess::Read && ValidateSource(descriptor, badDword)) memory.knownBuffer = AddKnownBuffer(InternSource(descriptor));
         m_info.usesDma = true;
         m_info.bdaWrites = m_info.bdaWrites || access == BufferAccess::Write || access == BufferAccess::Atomic;
         return true;
+    }
+
+    std::uint32_t AddKnownBuffer(std::uint32_t source) {
+        const auto found = std::ranges::find(m_info.knownBuffers, source);
+        if (found != m_info.knownBuffers.end()) return static_cast<std::uint32_t>(found - m_info.knownBuffers.begin());
+        if (m_info.knownBuffers.size() >= RuntimeAbi::BufferCapacity) return NoKnownBuffer;
+        m_info.knownBuffers.push_back(source);
+        return static_cast<std::uint32_t>(m_info.knownBuffers.size() - 1u);
     }
 
     void ValidateAddressHandle(IrValue* value) const {
