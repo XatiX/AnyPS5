@@ -187,7 +187,7 @@ bool servesFaultPages() {
 }
 
 bool residentDrawInputs() {
-    static const bool resident = std::getenv("APS5_RECODE_IMPORTED_INPUTS") == nullptr;
+    static const bool resident = std::getenv("APS5_RECODE_RESIDENT_INPUTS") != nullptr;
     return resident;
 }
 
