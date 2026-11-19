@@ -83,6 +83,7 @@ private:
 };
 
 inline constexpr std::uintptr_t ImageSetOwner = 2;
+inline constexpr std::uintptr_t TargetOwner = 4;
 
 inline std::uintptr_t ResourceOwner(const void* resources) {
     return reinterpret_cast<std::uintptr_t>(resources) | 1u;

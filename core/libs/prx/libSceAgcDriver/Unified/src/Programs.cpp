@@ -7,6 +7,7 @@
 #include "prx/libSceAgcDriver/Graphics/include/ShaderInputState.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/Shaders.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/State.hpp"
+#include "Optimization/ShaderStageInputInfo.hpp"
 #include <algorithm>
 #include <array>
 #include <atomic>
@@ -142,6 +143,16 @@ bool materializeStage(const ProgramInputs& inputs, ShaderRecompiler::RecompileRe
     return true;
 }
 
+}
+
+std::pair<std::uint64_t, std::uint64_t> KnownBufferSpan(const ShaderRecompiler::KnownBuffer& known, const ShaderRecompiler::DescriptorValue& value) {
+    if (known.Pointer()) {
+        if (value.dwordCount < 2u) return {0u, 0u};
+        return {value.dwords[0] | (static_cast<std::uint64_t>(value.dwords[1]) << 32u), known.pointerBytes};
+    }
+    if (value.dwordCount < 4u) return {0u, 0u};
+    const ShaderRecompiler::ShaderBufferResource descriptor{{value.dwords[0], value.dwords[1] & ~0x40000000u, value.dwords[2], value.dwords[3]}};
+    return {descriptor.Base48(), descriptor.GetSize()};
 }
 
 ShaderRecompiler::SpirvTarget HeapTarget(const ShaderRecompiler::SpirvTarget& device) {

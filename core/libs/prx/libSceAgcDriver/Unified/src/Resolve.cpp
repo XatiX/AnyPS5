@@ -23,6 +23,8 @@
 #include <map>
 #include <mutex>
 #include <set>
+#include <span>
+#include <utility>
 
 namespace AgcDriver::Unified::Resolve {
 
@@ -177,6 +179,9 @@ private:
             totals.templateMismatch = programs.templateMismatch;
         }
         if (!built) {
+            std::vector<GuestUse> targets;
+            TargetUses(state.Live(), targets);
+            noteTargetWrites(targets);
             refuse(totals, reason);
             totals.programNanoseconds += elapsed(started);
             return nullptr;
@@ -198,6 +203,7 @@ private:
         }
         const auto beforeTargets = draw.uses.size();
         TargetUses(programs.decode.state, draw.uses);
+        noteTargetWrites(std::span<const GuestUse>(draw.uses).subspan(beforeTargets));
         totals.targetUses += draw.uses.size() - beforeTargets;
         draw.targetBegin = beforeTargets;
         draw.targetEnd = draw.uses.size();
@@ -428,11 +434,9 @@ private:
             if (address == 0u || bytes == 0u) continue;
             uses.push_back({address, bytes, buffers[index].written || buffers[index].atomic});
         }
-        for (const auto& value : snapshot.knownBuffers) {
-            if (value.dwordCount < 4u) continue;
-            const ShaderRecompiler::ShaderBufferResource descriptor{{value.dwords[0], value.dwords[1] & ~0x40000000u, value.dwords[2], value.dwords[3]}};
-            const auto address = descriptor.Base48();
-            const auto bytes = static_cast<std::uint64_t>(descriptor.GetSize());
+        const auto& known = variant.info.info.knownBuffers;
+        for (std::size_t index = 0; index < snapshot.knownBuffers.size(); ++index) {
+            const auto [address, bytes] = KnownBufferSpan(index < known.size() ? known[index] : ShaderRecompiler::KnownBuffer{}, snapshot.knownBuffers[index]);
             if (address == 0u || bytes == 0u) continue;
             uses.push_back({address, bytes, false});
         }
@@ -497,6 +501,14 @@ private:
         resolved.image = {reinterpret_cast<std::uint64_t>(texture->View()), static_cast<std::uint32_t>(texture->Layout()), texture};
         resolved.memory = {resource.baseAddress, Graphics::SurfaceGuestBytes(resource)};
         return resolved;
+    }
+
+    void noteTargetWrites(std::span<const GuestUse> uses) {
+        std::lock_guard lock(writtenTargetsMutex);
+        for (const auto& use : uses) {
+            if (!use.write || use.size == 0u || !writtenTargets.emplace(use.address, use.size).second) continue;
+            Events::GpuWrites().Note(use.address, use.size, Events::TargetOwner);
+        }
     }
 
     void noteSurfaceReason(const std::string& why) {
@@ -594,6 +606,8 @@ private:
     std::set<std::string> seenReasons;
     std::set<std::string> seenSurfaceReasons;
     std::set<std::uint64_t> missedTargets;
+    std::mutex writtenTargetsMutex;
+    std::set<std::pair<std::uint64_t, std::uint64_t>> writtenTargets;
     std::map<std::string, std::uint64_t> surfaceReasons;
     bool firstBuilt = false;
     bool firstImage = false;

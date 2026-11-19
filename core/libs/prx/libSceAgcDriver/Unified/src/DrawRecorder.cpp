@@ -15,11 +15,13 @@
 #include "prx/libSceAgcDriver/Unified/include/DataRing.hpp"
 #include "prx/libSceAgcDriver/Unified/include/Events.hpp"
 #include "prx/libSceAgcDriver/Unified/include/ImageDetile.hpp"
+#include "prx/libSceAgcDriver/Unified/include/MemoryCore.hpp"
 #include "prx/libSceAgcDriver/Unified/include/ResidencyService.hpp"
 #include "prx/libSceAgcDriver/Unified/include/Shadow.hpp"
 #include "prx/libSceAgcDriver/Unified/include/TableMirror.hpp"
 #include "prx/libSceAgcDriver/Unified/include/Targets.hpp"
 #include "prx/libSceAgcDriver/Unified/include/VulkanHeap.hpp"
+#include "prx/libc/include/GuestArena.hpp"
 #include "Optimization/ShaderStageInputInfo.hpp"
 #include "BdaAbi.hpp"
 #include "RuntimeAbi.hpp"
@@ -148,6 +150,10 @@ struct Totals {
     std::uint64_t graphicsPipelineNanoseconds = 0;
     std::uint64_t uploadNanoseconds = 0;
     std::uint64_t knownServed = 0;
+    std::uint64_t knownMapped = 0;
+    std::uint64_t knownPaged = 0;
+    std::uint64_t knownCopied = 0;
+    std::uint64_t knownPointers = 0;
     std::uint64_t knownRefused = 0;
     std::uint64_t knownSkipped = 0;
     std::map<std::string, std::uint64_t> reasons;
@@ -177,11 +183,7 @@ bool servesFaultPages() {
 }
 
 constexpr std::uint64_t KnownBufferLimitBytes = 256ull << 20u;
-
-bool servesKnownBuffers() {
-    static const bool serves = std::getenv("APS5_RECODE_NO_KNOWN_BUFFERS") == nullptr;
-    return serves;
-}
+constexpr std::uint64_t KnownCopyLimitBytes = 64ull << 10u;
 
 bool shaderDataBinding(const Resolve::ResolvedStage& stage, std::uint32_t index) {
     const auto& bindings = stage.program.result->bindings;
@@ -439,7 +441,7 @@ public:
         line += "; batch moved before the pass " + std::to_string(totals.batchMoves);
         line += "; passes " + std::to_string(totals.passesBegun) + " begun, " + std::to_string(totals.passesContinued) + " draws continued, " + std::to_string(totals.passFeedback) + " broken by a target read";
         line += "; residency updates landed " + std::to_string(totals.residencyLands);
-        line += "; known buffers " + std::to_string(totals.knownServed) + " served, " + std::to_string(totals.knownRefused) + " refused, " + std::to_string(totals.knownSkipped) + " skipped";
+        line += "; known buffers " + std::to_string(totals.knownServed) + " served, " + std::to_string(totals.knownMapped) + " mapped (" + std::to_string(totals.knownPaged) + " paged in), " + std::to_string(totals.knownCopied) + " copied, " + std::to_string(totals.knownRefused) + " unresolved, " + std::to_string(totals.knownSkipped) + " skipped (" + std::to_string(totals.knownPointers) + " of them pointers)";
         std::snprintf(text, sizeof(text), "; draw phases surfaces %.1f ms, targets %.1f ms, pipelines %.1f ms, owned uploads %.1f ms", static_cast<double>(totals.surfaceNanoseconds) / 1e6, static_cast<double>(totals.targetNanoseconds) / 1e6, static_cast<double>(totals.graphicsPipelineNanoseconds) / 1e6, static_cast<double>(totals.uploadNanoseconds) / 1e6);
         line += text;
         std::snprintf(text, sizeof(text), "; dispatches %llu recorded, %llu to the existing path, %.1f us per dispatch; compute pipelines %zu held, %llu queued, %llu built in %.1f ms, %zu building, %zu failed", static_cast<unsigned long long>(totals.dispatches), static_cast<unsigned long long>(totals.dispatchExisting), totals.dispatches == 0 ? 0.0 : static_cast<double>(totals.dispatchNanoseconds) / 1000.0 / static_cast<double>(totals.dispatches), computePipelines.size(), static_cast<unsigned long long>(totals.pipelinesQueued), static_cast<unsigned long long>(totals.pipelinesBuilt), static_cast<double>(totals.pipelineNanoseconds) / 1e6, buildingPipelines.size(), failedPipelines.size());
@@ -471,7 +473,9 @@ private:
         device = context.device;
         alignment = std::max<std::uint64_t>(context.limits.minStorageBufferOffsetAlignment, 16u);
         const auto ringMemory = ResidencyService::ShaderReadMemory(context, RingBytes);
-        ring = std::make_shared<Graphics::Buffer>(context, RingBytes, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_INDIRECT_BUFFER_BIT, ringMemory);
+        const VkBufferUsageFlags addressable = context.bufferDeviceAddress ? VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT : 0u;
+        ring = std::make_shared<Graphics::Buffer>(context, RingBytes, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_INDIRECT_BUFFER_BIT | addressable, ringMemory);
+        ringAddress = addressable != 0u ? ring->DeviceAddress() : 0u;
         space.emplace(RingBytes, alignment);
         std::fprintf(stderr, "[recode-record] ring %llu MiB, alignment %llu, %s memory\n", static_cast<unsigned long long>(RingBytes >> 20u), static_cast<unsigned long long>(alignment), (ringMemory & VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT) != 0 ? "device" : "host");
         return true;
@@ -654,39 +658,67 @@ private:
     }
 
     template<typename TPut>
-    void serveKnownBuffers(const Context& context, const Resolve::ResolvedStage& stage, TPut&& put) {
-        if (!servesKnownBuffers() || stage.program.variant == nullptr || stage.program.capture == nullptr) return;
+    void serveKnownBuffers(const Context& context, const Resolve::ResolvedStage& stage, std::uint64_t serial, std::uint64_t completed, TPut&& put) {
+        if (stage.program.variant == nullptr || stage.program.capture == nullptr) return;
         const auto& layout = stage.program.variant->info.bindings;
         const auto& known = stage.program.capture->snapshot.knownBuffers;
-        for (std::uint32_t index = 0; index < layout.knownBufferCount && index < known.size(); ++index) {
-            const auto& value = known[index];
-            if (value.dwordCount < 4u) {
+        const auto& infos = stage.program.variant->info.info.knownBuffers;
+        for (std::uint32_t index = 0; index < layout.knownBufferCount; ++index) {
+            const auto dword = layout.KnownBufferDword() + index * ShaderRecompiler::KnownBufferDwords;
+            const auto write = [&](std::uint64_t device, std::uint64_t bytes) {
+                put(dword, static_cast<std::uint32_t>(device));
+                put(dword + 1u, static_cast<std::uint32_t>(device >> 32u));
+                put(dword + 2u, static_cast<std::uint32_t>(std::min<std::uint64_t>(bytes, 0xffffffffu)));
+            };
+            const auto [address, bytes] = index < known.size() ? Resolve::KnownBufferSpan(index < infos.size() ? infos[index] : ShaderRecompiler::KnownBuffer{}, known[index]) : std::pair<std::uint64_t, std::uint64_t>{0u, 0u};
+            if (index < infos.size() && infos[index].Pointer()) totals.knownPointers++;
+            if (address == 0u || bytes == 0u) {
                 totals.knownSkipped++;
+                write(0u, 0u);
                 continue;
             }
-            const ShaderRecompiler::ShaderBufferResource descriptor{{value.dwords[0], value.dwords[1] & ~0x40000000u, value.dwords[2], value.dwords[3]}};
-            const auto address = descriptor.Base48();
-            const auto bytes = descriptor.GetSize();
-            if (address == 0u || bytes == 0u || bytes > KnownBufferLimitBytes) {
-                totals.knownSkipped++;
+            if (const auto copied = copyKnownBuffer(address, bytes, serial, completed); copied != 0u) {
+                totals.knownCopied++;
+                write(copied, bytes);
                 continue;
             }
             Shadow::OwnedSpan span;
-            if (!Shadow::ServeOwned(context, address, bytes, &span) || span.address == 0u) {
-                totals.knownRefused++;
+            if (bytes <= KnownBufferLimitBytes && Shadow::ServeOwned(context, address, bytes, &span) && span.address != 0u) {
+                totals.knownServed++;
+                write(span.address, bytes);
                 continue;
             }
-            const auto dword = layout.KnownBufferDword() + index * ShaderRecompiler::KnownBufferDwords;
-            put(dword, static_cast<std::uint32_t>(span.address));
-            put(dword + 1u, static_cast<std::uint32_t>(span.address >> 32u));
-            put(dword + 2u, static_cast<std::uint32_t>(bytes));
-            totals.knownServed++;
+            auto mapped = ResidencyService::Get().TranslateMapped(address, bytes);
+            if (mapped == 0u && bytes <= KnownBufferLimitBytes && servesFaultPages()) {
+                std::vector<std::uint64_t> pages;
+                for (auto page = address & ~(GpuPageBytes - 1u); page < address + bytes; page += GpuPageBytes) pages.push_back(page);
+                Shadow::ServeFaultPages(pages);
+                mapped = ResidencyService::Get().TranslateMapped(address, bytes);
+                if (mapped != 0u) totals.knownPaged++;
+            }
+            if (mapped != 0u) {
+                totals.knownMapped++;
+                write(mapped, bytes);
+                continue;
+            }
+            totals.knownRefused++;
+            write(0u, 0u);
         }
     }
 
-    void servePushKnownBuffers(const Context& context, const Resolve::ResolvedStage& stage, std::span<std::byte> block) {
+    std::uint64_t copyKnownBuffer(std::uint64_t address, std::uint64_t bytes, std::uint64_t serial, std::uint64_t completed) {
+        if (ringAddress == 0u || bytes > KnownCopyLimitBytes) return 0u;
+        if (!GuestArena::GuestArenaContains_nid_postfix(reinterpret_cast<const void*>(address), static_cast<std::size_t>(bytes))) return 0u;
+        const auto committed = GuestMemory::CommittedRanges(address, static_cast<std::size_t>(bytes));
+        if (committed.size() != 1u || committed.front().first > address || committed.front().second < address + bytes) return 0u;
+        if (!MemoryCore::Get().Pages().GpuOwnedIn(address, bytes).empty()) return 0u;
+        const auto offset = ringWrite(std::span(reinterpret_cast<const std::byte*>(address), static_cast<std::size_t>(bytes)), serial, completed);
+        return offset.has_value() ? ringAddress + *offset : 0u;
+    }
+
+    void servePushKnownBuffers(const Context& context, const Resolve::ResolvedStage& stage, std::span<std::byte> block, std::uint64_t serial, std::uint64_t completed) {
         if (stage.program.variant == nullptr || !stage.program.variant->info.bindings.UsesPushData()) return;
-        serveKnownBuffers(context, stage, [&](std::uint32_t dword, std::uint32_t value) {
+        serveKnownBuffers(context, stage, serial, completed, [&](std::uint32_t dword, std::uint32_t value) {
             const auto offset = static_cast<std::size_t>(dword) * sizeof(std::uint32_t);
             if (offset + sizeof(value) <= block.size()) std::memcpy(block.data() + offset, &value, sizeof(value));
         });
@@ -708,7 +740,7 @@ private:
                     std::vector<std::byte> bytes(std::max<std::size_t>({words.size_bytes(), dataBytes, 16u}));
                     std::memcpy(bytes.data(), words.data(), words.size_bytes());
                     if (shaderData) {
-                        serveKnownBuffers(context, stage, [&](std::uint32_t dword, std::uint32_t value) {
+                        serveKnownBuffers(context, stage, serial, completed, [&](std::uint32_t dword, std::uint32_t value) {
                             const auto offset = static_cast<std::size_t>(dword) * sizeof(std::uint32_t);
                             if (offset + sizeof(value) <= bytes.size()) std::memcpy(bytes.data() + offset, &value, sizeof(value));
                         });
@@ -901,7 +933,7 @@ private:
         std::array<std::byte, Graphics::ComputePushConstantBytes> block{};
         const auto& push = stage.program.words.pushConstants;
         if (!push.empty()) std::memcpy(block.data(), push.data(), push.size());
-        servePushKnownBuffers(context, stage, block);
+        servePushKnownBuffers(context, stage, block, serial, completed);
 
         if (Shadow::OwnedUploadsPending()) {
             std::vector<std::shared_ptr<void>> kept;
@@ -1046,7 +1078,7 @@ private:
                 return false;
             }
             std::memcpy(block.data() + shaders[index].pushConstantOffset, push.data(), push.size());
-            servePushKnownBuffers(context, draw.stages[index], std::span(block).subspan(shaders[index].pushConstantOffset));
+            servePushKnownBuffers(context, draw.stages[index], std::span(block).subspan(shaders[index].pushConstantOffset), serial, completed);
         }
 
         VkBuffer argumentBuffer = VK_NULL_HANDLE;
@@ -1235,6 +1267,7 @@ private:
     VkDevice device = VK_NULL_HANDLE;
     std::uint64_t alignment = 16;
     std::shared_ptr<Graphics::Buffer> ring;
+    std::uint64_t ringAddress = 0;
     std::vector<std::pair<std::uint64_t, std::uint64_t>> passTargets;
     std::deque<FaultBuffer> faults;
     std::vector<std::shared_ptr<Graphics::Buffer>> spareFaults;
