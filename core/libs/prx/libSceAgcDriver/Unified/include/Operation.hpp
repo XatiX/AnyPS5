@@ -34,6 +34,21 @@ struct WaitEdge {
     [[nodiscard]] bool Present() const { return sequence != 0; }
 };
 
+struct DrawFacts {
+    std::uint64_t indexAddress = 0;
+    std::uint32_t indexCount = 0;
+    std::uint32_t indexSize = 0;
+    std::uint32_t instanceCount = 0;
+    std::uint32_t flags = 0;
+    std::uint32_t firstVertex = 0;
+    std::uint32_t firstInstance = 0;
+    bool indexed = false;
+    bool indirect = false;
+    std::uint64_t indirectAddress = 0;
+    std::uint64_t indirectBytes = 0;
+    std::uint64_t countAddress = 0;
+};
+
 struct Operation {
     OpKind kind = OpKind::Marker;
     std::uint8_t opcode = 0;
@@ -51,6 +66,7 @@ struct Operation {
     std::uint8_t function = 0;
     bool resolved = false;
     std::uint64_t key = 0;
+    DrawFacts draw;
 };
 
 [[nodiscard]] constexpr bool IsDraw(OpKind kind) {

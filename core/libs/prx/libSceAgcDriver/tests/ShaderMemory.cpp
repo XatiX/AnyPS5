@@ -35,6 +35,10 @@
 #include "BdaAbi.hpp"
 #include "ImageTableAbi.hpp"
 #include "ShaderDiskCache.hpp"
+#if defined(ANYPS5_UNIFIED)
+#include "prx/libSceAgcDriver/Unified/include/SlotPatch.hpp"
+#include "prx/libSceAgcDriver/Unified/include/SlotRequests.hpp"
+#endif
 #include <limits>
 #include <spirv/unified1/spirv.hpp>
 #include <algorithm>
@@ -554,6 +558,52 @@ void verifyResultMemoBudgetMasked() {
     SetResultMemoBudget(0u);
     require(!compileResultMemoPixel(3u), "result memo budget masked: a snapshot after the trim hit the memo");
     require(ResultMemoBytes() == first, std::string("result memo budget masked: the trim left a masked entry to patch from (" + std::to_string(ResultMemoBytes()) + " bytes after one compile, " + std::to_string(first) + " for a full one)").c_str());
+}
+
+ShaderRecompiler::RecompileRequest resultTemplateRequest(std::span<const std::uint32_t> color) {
+    using namespace ShaderRecompiler;
+    auto request = FrontendRequest(resultMemoPixelCode(), color);
+    request.shader.stage = ShaderStage::Fragment;
+    request.context.compute.reset();
+    request.context.pixel = ShaderPixelStageInfo{};
+    request.context.pixel->wave32 = true;
+    request.context.pixel->targetOutputMode[0] = 9u;
+    request.context.waveSize = 32u;
+    request.useCache = true;
+    return request;
+}
+
+void verifyResultTemplates() {
+    using namespace ShaderRecompiler;
+    const std::array<std::uint32_t, 1> first{1u};
+    const std::array<std::uint32_t, 1> second{7u};
+    const auto firstRequest = resultTemplateRequest(first);
+    const auto secondRequest = resultTemplateRequest(second);
+    const auto handle = PrepareShader(firstRequest);
+    require(handle != nullptr, "result templates: the pixel shader was not prepared");
+    const auto firstInvocation = PreparedShaderInvocation::TryCreate(firstRequest, handle);
+    const auto secondInvocation = PreparedShaderInvocation::TryCreate(secondRequest, handle);
+    require(firstInvocation.has_value() && secondInvocation.has_value(), "result templates: a request of the same shader did not match its prepared handle");
+    const auto firstCapture = firstInvocation->Capture(SrtRuntime{.userData = first});
+    const auto secondCapture = secondInvocation->Capture(SrtRuntime{.userData = second});
+    require(firstInvocation->TemplateKey(*firstCapture) == secondInvocation->TemplateKey(*secondCapture), "result templates: a user data word changed the template key");
+    require(firstInvocation->SnapshotKey(*firstCapture) != secondInvocation->SnapshotKey(*secondCapture), "result templates: a user data word left the snapshot key unchanged");
+    const auto shape = firstInvocation->BuildTemplate(*firstCapture);
+    require(shape != nullptr && shape->result != nullptr && shape->refillable, "result templates: the template of a push data shader is not refillable");
+    require(shape->snapshotKey == firstInvocation->SnapshotKey(*firstCapture), "result templates: the template does not record its snapshot key");
+    require(ResultTemplateBytes(*shape) > sizeof(ResultTemplate), "result templates: the template size leaves out its result");
+    const auto full = secondInvocation->MaterializeUnshared(*secondCapture);
+    TemplateWords stale;
+    stale.pushConstants = shape->result->pushConstants;
+    stale.poisonedSrtReads = shape->result->poisonedSrtReads;
+    require(TemplateWordsDifference(*shape, stale, *full) != nullptr, "result templates: the unrefilled template already matched another snapshot");
+    TemplateWords words;
+    RefillTemplate(*shape, secondCapture->snapshot, words);
+    const auto* difference = TemplateWordsDifference(*shape, words, *full);
+    require(difference == nullptr, (std::string("result templates: the refilled template differs from a full materialize in ") + (difference != nullptr ? difference : "")).c_str());
+    TemplateWords own;
+    RefillTemplate(*shape, firstCapture->snapshot, own);
+    require(TemplateWordsDifference(*shape, own, *firstInvocation->MaterializeUnshared(*firstCapture)) == nullptr, "result templates: refilling the template's own snapshot changed it");
 }
 
 void verifyResultMemoBudget() {
@@ -5680,6 +5730,70 @@ void verifySamplerLimits() {
     }
     require(pairedImages == 3u, "sampler limits: the three direct images are not bound");
     std::cout << "sampler limits: 20 direct samplers bound as 40 sampler elements; the image sampled only through samplers 16 to 19 pairs with elements 32 to 39\n";
+
+    auto heapRequest = TableRequest(directCode, userData);
+    heapRequest.target.directResources = true;
+    const auto heap = CompileTable(heapRequest);
+    std::uint32_t defaultElements = 0u;
+    for (const auto& binding : direct.result->bindings) {
+        if (binding.role == DescriptorRole::GuestSamplers || binding.role == DescriptorRole::GuestImages) defaultElements += binding.count;
+    }
+    require(heap.result->directHeap && heap.result->directSlotCount >= defaultElements, ("heap mode: the program reads " + std::to_string(heap.result->directSlotCount) + " heap slots, fewer than the " + std::to_string(defaultElements) + " image and sampler elements the default compile binds").c_str());
+    require(!direct.result->directHeap && direct.result->directSlotCount == 0u, "heap mode: the default compile reads heap slots");
+    require(heap.key != direct.key, "heap mode: the cache key does not tell heap mode from the default");
+    for (const auto& binding : heap.result->bindings) {
+        require(binding.role != DescriptorRole::GuestSamplers && binding.role != DescriptorRole::GuestImages, "heap mode: an image or sampler is still bound per draw");
+    }
+    std::vector<std::byte> encoded;
+    ShaderDiskCache::EncodeResult(*heap.result, encoded);
+    RecompileResult decoded;
+    require(ShaderDiskCache::DecodeResult(encoded, decoded) && decoded.directHeap && decoded.directSlotCount == heap.result->directSlotCount && decoded.directSlotDword == heap.result->directSlotDword, "heap mode: the disk cache does not keep the slot count and dword");
+    std::cout << "heap mode: 20 direct samplers and 3 images read " << heap.result->directSlotCount << " heap slots (the default binds " << defaultElements << " elements) from shader data dword " << heap.result->directSlotDword << "; no per-draw image or sampler bindings\n";
+#if defined(ANYPS5_UNIFIED)
+    const auto source = PrepareShader(heapRequest);
+    require(source != nullptr && source->artifact != nullptr, "heap mode: the compiled variant is not reachable for slot requests");
+    std::vector<AgcDriver::Unified::Heap::SlotRequest> requests;
+    AgcDriver::Unified::Heap::SlotStatistics statistics;
+    std::string reason;
+    require(AgcDriver::Unified::Heap::BuildSlotRequests(source->artifact->info, heap.capture->snapshot, requests, statistics, reason, true), ("heap mode: slot requests failed: " + reason).c_str());
+    require(requests.size() == heap.result->directSlotCount, "heap mode: one slot request per heap slot");
+    std::uint32_t samplerRequests = 0;
+    std::uint32_t pointRequests = 0;
+    std::uint32_t activeImages = 0;
+    for (const auto& request : requests) {
+        if ((request.flags & AgcDriver::Unified::Heap::RequestFlag::Sampler) != 0u) {
+            samplerRequests++;
+            if ((request.flags & AgcDriver::Unified::Heap::RequestFlag::Point) != 0u) pointRequests++;
+        } else if ((request.flags & AgcDriver::Unified::Heap::RequestFlag::Inactive) == 0u) {
+            activeImages++;
+        }
+    }
+    require(samplerRequests == Direct * 2u && pointRequests == Direct && activeImages == 3u, ("heap mode: slot requests hold " + std::to_string(samplerRequests) + " sampler elements (" + std::to_string(pointRequests) + " point) and " + std::to_string(activeImages) + " active images, expected 40 (20) and 3").c_str());
+    std::cout << "heap mode: " << requests.size() << " slot requests: 40 sampler elements, half point filtered, 3 active images and " << statistics.inactiveImages << " inactive\n";
+    std::vector<std::uint32_t> slots(requests.size());
+    for (std::uint32_t index = 0; index < slots.size(); ++index) slots[index] = 100u + index;
+    TemplateWords words;
+    words.pushConstants = heap.result->pushConstants;
+    require(AgcDriver::Unified::Resolve::PatchSlots(*heap.result, slots, words, reason), ("heap mode: slot patch failed: " + reason).c_str());
+    const auto shaderData = std::ranges::find_if(heap.result->bindings, [](const DescriptorBinding& binding) { return binding.role == DescriptorRole::ShaderData; });
+    std::vector<std::uint32_t> written(slots.size());
+    if (shaderData != heap.result->bindings.end()) {
+        const auto index = static_cast<std::uint32_t>(shaderData - heap.result->bindings.begin());
+        const auto patched = std::ranges::find_if(words.bindings, [&](const auto& pair) { return pair.first == index; });
+        require(patched != words.bindings.end() && patched->second.size() >= heap.result->directSlotDword + slots.size(), "heap mode: the slot patch left the shader data binding without the slots");
+        std::copy_n(patched->second.begin() + heap.result->directSlotDword, slots.size(), written.begin());
+        require(words.pushConstants == heap.result->pushConstants, "heap mode: a shader data slot patch changed the push data");
+    } else {
+        require(words.pushConstants.size() >= (heap.result->directSlotDword + slots.size()) * sizeof(std::uint32_t), "heap mode: the push data does not hold the direct slots");
+        std::memcpy(written.data(), words.pushConstants.data() + heap.result->directSlotDword * sizeof(std::uint32_t), slots.size() * sizeof(std::uint32_t));
+        require(words.bindings.empty(), "heap mode: a push data slot patch overrode a binding");
+    }
+    require(written == slots, "heap mode: the patched slot dwords differ from the resolved slots");
+    TemplateWords shortWords;
+    shortWords.pushConstants = heap.result->pushConstants;
+    require(!AgcDriver::Unified::Resolve::PatchSlots(*heap.result, std::span(slots).first(slots.size() - 1u), shortWords, reason), "heap mode: a slot list shorter than the stage's slots was patched");
+    std::cout << "heap mode: " << slots.size() << " slots patched into the " << (shaderData != heap.result->bindings.end() ? "shader data binding" : "push data") << " at dword " << heap.result->directSlotDword << "\n";
+#endif
 
     constexpr std::uint32_t TableDirect = 18u;
     std::vector<std::pair<std::uint32_t, std::uint32_t>> tablePairs;
@@ -13238,6 +13352,11 @@ int main(int argc, char** argv) {
         if (argc == 2 && std::string_view(argv[1]) == "--result-memo-budget-masked") {
             verifyResultMemoBudgetMasked();
             std::cout << "The result memo budget counts and trims the masked table's entries\n";
+            return 0;
+        }
+        if (argc == 2 && std::string_view(argv[1]) == "--result-templates") {
+            verifyResultTemplates();
+            std::cout << "A result template refilled with another snapshot matches a full materialize\n";
             return 0;
         }
         if (argc == 2 && (std::string_view(argv[1]) == "--region-merge" || std::string_view(argv[1]) == "--region-merge-bench")) {

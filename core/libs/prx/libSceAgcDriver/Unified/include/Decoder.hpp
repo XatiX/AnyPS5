@@ -76,11 +76,15 @@ public:
     [[nodiscard]] const DecodeCounts& Counts() const { return counts; }
     [[nodiscard]] std::uint32_t Queue() const { return queueId; }
     [[nodiscard]] std::uint64_t Sequence() const { return sequence; }
+    [[nodiscard]] const QueueState& Live() const { return state; }
+    [[nodiscard]] const DriverDetail::Submission* CurrentSubmission() const { return submission; }
 
 private:
     friend class Decoder;
+    friend void DecodeSubmission(const DriverDetail::Submission& submission, DecodeState& state, Sink& sink);
 
     std::uint32_t queueId;
+    const DriverDetail::Submission* submission = nullptr;
     QueueState state;
     SnapshotRing<Registers, SnapshotSlots> context;
     SnapshotRing<Registers, SnapshotSlots> userConfig;

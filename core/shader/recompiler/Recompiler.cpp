@@ -389,6 +389,7 @@ IrProgram PrepareResourceProgram(const RecompileRequest& request, ShaderPreparat
     if (gotoPhiRefiner.Refine(program).replacedOperands != 0u) {
         deadCodeEliminator.Eliminate(program);
     }
+    program.Metadata().directResources = request.target.directResources;
     constexpr SrtWalker srtWalker;
     srtWalker.BuildPlan(program);
     deadCodeEliminator.Eliminate(program);
@@ -1409,6 +1410,9 @@ RecompileResult materializeResult(const CompiledVariant& variant, const Recompil
         const auto index = reg - request.context.userDataBaseRegister;
         result.userDataRegisterReads |= reg >= request.context.userDataBaseRegister && index < 64u ? std::uint64_t{1} << index : ~std::uint64_t{0};
     }
+    result.directSlotCount = variant.bindings.layout.directSlotCount;
+    result.directSlotDword = variant.bindings.layout.DirectSlotDword();
+    result.directHeap = request.target.directResources && result.directSlotCount != 0u;
     const auto plan = preparedBindingPlan(variant, snapshot, request.context.pixel ? std::span<const std::uint8_t>(request.context.pixel->targetExportMapping) : std::span<const std::uint8_t>{}, request.target.registrationModules, substitutes, request.target.shaderImageMinLod);
     const DescriptorBindingPlan* bindingPlan = &plan->bindings;
     std::shared_ptr<PreparedModuleEntry> entry;
@@ -2510,6 +2514,89 @@ std::uint64_t PreparedShaderInvocation::SnapshotKey(const ResourceCapture& captu
         key *= 0x100000001b3ull;
     }
     return key;
+}
+
+std::uint64_t PreparedShaderInvocation::TemplateKey(const ResourceCapture& capture) const {
+    if (capture.source != handle->source) throw std::runtime_error("ShaderRecompiler: resource capture belongs to another prepared shader");
+    const auto substitutes = bufferSubstitutesEnabled() && handle->artifact->substitutes != nullptr ? handle->artifact->substitutes->Slots() : std::vector<BufferSubstitute>{};
+    std::uint64_t key = snapshotHash(request, capture.snapshot, true, substitutes);
+    for (const std::uint64_t value : {static_cast<std::uint64_t>(reinterpret_cast<std::uintptr_t>(handle.get())), static_cast<std::uint64_t>(handle->artifact->artifact.variantId), static_cast<std::uint64_t>(request.layout.descriptorSet), static_cast<std::uint64_t>(request.layout.pushConstantSizeBytes)}) {
+        key ^= value;
+        key *= 0x100000001b3ull;
+    }
+    return key;
+}
+
+std::shared_ptr<const ResultTemplate> PreparedShaderInvocation::BuildTemplate(const ResourceCapture& capture) const {
+    if (capture.source != handle->source) throw std::runtime_error("ShaderRecompiler: resource capture belongs to another prepared shader");
+    const auto substitutes = bufferSubstitutesEnabled() && handle->artifact->substitutes != nullptr ? handle->artifact->substitutes->Slots() : std::vector<BufferSubstitute>{};
+    MemoPatch patch;
+    auto result = std::make_shared<RecompileResult>(materializeResult(*handle->artifact, request, capture.snapshot, false, &patch, &substitutes));
+    result->cacheHit = true;
+    auto entry = std::make_shared<ResultTemplate>();
+    entry->result = std::move(result);
+    entry->buffers = std::move(patch.buffers);
+    entry->userWords = std::move(patch.userWords);
+    entry->shaderData = patch.shaderData;
+    entry->flattenedSrt = patch.flattenedSrt;
+    entry->pushData = patch.pushData;
+    entry->refillable = patch.valid;
+    entry->snapshotKey = SnapshotKey(capture);
+    return entry;
+}
+
+std::shared_ptr<const RecompileResult> PreparedShaderInvocation::MaterializeUnshared(const ResourceCapture& capture) const {
+    if (capture.source != handle->source) throw std::runtime_error("ShaderRecompiler: resource capture belongs to another prepared shader");
+    const auto substitutes = bufferSubstitutesEnabled() && handle->artifact->substitutes != nullptr ? handle->artifact->substitutes->Slots() : std::vector<BufferSubstitute>{};
+    auto result = std::make_shared<RecompileResult>(materializeResult(*handle->artifact, request, capture.snapshot, false, nullptr, &substitutes));
+    result->cacheHit = true;
+    return result;
+}
+
+void RefillTemplate(const ResultTemplate& entry, const ResourceSnapshot& snapshot, TemplateWords& out) {
+    const auto& result = *entry.result;
+    out.bindings.clear();
+    out.pushConstants.assign(result.pushConstants.begin(), result.pushConstants.end());
+    for (const auto& [binding, resources] : entry.buffers) {
+        auto& [position, words] = out.bindings.emplace_back(binding, std::vector<std::uint32_t>(resources.size() * 4u));
+        if (result.bindings.at(position).guestDescriptor.size() != words.size()) throw std::runtime_error("a refilled guest buffer binding changed its width");
+        for (std::size_t element = 0; element < resources.size(); ++element) std::copy_n(snapshot.buffers.at(resources[element]).dwords.begin(), 4u, words.begin() + element * 4u);
+    }
+    if (!entry.userWords.empty()) {
+        if (entry.pushData) {
+            if (entry.userWords.size() * sizeof(std::uint32_t) > out.pushConstants.size()) throw std::runtime_error("refilled user data lies outside the push data");
+            for (std::size_t word = 0; word < entry.userWords.size(); ++word) std::memcpy(out.pushConstants.data() + word * sizeof(std::uint32_t), &snapshot.userData.at(entry.userWords[word]), sizeof(std::uint32_t));
+        } else {
+            auto& [position, words] = out.bindings.emplace_back(entry.shaderData, result.bindings.at(entry.shaderData).guestDescriptor);
+            if (entry.userWords.size() > words.size()) throw std::runtime_error("refilled user data lies outside the shader data");
+            for (std::size_t word = 0; word < entry.userWords.size(); ++word) words[word] = snapshot.userData.at(entry.userWords[word]);
+        }
+    }
+    if (entry.flattenedSrt != ResultTemplate::NoBinding) out.bindings.emplace_back(entry.flattenedSrt, snapshot.flattenedSrt);
+    out.poisonedSrtReads = static_cast<std::uint32_t>(snapshot.srtPoison.size()) + snapshot.nullRootReads;
+}
+
+std::uint64_t ResultTemplateBytes(const ResultTemplate& entry) {
+    auto total = static_cast<std::uint64_t>(sizeof(ResultTemplate)) + vectorBytes(entry.buffers) + vectorBytes(entry.userWords);
+    for (const auto& buffer : entry.buffers) total += vectorBytes(buffer.second);
+    return entry.result != nullptr ? total + resultBytes(*entry.result) : total;
+}
+
+const char* TemplateWordsDifference(const ResultTemplate& entry, const TemplateWords& words, const RecompileResult& full) {
+    const auto& result = *entry.result;
+    if (words.pushConstants != full.pushConstants) return "push constants";
+    if (words.poisonedSrtReads != full.poisonedSrtReads) return "poisoned SRT reads";
+    if (result.specializationId != full.specializationId || result.spirv.ContentHash() != full.spirv.ContentHash()) return "module";
+    if (result.bindings.size() != full.bindings.size()) return "binding count";
+    for (std::size_t index = 0; index < full.bindings.size(); ++index) {
+        const auto& left = result.bindings[index];
+        const auto& right = full.bindings[index];
+        if (left.role != right.role || left.binding != right.binding || left.count != right.count) return "binding shape";
+        const auto refilled = std::ranges::find_if(words.bindings, [&](const auto& pair) { return pair.first == index; });
+        const auto& leftWords = refilled != words.bindings.end() ? refilled->second : left.guestDescriptor;
+        if (leftWords != right.guestDescriptor) return "binding words";
+    }
+    return nullptr;
 }
 
 const CompiledShaderArtifact& GetPreparedArtifact(const SourceHandle& handle) {

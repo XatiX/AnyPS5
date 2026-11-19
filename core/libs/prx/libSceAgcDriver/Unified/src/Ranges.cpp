@@ -22,7 +22,10 @@ void DrawUses(const Pm4::DrawParameters& draw, std::vector<GuestUse>& uses) {
 }
 
 void TargetUses(const QueueState& queue, std::vector<GuestUse>& uses) {
-    const auto state = Graphics::DecodeState(queue);
+    TargetUses(Graphics::DecodeState(queue), uses);
+}
+
+void TargetUses(const Graphics::State& state, std::vector<GuestUse>& uses) {
     for (const auto& color : state.colors) {
         add(uses, color.address, color.bytes, true);
         add(uses, color.dccAddress, color.bytes / 256 + 1, true);

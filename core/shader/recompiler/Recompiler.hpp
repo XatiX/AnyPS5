@@ -361,6 +361,7 @@ struct SpirvTarget {
     bool fixedPushSlots = false;
     bool float64DenormPreserve = false;
     bool registrationModules = false;
+    bool directResources = false;
     std::uint32_t registrationWordLimit = 200000u;
     bool vertexSubgroups = true;
     bool tessellationEvaluationSubgroups = true;
@@ -938,6 +939,9 @@ struct CompiledShaderArtifact {
     bool bdaWrites = false;
     bool layerReplaySafe = false;
     std::uint32_t stencilReferenceDword = 0xffffffffu;
+    std::uint32_t directSlotCount = 0;
+    std::uint32_t directSlotDword = 0;
+    bool directHeap = false;
     std::uint64_t variantId = 0;
 };
 

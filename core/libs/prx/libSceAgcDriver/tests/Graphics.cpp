@@ -13825,6 +13825,50 @@ void pipelineStoreLazyBufferPoolTests() {
     Require(mock.live == 0, "lazy buffer pool pipeline tests leaked Vulkan objects");
 }
 
+void pipelineHeapLayoutTests() {
+    using namespace AgcDriver::Graphics;
+    mock = MockVulkan{};
+    auto context = mockContext();
+    context.device = makeHandle<VkDevice>();
+    context.graphicsPipelineLibrary = true;
+    context.pipelineLinkTimeOptimization = false;
+    context.limits.framebufferNoAttachmentsSampleCounts = VK_SAMPLE_COUNT_1_BIT;
+    ShaderRecompiler::RecompileResult vertex, fragment;
+    vertex.spirv = makeModule({});
+    fragment.spirv = makeModule({.fragment = true});
+    vertex.variantId = 401;
+    fragment.variantId = 402;
+    const std::array<CompiledShader, 2> shaders{{{ShaderRecompiler::ShaderStage::Vertex, &vertex, 0}, {ShaderRecompiler::ShaderStage::Fragment, &fragment, PipelinePushSlotBytes}}};
+    std::array<std::uint32_t, 1> mainKey{51}, fragmentKey{52};
+    context.graphicsPipelineLibrary = false;
+    context.deviceProc = sampleLocationProc;
+    const auto main = makeHandle<VkDescriptorSetLayout>();
+    const auto fragmentSet = makeHandle<VkDescriptorSetLayout>();
+    const auto heap = makeHandle<VkDescriptorSetLayout>();
+    const PipelineSetLayouts plain{main, fragmentSet, true, mainKey, fragmentKey};
+    PipelineSetLayouts heaped = plain;
+    heaped.heap = heap;
+    auto withoutHeap = CachedPipeline(context, State{}, VertexInputLayout{}, plain, shaders);
+    const auto layoutsBefore = mock.pipelineLayoutSets.size();
+    auto withHeap = CachedPipeline(context, State{}, VertexInputLayout{}, heaped, shaders);
+    Require(withHeap != nullptr && withHeap != withoutHeap, "a heap layout did not give its own pipeline");
+    Require(mock.pipelineLayoutSets.size() == layoutsBefore + 1u, "a heap pipeline did not create exactly one full layout");
+    const auto heapLayout = std::ranges::find_if(mock.pipelineLayoutSets, [&](const auto& entry) { return entry.second.size() == 5u && entry.second[4] == heap; });
+    Require(heapLayout != mock.pipelineLayoutSets.end(), "the heap set layout is not set 4 of a five-set layout");
+    const auto& sets = heapLayout->second;
+    Require(sets[0] == main && sets[1] == fragmentSet, "the heap layout lost the resource sets");
+    Require(sets[2] != VK_NULL_HANDLE && sets[3] != VK_NULL_HANDLE && sets[2] == sets[3], "the heap layout does not fill sets 2 and 3 with the empty layout");
+    Require(mock.pipelineLayoutFlags.at(heapLayout->first) == 0u, "the heap layout kept independent sets");
+    auto again = CachedPipeline(context, State{}, VertexInputLayout{}, heaped, shaders);
+    Require(again == withHeap, "the heap pipeline was not cached");
+    ClearCachedPipelines(context.device);
+    again.reset();
+    withHeap.reset();
+    withoutHeap.reset();
+    context.bufferPool.reset();
+    Require(mock.live == 0, "heap layout pipeline tests leaked Vulkan objects");
+}
+
 // The pipeline store's bound without a GPU: 1536 configurations cycled through the default 1024
 // entries keep coming back after their eviction, so the bound doubles and a later pass finds every
 // pipeline resident; a bound set with APS5_PIPELINE_STORE_ENTRIES never moves.
@@ -15090,6 +15134,11 @@ int main(int argc, char** argv) {
         if (argc == 2 && std::string_view(argv[1]) == "--pipeline-store-lazy-buffer-pool") {
             pipelineStoreLazyBufferPoolTests();
             std::cout << "cached pipelines survive lazy buffer pool creation\n";
+            return 0;
+        }
+        if (argc == 2 && std::string_view(argv[1]) == "--pipeline-heap-layout") {
+            pipelineHeapLayoutTests();
+            std::cout << "a heap set layout becomes set 4 of its own full pipeline layout\n";
             return 0;
         }
         if (argc == 2 && std::string_view(argv[1]) == "--copy-input-failure-lifetime") {

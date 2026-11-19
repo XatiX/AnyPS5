@@ -306,6 +306,7 @@ void testResolveFillsDrawParametersAndKeys() {
     if (operations.size() != 3) return;
     Expect(state.Counts().resolved == 3 && state.Counts().resolveErrors == 0, "every draw resolves");
     Expect(operations[0].resolved && operations[0].size == 12 && (operations[0].value & 0xffffffffu) == 4, "a resolved auto draw carries its vertex count and instance count");
+    Expect(!operations[0].draw.indexed && !operations[0].draw.indirect && operations[0].draw.indexCount == 12 && operations[0].draw.instanceCount == 4, "a resolved auto draw keeps its draw facts");
     Expect(operations[0].key == operations[1].key, "draws without a register write between them share a key");
     Expect(operations[2].key != operations[1].key, "a context write changes the key");
     DecodeState plain(0);
@@ -354,6 +355,7 @@ void testRebuiltStateResolvesLikeTheDecoder() {
     sink.retire = false;
     DecodeSubmission(stream.submission, state, sink);
     Expect(sink.operations.size() == 3 && state.Counts().resolved == 3, "three indexed draws resolve");
+    for (const auto& operation : sink.operations) Expect(operation.draw.indexed && operation.draw.indexSize != 0u && operation.draw.indexAddress == operation.address, "a resolved indexed draw keeps its index facts");
     int matched = 0;
     for (const auto& operation : sink.operations) {
         const auto queue = Record::QueueStateAt(state, operation.snapshots);

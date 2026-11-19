@@ -15,6 +15,10 @@ namespace AgcDriver::Graphics {
 struct Context;
 }
 
+namespace AgcDriver {
+class VulkanDevice;
+}
+
 namespace AgcDriver::Unified::Shadow {
 
 struct OwnedSpan {
@@ -30,6 +34,7 @@ bool MemoryActive();
 bool DrawScope();
 bool Teeing();
 std::shared_ptr<QueueState> RecordedState(const DriverDetail::Submission& submission, std::size_t packetOffset);
+void NoteDevice(const std::shared_ptr<VulkanDevice>& device);
 void NoteDriverDraw(const QueueState& queue, const DriverDetail::Submission& submission, std::size_t packetOffset);
 void NoteGpuMapping(const GuestAllocations::Mapped& ranges);
 void NoteGuestAccess(GuestRanges reads, GuestRanges writes, bool unknown);

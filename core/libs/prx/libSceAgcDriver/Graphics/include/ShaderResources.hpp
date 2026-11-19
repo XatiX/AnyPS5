@@ -109,6 +109,7 @@ struct PipelineSetLayouts {
     bool split = false;
     std::span<const std::uint32_t> mainKey;
     std::span<const std::uint32_t> fragmentKey;
+    VkDescriptorSetLayout heap = VK_NULL_HANDLE;
 };
 
 struct TableDescriptors {
