@@ -391,7 +391,7 @@ void appendKey(std::vector<std::byte>& key, const TValue& value) {
 
 bool libraryKeys(PipelineLibraryKeys& keys, const Context& context, const State& state, const VertexInputLayout& input, const PipelineSetLayouts& resources, std::span<const CompiledShader> shaders) {
     using Stage = ShaderRecompiler::ShaderStage;
-    if (!context.graphicsPipelineLibrary || context.pipelineExecutableInfo || (state.stages.tessellation && !context.tessellationPipelineCache) || state.depthBiasPerFace || state.rectList || BarycentricPatches(state, shaders) || SplitsAlternateAlpha(state) || std::ranges::any_of(shaders, [](const CompiledShader& shader) { return shader.program != nullptr && shader.program->functionLdsBuffer; }) || UsesMeshWindow(shaders) || FragmentInterlock(shaders)) return false;
+    if (!context.graphicsPipelineLibrary || resources.heap != VK_NULL_HANDLE || context.pipelineExecutableInfo || (state.stages.tessellation && !context.tessellationPipelineCache) || state.depthBiasPerFace || state.rectList || BarycentricPatches(state, shaders) || SplitsAlternateAlpha(state) || std::ranges::any_of(shaders, [](const CompiledShader& shader) { return shader.program != nullptr && shader.program->functionLdsBuffer; }) || UsesMeshWindow(shaders) || FragmentInterlock(shaders)) return false;
     keys = {};
     for (const auto& shader : shaders) {
         const auto identity = shader.program->Identity();
@@ -589,13 +589,14 @@ Pipeline::Pipeline(const Context& context, const State& state, const VertexInput
         // layout, so later draws bind their own ShaderResources' set under it.
         const bool pixelLds = std::ranges::any_of(shaders, [](const CompiledShader& shader) { return shader.program != nullptr && shader.program->functionLdsBuffer; });
         const bool meshWindow = UsesMeshWindow(shaders);
-        const auto pixelLdsLayouts = pixelLds || meshWindow ? PixelFunctionLdsSetLayouts(context) : PixelFunctionLdsLayouts{};
-        const std::array<VkDescriptorSetLayout, 4> setLayouts{resources.main, (pixelLds || meshWindow) && !resources.split ? pixelLdsLayouts.empty : resources.fragment, pixelLds ? pixelLdsLayouts.buffer : pixelLdsLayouts.empty, meshWindow ? MeshWindowSetLayout(context) : VK_NULL_HANDLE};
+        const bool heap = resources.heap != VK_NULL_HANDLE;
+        const auto pixelLdsLayouts = pixelLds || meshWindow || heap ? PixelFunctionLdsSetLayouts(context) : PixelFunctionLdsLayouts{};
+        const std::array<VkDescriptorSetLayout, 5> setLayouts{resources.main, (pixelLds || meshWindow || heap) && !resources.split ? pixelLdsLayouts.empty : resources.fragment, pixelLds ? pixelLdsLayouts.buffer : pixelLdsLayouts.empty, meshWindow ? MeshWindowSetLayout(context) : heap ? pixelLdsLayouts.empty : VK_NULL_HANDLE, resources.heap};
         const VkPushConstantRange push{pushStages, 0, PipelinePushSlotBytes};
         const std::array<VkPushConstantRange, 2> slots{{{pushStagesOf(context), 0, PipelinePushSlotBytes}, {VK_SHADER_STAGE_FRAGMENT_BIT, PipelinePushSlotBytes, PipelinePushSlotBytes}}};
         VkPipelineLayoutCreateInfo layoutInfo{VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO};
-        layoutInfo.flags = pixelLds || meshWindow || !resources.split ? 0 : VK_PIPELINE_LAYOUT_CREATE_INDEPENDENT_SETS_BIT_EXT;
-        layoutInfo.setLayoutCount = meshWindow ? 4u : pixelLds ? 3u : resources.split ? 2u : 1u;
+        layoutInfo.flags = pixelLds || meshWindow || heap || !resources.split ? 0 : VK_PIPELINE_LAYOUT_CREATE_INDEPENDENT_SETS_BIT_EXT;
+        layoutInfo.setLayoutCount = heap ? 5u : meshWindow ? 4u : pixelLds ? 3u : resources.split ? 2u : 1u;
         layoutInfo.pSetLayouts = setLayouts.data();
         layoutInfo.pushConstantRangeCount = dynamicRendering ? static_cast<std::uint32_t>(slots.size()) : pushStages != 0 ? 1 : 0;
         layoutInfo.pPushConstantRanges = dynamicRendering ? slots.data() : pushStages != 0 ? &push : nullptr;
@@ -1159,6 +1160,7 @@ std::size_t pipelineKey(std::vector<std::byte>& storage, const Context& context,
     key.PutBytes(resources.mainKey.data(), resources.mainKey.size_bytes());
     append(key, resources.fragmentKey.size());
     key.PutBytes(resources.fragmentKey.data(), resources.fragmentKey.size_bytes());
+    if (resources.heap != VK_NULL_HANDLE) append(key, static_cast<std::uint64_t>(reinterpret_cast<std::uintptr_t>(resources.heap)));
     append(key, state.hasColorTarget);
     append(key, state.rectList);
     append(key, state.topology);
