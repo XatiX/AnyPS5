@@ -40,6 +40,7 @@ public:
     Refill(SlotTable& table, Memo& memo, ImageLookup images, SamplerLookup samplers);
 
     [[nodiscard]] bool Fill(std::span<const SlotRequest> requests, std::vector<std::uint32_t>& slots, std::string& reason, std::vector<ImageUse>* uses = nullptr, std::vector<std::shared_ptr<const void>>* owners = nullptr);
+    [[nodiscard]] std::uint32_t FillOne(const SlotRequest& request, std::string& reason, Span& memory, std::shared_ptr<const void>& owner);
     [[nodiscard]] RefillCounts Counts() const { return counts; }
 
 private:

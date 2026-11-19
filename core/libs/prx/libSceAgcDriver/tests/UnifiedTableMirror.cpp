@@ -100,10 +100,28 @@ void testWritesToElementImagesRefill() {
     Expect(uses.size() == 2u && fixture.mirror.Counts().unchanged == 1u, "an unchanged mirror reports the same uses");
     static_cast<void>(fixture.imageLog.Note(0x300000000ull + 2u * Events::RegionBytes, 0x100));
     const auto again = fixture.mirror.Build(tables, reason);
-    Expect(again == first && fixture.mirror.Counts().reused == 1u && fixture.mirror.Counts().elements == 4u, "a write to an element image refills the mirror");
+    Expect(again == first && fixture.mirror.Counts().reused == 1u && fixture.mirror.Counts().elements == 3u && fixture.mirror.Counts().kept == 1u, "a write to an element image refills that element alone");
     static_cast<void>(fixture.shared.Note(0x400000000ull, 0x100));
     static_cast<void>(fixture.mirror.Build(tables, reason));
     Expect(fixture.mirror.Counts().unchanged == 2u, "a write elsewhere keeps the mirror unchanged");
+}
+
+void testNewTablesInheritTheirPredecessor() {
+    Fixture fixture;
+    std::string reason;
+    const auto first = fixture.mirror.Build(Tables({1u, 2u, 3u}), reason);
+    const auto same = fixture.mirror.Build(Tables({1u, 2u, 3u}), reason);
+    Expect(first != nullptr && same == first, "new tables with the same map and elements keep the mirror");
+    Expect(fixture.mirror.Counts().inherited == 1u && fixture.mirror.Counts().kept == 3u && fixture.mirror.Counts().elements == 3u, "their elements keep the predecessor's slots without a refill");
+    const auto changed = fixture.mirror.Build(Tables({1u, 4u, 3u}), reason);
+    Expect(changed != nullptr && changed->id != first->id, "a changed element builds a new mirror");
+    Expect(fixture.mirror.Counts().elements == 4u && fixture.mirror.Counts().kept == 5u, "only the changed element is filled");
+    if (changed == nullptr) return;
+    const auto base = changed->map[Abi::HeaderElementBase];
+    const auto firstBase = first->map[Abi::HeaderElementBase];
+    Expect(changed->map[base] == first->map[firstBase] && changed->map[base + 2u] == first->map[firstBase + 2u] && changed->map[base + 1u] != first->map[firstBase + 1u], "kept elements keep their slots and the new one takes another slot");
+    static_cast<void>(fixture.mirror.Build(Tables({1u, 2u}), reason));
+    Expect(fixture.mirror.Counts().inherited == 2u, "a table with another map does not inherit");
 }
 
 void testSpansCoalesce() {
@@ -130,6 +148,7 @@ int main() {
     testMirrorAppendsSlots();
     testMirrorReusedForSameTables();
     testWritesToElementImagesRefill();
+    testNewTablesInheritTheirPredecessor();
     testSpansCoalesce();
     testMirrorRefusesStorageAndSamplers();
     if (failures != 0) return 1;

@@ -28,6 +28,12 @@ bool Refill::Fill(std::span<const SlotRequest> requests, std::vector<std::uint32
     return true;
 }
 
+std::uint32_t Refill::FillOne(const SlotRequest& request, std::string& reason, Span& memory, std::shared_ptr<const void>& owner) {
+    const auto slot = (request.flags & RequestFlag::Sampler) != 0u ? sampler(request, reason) : image(request, reason, memory, owner);
+    if (slot == NoSlot) counts.failures++;
+    return slot;
+}
+
 std::uint32_t Refill::image(const SlotRequest& request, std::string& reason, Span& memory, std::shared_ptr<const void>& owner) {
     if ((request.flags & RequestFlag::Inactive) != 0u) return 0u;
     const auto key = KeyOf(request);
