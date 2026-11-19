@@ -36,6 +36,7 @@
 #include "ImageTableAbi.hpp"
 #include "ShaderDiskCache.hpp"
 #if defined(ANYPS5_UNIFIED)
+#include "prx/libSceAgcDriver/Unified/include/SlotPatch.hpp"
 #include "prx/libSceAgcDriver/Unified/include/SlotRequests.hpp"
 #endif
 #include <limits>
@@ -5769,6 +5770,29 @@ void verifySamplerLimits() {
     }
     require(samplerRequests == Direct * 2u && pointRequests == Direct && activeImages == 3u, ("heap mode: slot requests hold " + std::to_string(samplerRequests) + " sampler elements (" + std::to_string(pointRequests) + " point) and " + std::to_string(activeImages) + " active images, expected 40 (20) and 3").c_str());
     std::cout << "heap mode: " << requests.size() << " slot requests: 40 sampler elements, half point filtered, 3 active images and " << statistics.inactiveImages << " inactive\n";
+    std::vector<std::uint32_t> slots(requests.size());
+    for (std::uint32_t index = 0; index < slots.size(); ++index) slots[index] = 100u + index;
+    TemplateWords words;
+    words.pushConstants = heap.result->pushConstants;
+    require(AgcDriver::Unified::Resolve::PatchSlots(*heap.result, slots, words, reason), ("heap mode: slot patch failed: " + reason).c_str());
+    const auto shaderData = std::ranges::find_if(heap.result->bindings, [](const DescriptorBinding& binding) { return binding.role == DescriptorRole::ShaderData; });
+    std::vector<std::uint32_t> written(slots.size());
+    if (shaderData != heap.result->bindings.end()) {
+        const auto index = static_cast<std::uint32_t>(shaderData - heap.result->bindings.begin());
+        const auto patched = std::ranges::find_if(words.bindings, [&](const auto& pair) { return pair.first == index; });
+        require(patched != words.bindings.end() && patched->second.size() >= heap.result->directSlotDword + slots.size(), "heap mode: the slot patch left the shader data binding without the slots");
+        std::copy_n(patched->second.begin() + heap.result->directSlotDword, slots.size(), written.begin());
+        require(words.pushConstants == heap.result->pushConstants, "heap mode: a shader data slot patch changed the push data");
+    } else {
+        require(words.pushConstants.size() >= (heap.result->directSlotDword + slots.size()) * sizeof(std::uint32_t), "heap mode: the push data does not hold the direct slots");
+        std::memcpy(written.data(), words.pushConstants.data() + heap.result->directSlotDword * sizeof(std::uint32_t), slots.size() * sizeof(std::uint32_t));
+        require(words.bindings.empty(), "heap mode: a push data slot patch overrode a binding");
+    }
+    require(written == slots, "heap mode: the patched slot dwords differ from the resolved slots");
+    TemplateWords shortWords;
+    shortWords.pushConstants = heap.result->pushConstants;
+    require(!AgcDriver::Unified::Resolve::PatchSlots(*heap.result, std::span(slots).first(slots.size() - 1u), shortWords, reason), "heap mode: a slot list shorter than the stage's slots was patched");
+    std::cout << "heap mode: " << slots.size() << " slots patched into the " << (shaderData != heap.result->bindings.end() ? "shader data binding" : "push data") << " at dword " << heap.result->directSlotDword << "\n";
 #endif
 
     constexpr std::uint32_t TableDirect = 18u;

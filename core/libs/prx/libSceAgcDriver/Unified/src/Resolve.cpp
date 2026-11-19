@@ -8,6 +8,7 @@
 #include "prx/libSceAgcDriver/Graphics/include/TextureTiling.hpp"
 #include "prx/libSceAgcDriver/Unified/include/Events.hpp"
 #include "prx/libSceAgcDriver/Unified/include/Refill.hpp"
+#include "prx/libSceAgcDriver/Unified/include/SlotPatch.hpp"
 #include "prx/libSceAgcDriver/Unified/include/VulkanHeap.hpp"
 #include "Optimization/ShaderStageInputInfo.hpp"
 #include <chrono>
@@ -134,7 +135,7 @@ public:
                 }
             }
             ResolvedStage resolved{std::move(stage), {}};
-            if (!refill->Fill(requests, resolved.slots, reason, &imageUses)) {
+            if (!refill->Fill(requests, resolved.slots, reason, &imageUses) || !PatchSlots(*resolved.program.result, resolved.slots, resolved.program.words, reason)) {
                 refuse(reason);
                 totals.slotNanoseconds += elapsed(slotsStarted);
                 return;
