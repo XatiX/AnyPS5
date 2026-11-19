@@ -23,6 +23,8 @@
 #include <map>
 #include <mutex>
 #include <set>
+#include <span>
+#include <utility>
 
 namespace AgcDriver::Unified::Resolve {
 
@@ -177,6 +179,9 @@ private:
             totals.templateMismatch = programs.templateMismatch;
         }
         if (!built) {
+            std::vector<GuestUse> targets;
+            TargetUses(state.Live(), targets);
+            noteTargetWrites(targets);
             refuse(totals, reason);
             totals.programNanoseconds += elapsed(started);
             return nullptr;
@@ -198,6 +203,7 @@ private:
         }
         const auto beforeTargets = draw.uses.size();
         TargetUses(programs.decode.state, draw.uses);
+        noteTargetWrites(std::span<const GuestUse>(draw.uses).subspan(beforeTargets));
         totals.targetUses += draw.uses.size() - beforeTargets;
         draw.targetBegin = beforeTargets;
         draw.targetEnd = draw.uses.size();
@@ -497,6 +503,14 @@ private:
         return resolved;
     }
 
+    void noteTargetWrites(std::span<const GuestUse> uses) {
+        std::lock_guard lock(writtenTargetsMutex);
+        for (const auto& use : uses) {
+            if (!use.write || use.size == 0u || !writtenTargets.emplace(use.address, use.size).second) continue;
+            Events::GpuWrites().Note(use.address, use.size, Events::TargetOwner);
+        }
+    }
+
     void noteSurfaceReason(const std::string& why) {
         if (seenSurfaceReasons.insert(why).second) std::fprintf(stderr, "[recode-resolve] first surface refusal: %s\n", why.c_str());
         if (surfaceReasons.size() < 16u || surfaceReasons.contains(why)) surfaceReasons[why]++;
@@ -592,6 +606,8 @@ private:
     std::set<std::string> seenReasons;
     std::set<std::string> seenSurfaceReasons;
     std::set<std::uint64_t> missedTargets;
+    std::mutex writtenTargetsMutex;
+    std::set<std::pair<std::uint64_t, std::uint64_t>> writtenTargets;
     std::map<std::string, std::uint64_t> surfaceReasons;
     bool firstBuilt = false;
     bool firstImage = false;
