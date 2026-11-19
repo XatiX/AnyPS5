@@ -29,6 +29,14 @@ bool readOnlyDepthBoundsCompare() {
     return enabled;
 }
 
+bool tablesRouted() {
+    static const bool enabled = [] {
+        const auto* value = std::getenv("APS5_RECODE_TABLES");
+        return value != nullptr && std::string_view(value) == "1";
+    }();
+    return enabled;
+}
+
 template <typename T>
 std::uint64_t capacityBytes(const std::vector<T>& values) {
     return static_cast<std::uint64_t>(values.capacity()) * sizeof(T);
@@ -52,6 +60,10 @@ void reportLargeTemplate(const ShaderRecompiler::ResultTemplate& shape) {
 
 bool usesSamplerTables(const ShaderRecompiler::ShaderInfo& info) {
     return std::ranges::any_of(info.samplers, [](const auto& sampler) { return sampler.table != ShaderRecompiler::NoTable; });
+}
+
+bool usesImageTables(const ShaderRecompiler::ShaderInfo& info) {
+    return std::ranges::any_of(info.images, [](const auto& image) { return image.table != ShaderRecompiler::NoTable; });
 }
 
 }
@@ -182,6 +194,10 @@ bool BuildPrograms(const ProgramInputs& inputs, const DrawFacts& facts, ProgramS
         }
         if (usesSamplerTables(source->artifact->info.info)) {
             reason = "sampler tables";
+            return false;
+        }
+        if (!tablesRouted() && usesImageTables(source->artifact->info.info)) {
+            reason = "image tables";
             return false;
         }
         auto invocation = DriverDetail::InvocationFor(*program.snapshot, program.codeOffset, request, false);

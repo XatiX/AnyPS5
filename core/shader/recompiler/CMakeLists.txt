@@ -273,6 +273,7 @@ function(add_shader_recompiler target runtimeTarget)
             ImageBindingResourceClass
             ResourceMaterializer::RuntimeImageMode
             ResourceMaterializer::ResolveImageTablesShared
+            ResourceMaterializer::TableReuse
             RefillTemplate
             TemplateWordsDifference
             ResultTemplateBytes

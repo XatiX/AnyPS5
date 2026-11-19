@@ -225,6 +225,10 @@ private:
             reason = "a second device";
             return false;
         }
+        if (ResidencyService::PageTableEnabled() && !ResidencyService::Get().Attach(context)) {
+            reason = "residency service did not attach";
+            return false;
+        }
         device = context.device;
         alignment = std::max<std::uint64_t>(context.limits.minStorageBufferOffsetAlignment, 16u);
         ring = std::make_shared<Graphics::Buffer>(context, RingBytes, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_INDIRECT_BUFFER_BIT);
