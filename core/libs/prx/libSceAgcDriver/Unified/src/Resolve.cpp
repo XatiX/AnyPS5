@@ -79,13 +79,24 @@ public:
     }
 
     void Consume(const Operation& operation, const DecodeState& state) {
-        if (!IsDraw(operation.kind) || !operation.resolved) return;
-        std::lock_guard lock(mutex);
+        if (!IsDraw(operation.kind)) return;
+        std::shared_ptr<const ResolvedDraw> draw;
+        if (operation.resolved) {
+            std::lock_guard lock(mutex);
+            draw = resolve(operation, state);
+        }
+        table.Offer(operation.queue, operation.submission, operation.packetOffset, std::move(draw));
+    }
+
+    PacketTable<ResolvedDraw>& Table() { return table; }
+
+private:
+    std::shared_ptr<const ResolvedDraw> resolve(const Operation& operation, const DecodeState& state) {
         totals.draws++;
         const auto* submission = state.CurrentSubmission();
         if (refill == nullptr || submission == nullptr || submission->shaders == nullptr) {
             totals.noDevice++;
-            return;
+            return nullptr;
         }
         const auto started = std::chrono::steady_clock::now();
         std::string reason;
@@ -100,7 +111,7 @@ public:
         if (!built) {
             refuse(reason);
             totals.programNanoseconds += elapsed(started);
-            return;
+            return nullptr;
         }
         const auto slotsStarted = std::chrono::steady_clock::now();
         totals.programNanoseconds += elapsed(started);
@@ -131,14 +142,14 @@ public:
                 if (!Heap::BuildSlotRequests(stage.variant->info, stage.capture->snapshot, requests, statistics, reason, false)) {
                     refuse(reason);
                     totals.slotNanoseconds += elapsed(slotsStarted);
-                    return;
+                    return nullptr;
                 }
             }
             ResolvedStage resolved{std::move(stage), {}};
             if (!refill->Fill(requests, resolved.slots, reason, &imageUses) || !PatchSlots(*resolved.program.result, resolved.slots, resolved.program.words, reason)) {
                 refuse(reason);
                 totals.slotNanoseconds += elapsed(slotsStarted);
-                return;
+                return nullptr;
             }
             totals.slots += resolved.slots.size();
             draw.stages.push_back(std::move(resolved));
@@ -155,8 +166,10 @@ public:
         totals.uses += draw.uses.size();
         if (!draw.complete) totals.incomplete++;
         totals.resolved++;
+        return std::make_shared<const ResolvedDraw>(std::move(draw));
     }
 
+public:
     std::string Line() {
         std::lock_guard lock(mutex);
         char text[512];
@@ -172,6 +185,9 @@ public:
         std::snprintf(text, sizeof(text), "; per draw: decode %.1f, prepare %.1f, capture %.1f, materialize %.1f, variant %.1f us", perDraw(totals.phases[PhaseDecode]), perDraw(totals.phases[PhasePrepare]), perDraw(totals.phases[PhaseCapture]), perDraw(totals.phases[PhaseMaterialize]), perDraw(totals.phases[PhaseVariant]));
         line += text;
         line += "; gpu lock busy " + std::to_string(totals.lockBusy);
+        const auto packets = table.TakeCounts();
+        std::snprintf(text, sizeof(text), "; hand-off %llu offered (%llu refused), %llu found, %llu refused, %llu waited, %llu missed, %llu released, %llu dropped, %llu pending", static_cast<unsigned long long>(packets.offered), static_cast<unsigned long long>(packets.refusedOffers), static_cast<unsigned long long>(packets.found), static_cast<unsigned long long>(packets.refused), static_cast<unsigned long long>(packets.waited), static_cast<unsigned long long>(packets.missed), static_cast<unsigned long long>(packets.released), static_cast<unsigned long long>(packets.dropped), static_cast<unsigned long long>(packets.pending));
+        line += text;
         std::snprintf(text, sizeof(text), "; access %.1f ranges per resolved draw, %llu incomplete (%llu indirect, %llu placeholder)", totals.resolved == 0 ? 0.0 : static_cast<double>(totals.uses) / static_cast<double>(totals.resolved), static_cast<unsigned long long>(totals.incomplete), static_cast<unsigned long long>(totals.indirect), static_cast<unsigned long long>(totals.placeholderDraws));
         line += text;
         std::snprintf(text, sizeof(text), " [targets %llu, buffers %llu, images %llu]", static_cast<unsigned long long>(totals.targetUses), static_cast<unsigned long long>(totals.bufferUses), static_cast<unsigned long long>(totals.imageUses));
@@ -274,6 +290,7 @@ private:
     std::unique_ptr<Heap::Memo> memo;
     std::unique_ptr<Heap::Refill> refill;
     TemplateTable templates{templateBudget()};
+    PacketTable<ResolvedDraw> table;
     Totals totals;
     std::set<std::string> seenReasons;
     bool firstBuilt = false;
@@ -305,6 +322,10 @@ void Consume(const Operation& operation, const DecodeState& state) {
 
 std::string Line() {
     return shared().Line();
+}
+
+PacketTable<ResolvedDraw>& ResolvedDraws() {
+    return shared().Table();
 }
 
 }

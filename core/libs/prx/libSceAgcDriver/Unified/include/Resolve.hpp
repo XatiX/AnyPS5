@@ -3,6 +3,7 @@
 
 #include "prx/libSceAgcDriver/Unified/include/Decoder.hpp"
 #include "prx/libSceAgcDriver/Unified/include/Operation.hpp"
+#include "prx/libSceAgcDriver/Unified/include/PacketTable.hpp"
 #include "prx/libSceAgcDriver/Unified/include/Programs.hpp"
 #include "prx/libSceAgcDriver/Unified/include/Ranges.hpp"
 #include <cstdint>
@@ -32,6 +33,7 @@ struct ResolvedDraw {
 void Attach(const std::shared_ptr<VulkanDevice>& device);
 void Consume(const Operation& operation, const DecodeState& state);
 [[nodiscard]] std::string Line();
+[[nodiscard]] PacketTable<ResolvedDraw>& ResolvedDraws();
 
 }
 
