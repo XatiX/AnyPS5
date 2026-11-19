@@ -17,6 +17,8 @@ namespace AgcDriver::Unified::Images {
 
 class VulkanSurface;
 
+inline constexpr std::uint64_t DetileTimingKey = 0x7ec0de01;
+
 struct DetileCounts {
     std::uint64_t surfaces = 0;
     std::uint64_t dispatches = 0;

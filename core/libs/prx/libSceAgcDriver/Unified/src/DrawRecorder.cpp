@@ -48,6 +48,10 @@ namespace {
 
 using Graphics::Context;
 
+constexpr std::uint64_t UploadTimingKey = 0x7ec0de02;
+constexpr std::uint64_t DrawTimingKey = Graphics::Recorder::DrawTimingFlag;
+constexpr std::uint64_t DispatchTimingKey = 0x7ec0de04;
+
 bool writesFaultTokens() {
     static const bool writes = std::getenv("APS5_GPU_CHECKPOINTS") != nullptr;
     return writes;
@@ -848,7 +852,9 @@ private:
         bind(commands, VK_PIPELINE_BIND_POINT_COMPUTE, pipeline->layout, ShaderRecompiler::RuntimeAbi::DirectHeapSet, 1, &heapSet, 0, nullptr);
         if (!push.empty()) context.Function<PFN_vkCmdPushConstants>("vkCmdPushConstants")(commands, pipeline->layout, VK_SHADER_STAGE_COMPUTE_BIT, 0, Graphics::ComputePushConstantBytes, block.data());
         noteFaultToken(context, *recorder, commands, dispatch.stages, FaultStage::compute, "dispatch", groups[0], groups[1] * groups[2]);
+        const auto dispatchTiming = recorder->BeginGpuTiming(DispatchTimingKey);
         context.Resolved(&Graphics::DeviceFunctions::cmdDispatch, "vkCmdDispatch")(commands, groups[0], groups[1], groups[2]);
+        recorder->EndGpuTiming(dispatchTiming);
         Graphics::RecordMemoryBarrier(context, commands, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT | VK_PIPELINE_STAGE_HOST_BIT, VK_ACCESS_SHADER_WRITE_BIT, VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT | VK_ACCESS_UNIFORM_READ_BIT | VK_ACCESS_TRANSFER_READ_BIT | VK_ACCESS_TRANSFER_WRITE_BIT | VK_ACCESS_INDIRECT_COMMAND_READ_BIT | VK_ACCESS_INDEX_READ_BIT | VK_ACCESS_VERTEX_ATTRIBUTE_READ_BIT | VK_ACCESS_COLOR_ATTACHMENT_READ_BIT | VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_READ_BIT | VK_ACCESS_HOST_READ_BIT);
 
         recorder->Keep(pipeline);
@@ -1041,7 +1047,10 @@ private:
         if (Shadow::OwnedUploadsPending()) {
             phase = std::chrono::steady_clock::now();
             std::vector<std::shared_ptr<void>> kept;
-            if (Shadow::RecordOwnedUploads(recorder->Commands(), kept) != 0u) totals.residencyLands++;
+            const auto uploadCommands = recorder->Commands();
+            const auto uploadTiming = recorder->BeginGpuTiming(UploadTimingKey);
+            if (Shadow::RecordOwnedUploads(uploadCommands, kept) != 0u) totals.residencyLands++;
+            recorder->EndGpuTiming(uploadTiming);
             for (auto& object : kept) recorder->Keep(std::move(object));
             totals.uploadNanoseconds += elapsed(phase);
         }
@@ -1104,6 +1113,11 @@ private:
         if (!vertexBuffers.empty()) context.Resolved(&Graphics::DeviceFunctions::cmdBindVertexBuffers, "vkCmdBindVertexBuffers")(commands, 0, static_cast<std::uint32_t>(vertexBuffers.size()), vertexBuffers.data(), vertexOffsets.data());
         if (indexImport != nullptr) context.Resolved(&Graphics::DeviceFunctions::cmdBindIndexBuffer, "vkCmdBindIndexBuffer")(commands, indexImport->buffer, Graphics::HostImportOffset(*indexImport, parameters.indexAddress), parameters.indexSize == 2u ? VK_INDEX_TYPE_UINT16 : VK_INDEX_TYPE_UINT32);
         noteFaultToken(context, *recorder, commands, draw.stages, FaultStage::graphics, parameters.indirect ? "indirect" : (parameters.indexed ? "indexed" : "draw"), parameters.indexCount, parameters.instanceCount);
+        std::uint64_t timedProgram = 0;
+        for (const auto& one : draw.stages) {
+            if (timedProgram == 0 || one.program.stage == ShaderRecompiler::ShaderStage::Fragment) timedProgram = one.program.codeAddress;
+        }
+        const auto drawTiming = recorder->BeginInPassGpuTiming(DrawTimingKey | (std::uint64_t{0x7ec} << 48u) | (timedProgram & 0xffffffffffffull));
         if (parameters.indirect) {
             const auto& args = *parameters.indirect;
             if (countImport != nullptr) {
@@ -1124,6 +1138,7 @@ private:
         } else {
             context.Resolved(&Graphics::DeviceFunctions::cmdDraw, "vkCmdDraw")(commands, parameters.indexCount, parameters.instanceCount, parameters.firstVertex, parameters.firstInstance);
         }
+        recorder->EndGpuTiming(drawTiming);
 
         recorder->LeaveRenderPassOpen(key, 0, fenced, access);
         recorder->Keep(pipeline);
