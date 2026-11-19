@@ -183,6 +183,8 @@ private:
         const auto beforeTargets = draw.uses.size();
         TargetUses(programs.decode.state, draw.uses);
         totals.targetUses += draw.uses.size() - beforeTargets;
+        draw.targetBegin = beforeTargets;
+        draw.targetEnd = draw.uses.size();
         draw.state = std::make_shared<const Graphics::State>(programs.decode.state);
         return resolveStages(totals, std::move(draw), programs, beforeTargets, slotsStarted);
     }

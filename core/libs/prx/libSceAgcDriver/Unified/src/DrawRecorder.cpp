@@ -73,6 +73,9 @@ struct Totals {
     std::uint64_t surfaceFailures = 0;
     std::uint64_t faultReads = 0;
     std::uint64_t batchMoves = 0;
+    std::uint64_t passesBegun = 0;
+    std::uint64_t passesContinued = 0;
+    std::uint64_t passFeedback = 0;
     std::uint64_t residencyLands = 0;
     std::uint64_t faults = 0;
     std::uint64_t unmappedFaults = 0;
@@ -91,6 +94,20 @@ struct Totals {
 
 std::uint64_t elapsed(std::chrono::steady_clock::time_point from) {
     return static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - from).count());
+}
+
+bool mergesPasses() {
+    static const bool merges = std::getenv("APS5_RECODE_NO_PASS_MERGE") == nullptr;
+    return merges;
+}
+
+bool overlaps(std::span<const std::pair<std::uint64_t, std::uint64_t>> left, std::span<const std::pair<std::uint64_t, std::uint64_t>> right) {
+    for (const auto& [begin, end] : left) {
+        for (const auto& [otherBegin, otherEnd] : right) {
+            if (begin < otherEnd && otherBegin < end) return true;
+        }
+    }
+    return false;
 }
 
 bool servesFaultPages() {
@@ -347,6 +364,7 @@ public:
         std::string line = text;
         line += "; linear target stores " + std::to_string(totals.linearStores);
         line += "; batch moved before the pass " + std::to_string(totals.batchMoves);
+        line += "; passes " + std::to_string(totals.passesBegun) + " begun, " + std::to_string(totals.passesContinued) + " draws continued, " + std::to_string(totals.passFeedback) + " broken by a target read";
         line += "; residency updates landed " + std::to_string(totals.residencyLands);
         std::snprintf(text, sizeof(text), "; dispatches %llu recorded, %llu to the existing path, %.1f us per dispatch; compute pipelines %zu held, %llu queued, %llu built in %.1f ms, %zu building, %zu failed", static_cast<unsigned long long>(totals.dispatches), static_cast<unsigned long long>(totals.dispatchExisting), totals.dispatches == 0 ? 0.0 : static_cast<double>(totals.dispatchNanoseconds) / 1000.0 / static_cast<double>(totals.dispatches), computePipelines.size(), static_cast<unsigned long long>(totals.pipelinesQueued), static_cast<unsigned long long>(totals.pipelinesBuilt), static_cast<double>(totals.pipelineNanoseconds) / 1e6, buildingPipelines.size(), failedPipelines.size());
         line += text;
@@ -966,21 +984,49 @@ private:
         if (recorder->HasQueuedKeyStores()) recorder->FlushKeyStores();
         if (recorder->HasQueuedStores()) recorder->FlushStores();
         const auto key = Graphics::DrawRenderPassKey(context, state, views);
-        Graphics::PassAccess access;
-        access.anyReads = true;
-        access.anyWrites = true;
+        std::vector<std::pair<std::uint64_t, std::uint64_t>> passReads;
+        std::vector<std::pair<std::uint64_t, std::uint64_t>> passWrites;
+        std::vector<std::pair<std::uint64_t, std::uint64_t>> drawTargets;
+        for (std::size_t index = 0; index < draw.uses.size(); ++index) {
+            const auto& use = draw.uses[index];
+            if (use.size == 0u) continue;
+            const std::pair range{use.address, use.address + use.size};
+            if (index >= draw.targetBegin && index < draw.targetEnd) drawTargets.push_back(range);
+            else if (use.write) passWrites.push_back(range);
+            else passReads.push_back(range);
+        }
+        std::vector<std::pair<VkImage, bool>> attachments;
+        for (const auto& resident : residents) attachments.emplace_back(resident->Image(), true);
+        Graphics::PassAccess access{passReads, passWrites, {}, attachments};
+        access.anyReads = pageTable != nullptr;
+        access.anyWrites = pageTable != nullptr && std::ranges::any_of(draw.stages, [](const Resolve::ResolvedStage& stage) { return Graphics::ShaderStoresThroughAddresses(stage.program.result->spirv); });
+        const bool feedback = recorder->RenderPassOpen() && overlaps(passReads, passTargets);
+        if (feedback) totals.passFeedback++;
+        const bool snapshotArguments = parameters.indirect && ring != nullptr && argumentBuffer == ring->Handle();
+        const bool forced = !mergesPasses() || !draw.complete || feedback || (parameters.indirect && !snapshotArguments) || countImport != nullptr;
         const bool fenced = state.depth.has_value();
-        const auto start = recorder->StartDrawPass(key, true, fenced, access);
+        const auto start = recorder->StartDrawPass(key, forced, fenced, access);
         if (recorder->OpenBatchSerial() != serial) totals.batchMoves++;
         const auto commands = start.commands;
         auto& recording = recorder->GraphicsState();
-        recorder->PrepareSampleSlot();
+        if (start.continued) {
+            totals.passesContinued++;
+            passTargets.insert(passTargets.end(), drawTargets.begin(), drawTargets.end());
+        } else {
+            totals.passesBegun++;
+            passTargets = std::move(drawTargets);
+            recorder->PrepareSampleSlot();
+        }
         if (start.barrier) {
             Graphics::RecordMemoryBarrier(context, commands, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_PIPELINE_STAGE_ALL_GRAPHICS_BIT, VK_ACCESS_SHADER_WRITE_BIT | VK_ACCESS_TRANSFER_WRITE_BIT | VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT | VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT, VK_ACCESS_COLOR_ATTACHMENT_READ_BIT | VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT | VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_READ_BIT | VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT | VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_INDIRECT_COMMAND_READ_BIT | VK_ACCESS_INDEX_READ_BIT);
         }
-        if (parameters.indirect) Graphics::RecordMemoryBarrier(context, commands, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT | VK_PIPELINE_STAGE_HOST_BIT, VK_PIPELINE_STAGE_DRAW_INDIRECT_BIT, VK_ACCESS_SHADER_WRITE_BIT | VK_ACCESS_TRANSFER_WRITE_BIT | VK_ACCESS_HOST_WRITE_BIT, VK_ACCESS_INDIRECT_COMMAND_READ_BIT);
         const auto* maskedState = masked.has_value() ? &*masked : nullptr;
-        pipeline->Begin(recording, *framebuffer, state.renderExtent, state, maskedState);
+        if (start.continued) {
+            pipeline->Continue(recording, state, maskedState);
+        } else {
+            if (parameters.indirect) Graphics::RecordMemoryBarrier(context, commands, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT | VK_PIPELINE_STAGE_HOST_BIT, VK_PIPELINE_STAGE_DRAW_INDIRECT_BIT, VK_ACCESS_SHADER_WRITE_BIT | VK_ACCESS_TRANSFER_WRITE_BIT | VK_ACCESS_HOST_WRITE_BIT, VK_ACCESS_INDIRECT_COMMAND_READ_BIT);
+            pipeline->Begin(recording, *framebuffer, state.renderExtent, state, maskedState);
+        }
 
         const auto bind = context.Resolved(&Graphics::DeviceFunctions::cmdBindDescriptorSets, "vkCmdBindDescriptorSets");
         bind(commands, VK_PIPELINE_BIND_POINT_GRAPHICS, pipeline->Layout(), ShaderRecompiler::RuntimeAbi::DescriptorSet, 1, &descriptorSets[0], 0, nullptr);
@@ -1039,6 +1085,7 @@ private:
     VkDevice device = VK_NULL_HANDLE;
     std::uint64_t alignment = 16;
     std::shared_ptr<Graphics::Buffer> ring;
+    std::vector<std::pair<std::uint64_t, std::uint64_t>> passTargets;
     std::deque<FaultBuffer> faults;
     std::vector<std::shared_ptr<Graphics::Buffer>> spareFaults;
     std::map<std::uint32_t, std::uint64_t> faultReasons;

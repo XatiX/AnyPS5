@@ -42,6 +42,8 @@ struct ResolvedDraw {
     std::vector<ResolvedStage> stages;
     std::vector<GuestUse> uses;
     bool complete = true;
+    std::size_t targetBegin = 0;
+    std::size_t targetEnd = 0;
     Bindings::Layout layout;
     std::shared_ptr<const Graphics::State> state;
 };
