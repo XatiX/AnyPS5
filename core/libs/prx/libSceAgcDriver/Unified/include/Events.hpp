@@ -86,7 +86,6 @@ private:
     std::uintptr_t previous;
 };
 void NoteRanges(std::span<const std::pair<std::uint64_t, std::uint64_t>> ranges, std::uintptr_t owner = 0);
-void NoteGpuWrites(std::span<const std::pair<std::uint64_t, std::uint64_t>> ranges, std::uintptr_t owner);
 
 }
 

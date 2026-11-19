@@ -160,12 +160,4 @@ void NoteRanges(std::span<const std::pair<std::uint64_t, std::uint64_t>> ranges,
     }
 }
 
-void NoteGpuWrites(std::span<const std::pair<std::uint64_t, std::uint64_t>> ranges, std::uintptr_t owner) {
-    for (const auto& [begin, end] : ranges) {
-        if (end <= begin) continue;
-        Shared().Note(begin, end - begin, owner);
-        GpuWrites().Note(begin, end - begin, owner);
-    }
-}
-
 }
