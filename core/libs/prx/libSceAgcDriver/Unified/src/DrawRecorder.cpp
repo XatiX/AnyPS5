@@ -292,6 +292,7 @@ public:
         bool recorded = false;
         try {
             recorded = record(context, draw, parameters, reason);
+            landWrites();
         } catch (const std::exception& error) {
             reason = std::string("record failed: ") + error.what();
         }
@@ -319,6 +320,7 @@ public:
         bool recorded = false;
         try {
             recorded = recordDispatch(context, dispatch, groups, reason);
+            landWrites();
         } catch (const std::exception& error) {
             reason = std::string("record failed: ") + error.what();
         }
@@ -396,6 +398,17 @@ private:
         });
     }
 
+    void landWrites() {
+        if (landing.empty()) return;
+        const auto written = std::move(landing);
+        landing.clear();
+        Shadow::LandGpuWrites(written);
+        std::vector<std::pair<std::uint64_t, std::uint64_t>> ends;
+        ends.reserve(written.size());
+        for (const auto& [begin, size] : written) ends.emplace_back(begin, begin + size);
+        Events::NoteRanges(ends);
+    }
+
     void readFaults(Graphics::Buffer& buffer) {
         namespace Abi = ShaderRecompiler::BdaAbi;
         auto bytes = buffer.Bytes();
@@ -405,13 +418,7 @@ private:
         std::vector<std::pair<std::uint64_t, std::uint64_t>> written;
         if (Abi::ForEachWrittenRange(words, [&](std::uint64_t begin, std::size_t size) { written.emplace_back(begin, size); })) {
             totals.writtenRanges += written.size();
-            if (!written.empty()) {
-                Shadow::LandGpuWrites(written);
-                std::vector<std::pair<std::uint64_t, std::uint64_t>> ends;
-                ends.reserve(written.size());
-                for (const auto& [begin, size] : written) ends.emplace_back(begin, begin + size);
-                Events::NoteRanges(ends);
-            }
+            landing.insert(landing.end(), written.begin(), written.end());
         }
         Abi::Fault report{};
         std::memcpy(&report, bytes.data(), sizeof(report));
@@ -1040,6 +1047,7 @@ private:
     std::set<std::uint32_t> seenFaults;
     std::unique_ptr<Images::SurfaceDetiler> surfaceDetiler;
     std::map<std::vector<std::uint64_t>, std::shared_ptr<ComputePipeline>> computePipelines;
+    std::vector<std::pair<std::uint64_t, std::uint64_t>> landing;
     std::set<std::vector<std::uint64_t>> buildingPipelines;
     std::map<std::vector<std::uint64_t>, std::string> failedPipelines;
     std::deque<PipelineJob> pipelineJobs;
