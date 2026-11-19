@@ -5,9 +5,7 @@
 #include <windows.h>
 #include <algorithm>
 #include <array>
-#ifdef APS5_COUNT_MAPPING_QUERIES
 #include <atomic>
-#endif
 #include <cstdio>
 #include <cstddef>
 #include <cstdint>
@@ -620,6 +618,10 @@ public:
         forgetZero(address, address + bytes);
     }
 
+    std::uint64_t KnownZeroMarks() const {
+        return zeroMarks.load(std::memory_order_acquire);
+    }
+
     void KnownZero(std::uintptr_t address, std::size_t bytes, void (*zero)(void* context, std::uintptr_t begin, std::uintptr_t end), void* context) {
         if (bytes == 0 || bytes > UINTPTR_MAX - address) return;
         const auto end = address + bytes;
@@ -926,6 +928,7 @@ private:
     void markZero(std::uintptr_t start, std::uintptr_t end) {
         start = (start + 4095) & ~std::uintptr_t{4095};
         end &= ~std::uintptr_t{4095};
+        if (start >= end) return;
         while (start < end) {
             const auto chunk = start & ~(chunkBytes - 1);
             const auto stop = std::min(end, chunk + chunkBytes);
@@ -933,6 +936,7 @@ private:
             for (auto bit = (start - chunk) >> 12; bit < (stop - chunk) >> 12; ++bit) bits[bit >> 6] |= std::uint64_t{1} << (bit & 63);
             start = stop;
         }
+        zeroMarks.fetch_add(1, std::memory_order_release);
     }
 
     static void clearZeroBits(auto& bits, std::uintptr_t chunk, std::uintptr_t from, std::uintptr_t to) {
@@ -1803,6 +1807,7 @@ private:
 #endif
     Ranges freshRanges;
     std::unordered_map<std::uintptr_t, std::array<std::uint64_t, chunkBytes / 4096 / 64>> zeroPages;
+    std::atomic<std::uint64_t> zeroMarks{0};
     std::map<std::uintptr_t, View> views;
     std::map<std::uintptr_t, std::uint8_t> coreCaps;
 
