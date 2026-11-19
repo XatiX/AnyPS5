@@ -36,6 +36,7 @@ struct MirrorCounts {
 [[nodiscard]] std::vector<std::uint32_t> MirrorMap(std::span<const std::uint32_t> map, std::span<const std::uint32_t> slots);
 
 [[nodiscard]] std::vector<std::pair<std::uint64_t, std::uint64_t>> CoalescedSpans(std::span<const Heap::ImageUse> uses);
+[[nodiscard]] std::vector<std::pair<std::uint64_t, std::uint64_t>> Outside(std::pair<std::uint64_t, std::uint64_t> span, std::vector<std::pair<std::uint64_t, std::uint64_t>> holes);
 
 class TableMirror {
 public:

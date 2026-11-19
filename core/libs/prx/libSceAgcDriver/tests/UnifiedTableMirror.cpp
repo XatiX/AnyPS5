@@ -130,6 +130,24 @@ void testSpansCoalesce() {
     Expect(spans.size() == 2u && spans[0] == std::pair<std::uint64_t, std::uint64_t>{0x1000u, 0x3800u} && spans[1].first == 0x8000u, "touching and overlapping spans merge in address order");
 }
 
+void testUsesAreCoalescedSpans() {
+    Fixture fixture;
+    const auto tables = Tables({1u, 2u});
+    tables->elements.push_back(Element(1u));
+    tables->elements.back().words[1] = 2u;
+    std::string reason;
+    std::vector<ImageUse> uses;
+    static_cast<void>(fixture.mirror.Build(tables, reason, &uses));
+    Expect(uses.size() == 2u && uses[0].memory.address < uses[1].memory.address && !uses[0].write, "elements over the same memory report one sampled use");
+}
+
+void testOutsideCutsHoles() {
+    const auto pieces = Tables::Outside({0x1000u, 0x5000u}, {{0x4000u, 0x6000u}, {0x2000u, 0x3000u}, {0x8000u, 0x9000u}});
+    Expect(pieces.size() == 2u && pieces[0] == std::pair<std::uint64_t, std::uint64_t>{0x1000u, 0x2000u} && pieces[1] == std::pair<std::uint64_t, std::uint64_t>{0x3000u, 0x4000u}, "holes are cut out of the span in address order");
+    Expect(Tables::Outside({0x1000u, 0x2000u}, {{0x0u, 0x3000u}}).empty(), "a span inside a hole leaves nothing");
+    Expect(Tables::Outside({0x1000u, 0x2000u}, {}).size() == 1u, "a span without holes is kept whole");
+}
+
 void testMirrorRefusesStorageAndSamplers() {
     Fixture fixture;
     std::string reason;
@@ -150,6 +168,8 @@ int main() {
     testWritesToElementImagesRefill();
     testNewTablesInheritTheirPredecessor();
     testSpansCoalesce();
+    testUsesAreCoalescedSpans();
+    testOutsideCutsHoles();
     testMirrorRefusesStorageAndSamplers();
     if (failures != 0) return 1;
     std::printf("unified table mirror tests passed\n");

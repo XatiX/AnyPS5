@@ -57,6 +57,20 @@ std::vector<std::pair<std::uint64_t, std::uint64_t>> CoalescedSpans(std::span<co
     return spans;
 }
 
+std::vector<std::pair<std::uint64_t, std::uint64_t>> Outside(std::pair<std::uint64_t, std::uint64_t> span, std::vector<std::pair<std::uint64_t, std::uint64_t>> holes) {
+    std::sort(holes.begin(), holes.end());
+    std::vector<std::pair<std::uint64_t, std::uint64_t>> pieces;
+    auto cursor = span.first;
+    for (const auto& [begin, end] : holes) {
+        if (end <= cursor || begin >= span.second) continue;
+        if (begin > cursor) pieces.emplace_back(cursor, begin);
+        cursor = std::max(cursor, end);
+        if (cursor >= span.second) break;
+    }
+    if (cursor < span.second) pieces.emplace_back(cursor, span.second);
+    return pieces;
+}
+
 namespace {
 
 std::uint64_t mapKey(std::span<const std::uint32_t> map) {
@@ -124,9 +138,11 @@ bool TableMirror::fill(const Cached* base, Cached& out, std::string& reason) {
     }
     out.uses.clear();
     for (std::size_t index = 0; index < count; ++index) {
-        if (out.memory[index].bytes != 0u) out.uses.push_back({out.memory[index], (out.requests[index].flags & Heap::RequestFlag::Written) != 0u});
+        if (out.memory[index].bytes != 0u) out.uses.push_back({out.memory[index], false});
     }
     out.spans = CoalescedSpans(out.uses);
+    out.uses.clear();
+    for (const auto& [begin, end] : out.spans) out.uses.push_back({{begin, end - begin}, false});
     return true;
 }
 

@@ -209,14 +209,15 @@ private:
             }
             draw.stages.push_back(std::move(resolved));
         }
+        std::vector<std::pair<std::uint64_t, std::uint64_t>> held;
+        for (auto index = beforeTargets; index < beforeBuffers; ++index) held.emplace_back(draw.uses[index].address, draw.uses[index].address + draw.uses[index].size);
         for (const auto& use : tableUses) {
-            const bool target = std::any_of(draw.uses.begin() + static_cast<std::ptrdiff_t>(beforeTargets), draw.uses.begin() + static_cast<std::ptrdiff_t>(beforeBuffers),[&](const GuestUse& held) { return use.memory.address < held.address + held.size && held.address < use.memory.address + use.memory.bytes; });
-            if (target) {
-                totals.tableTargetHolds++;
-                continue;
+            const auto pieces = Tables::Outside({use.memory.address, use.memory.address + use.memory.bytes}, held);
+            if (pieces.size() != 1u || pieces.front().second - pieces.front().first != use.memory.bytes) totals.tableTargetHolds++;
+            for (const auto& [begin, end] : pieces) {
+                draw.uses.push_back({begin, end - begin, use.write});
+                totals.tableUses++;
             }
-            draw.uses.push_back({use.memory.address, use.memory.bytes, use.write});
-            totals.tableUses++;
         }
         totals.tablePlaceholders += tablePlaceholdersHere;
         std::vector<Bindings::StageInput> inputsOfLayout;
