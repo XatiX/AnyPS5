@@ -22,6 +22,10 @@
 #include <optional>
 #include <stdexcept>
 #include <utility>
+#if ANYPS5_UNIFIED
+#include "prx/libSceAgcDriver/Execution/include/VulkanDevice.hpp"
+#include "prx/libSceAgcDriver/Unified/include/DrawRecorder.hpp"
+#endif
 
 namespace AgcDriver::DriverDetail {
 
@@ -209,6 +213,38 @@ void Driver::dispatch(QueueState& queue, std::span<const std::uint32_t> packet, 
             if (resolvedAhead().empty()) gateOpened() = true;
             return;
         }
+#if ANYPS5_UNIFIED
+        if (Unified::Record::RecordActive() && Unified::Resolve::DispatchesActive() && pipelineCandidate && submission.queue == 0 && indirectArguments == 0 && !htileClearCompletion.has_value() && htileMask.bytes == 0u) {
+            auto& resolvedDispatches = Unified::Resolve::ResolvedDispatches();
+            const auto packetOffset = currentPacketOffset();
+            const auto found = resolvedDispatches.Find(submission.queue, submission.serial, packetOffset, std::chrono::milliseconds(50));
+            if (found.offered) resolvedDispatches.Release(submission.queue, submission.serial, packetOffset);
+            std::array<std::uint32_t, 3> recodeGroups{packet[1], packet[2], packet[3]};
+            if ((packet[4] & 0x20u) != 0) {
+                for (std::uint32_t axis = 0; axis < 3; ++axis) recodeGroups[axis] = ThreadDimensionGroups(recodeGroups[axis], std::max(readRegister(queue.shader, 0x207 + axis) & 0xffffu, 1u));
+            }
+            const auto code = std::span(snapshot.code).subspan(codeOffset);
+            std::string recodeReason;
+            if (found.value != nullptr && found.value->stages.size() == 1u && found.value->stages.front().program.codeAddress == address && !MatchSgprPatternFill(packet, code, userData, compute) && !Graphics::MatchStorageImageClear(code, userData, compute, recodeGroups) && Unified::Record::RecordDispatchPrecheck(localDevice->graphicsContext(), *localDevice, *found.value, recodeReason)) {
+                std::vector<DrawPipeline::Range> reads;
+                std::vector<DrawPipeline::Range> writes;
+                for (const auto& use : found.value->uses) (use.write ? writes : reads).emplace_back(use.address, use.address + use.size);
+                const auto commitQueue = submission.queue;
+                DrawPipeline::Queue0().Enqueue(DrawPipeline::CommitKind::Dispatch, [this, localDevice, resolved = found.value, recodeGroups, commitQueue] {
+                    GuestMemory::SetCurrentPacket(0x15, commitQueue);
+                    GuestMemory::TagGpuLockSite(GuestMemory::GpuLockSite::Dispatch);
+                    std::lock_guard commitLock(GuestMemory::GpuMutex());
+                    auto current = device.Load();
+                    if (current == nullptr) current = localDevice;
+                    recordLabelsForPacket(current.get(), commitQueue);
+                    std::string reason;
+                    Unified::Record::RecordDispatch(current->graphicsContext(), *resolved, recodeGroups, reason);
+                    wakeQueueZeroForIdleResults();
+                }, std::move(writes), 0, {}, std::move(reads));
+                return;
+            }
+        }
+#endif
     }
     if (indirectArguments == 0 && (packet[4] & 0x20u) != 0) {
         const std::array<std::uint32_t, 3> threads{packet[1], packet[2], packet[3]};

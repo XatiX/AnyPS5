@@ -1,9 +1,11 @@
 #include "prx/libSceAgcDriver/Unified/include/DrawRecorder.hpp"
 #include "prx/libSceAgcDriver/Execution/include/GuestMemory.hpp"
+#include "prx/libSceAgcDriver/Execution/include/VulkanDevice.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/DepthSurface.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/Draw.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/GuestBufferMemory.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/Pipeline.hpp"
+#include "prx/libSceAgcDriver/Graphics/include/PipelineSpecialization.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/Recorder.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/Resources.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/ShaderResources.hpp"
@@ -23,6 +25,7 @@
 #include <algorithm>
 #include <array>
 #include <chrono>
+#include <condition_variable>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -32,6 +35,7 @@
 #include <mutex>
 #include <optional>
 #include <set>
+#include <thread>
 
 namespace AgcDriver::Unified::Record {
 
@@ -76,6 +80,12 @@ struct Totals {
     std::uint64_t writtenRanges = 0;
     std::uint64_t writtenOverflows = 0;
     std::uint64_t nanoseconds = 0;
+    std::uint64_t dispatches = 0;
+    std::uint64_t dispatchExisting = 0;
+    std::uint64_t dispatchNanoseconds = 0;
+    std::uint64_t pipelinesQueued = 0;
+    std::uint64_t pipelinesBuilt = 0;
+    std::uint64_t pipelineNanoseconds = 0;
     std::map<std::string, std::uint64_t> reasons;
 };
 
@@ -187,6 +197,77 @@ bool precheck(const Resolve::ResolvedDraw& draw, const Pm4::DrawParameters& para
     return true;
 }
 
+struct ComputePipeline {
+    VkDevice device = VK_NULL_HANDLE;
+    PFN_vkDestroyPipeline destroyPipeline = nullptr;
+    PFN_vkDestroyPipelineLayout destroyLayout = nullptr;
+    VkPipelineLayout layout = VK_NULL_HANDLE;
+    VkPipeline pipeline = VK_NULL_HANDLE;
+
+    ComputePipeline() = default;
+    ComputePipeline(const ComputePipeline&) = delete;
+    ComputePipeline& operator=(const ComputePipeline&) = delete;
+    ~ComputePipeline() {
+        if (pipeline != VK_NULL_HANDLE) destroyPipeline(device, pipeline, nullptr);
+        if (layout != VK_NULL_HANDLE) destroyLayout(device, layout, nullptr);
+    }
+};
+
+struct PipelineJob {
+    std::vector<std::uint64_t> key;
+    Graphics::Context context;
+    std::shared_ptr<const ShaderRecompiler::RecompileResult> result;
+    VkDescriptorSetLayout main = VK_NULL_HANDLE;
+    VkDescriptorSetLayout heap = VK_NULL_HANDLE;
+    VkDescriptorSetLayout empty = VK_NULL_HANDLE;
+    VkPipelineCreateFlags flags = 0;
+    VkPipelineShaderStageCreateFlags stageFlags = 0;
+    std::uint32_t subgroupSize = 0;
+};
+
+bool dispatchPrecheck(const Resolve::ResolvedDraw& dispatch, std::string& reason) {
+    if (dispatch.stages.size() != 1u || dispatch.stages.front().program.stage != ShaderRecompiler::ShaderStage::Compute) {
+        reason = "not one compute stage";
+        return false;
+    }
+    if (!dispatch.complete) {
+        reason = "placeholder images";
+        return false;
+    }
+    if (dispatch.operation.dispatch.indirect) {
+        reason = "indirect dispatch";
+        return false;
+    }
+    const auto& result = *dispatch.stages.front().program.result;
+    if (result.workgroupMemoryDwords != 0u) {
+        reason = "workgroup memory buffer";
+        return false;
+    }
+    if (result.scratchPoolSlotDwords != 0u) {
+        reason = "scratch pool";
+        return false;
+    }
+    if (dispatch.stages.front().program.words.pushConstants.size() > Graphics::ComputePushConstantBytes) {
+        reason = "push data outside the block";
+        return false;
+    }
+    for (const auto& binding : dispatch.layout.bindings) {
+        if (binding.count != 1u) {
+            reason = "buffer array binding";
+            return false;
+        }
+        if (binding.source == Bindings::Source::Guest || binding.source == Bindings::Source::Gds) {
+            reason = "guest or GDS buffer binding";
+            return false;
+        }
+        if (binding.source == Bindings::Source::TableMap && dispatch.stages.front().tableMap == nullptr) {
+            reason = "table map without a mirror";
+            return false;
+        }
+    }
+    return true;
+}
+
 std::span<const std::uint32_t> wordsOf(const Resolve::ResolvedStage& stage, std::uint32_t index) {
     for (const auto& [position, words] : stage.program.words.bindings) {
         if (position == index) return words;
@@ -223,6 +304,33 @@ public:
         return false;
     }
 
+    bool DispatchPrecheck(const Context& context, const VulkanDevice& owner, const Resolve::ResolvedDraw& dispatch, std::string& reason) {
+        std::lock_guard lock(mutex);
+        if (dispatchPrecheck(dispatch, reason) && pipelineReady(context, owner, dispatch, reason)) return true;
+        totals.dispatchExisting++;
+        const auto key = "existing path dispatch: " + reason.substr(0, 45);
+        if (totals.reasons.size() < 24u || totals.reasons.contains(key)) totals.reasons[key]++;
+        return false;
+    }
+
+    bool RecordDispatch(const Context& context, const Resolve::ResolvedDraw& dispatch, const std::array<std::uint32_t, 3>& groups, std::string& reason) {
+        std::lock_guard lock(mutex);
+        const auto started = std::chrono::steady_clock::now();
+        bool recorded = false;
+        try {
+            recorded = recordDispatch(context, dispatch, groups, reason);
+        } catch (const std::exception& error) {
+            reason = std::string("record failed: ") + error.what();
+        }
+        totals.dispatchNanoseconds += elapsed(started);
+        if (recorded) {
+            totals.dispatches++;
+            return true;
+        }
+        refuse("dispatch " + reason);
+        return false;
+    }
+
     std::string Line() {
         std::lock_guard lock(mutex);
         char text[384];
@@ -233,6 +341,8 @@ public:
         line += "; linear target stores " + std::to_string(totals.linearStores);
         line += "; batch moved before the pass " + std::to_string(totals.batchMoves);
         line += "; residency updates landed " + std::to_string(totals.residencyLands);
+        std::snprintf(text, sizeof(text), "; dispatches %llu recorded, %llu to the existing path, %.1f us per dispatch; compute pipelines %zu held, %llu queued, %llu built in %.1f ms, %zu building, %zu failed", static_cast<unsigned long long>(totals.dispatches), static_cast<unsigned long long>(totals.dispatchExisting), totals.dispatches == 0 ? 0.0 : static_cast<double>(totals.dispatchNanoseconds) / 1000.0 / static_cast<double>(totals.dispatches), computePipelines.size(), static_cast<unsigned long long>(totals.pipelinesQueued), static_cast<unsigned long long>(totals.pipelinesBuilt), static_cast<double>(totals.pipelineNanoseconds) / 1e6, buildingPipelines.size(), failedPipelines.size());
+        line += text;
         std::snprintf(text, sizeof(text), "; table maps %llu hits, %llu uploads (%.1f MiB), %llu retired, %zu held (%.1f MiB)", static_cast<unsigned long long>(totals.mapHits), static_cast<unsigned long long>(totals.mapUploads), static_cast<double>(totals.mapUploadBytes) / 1048576.0, static_cast<unsigned long long>(totals.mapRetired), maps.size(), static_cast<double>(mapBytes) / 1048576.0);
         line += text;
         std::snprintf(text, sizeof(text), "; fault buffers %zu in flight, %llu read: %llu faults (%llu unmapped), %llu fault pages served, %llu written ranges landed, %llu written overflows", faults.size(), static_cast<unsigned long long>(totals.faultReads), static_cast<unsigned long long>(totals.faults), static_cast<unsigned long long>(totals.unmappedFaults), static_cast<unsigned long long>(totals.faultPages), static_cast<unsigned long long>(totals.writtenRanges), static_cast<unsigned long long>(totals.writtenOverflows));
@@ -435,6 +545,237 @@ private:
         return set;
     }
 
+    bool writeSet(const Context& context, const Resolve::ResolvedDraw& draw, std::uint32_t set, VkDescriptorSet target, std::uint64_t serial, std::uint64_t completed, std::shared_ptr<Graphics::Buffer>& pageTable, std::string& reason) {
+        std::vector<VkDescriptorBufferInfo> infos;
+        std::vector<VkWriteDescriptorSet> writes;
+        infos.reserve(draw.layout.bindings.size());
+        for (const auto& binding : draw.layout.bindings) {
+            if (binding.set != set) continue;
+            VkDescriptorBufferInfo info{};
+            switch (binding.source) {
+                case Bindings::Source::Words: {
+                    const auto words = wordsOf(draw.stages.at(binding.stage), binding.index);
+                    std::vector<std::byte> bytes(std::max<std::size_t>(words.size_bytes(), 16u));
+                    std::memcpy(bytes.data(), words.data(), words.size_bytes());
+                    const auto offset = ringWrite(bytes, serial, completed);
+                    if (!offset.has_value()) {
+                        reason = "ring full";
+                        return false;
+                    }
+                    info = {ring->Handle(), *offset, bytes.size()};
+                    break;
+                }
+                case Bindings::Source::PageTable:
+                    if (pageTable == nullptr) pageTable = ResidencyService::Get().PageTableBuffer();
+                    if (pageTable == nullptr) {
+                        reason = "no GPU page table";
+                        return false;
+                    }
+                    info = {pageTable->Handle(), 0, VK_WHOLE_SIZE};
+                    break;
+                case Bindings::Source::Fault: info = {faultFor(context, serial, completed)->Handle(), 0, VK_WHOLE_SIZE}; break;
+                case Bindings::Source::TableMap: {
+                    const auto& mirror = draw.stages.at(binding.stage).tableMap;
+                    if (mirror == nullptr) {
+                        reason = "table map without a mirror";
+                        return false;
+                    }
+                    info = {mapBuffer(context, *mirror, serial, completed)->Handle(), 0, VK_WHOLE_SIZE};
+                    break;
+                }
+                default: reason = "guest or GDS buffer binding"; return false;
+            }
+            infos.push_back(info);
+            VkWriteDescriptorSet write{VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET};
+            write.dstSet = target;
+            write.dstBinding = binding.binding;
+            write.descriptorCount = 1;
+            write.descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
+            write.pBufferInfo = &infos.back();
+            writes.push_back(write);
+        }
+        if (!writes.empty()) context.Resolved(&Graphics::DeviceFunctions::updateDescriptorSets, "vkUpdateDescriptorSets")(context.device, static_cast<std::uint32_t>(writes.size()), writes.data(), 0u, nullptr);
+        return true;
+    }
+
+    VkDescriptorSetLayout emptySetLayout(const Context& context) {
+        if (emptyLayout != VK_NULL_HANDLE) return emptyLayout;
+        VkDescriptorSetLayoutCreateInfo info{VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO};
+        Graphics::Check(context.Function<PFN_vkCreateDescriptorSetLayout>("vkCreateDescriptorSetLayout")(context.device, &info, nullptr, &emptyLayout), "vkCreateDescriptorSetLayout recode dispatch");
+        return emptyLayout;
+    }
+
+    static std::vector<std::uint64_t> pipelineKey(const Resolve::ResolvedDraw& dispatch) {
+        const auto hash = dispatch.stages.front().program.result->spirv.ContentHash();
+        std::vector<std::uint64_t> key{hash.low, hash.high};
+        key.insert(key.end(), dispatch.layout.keys[0].begin(), dispatch.layout.keys[0].end());
+        return key;
+    }
+
+    static std::shared_ptr<ComputePipeline> buildComputePipeline(const PipelineJob& job) {
+        const auto& context = job.context;
+        const auto& result = *job.result;
+        auto made = std::make_shared<ComputePipeline>();
+        made->device = context.device;
+        made->destroyPipeline = context.Function<PFN_vkDestroyPipeline>("vkDestroyPipeline");
+        made->destroyLayout = context.Function<PFN_vkDestroyPipelineLayout>("vkDestroyPipelineLayout");
+        const std::array<VkDescriptorSetLayout, ShaderRecompiler::RuntimeAbi::DirectHeapSet + 1u> setLayouts{job.main, job.empty, job.empty, job.empty, job.heap};
+        const VkPushConstantRange push{VK_SHADER_STAGE_COMPUTE_BIT, 0, Graphics::ComputePushConstantBytes};
+        VkPipelineLayoutCreateInfo layoutInfo{VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO};
+        layoutInfo.setLayoutCount = static_cast<std::uint32_t>(setLayouts.size());
+        layoutInfo.pSetLayouts = setLayouts.data();
+        layoutInfo.pushConstantRangeCount = 1;
+        layoutInfo.pPushConstantRanges = &push;
+        Graphics::Check(context.Function<PFN_vkCreatePipelineLayout>("vkCreatePipelineLayout")(context.device, &layoutInfo, nullptr, &made->layout), "vkCreatePipelineLayout recode dispatch");
+        const Graphics::PipelineSpecialization specialization(result, context.atomicLockTable);
+        const auto module = Graphics::CreateShaderModule(context, result.spirv.data(), result.spirv.size() * sizeof(std::uint32_t), "vkCreateShaderModule recode dispatch");
+        VkComputePipelineCreateInfo info{VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO};
+        info.flags = job.flags;
+        info.stage.sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO;
+        info.stage.flags = job.stageFlags;
+        info.stage.stage = VK_SHADER_STAGE_COMPUTE_BIT;
+        info.stage.module = module;
+        info.stage.pName = "main";
+        info.stage.pSpecializationInfo = specialization.Info();
+        VkPipelineShaderStageRequiredSubgroupSizeCreateInfoEXT subgroup{VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_REQUIRED_SUBGROUP_SIZE_CREATE_INFO_EXT};
+        subgroup.requiredSubgroupSize = job.subgroupSize;
+        if (job.subgroupSize != 0u) info.stage.pNext = &subgroup;
+        info.layout = made->layout;
+        VkResult created = VK_SUCCESS;
+        {
+            const auto cacheLock = context.LockPipelineCacheForUse();
+            created = context.Function<PFN_vkCreateComputePipelines>("vkCreateComputePipelines")(context.device, context.pipelineCache, 1, &info, nullptr, &made->pipeline);
+        }
+        context.Function<PFN_vkDestroyShaderModule>("vkDestroyShaderModule")(context.device, module, nullptr);
+        Graphics::Check(created, "vkCreateComputePipelines recode dispatch");
+        return made;
+    }
+
+    bool pipelineReady(const Context& context, const VulkanDevice& owner, const Resolve::ResolvedDraw& dispatch, std::string& reason) {
+        auto key = pipelineKey(dispatch);
+        if (computePipelines.contains(key)) return true;
+        if (const auto failed = failedPipelines.find(key); failed != failedPipelines.end()) {
+            reason = "compute pipeline failed: " + failed->second;
+            return false;
+        }
+        reason = "compute pipeline building";
+        if (buildingPipelines.contains(key)) return false;
+        const auto* heap = Resolve::HeapDevice();
+        if (heap == nullptr) {
+            reason = "no heap";
+            return false;
+        }
+        const auto& result = dispatch.stages.front().program.result;
+        PipelineJob job{key, context, result, setLayout(context, dispatch, 0), heap->Layout(), emptySetLayout(context), owner.computePipelineFlags(), 0u, owner.computeSubgroupSize(*result)};
+        try {
+            job.stageFlags = owner.computeStageFlags(*result);
+        } catch (const std::exception& error) {
+            failedPipelines.emplace(std::move(key), error.what());
+            reason = std::string("compute pipeline failed: ") + error.what();
+            return false;
+        }
+        buildingPipelines.insert(key);
+        pipelineJobs.push_back(std::move(job));
+        totals.pipelinesQueued++;
+        if (!builder.joinable()) builder = std::thread([this] { buildPipelines(); });
+        jobsReady.notify_one();
+        return false;
+    }
+
+    void buildPipelines() {
+        for (;;) {
+            std::optional<PipelineJob> job;
+            {
+                std::unique_lock lock(mutex);
+                jobsReady.wait(lock, [&] { return !pipelineJobs.empty(); });
+                job.emplace(std::move(pipelineJobs.front()));
+                pipelineJobs.pop_front();
+            }
+            const auto started = std::chrono::steady_clock::now();
+            std::shared_ptr<ComputePipeline> made;
+            std::string failure;
+            try {
+                made = buildComputePipeline(*job);
+            } catch (const std::exception& error) {
+                failure = error.what();
+            }
+            std::lock_guard lock(mutex);
+            buildingPipelines.erase(job->key);
+            totals.pipelineNanoseconds += elapsed(started);
+            if (made != nullptr) {
+                computePipelines.emplace(std::move(job->key), std::move(made));
+                totals.pipelinesBuilt++;
+            } else {
+                if (seen.insert("pipeline: " + failure.substr(0, 50)).second) std::fprintf(stderr, "[recode-record] first compute pipeline failure: %s\n", failure.c_str());
+                failedPipelines.emplace(std::move(job->key), std::move(failure));
+            }
+        }
+    }
+
+    bool recordDispatch(const Context& context, const Resolve::ResolvedDraw& dispatch, const std::array<std::uint32_t, 3>& groups, std::string& reason) {
+        auto* recorder = context.recorder;
+        const auto* heap = Resolve::HeapDevice();
+        if (recorder == nullptr || heap == nullptr) {
+            reason = "no recorder or heap";
+            return false;
+        }
+        if (!attach(context, reason) || !dispatchPrecheck(dispatch, reason)) return false;
+        for (std::uint32_t axis = 0; axis < 3; ++axis) {
+            if (groups[axis] > context.limits.maxComputeWorkGroupCount[axis]) {
+                reason = "group count past the device limit";
+                return false;
+            }
+        }
+        drainSurfaces(context, *recorder);
+        const auto& stage = dispatch.stages.front();
+        const auto main = setLayout(context, dispatch, 0);
+        const auto found = computePipelines.find(pipelineKey(dispatch));
+        if (found == computePipelines.end()) {
+            reason = "compute pipeline not ready";
+            return false;
+        }
+        const auto pipeline = found->second;
+
+        recorder->OpenBatch();
+        const auto serial = recorder->OpenBatchSerial();
+        const auto completed = recorder->CompletedThrough();
+        std::shared_ptr<Graphics::Buffer> pageTable;
+        const auto set = allocateSet(context, main, serial, completed);
+        if (!writeSet(context, dispatch, 0, set, serial, completed, pageTable, reason)) return false;
+        std::array<std::byte, Graphics::ComputePushConstantBytes> block{};
+        const auto& push = stage.program.words.pushConstants;
+        if (!push.empty()) std::memcpy(block.data(), push.data(), push.size());
+
+        if (Shadow::OwnedUploadsPending()) {
+            std::vector<std::shared_ptr<void>> kept;
+            if (Shadow::RecordOwnedUploads(recorder->Commands(), kept) != 0u) totals.residencyLands++;
+            for (auto& object : kept) recorder->Keep(std::move(object));
+        }
+        if (recorder->HasQueuedKeyStores()) recorder->FlushKeyStores();
+        if (recorder->HasQueuedStores()) recorder->FlushStores();
+        const auto commands = recorder->Commands();
+        Graphics::RecordMemoryBarrier(context, commands, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT | VK_PIPELINE_STAGE_HOST_BIT, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_ACCESS_SHADER_WRITE_BIT | VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT | VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT | VK_ACCESS_TRANSFER_WRITE_BIT | VK_ACCESS_HOST_WRITE_BIT, VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT);
+        context.BindComputePipeline(commands, pipeline->pipeline);
+        const auto bind = context.Resolved(&Graphics::DeviceFunctions::cmdBindDescriptorSets, "vkCmdBindDescriptorSets");
+        bind(commands, VK_PIPELINE_BIND_POINT_COMPUTE, pipeline->layout, ShaderRecompiler::RuntimeAbi::DescriptorSet, 1, &set, 0, nullptr);
+        const VkDescriptorSet heapSet = heap->Set();
+        bind(commands, VK_PIPELINE_BIND_POINT_COMPUTE, pipeline->layout, ShaderRecompiler::RuntimeAbi::DirectHeapSet, 1, &heapSet, 0, nullptr);
+        if (!push.empty()) context.Function<PFN_vkCmdPushConstants>("vkCmdPushConstants")(commands, pipeline->layout, VK_SHADER_STAGE_COMPUTE_BIT, 0, Graphics::ComputePushConstantBytes, block.data());
+        context.Resolved(&Graphics::DeviceFunctions::cmdDispatch, "vkCmdDispatch")(commands, groups[0], groups[1], groups[2]);
+        Graphics::RecordMemoryBarrier(context, commands, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT | VK_PIPELINE_STAGE_HOST_BIT, VK_ACCESS_SHADER_WRITE_BIT, VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT | VK_ACCESS_UNIFORM_READ_BIT | VK_ACCESS_TRANSFER_READ_BIT | VK_ACCESS_TRANSFER_WRITE_BIT | VK_ACCESS_INDIRECT_COMMAND_READ_BIT | VK_ACCESS_INDEX_READ_BIT | VK_ACCESS_VERTEX_ATTRIBUTE_READ_BIT | VK_ACCESS_COLOR_ATTACHMENT_READ_BIT | VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_READ_BIT | VK_ACCESS_HOST_READ_BIT);
+
+        recorder->Keep(pipeline);
+        for (const auto& owned : stage.owners) recorder->Keep(std::const_pointer_cast<void>(owned));
+        if (stage.tableMap != nullptr) recorder->Keep(std::const_pointer_cast<Tables::Mirror>(stage.tableMap));
+        if (pageTable != nullptr) recorder->Keep(pageTable);
+        std::vector<std::pair<std::uint64_t, std::uint64_t>> written;
+        for (const auto& use : dispatch.uses) {
+            if (use.write) written.emplace_back(use.address, use.address + use.size);
+        }
+        if (!written.empty()) Events::NoteRanges(written);
+        return true;
+    }
+
     std::uint32_t fragmentOutputs(std::span<const Graphics::CompiledShader> shaders) {
         std::uint32_t mask = 0;
         for (const auto& shader : shaders) {
@@ -527,55 +868,7 @@ private:
         std::shared_ptr<Graphics::Buffer> pageTable;
         for (std::uint32_t set = 0; set < (sets.split ? 2u : 1u); ++set) {
             descriptorSets[set] = allocateSet(context, set == 0u ? sets.main : sets.fragment, serial, completed);
-            std::vector<VkDescriptorBufferInfo> infos;
-            std::vector<VkWriteDescriptorSet> writes;
-            infos.reserve(draw.layout.bindings.size());
-            for (const auto& binding : draw.layout.bindings) {
-                if (binding.set != set) continue;
-                VkDescriptorBufferInfo info{};
-                switch (binding.source) {
-                    case Bindings::Source::Words: {
-                        const auto words = wordsOf(draw.stages.at(binding.stage), binding.index);
-                        std::vector<std::byte> bytes(std::max<std::size_t>(words.size_bytes(), 16u));
-                        std::memcpy(bytes.data(), words.data(), words.size_bytes());
-                        const auto offset = ringWrite(bytes, serial, completed);
-                        if (!offset.has_value()) {
-                            reason = "ring full";
-                            return false;
-                        }
-                        info = {ring->Handle(), *offset, bytes.size()};
-                        break;
-                    }
-                    case Bindings::Source::PageTable:
-                        if (pageTable == nullptr) pageTable = ResidencyService::Get().PageTableBuffer();
-                        if (pageTable == nullptr) {
-                            reason = "no GPU page table";
-                            return false;
-                        }
-                        info = {pageTable->Handle(), 0, VK_WHOLE_SIZE};
-                        break;
-                    case Bindings::Source::Fault: info = {faultFor(context, serial, completed)->Handle(), 0, VK_WHOLE_SIZE}; break;
-                    case Bindings::Source::TableMap: {
-                        const auto& mirror = draw.stages.at(binding.stage).tableMap;
-                        if (mirror == nullptr) {
-                            reason = "table map without a mirror";
-                            return false;
-                        }
-                        info = {mapBuffer(context, *mirror, serial, completed)->Handle(), 0, VK_WHOLE_SIZE};
-                        break;
-                    }
-                    default: reason = "guest or GDS buffer binding"; return false;
-                }
-                infos.push_back(info);
-                VkWriteDescriptorSet write{VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET};
-                write.dstSet = descriptorSets[set];
-                write.dstBinding = binding.binding;
-                write.descriptorCount = 1;
-                write.descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
-                write.pBufferInfo = &infos.back();
-                writes.push_back(write);
-            }
-            if (!writes.empty()) context.Resolved(&Graphics::DeviceFunctions::updateDescriptorSets, "vkUpdateDescriptorSets")(context.device, static_cast<std::uint32_t>(writes.size()), writes.data(), 0u, nullptr);
+            if (!writeSet(context, draw, set, descriptorSets[set], serial, completed, pageTable, reason)) return false;
         }
 
         std::array<std::byte, Graphics::PipelinePushConstantBytes> block{};
@@ -746,6 +1039,13 @@ private:
     std::set<std::string> seen;
     std::set<std::uint32_t> seenFaults;
     std::unique_ptr<Images::SurfaceDetiler> surfaceDetiler;
+    std::map<std::vector<std::uint64_t>, std::shared_ptr<ComputePipeline>> computePipelines;
+    std::set<std::vector<std::uint64_t>> buildingPipelines;
+    std::map<std::vector<std::uint64_t>, std::string> failedPipelines;
+    std::deque<PipelineJob> pipelineJobs;
+    std::condition_variable jobsReady;
+    std::thread builder;
+    VkDescriptorSetLayout emptyLayout = VK_NULL_HANDLE;
     Totals totals;
 };
 
@@ -770,6 +1070,14 @@ bool RecordPrecheck(const Resolve::ResolvedDraw& draw, const Pm4::DrawParameters
 
 bool RecordResolved(const Context& context, const Resolve::ResolvedDraw& draw, const Pm4::DrawParameters& parameters, std::string& reason) {
     return shared().Record(context, draw, parameters, reason);
+}
+
+bool RecordDispatchPrecheck(const Context& context, const VulkanDevice& owner, const Resolve::ResolvedDraw& dispatch, std::string& reason) {
+    return shared().DispatchPrecheck(context, owner, dispatch, reason);
+}
+
+bool RecordDispatch(const Context& context, const Resolve::ResolvedDraw& dispatch, const std::array<std::uint32_t, 3>& groups, std::string& reason) {
+    return shared().RecordDispatch(context, dispatch, groups, reason);
 }
 
 std::string RecordLine() {

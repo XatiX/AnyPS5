@@ -4,13 +4,21 @@
 #include "prx/libSceAgcDriver/Execution/include/Pm4.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/Context.hpp"
 #include "prx/libSceAgcDriver/Unified/include/Resolve.hpp"
+#include <array>
+#include <cstdint>
 #include <string>
+
+namespace AgcDriver {
+class VulkanDevice;
+}
 
 namespace AgcDriver::Unified::Record {
 
 [[nodiscard]] bool RecordActive();
 bool RecordPrecheck(const Resolve::ResolvedDraw& draw, const Pm4::DrawParameters& parameters, std::vector<std::pair<std::uint64_t, std::uint64_t>>& reads, std::string& reason);
 bool RecordResolved(const Graphics::Context& context, const Resolve::ResolvedDraw& draw, const Pm4::DrawParameters& parameters, std::string& reason);
+bool RecordDispatchPrecheck(const Graphics::Context& context, const VulkanDevice& owner, const Resolve::ResolvedDraw& dispatch, std::string& reason);
+bool RecordDispatch(const Graphics::Context& context, const Resolve::ResolvedDraw& dispatch, const std::array<std::uint32_t, 3>& groups, std::string& reason);
 [[nodiscard]] std::string RecordLine();
 
 }

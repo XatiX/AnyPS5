@@ -47,10 +47,12 @@ struct ResolvedDraw {
 };
 
 [[nodiscard]] bool Active();
+[[nodiscard]] bool DispatchesActive();
 void Attach(const std::shared_ptr<VulkanDevice>& device);
 void Consume(const Operation& operation, const DecodeState& state);
 [[nodiscard]] std::string Line();
 [[nodiscard]] PacketTable<ResolvedDraw>& ResolvedDraws();
+[[nodiscard]] PacketTable<ResolvedDraw>& ResolvedDispatches();
 [[nodiscard]] const Heap::VulkanHeapDevice* HeapDevice();
 [[nodiscard]] Images::SurfaceTable* Surfaces();
 

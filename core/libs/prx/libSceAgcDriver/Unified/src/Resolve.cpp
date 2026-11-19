@@ -119,9 +119,13 @@ public:
 
     void Consume(const Operation& operation, const DecodeState& state) {
         if (IsDispatch(operation.kind)) {
-            if (!dispatchesRouted()) return;
-            std::lock_guard lock(mutex);
-            static_cast<void>(resolveDispatch(operation, state));
+            if (!dispatchesRouted() || operation.queue != 0u) return;
+            std::shared_ptr<const ResolvedDraw> dispatch;
+            {
+                std::lock_guard lock(mutex);
+                dispatch = resolveDispatch(operation, state);
+            }
+            dispatchHandoff.Offer(operation.queue, operation.submission, operation.packetOffset, std::move(dispatch));
             return;
         }
         if (!IsDraw(operation.kind)) return;
@@ -134,6 +138,7 @@ public:
     }
 
     PacketTable<ResolvedDraw>& Table() { return handoff; }
+    PacketTable<ResolvedDraw>& DispatchTable() { return dispatchHandoff; }
     const Heap::VulkanHeapDevice* Device() const { return published.load(std::memory_order_acquire); }
     Images::SurfaceTable* SurfaceTableOf() const { return publishedSurfaces.load(std::memory_order_acquire); }
 
@@ -351,6 +356,9 @@ public:
             const auto perDispatch = [&](std::uint64_t nanoseconds) { return d.draws == 0 ? 0.0 : static_cast<double>(nanoseconds) / 1000.0 / static_cast<double>(d.draws); };
             std::snprintf(text, sizeof(text), "\n[recode-resolve] %llu dispatches, %llu resolved, %llu refused, %llu without device, %llu incomplete (%llu indirect, %llu placeholder); %llu slots, %.1f ranges per resolved dispatch [buffers %llu, images %llu]; programs %.1f us (capture %.1f, materialize %.1f), slots %.1f us per dispatch", static_cast<unsigned long long>(d.draws), static_cast<unsigned long long>(d.resolved), static_cast<unsigned long long>(d.refused), static_cast<unsigned long long>(d.noDevice), static_cast<unsigned long long>(d.incomplete), static_cast<unsigned long long>(d.indirect), static_cast<unsigned long long>(d.placeholderDraws), static_cast<unsigned long long>(d.slots), d.resolved == 0 ? 0.0 : static_cast<double>(d.uses) / static_cast<double>(d.resolved), static_cast<unsigned long long>(d.bufferUses), static_cast<unsigned long long>(d.imageUses), perDispatch(d.programNanoseconds), perDispatch(d.phases[PhaseCapture]), perDispatch(d.phases[PhaseMaterialize]), perDispatch(d.slotNanoseconds));
             line += text;
+            const auto handed = dispatchHandoff.TakeCounts();
+            std::snprintf(text, sizeof(text), "; hand-off %llu offered, %llu found, %llu waited, %llu missed, %llu released, %llu dropped, %llu pending", static_cast<unsigned long long>(handed.offered), static_cast<unsigned long long>(handed.found), static_cast<unsigned long long>(handed.waited), static_cast<unsigned long long>(handed.missed), static_cast<unsigned long long>(handed.released), static_cast<unsigned long long>(handed.dropped), static_cast<unsigned long long>(handed.pending));
+            line += text;
             for (const auto& [reason, count] : d.reasons) line += "; " + reason + " " + std::to_string(count);
             dispatchTotals = {};
         }
@@ -515,6 +523,7 @@ private:
     std::unique_ptr<Tables::TableMirror> mirror;
     TemplateTable templates{templateBudget()};
     PacketTable<ResolvedDraw> handoff;
+    PacketTable<ResolvedDraw> dispatchHandoff;
     Totals totals;
     Totals dispatchTotals;
     std::set<std::string> seenReasons;
@@ -554,6 +563,14 @@ std::string Line() {
 
 PacketTable<ResolvedDraw>& ResolvedDraws() {
     return shared().Table();
+}
+
+bool DispatchesActive() {
+    return Active() && dispatchesRouted();
+}
+
+PacketTable<ResolvedDraw>& ResolvedDispatches() {
+    return shared().DispatchTable();
 }
 
 const Heap::VulkanHeapDevice* HeapDevice() {
