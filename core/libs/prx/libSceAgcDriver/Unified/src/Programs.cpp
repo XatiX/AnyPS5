@@ -6,7 +6,9 @@
 #include "prx/libSceAgcDriver/Graphics/include/Shaders.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/State.hpp"
 #include <algorithm>
+#include <atomic>
 #include <chrono>
+#include <cstdio>
 #include <spirv/unified1/spirv.hpp>
 #include <cstdlib>
 #include <exception>
@@ -27,8 +29,33 @@ bool readOnlyDepthBoundsCompare() {
     return enabled;
 }
 
+template <typename T>
+std::uint64_t capacityBytes(const std::vector<T>& values) {
+    return static_cast<std::uint64_t>(values.capacity()) * sizeof(T);
+}
+
+void reportLargeTemplate(const ShaderRecompiler::ResultTemplate& shape) {
+    static std::atomic<bool> reported{false};
+    const auto bytes = ShaderRecompiler::ResultTemplateBytes(shape);
+    if (bytes < (256u << 10u) || reported.exchange(true)) return;
+    const auto& result = *shape.result;
+    std::uint64_t descriptors = 0;
+    std::uint64_t largestBinding = 0;
+    for (const auto& binding : result.bindings) {
+        descriptors += capacityBytes(binding.guestDescriptor);
+        largestBinding = std::max<std::uint64_t>(largestBinding, binding.guestDescriptor.size());
+    }
+    std::uint64_t readRanges = capacityBytes(result.imageTableReadRanges);
+    for (const auto& ranges : result.imageTableReadRanges) readRanges += capacityBytes(ranges);
+    std::fprintf(stderr, "[recode-resolve] first large template: %llu bytes; %zu bindings, descriptor words %llu bytes (largest %llu words), push %zu, table poison %llu, table ranges %llu, table read ranges %llu, vertex patches %llu, runtime images %llu, fragment parameters %llu, vertex attributes %llu\n", static_cast<unsigned long long>(bytes), result.bindings.size(), static_cast<unsigned long long>(descriptors), static_cast<unsigned long long>(largestBinding), result.pushConstants.size(), static_cast<unsigned long long>(capacityBytes(result.imageTablePoison)), static_cast<unsigned long long>(capacityBytes(result.imageTableRanges)), static_cast<unsigned long long>(readRanges), static_cast<unsigned long long>(capacityBytes(result.vertexInputPatches)), static_cast<unsigned long long>(capacityBytes(result.runtimeImageResources)), static_cast<unsigned long long>(capacityBytes(result.fragmentParameters)), static_cast<unsigned long long>(capacityBytes(result.vertexAttributes)));
+}
+
 bool usesImageTables(const ShaderRecompiler::RecompileResult& result) {
     return std::ranges::any_of(result.bindings, [](const ShaderRecompiler::DescriptorBinding& binding) { return binding.role == ShaderRecompiler::DescriptorRole::ImageTable; });
+}
+
+bool usesImageTables(const ShaderRecompiler::ShaderInfo& info) {
+    return std::ranges::any_of(info.images, [](const auto& image) { return image.table != ShaderRecompiler::NoTable; }) || std::ranges::any_of(info.samplers, [](const auto& sampler) { return sampler.table != ShaderRecompiler::NoTable; });
 }
 
 }
@@ -151,6 +178,16 @@ bool BuildPrograms(const ProgramInputs& inputs, const DrawFacts& facts, ProgramS
             ShaderRecompiler::GraphicsCompileContext{program.firstUserSgpr, linked, Graphics::StageMeshConfiguration(state.stages, stage), state.stages.tessellation, {facts.indexAddress, facts.indexCount, facts.indexSize, facts.instanceCount}, std::nullopt},
         };
         lap(PhaseDecode);
+        const auto source = ShaderRecompiler::PrepareShader(request);
+        lap(PhaseVariant);
+        if (source == nullptr || source->artifact == nullptr) {
+            reason = "compiled variant not reachable";
+            return false;
+        }
+        if (usesImageTables(source->artifact->info.info)) {
+            reason = "image tables";
+            return false;
+        }
         auto invocation = DriverDetail::InvocationFor(*program.snapshot, program.codeOffset, request, false);
         lap(PhasePrepare);
         const auto capture = DriverDetail::CaptureInvocation(shaderMemory, *program.snapshot, program.codeOffset, request, invocation);
@@ -168,6 +205,7 @@ bool BuildPrograms(const ProgramInputs& inputs, const DrawFacts& facts, ProgramS
                 shape = invocation.BuildTemplate(*capture);
                 inputs.templates->CountBuild(stale);
                 inputs.templates->Store(key, shape);
+                reportLargeTemplate(*shape);
             }
             result = shape->result;
             if (shape->refillable) {
@@ -197,12 +235,6 @@ bool BuildPrograms(const ProgramInputs& inputs, const DrawFacts& facts, ProgramS
         }
         if (result->pushConstants.size() > budget) {
             reason = "push constants past the stage budget";
-            return false;
-        }
-        const auto source = ShaderRecompiler::PrepareShader(request);
-        lap(PhaseVariant);
-        if (source == nullptr || source->artifact == nullptr) {
-            reason = "compiled variant not reachable";
             return false;
         }
         out.stages.push_back({stage, program.binary.codeAddress, result->pushConstants.empty() ? 0u : pushCursor, capture, std::move(result), source->artifact, std::move(shape), std::move(words)});
