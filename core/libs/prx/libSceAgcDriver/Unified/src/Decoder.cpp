@@ -232,6 +232,11 @@ private:
         const std::uint64_t size = draw.indirect.has_value() ? draw.indirect->RangeBytes() : draw.indexCount;
         resolvedKey = key;
         resolvedDraw = {draw.indexAddress, draw.indexCount, draw.indexSize, draw.instanceCount, draw.flags, draw.firstVertex, draw.firstInstance, draw.indexed, draw.indirect.has_value()};
+        if (draw.indirect) {
+            resolvedDraw.indirectAddress = draw.indirect->arguments;
+            resolvedDraw.indirectBytes = draw.indirect->RangeBytes();
+            if (draw.indirect->countIndirect) resolvedDraw.countAddress = draw.indirect->countAddress;
+        }
         emit(kind, address, size, draw.instanceCount | (static_cast<std::uint64_t>(draw.indexSize) << 32u), ids);
         return true;
     }

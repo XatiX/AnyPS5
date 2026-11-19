@@ -106,7 +106,7 @@ public:
     Memo(const Events::ChangeLog& shared, const Events::ChangeLog& images, std::size_t bound = DefaultMemoBound);
 
     [[nodiscard]] Stamps Now() const { return {shared.Serial(), images.Serial()}; }
-    [[nodiscard]] std::optional<std::uint32_t> Find(const DescriptorKey& key);
+    [[nodiscard]] std::optional<std::uint32_t> Find(const DescriptorKey& key, Span* image = nullptr);
     void Store(const DescriptorKey& key, std::uint32_t slot, std::weak_ptr<const void> owner, Span descriptor, Span image, Stamps before);
     [[nodiscard]] std::size_t Size() const { return entries.size(); }
     [[nodiscard]] MemoCounts Counts() const { return counts; }

@@ -94,6 +94,21 @@ void testRefillUsesTheMemoUntilTheImageChanges() {
     Expect(fixture.imageLookups == lookups + 1u && fixture.device.writes == writes, "only the written image is looked up again, and its live view keeps its slot");
 }
 
+void testFillReportsImageMemory() {
+    Fixture fixture;
+    const std::vector<SlotRequest> requests{Image(1), Image(2, RequestFlag::Storage | RequestFlag::Written), Image(0, RequestFlag::Inactive), Image(0xdead), Sampler(7)};
+    std::vector<std::uint32_t> slots;
+    std::vector<ImageUse> uses;
+    std::string reason;
+    Expect(fixture.refill.Fill(requests, slots, reason, &uses), "a fill with image uses succeeds");
+    Expect(uses.size() == 2u, "only resolved images report memory");
+    if (uses.size() != 2u) return;
+    Expect(uses[0].memory.address == ImageBase + Events::RegionBytes && uses[0].memory.bytes == 0x1000 && !uses[0].write, "a sampled image reports its memory as a read");
+    Expect(uses[1].memory.address == ImageBase + 2u * Events::RegionBytes && uses[1].write, "a written storage image reports a write");
+    uses.clear();
+    Expect(fixture.refill.Fill(requests, slots, reason, &uses) && uses.size() == 2u && uses[0].memory.address == ImageBase + Events::RegionBytes, "memo hits report the same memory");
+}
+
 void testExpiredTextureTakesANewLookup() {
     Fixture fixture;
     const std::vector<SlotRequest> requests{Image(1)};
@@ -120,6 +135,7 @@ void testFullHeapFailsTheFill() {
 int main() {
     testFillGivesSlotsInRequestOrder();
     testRefillUsesTheMemoUntilTheImageChanges();
+    testFillReportsImageMemory();
     testExpiredTextureTakesANewLookup();
     testFullHeapFailsTheFill();
     if (failures != 0) {

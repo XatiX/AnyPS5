@@ -44,6 +44,9 @@ struct DrawFacts {
     std::uint32_t firstInstance = 0;
     bool indexed = false;
     bool indirect = false;
+    std::uint64_t indirectAddress = 0;
+    std::uint64_t indirectBytes = 0;
+    std::uint64_t countAddress = 0;
 };
 
 struct Operation {

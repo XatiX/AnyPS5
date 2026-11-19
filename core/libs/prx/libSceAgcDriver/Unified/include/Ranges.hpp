@@ -5,6 +5,10 @@
 #include <cstdint>
 #include <vector>
 
+namespace AgcDriver::Graphics {
+struct State;
+}
+
 namespace AgcDriver::Unified {
 
 struct GuestUse {
@@ -17,6 +21,7 @@ struct GuestUse {
 
 void DrawUses(const Pm4::DrawParameters& draw, std::vector<GuestUse>& uses);
 void TargetUses(const QueueState& queue, std::vector<GuestUse>& uses);
+void TargetUses(const Graphics::State& state, std::vector<GuestUse>& uses);
 
 }
 

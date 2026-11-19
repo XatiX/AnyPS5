@@ -15,6 +15,11 @@ struct ResolvedImage {
     Span memory;
 };
 
+struct ImageUse {
+    Span memory;
+    bool write = false;
+};
+
 struct ResolvedSampler {
     std::uint64_t sampler = 0;
     std::shared_ptr<const void> keep;
@@ -34,11 +39,11 @@ class Refill {
 public:
     Refill(SlotTable& table, Memo& memo, ImageLookup images, SamplerLookup samplers);
 
-    [[nodiscard]] bool Fill(std::span<const SlotRequest> requests, std::vector<std::uint32_t>& slots, std::string& reason);
+    [[nodiscard]] bool Fill(std::span<const SlotRequest> requests, std::vector<std::uint32_t>& slots, std::string& reason, std::vector<ImageUse>* uses = nullptr);
     [[nodiscard]] RefillCounts Counts() const { return counts; }
 
 private:
-    [[nodiscard]] std::uint32_t image(const SlotRequest& request, std::string& reason);
+    [[nodiscard]] std::uint32_t image(const SlotRequest& request, std::string& reason, Span& memory);
     [[nodiscard]] std::uint32_t sampler(const SlotRequest& request, std::string& reason);
 
     SlotTable& table;

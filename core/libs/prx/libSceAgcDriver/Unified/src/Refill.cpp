@@ -9,24 +9,27 @@ DescriptorKey KeyOf(const SlotRequest& request) {
 
 Refill::Refill(SlotTable& table, Memo& memo, ImageLookup images, SamplerLookup samplers) : table(table), memo(memo), images(std::move(images)), samplers(std::move(samplers)) {}
 
-bool Refill::Fill(std::span<const SlotRequest> requests, std::vector<std::uint32_t>& slots, std::string& reason) {
+bool Refill::Fill(std::span<const SlotRequest> requests, std::vector<std::uint32_t>& slots, std::string& reason, std::vector<ImageUse>* uses) {
     slots.clear();
     slots.reserve(requests.size());
     for (const auto& request : requests) {
-        const auto slot = (request.flags & RequestFlag::Sampler) != 0u ? sampler(request, reason) : image(request, reason);
+        const bool isSampler = (request.flags & RequestFlag::Sampler) != 0u;
+        Span memory;
+        const auto slot = isSampler ? sampler(request, reason) : image(request, reason, memory);
         if (slot == NoSlot) {
             counts.failures++;
             return false;
         }
         slots.push_back(slot);
+        if (uses != nullptr && memory.bytes != 0u) uses->push_back({memory, (request.flags & RequestFlag::Written) != 0u});
     }
     return true;
 }
 
-std::uint32_t Refill::image(const SlotRequest& request, std::string& reason) {
+std::uint32_t Refill::image(const SlotRequest& request, std::string& reason, Span& memory) {
     if ((request.flags & RequestFlag::Inactive) != 0u) return 0u;
     const auto key = KeyOf(request);
-    if (const auto hit = memo.Find(key)) {
+    if (const auto hit = memo.Find(key, &memory)) {
         counts.memoHits++;
         return *hit;
     }
@@ -43,6 +46,7 @@ std::uint32_t Refill::image(const SlotRequest& request, std::string& reason) {
         return NoSlot;
     }
     memo.Store(key, slot, resolved->image.owner, {}, resolved->memory, before);
+    memory = resolved->memory;
     return slot;
 }
 

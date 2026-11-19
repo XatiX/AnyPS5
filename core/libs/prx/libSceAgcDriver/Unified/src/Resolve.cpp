@@ -9,6 +9,7 @@
 #include "prx/libSceAgcDriver/Unified/include/Events.hpp"
 #include "prx/libSceAgcDriver/Unified/include/Refill.hpp"
 #include "prx/libSceAgcDriver/Unified/include/VulkanHeap.hpp"
+#include "Optimization/ShaderStageInputInfo.hpp"
 #include <chrono>
 #include <cstdio>
 #include <cstdlib>
@@ -31,6 +32,13 @@ struct Totals {
     std::uint64_t programNanoseconds = 0;
     std::uint64_t slotNanoseconds = 0;
     std::uint64_t lockBusy = 0;
+    std::uint64_t uses = 0;
+    std::uint64_t incomplete = 0;
+    std::uint64_t indirect = 0;
+    std::uint64_t targetUses = 0;
+    std::uint64_t bufferUses = 0;
+    std::uint64_t imageUses = 0;
+    std::uint64_t placeholderDraws = 0;
     std::uint64_t templateMismatches = 0;
     const char* templateMismatch = nullptr;
     std::map<std::string, std::uint64_t> reasons;
@@ -99,8 +107,23 @@ public:
             firstBuilt = true;
             std::fprintf(stderr, "[recode-resolve] first program set: %zu stages\n", programs.stages.size());
         }
-        ResolvedDraw draw{operation, {}};
+        ResolvedDraw draw{operation, {}, {}, true};
+        const auto& facts = operation.draw;
+        if (facts.indexed && facts.indexAddress != 0u) draw.uses.push_back({facts.indexAddress, static_cast<std::uint64_t>(facts.indexCount) * facts.indexSize, false});
+        if (facts.indirect) {
+            totals.indirect++;
+            if (facts.indirectAddress != 0u && facts.indirectBytes != 0u) draw.uses.push_back({facts.indirectAddress, facts.indirectBytes, false});
+            else draw.complete = false;
+            if (facts.countAddress != 0u) draw.uses.push_back({facts.countAddress, sizeof(std::uint32_t), false});
+        }
+        const auto beforeTargets = draw.uses.size();
+        TargetUses(programs.decode.state, draw.uses);
+        totals.targetUses += draw.uses.size() - beforeTargets;
+        const auto beforeBuffers = draw.uses.size();
+        const auto placeholdersBefore = refill->Counts().placeholders;
+        std::vector<Heap::ImageUse> imageUses;
         for (auto& stage : programs.stages) {
+            bufferUses(*stage.variant, stage.capture->snapshot, draw.uses);
             std::vector<Heap::SlotRequest> requests;
             if (stage.result->directHeap) {
                 Heap::SlotStatistics statistics;
@@ -111,7 +134,7 @@ public:
                 }
             }
             ResolvedStage resolved{std::move(stage), {}};
-            if (!refill->Fill(requests, resolved.slots, reason)) {
+            if (!refill->Fill(requests, resolved.slots, reason, &imageUses)) {
                 refuse(reason);
                 totals.slotNanoseconds += elapsed(slotsStarted);
                 return;
@@ -119,8 +142,17 @@ public:
             totals.slots += resolved.slots.size();
             draw.stages.push_back(std::move(resolved));
         }
+        totals.bufferUses += draw.uses.size() - beforeBuffers;
+        totals.imageUses += imageUses.size();
+        for (const auto& use : imageUses) draw.uses.push_back({use.memory.address, use.memory.bytes, use.write});
+        if (refill->Counts().placeholders != placeholdersBefore) {
+            draw.complete = false;
+            totals.placeholderDraws++;
+        }
         totals.slotNanoseconds += elapsed(slotsStarted);
         totals.stages += draw.stages.size();
+        totals.uses += draw.uses.size();
+        if (!draw.complete) totals.incomplete++;
         totals.resolved++;
     }
 
@@ -139,6 +171,10 @@ public:
         std::snprintf(text, sizeof(text), "; per draw: decode %.1f, prepare %.1f, capture %.1f, materialize %.1f, variant %.1f us", perDraw(totals.phases[PhaseDecode]), perDraw(totals.phases[PhasePrepare]), perDraw(totals.phases[PhaseCapture]), perDraw(totals.phases[PhaseMaterialize]), perDraw(totals.phases[PhaseVariant]));
         line += text;
         line += "; gpu lock busy " + std::to_string(totals.lockBusy);
+        std::snprintf(text, sizeof(text), "; access %.1f ranges per resolved draw, %llu incomplete (%llu indirect, %llu placeholder)", totals.resolved == 0 ? 0.0 : static_cast<double>(totals.uses) / static_cast<double>(totals.resolved), static_cast<unsigned long long>(totals.incomplete), static_cast<unsigned long long>(totals.indirect), static_cast<unsigned long long>(totals.placeholderDraws));
+        line += text;
+        std::snprintf(text, sizeof(text), " [targets %llu, buffers %llu, images %llu]", static_cast<unsigned long long>(totals.targetUses), static_cast<unsigned long long>(totals.bufferUses), static_cast<unsigned long long>(totals.imageUses));
+        line += text;
         const auto shapes = templates.TakeCounts();
         std::snprintf(text, sizeof(text), "; templates %llu hits, %llu builds (%llu stale), %llu evicted, %zu held, %.1f MiB", static_cast<unsigned long long>(shapes.hits), static_cast<unsigned long long>(shapes.builds), static_cast<unsigned long long>(shapes.rebuilds), static_cast<unsigned long long>(shapes.evictions), templates.Size(), static_cast<double>(templates.HeldBytes()) / 1048576.0);
         line += text;
@@ -149,6 +185,19 @@ public:
     }
 
 private:
+    static void bufferUses(const ShaderRecompiler::CompiledVariant& variant, const ShaderRecompiler::ResourceSnapshot& snapshot, std::vector<GuestUse>& uses) {
+        const auto& buffers = variant.info.info.buffers;
+        for (std::size_t index = 0; index < buffers.size() && index < snapshot.buffers.size(); ++index) {
+            const auto& value = snapshot.buffers[index];
+            if (value.dwordCount < 4u) continue;
+            const ShaderRecompiler::ShaderBufferResource descriptor{{value.dwords[0], value.dwords[1] & ~0x40000000u, value.dwords[2], value.dwords[3]}};
+            const auto address = descriptor.Base48();
+            const auto bytes = static_cast<std::uint64_t>(descriptor.GetSize());
+            if (address == 0u || bytes == 0u) continue;
+            uses.push_back({address, bytes, buffers[index].written || buffers[index].atomic});
+        }
+    }
+
     static bool verifyTemplates() {
         static const bool enabled = [] {
             const auto* value = std::getenv("APS5_RECODE_TEMPLATE_VERIFY");

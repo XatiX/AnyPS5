@@ -4,6 +4,7 @@
 #include "prx/libSceAgcDriver/Unified/include/Decoder.hpp"
 #include "prx/libSceAgcDriver/Unified/include/Operation.hpp"
 #include "prx/libSceAgcDriver/Unified/include/Programs.hpp"
+#include "prx/libSceAgcDriver/Unified/include/Ranges.hpp"
 #include <cstdint>
 #include <memory>
 #include <string>
@@ -23,6 +24,8 @@ struct ResolvedStage {
 struct ResolvedDraw {
     Operation operation;
     std::vector<ResolvedStage> stages;
+    std::vector<GuestUse> uses;
+    bool complete = true;
 };
 
 [[nodiscard]] bool Active();
