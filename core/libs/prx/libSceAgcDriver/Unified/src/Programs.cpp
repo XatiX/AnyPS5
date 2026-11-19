@@ -237,7 +237,21 @@ bool BuildPrograms(const ProgramInputs& inputs, const DrawFacts& facts, ProgramS
             reason = "push constants past the stage budget";
             return false;
         }
-        out.stages.push_back({stage, program.binary.codeAddress, result->pushConstants.empty() ? 0u : pushCursor, capture, std::move(result), source->artifact, std::move(shape), std::move(words)});
+        std::vector<ShaderRecompiler::VertexAttribute> attributes = result->vertexAttributes;
+        for (auto& attribute : attributes) {
+            const auto& live = vertexInfos[i];
+            if (!live.has_value() || attribute.location >= live->resources.size()) {
+                reason = "vertex attribute without live vertex info";
+                return false;
+            }
+            const auto& fields = live->resources[attribute.location].fields;
+            if (fields[3] != attribute.resource.fields[3] || (fields[1] >> 16u) != (attribute.resource.fields[1] >> 16u)) {
+                reason = "vertex format differs from the template";
+                return false;
+            }
+            attribute.resource = live->resources[attribute.location];
+        }
+        out.stages.push_back({stage, program.binary.codeAddress, result->pushConstants.empty() ? 0u : pushCursor, capture, std::move(result), source->artifact, std::move(shape), std::move(words), std::move(attributes)});
         pushCursor += static_cast<std::uint32_t>(out.stages.back().result->pushConstants.size());
     }
     return true;

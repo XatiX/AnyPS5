@@ -36,6 +36,7 @@
 #include <string_view>
 #include <typeinfo>
 #if ANYPS5_UNIFIED
+#include "prx/libSceAgcDriver/Unified/include/DrawRecorder.hpp"
 #include "prx/libSceAgcDriver/Unified/include/Shadow.hpp"
 #endif
 
@@ -419,6 +420,29 @@ DrawVerdict Driver::draw(QueueState& queue, std::span<const std::uint32_t> packe
     }
 #if ANYPS5_UNIFIED
     Unified::Shadow::NoteDevice(localDevice);
+    if (Unified::Record::RecordActive() && pipelined && !lockedPrepare) {
+        auto& resolvedDraws = Unified::Resolve::ResolvedDraws();
+        const auto found = resolvedDraws.Find(submission.queue, submission.serial, packetOffset, std::chrono::milliseconds(50));
+        std::vector<DrawPipeline::Range> reads;
+        std::string recodeReason;
+        if (found.value != nullptr && Unified::Record::RecordPrecheck(*found.value, drawParameters, reads, recodeReason)) {
+            resolvedDraws.Release(submission.queue, submission.serial, packetOffset);
+            std::vector<DrawPipeline::Range> writes;
+            for (const auto& use : found.value->uses) (use.write ? writes : reads).emplace_back(use.address, use.address + use.size);
+            const auto commitQueue = submission.queue;
+            DrawPipeline::Queue0().Enqueue(DrawPipeline::CommitKind::Draw, [this, localDevice, resolved = found.value, drawParameters, commitQueue] {
+                GuestMemory::TagGpuLockSite(GuestMemory::GpuLockSite::Draw);
+                std::lock_guard commitLock(GuestMemory::GpuMutex());
+                auto current = device.Load();
+                if (current == nullptr) current = localDevice;
+                recordLabelsForPacket(current.get(), commitQueue);
+                std::string reason;
+                Unified::Record::RecordResolved(current->graphicsContext(), *resolved, drawParameters, reason);
+                submitDueAfterCommit(current.get());
+            }, std::move(writes), 0, {}, std::move(reads), true);
+            return drawn();
+        }
+    }
 #endif
     timing.Mark("device_setup");
     phaseTiming.Phase(DrawRowVectors);

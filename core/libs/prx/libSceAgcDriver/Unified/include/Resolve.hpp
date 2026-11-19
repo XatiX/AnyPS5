@@ -16,6 +16,10 @@ namespace AgcDriver {
 class VulkanDevice;
 }
 
+namespace AgcDriver::Unified::Heap {
+class VulkanHeapDevice;
+}
+
 namespace AgcDriver::Unified::Resolve {
 
 struct ResolvedStage {
@@ -37,6 +41,7 @@ void Attach(const std::shared_ptr<VulkanDevice>& device);
 void Consume(const Operation& operation, const DecodeState& state);
 [[nodiscard]] std::string Line();
 [[nodiscard]] PacketTable<ResolvedDraw>& ResolvedDraws();
+[[nodiscard]] const Heap::VulkanHeapDevice* HeapDevice();
 
 }
 

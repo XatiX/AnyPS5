@@ -7,6 +7,7 @@
 #include "prx/libc/include/GuestArena.hpp"
 #include "prx/libSceAgcDriver/Execution/include/GuestMemory.hpp"
 #include "prx/libSceAgcDriver/Unified/include/RecordVerify.hpp"
+#include "prx/libSceAgcDriver/Unified/include/DrawRecorder.hpp"
 #include "prx/libSceAgcDriver/Unified/include/RecordDraw.hpp"
 #include "prx/libSceAgcDriver/Unified/include/Resolve.hpp"
 #include <atomic>
@@ -187,6 +188,7 @@ void report() {
         last = now;
     }
     if (Resolve::Active()) std::fputs((Resolve::Line() + "\n").c_str(), stderr);
+    if (Record::RecordActive()) std::fputs((Record::RecordLine() + "\n").c_str(), stderr);
     if (!Active()) {
         const auto memory = memoryLine() + Record::VerifyLine() + Record::HandoffLine() + Proof::VerdictLine();
         if (!memory.empty()) std::fputs(memory.c_str(), stderr);

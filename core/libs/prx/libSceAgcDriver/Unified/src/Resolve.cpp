@@ -11,6 +11,7 @@
 #include "prx/libSceAgcDriver/Unified/include/SlotPatch.hpp"
 #include "prx/libSceAgcDriver/Unified/include/VulkanHeap.hpp"
 #include "Optimization/ShaderStageInputInfo.hpp"
+#include <atomic>
 #include <chrono>
 #include <cstdio>
 #include <cstdlib>
@@ -56,6 +57,7 @@ public:
         context = std::make_unique<Graphics::Context>(device->graphicsContext());
         target = HeapTarget(device->Target());
         fixedSlots = device->GraphicsPipelineLibraries();
+        published.store(nullptr, std::memory_order_release);
         heap.reset();
         table.reset();
         memo.reset();
@@ -69,6 +71,7 @@ public:
             table = std::make_unique<Heap::SlotTable>(*heap, heap->SampledSlotCount(), heap->SamplerSlotCount(), heap->StorageSlotCount());
             memo = std::make_unique<Heap::Memo>(Events::Shared(), Events::Images());
             refill = std::make_unique<Heap::Refill>(*table, *memo, [this](const Heap::SlotRequest& request) { return image(request); }, [this](const Heap::SlotRequest& request) { return sampler(request); });
+            published.store(heap.get(), std::memory_order_release);
             std::fprintf(stderr, "[recode-resolve] descriptor heap: %u sampled, %u storage, %u sampler slots\n", heap->SampledSlotCount(), heap->StorageSlotCount(), heap->SamplerSlotCount());
         } catch (const std::exception& error) {
             std::fprintf(stderr, "[recode-resolve] descriptor heap unavailable: %s\n", error.what());
@@ -90,6 +93,7 @@ public:
     }
 
     PacketTable<ResolvedDraw>& Table() { return handoff; }
+    const Heap::VulkanHeapDevice* Device() const { return published.load(std::memory_order_acquire); }
 
 private:
     std::shared_ptr<const ResolvedDraw> resolve(const Operation& operation, const DecodeState& state) {
@@ -299,6 +303,7 @@ private:
     ShaderRecompiler::SpirvTarget target;
     bool fixedSlots = false;
     std::unique_ptr<Heap::VulkanHeapDevice> heap;
+    std::atomic<const Heap::VulkanHeapDevice*> published{nullptr};
     std::unique_ptr<Heap::SlotTable> table;
     std::unique_ptr<Heap::Memo> memo;
     std::unique_ptr<Heap::Refill> refill;
@@ -320,7 +325,7 @@ Resolver& shared() {
 bool Active() {
     static const bool enabled = [] {
         const auto* value = std::getenv("APS5_RECODE_DRAW");
-        return value != nullptr && value[0] == '1';
+        return value != nullptr && (value[0] == '1' || std::string_view(value) == "record");
     }();
     return enabled;
 }
@@ -339,6 +344,10 @@ std::string Line() {
 
 PacketTable<ResolvedDraw>& ResolvedDraws() {
     return shared().Table();
+}
+
+const Heap::VulkanHeapDevice* HeapDevice() {
+    return shared().Device();
 }
 
 }

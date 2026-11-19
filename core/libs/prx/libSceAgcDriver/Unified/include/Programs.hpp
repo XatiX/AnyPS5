@@ -32,6 +32,7 @@ struct StageProgram {
     std::shared_ptr<const ShaderRecompiler::CompiledVariant> variant;
     std::shared_ptr<const ShaderRecompiler::ResultTemplate> shape;
     ShaderRecompiler::TemplateWords words;
+    std::vector<ShaderRecompiler::VertexAttribute> vertexAttributes;
 };
 
 enum ProgramPhase : std::size_t {
