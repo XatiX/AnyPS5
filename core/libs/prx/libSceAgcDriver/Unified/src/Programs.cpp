@@ -238,7 +238,7 @@ bool BuildPrograms(const ProgramInputs& inputs, const DrawFacts& facts, ProgramS
         Graphics::ApplyPointSize(state, info);
         vertexInfos[i] = info;
     }
-    ShaderMemory shaderMemory(memory, nullptr, nullptr, nullptr, &DriverDetail::Driver::QueryPendingSpan);
+    ShaderMemory shaderMemory(memory, &DriverDetail::Driver::QueryPendingSpan, nullptr, nullptr, &DriverDetail::Driver::QueryPendingSpan);
     const bool hasFragment = std::ranges::any_of(programs, [](const DriverDetail::DrawProgram& program) { return program.binary.stage == Stage::Fragment; });
     std::uint32_t pushCursor = 0;
     for (std::size_t i = 0; i < programs.size(); ++i) {
@@ -351,7 +351,7 @@ bool BuildComputeProgram(const ProgramInputs& inputs, const DispatchFacts& facts
         {0, 0, 0, budget},
     };
     lap(PhaseDecode);
-    ShaderMemory shaderMemory(memory, nullptr, nullptr, nullptr, &DriverDetail::Driver::QueryPendingSpan);
+    ShaderMemory shaderMemory(memory, &DriverDetail::Driver::QueryPendingSpan, nullptr, nullptr, &DriverDetail::Driver::QueryPendingSpan);
     StageProgram built;
     if (!materializeStage(inputs, request, *snapshot, codeOffset, budget, shaderMemory, out, lap, built, reason)) return false;
     built.stage = Stage::Compute;

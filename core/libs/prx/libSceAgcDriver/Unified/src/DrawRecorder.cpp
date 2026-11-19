@@ -37,11 +37,64 @@
 #include <set>
 #include <thread>
 
+namespace AgcDriver::Graphics {
+void WriteCheckpointMarker(const Context& context, VkCommandBuffer commands, std::uint64_t token, std::uint32_t queue);
+void WriteNvCheckpointToken(const Context& context, VkCommandBuffer commands, std::uint64_t token, std::uint32_t queue);
+}
+
 namespace AgcDriver::Unified::Record {
 
 namespace {
 
 using Graphics::Context;
+
+constexpr std::uint64_t UploadTimingKey = 0x7ec0de02;
+constexpr std::uint64_t DrawTimingKey = Graphics::Recorder::DrawTimingFlag;
+constexpr std::uint64_t DispatchTimingKey = 0x7ec0de04;
+
+bool writesFaultTokens() {
+    static const bool writes = std::getenv("APS5_GPU_CHECKPOINTS") != nullptr;
+    return writes;
+}
+
+void noteFaultToken(const Context& context, Graphics::Recorder& recorder, VkCommandBuffer commands, std::span<const Resolve::ResolvedStage> stages, FaultStage stage, const char* kind, std::uint32_t count, std::uint32_t instances) {
+    try {
+        if (!writesFaultTokens()) return;
+        const auto queue = GuestMemory::GpuLockThreadTag();
+        if (queue != 0) return;
+        auto& ring = FaultTokenRing::Instance();
+        const auto token = ring.Claim();
+        auto* entry = ring.Mutable(token);
+        if (entry == nullptr) return;
+        std::uint64_t hashes[2] = {};
+        std::uint64_t address = 0;
+        std::uint64_t variant = 0;
+        for (const auto& one : stages) {
+            if (one.program.result == nullptr) continue;
+            const auto hash = one.program.result->spirv.ContentHash().low;
+            const bool fragment = one.program.stage == ShaderRecompiler::ShaderStage::Fragment;
+            hashes[fragment ? 1 : 0] = hash;
+            if (variant == 0 || fragment) {
+                variant = one.program.result->variantId;
+                address = one.program.codeAddress;
+            }
+        }
+        entry->submitSerial = recorder.OpenSerial();
+        entry->programAddress = address;
+        entry->variantId = variant;
+        entry->stage = static_cast<std::uint32_t>(stage);
+        entry->argBuffer = 0;
+        entry->argOffset = 0;
+        entry->argStride = 0;
+        entry->argCount = 0;
+        std::snprintf(entry->desc, sizeof(entry->desc), "recode %s %08x/%08x c=%u i=%u", kind, static_cast<std::uint32_t>(hashes[0]), static_cast<std::uint32_t>(hashes[1]), count, instances);
+        recorder.NoteFaultToken(token);
+        std::atomic_ref<FaultToken>(entry->token).store(token, std::memory_order_release);
+        Graphics::WriteCheckpointMarker(context, commands, token, queue);
+        Graphics::WriteNvCheckpointToken(context, commands, token, queue);
+    } catch (...) {
+    }
+}
 
 constexpr std::uint64_t RingBytes = 64ull << 20u;
 constexpr std::uint32_t PoolSets = 512;
@@ -89,6 +142,10 @@ struct Totals {
     std::uint64_t pipelinesQueued = 0;
     std::uint64_t pipelinesBuilt = 0;
     std::uint64_t pipelineNanoseconds = 0;
+    std::uint64_t surfaceNanoseconds = 0;
+    std::uint64_t targetNanoseconds = 0;
+    std::uint64_t graphicsPipelineNanoseconds = 0;
+    std::uint64_t uploadNanoseconds = 0;
     std::map<std::string, std::uint64_t> reasons;
 };
 
@@ -366,6 +423,8 @@ public:
         line += "; batch moved before the pass " + std::to_string(totals.batchMoves);
         line += "; passes " + std::to_string(totals.passesBegun) + " begun, " + std::to_string(totals.passesContinued) + " draws continued, " + std::to_string(totals.passFeedback) + " broken by a target read";
         line += "; residency updates landed " + std::to_string(totals.residencyLands);
+        std::snprintf(text, sizeof(text), "; draw phases surfaces %.1f ms, targets %.1f ms, pipelines %.1f ms, owned uploads %.1f ms", static_cast<double>(totals.surfaceNanoseconds) / 1e6, static_cast<double>(totals.targetNanoseconds) / 1e6, static_cast<double>(totals.graphicsPipelineNanoseconds) / 1e6, static_cast<double>(totals.uploadNanoseconds) / 1e6);
+        line += text;
         std::snprintf(text, sizeof(text), "; dispatches %llu recorded, %llu to the existing path, %.1f us per dispatch; compute pipelines %zu held, %llu queued, %llu built in %.1f ms, %zu building, %zu failed", static_cast<unsigned long long>(totals.dispatches), static_cast<unsigned long long>(totals.dispatchExisting), totals.dispatches == 0 ? 0.0 : static_cast<double>(totals.dispatchNanoseconds) / 1000.0 / static_cast<double>(totals.dispatches), computePipelines.size(), static_cast<unsigned long long>(totals.pipelinesQueued), static_cast<unsigned long long>(totals.pipelinesBuilt), static_cast<double>(totals.pipelineNanoseconds) / 1e6, buildingPipelines.size(), failedPipelines.size());
         line += text;
         std::snprintf(text, sizeof(text), "; table maps %llu hits, %llu uploads (%.1f MiB), %llu retired, %zu held (%.1f MiB)", static_cast<unsigned long long>(totals.mapHits), static_cast<unsigned long long>(totals.mapUploads), static_cast<double>(totals.mapUploadBytes) / 1048576.0, static_cast<unsigned long long>(totals.mapRetired), maps.size(), static_cast<double>(mapBytes) / 1048576.0);
@@ -792,7 +851,10 @@ private:
         const VkDescriptorSet heapSet = heap->Set();
         bind(commands, VK_PIPELINE_BIND_POINT_COMPUTE, pipeline->layout, ShaderRecompiler::RuntimeAbi::DirectHeapSet, 1, &heapSet, 0, nullptr);
         if (!push.empty()) context.Function<PFN_vkCmdPushConstants>("vkCmdPushConstants")(commands, pipeline->layout, VK_SHADER_STAGE_COMPUTE_BIT, 0, Graphics::ComputePushConstantBytes, block.data());
+        noteFaultToken(context, *recorder, commands, dispatch.stages, FaultStage::compute, "dispatch", groups[0], groups[1] * groups[2]);
+        const auto dispatchTiming = recorder->BeginGpuTiming(DispatchTimingKey);
         context.Resolved(&Graphics::DeviceFunctions::cmdDispatch, "vkCmdDispatch")(commands, groups[0], groups[1], groups[2]);
+        recorder->EndGpuTiming(dispatchTiming);
         Graphics::RecordMemoryBarrier(context, commands, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT | VK_PIPELINE_STAGE_HOST_BIT, VK_ACCESS_SHADER_WRITE_BIT, VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT | VK_ACCESS_UNIFORM_READ_BIT | VK_ACCESS_TRANSFER_READ_BIT | VK_ACCESS_TRANSFER_WRITE_BIT | VK_ACCESS_INDIRECT_COMMAND_READ_BIT | VK_ACCESS_INDEX_READ_BIT | VK_ACCESS_VERTEX_ATTRIBUTE_READ_BIT | VK_ACCESS_COLOR_ATTACHMENT_READ_BIT | VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_READ_BIT | VK_ACCESS_HOST_READ_BIT);
 
         recorder->Keep(pipeline);
@@ -828,7 +890,9 @@ private:
             return false;
         }
         if (!attach(context, reason) || !precheck(draw, parameters, nullptr, reason)) return false;
+        auto phase = std::chrono::steady_clock::now();
         drainSurfaces(context, *recorder);
+        totals.surfaceNanoseconds += elapsed(phase);
         const auto& state = *draw.state;
         std::vector<Graphics::CompiledShader> shaders;
         for (const auto& stage : draw.stages) shaders.push_back({stage.program.stage, stage.program.result.get(), stage.program.pushOffset});
@@ -859,6 +923,7 @@ private:
         std::vector<VkImageView> views;
         std::vector<std::shared_ptr<void>> owners;
         std::vector<std::shared_ptr<Graphics::StorageTexture>> residents;
+        phase = std::chrono::steady_clock::now();
         for (const auto& color : state.colors) {
             if (Graphics::AttachmentProxyFormat(context, color.format) != VK_FORMAT_UNDEFINED) {
                 reason = "proxied color format";
@@ -884,7 +949,10 @@ private:
         sets.mainKey = draw.layout.keys[0];
         sets.fragmentKey = draw.layout.keys[1];
         sets.heap = heap->Layout();
+        totals.targetNanoseconds += elapsed(phase);
+        phase = std::chrono::steady_clock::now();
         auto pipeline = Graphics::CachedPipeline(context, state, vertexInput, sets, shaders, VK_IMAGE_LAYOUT_GENERAL);
+        totals.graphicsPipelineNanoseconds += elapsed(phase);
         if (pipeline == nullptr) {
             reason = "no pipeline";
             return false;
@@ -977,9 +1045,14 @@ private:
         }
 
         if (Shadow::OwnedUploadsPending()) {
+            phase = std::chrono::steady_clock::now();
             std::vector<std::shared_ptr<void>> kept;
-            if (Shadow::RecordOwnedUploads(recorder->Commands(), kept) != 0u) totals.residencyLands++;
+            const auto uploadCommands = recorder->Commands();
+            const auto uploadTiming = recorder->BeginGpuTiming(UploadTimingKey);
+            if (Shadow::RecordOwnedUploads(uploadCommands, kept) != 0u) totals.residencyLands++;
+            recorder->EndGpuTiming(uploadTiming);
             for (auto& object : kept) recorder->Keep(std::move(object));
+            totals.uploadNanoseconds += elapsed(phase);
         }
         if (recorder->HasQueuedKeyStores()) recorder->FlushKeyStores();
         if (recorder->HasQueuedStores()) recorder->FlushStores();
@@ -1039,6 +1112,12 @@ private:
 
         if (!vertexBuffers.empty()) context.Resolved(&Graphics::DeviceFunctions::cmdBindVertexBuffers, "vkCmdBindVertexBuffers")(commands, 0, static_cast<std::uint32_t>(vertexBuffers.size()), vertexBuffers.data(), vertexOffsets.data());
         if (indexImport != nullptr) context.Resolved(&Graphics::DeviceFunctions::cmdBindIndexBuffer, "vkCmdBindIndexBuffer")(commands, indexImport->buffer, Graphics::HostImportOffset(*indexImport, parameters.indexAddress), parameters.indexSize == 2u ? VK_INDEX_TYPE_UINT16 : VK_INDEX_TYPE_UINT32);
+        noteFaultToken(context, *recorder, commands, draw.stages, FaultStage::graphics, parameters.indirect ? "indirect" : (parameters.indexed ? "indexed" : "draw"), parameters.indexCount, parameters.instanceCount);
+        std::uint64_t timedProgram = 0;
+        for (const auto& one : draw.stages) {
+            if (timedProgram == 0 || one.program.stage == ShaderRecompiler::ShaderStage::Fragment) timedProgram = one.program.codeAddress;
+        }
+        const auto drawTiming = recorder->BeginInPassGpuTiming(DrawTimingKey | (std::uint64_t{0x7ec} << 48u) | (timedProgram & 0xffffffffffffull));
         if (parameters.indirect) {
             const auto& args = *parameters.indirect;
             if (countImport != nullptr) {
@@ -1059,6 +1138,7 @@ private:
         } else {
             context.Resolved(&Graphics::DeviceFunctions::cmdDraw, "vkCmdDraw")(commands, parameters.indexCount, parameters.instanceCount, parameters.firstVertex, parameters.firstInstance);
         }
+        recorder->EndGpuTiming(drawTiming);
 
         recorder->LeaveRenderPassOpen(key, 0, fenced, access);
         recorder->Keep(pipeline);

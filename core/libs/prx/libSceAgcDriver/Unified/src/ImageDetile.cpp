@@ -63,6 +63,7 @@ void SurfaceDetiler::Record(Graphics::Recorder& recorder, SurfaceTable& table, s
     }
     if (served.empty()) return;
     VkCommandBuffer commands = VK_NULL_HANDLE;
+    auto timing = Graphics::Recorder::NoTiming;
     try {
         const auto serial = recorder.OpenBatchSerial();
         if (serial != batch) {
@@ -70,12 +71,14 @@ void SurfaceDetiler::Record(Graphics::Recorder& recorder, SurfaceTable& table, s
             batch = serial;
         }
         commands = recorder.Commands();
+        timing = recorder.BeginGpuTiming(DetileTimingKey);
         std::vector<std::shared_ptr<void>> kept;
         if (Shadow::RecordOwnedUploads(commands, kept) != 0u) {
             for (auto& object : kept) recorder.Keep(std::move(object));
         }
         Graphics::RecordMemoryBarrier(context, commands, VK_PIPELINE_STAGE_TRANSFER_BIT | VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_ACCESS_TRANSFER_WRITE_BIT | VK_ACCESS_SHADER_WRITE_BIT, VK_ACCESS_SHADER_READ_BIT);
     } catch (const std::exception& error) {
+        recorder.EndGpuTiming(timing);
         counts.refused += served.size();
         refused(std::string("detile: ") + error.what());
         return;
@@ -89,6 +92,7 @@ void SurfaceDetiler::Record(Graphics::Recorder& recorder, SurfaceTable& table, s
             refused(std::string("detile: ") + error.what());
         }
     }
+    recorder.EndGpuTiming(timing);
 }
 
 void SurfaceDetiler::recordOne(Graphics::Recorder& recorder, VkCommandBuffer commands, SurfaceTable& table, Surface& surface, VulkanSurface& vulkan, VkBuffer buffer, std::uint64_t base, std::uint64_t stamp, std::uint64_t imageStamp) {
