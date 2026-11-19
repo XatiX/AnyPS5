@@ -1011,7 +1011,9 @@ private:
         auto& recording = recorder->GraphicsState();
         if (start.continued) {
             totals.passesContinued++;
-            passTargets.insert(passTargets.end(), drawTargets.begin(), drawTargets.end());
+            for (const auto& range : drawTargets) {
+                if (std::ranges::find(passTargets, range) == passTargets.end()) passTargets.push_back(range);
+            }
         } else {
             totals.passesBegun++;
             passTargets = std::move(drawTargets);

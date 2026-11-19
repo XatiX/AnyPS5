@@ -14,6 +14,18 @@ std::uint64_t ThreadNotes() {
     return threadNotes;
 }
 
+std::size_t StripedCount::Stripe() noexcept {
+    static std::atomic<std::size_t> next{0};
+    thread_local const std::size_t stripe = next.fetch_add(1, std::memory_order_relaxed) % Stripes;
+    return stripe;
+}
+
+std::uint64_t StripedCount::Sum() const noexcept {
+    std::uint64_t total = 0;
+    for (const auto& slot : slots) total += slot.value.load(std::memory_order_relaxed);
+    return total;
+}
+
 ChangeLog::ChangeLog() : buckets(new Bucket[BucketCount]), regions(new std::atomic<std::uint64_t>[RegionCount]) {
     for (std::size_t region = 0; region < RegionCount; ++region) regions[region].store(0, std::memory_order_relaxed);
 }
@@ -21,7 +33,7 @@ ChangeLog::ChangeLog() : buckets(new Bucket[BucketCount]), regions(new std::atom
 std::uint64_t ChangeLog::Note(std::uint64_t address, std::uint64_t bytes, std::uintptr_t owner) {
     if (bytes == 0) return Serial();
     const auto epoch = serial.fetch_add(1, std::memory_order_acq_rel) + 1;
-    notes.fetch_add(1, std::memory_order_relaxed);
+    notes.Add();
     ++threadNotes;
     const auto first = address / BucketBytes;
     const auto last = (address + bytes - 1) / BucketBytes;
@@ -63,19 +75,19 @@ ChangeLog::Seen ChangeLog::read(const Bucket& bucket) const {
 
 bool ChangeLog::ChangedSince(std::uint64_t address, std::uint64_t bytes, std::uint64_t stamp, std::uintptr_t owner, bool* exemptedOut) const {
     if (bytes == 0) return false;
-    queries.fetch_add(1, std::memory_order_relaxed);
+    queries.Add();
     const auto firstRegion = address / RegionBytes;
     const auto lastRegion = (address + bytes - 1) / RegionBytes;
     bool regionMoved = lastRegion - firstRegion + 1 >= RegionCount;
     for (auto region = firstRegion; !regionMoved && region <= lastRegion; ++region) regionMoved = regions[regionOf(region * RegionBytes)].load(std::memory_order_acquire) > stamp;
     if (!regionMoved) {
-        regionSkips.fetch_add(1, std::memory_order_relaxed);
+        regionSkips.Add();
         return false;
     }
     const auto first = address / BucketBytes;
     const auto last = (address + bytes - 1) / BucketBytes;
     if (last - first + 1 >= BucketCount) {
-        changed.fetch_add(1, std::memory_order_relaxed);
+        changed.Add();
         return true;
     }
     bool exempted = false;
@@ -86,11 +98,11 @@ bool ChangeLog::ChangedSince(std::uint64_t address, std::uint64_t bytes, std::ui
             exempted = true;
             continue;
         }
-        changed.fetch_add(1, std::memory_order_relaxed);
+        changed.Add();
         return true;
     }
     if (exempted) {
-        ownerExempt.fetch_add(1, std::memory_order_relaxed);
+        ownerExempt.Add();
         if (exemptedOut != nullptr) *exemptedOut = true;
     }
     return false;
@@ -107,8 +119,24 @@ std::uintptr_t ChangeLog::ChangedOwner(std::uint64_t address, std::uint64_t byte
     return 0;
 }
 
+bool ChangeLog::RegionsChangedSince(std::span<const std::uint32_t> regionIndices, std::uint64_t stamp) const {
+    return std::ranges::any_of(regionIndices, [&](std::uint32_t region) { return regions[region].load(std::memory_order_acquire) > stamp; });
+}
+
+bool ChangeLog::RegionChangedSince(std::uint32_t regionIndex, std::uint64_t stamp) const {
+    return regions[regionIndex & (RegionCount - 1)].load(std::memory_order_acquire) > stamp;
+}
+
+void ChangeLog::AppendRegions(std::uint64_t address, std::uint64_t bytes, std::vector<std::uint32_t>& regionIndices) {
+    if (bytes == 0) return;
+    const auto firstRegion = address / RegionBytes;
+    const auto lastRegion = (address + bytes - 1) / RegionBytes;
+    const auto span = std::min<std::uint64_t>(lastRegion - firstRegion + 1, RegionCount);
+    for (std::uint64_t step = 0; step < span; ++step) regionIndices.push_back(static_cast<std::uint32_t>(regionOf((firstRegion + step) * RegionBytes)));
+}
+
 ChangeLogCounts ChangeLog::Counts() const {
-    return {notes.load(std::memory_order_relaxed), queries.load(std::memory_order_relaxed), regionSkips.load(std::memory_order_relaxed), changed.load(std::memory_order_relaxed), ownerExempt.load(std::memory_order_relaxed)};
+    return {notes.Sum(), queries.Sum(), regionSkips.Sum(), changed.Sum(), ownerExempt.Sum()};
 }
 
 namespace {

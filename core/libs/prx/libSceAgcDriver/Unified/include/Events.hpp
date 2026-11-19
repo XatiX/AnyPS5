@@ -9,6 +9,7 @@
 #include <mutex>
 #include <span>
 #include <utility>
+#include <vector>
 
 namespace AgcDriver::Unified::Events {
 
@@ -17,6 +18,21 @@ inline constexpr std::size_t BucketCount = std::size_t{1} << 18u;
 inline constexpr std::uint64_t RegionBytes = 0x400000;
 inline constexpr std::size_t RegionCount = std::size_t{1} << 12u;
 inline constexpr std::size_t WriterStripes = 256;
+
+class StripedCount {
+public:
+    static constexpr std::size_t Stripes = 16;
+
+    void Add() noexcept { slots[Stripe()].value.fetch_add(1, std::memory_order_relaxed); }
+    [[nodiscard]] std::uint64_t Sum() const noexcept;
+    static std::size_t Stripe() noexcept;
+
+private:
+    struct alignas(64) Slot {
+        std::atomic<std::uint64_t> value{0};
+    };
+    std::array<Slot, Stripes> slots;
+};
 
 struct ChangeLogCounts {
     std::uint64_t notes = 0;
@@ -35,6 +51,9 @@ public:
     [[nodiscard]] bool ChangedSince(std::uint64_t address, std::uint64_t bytes, std::uint64_t stamp, std::uintptr_t owner = 0, bool* exempted = nullptr) const;
     [[nodiscard]] ChangeLogCounts Counts() const;
     [[nodiscard]] std::uintptr_t ChangedOwner(std::uint64_t address, std::uint64_t bytes, std::uint64_t stamp) const;
+    [[nodiscard]] bool RegionsChangedSince(std::span<const std::uint32_t> regionIndices, std::uint64_t stamp) const;
+    [[nodiscard]] bool RegionChangedSince(std::uint32_t regionIndex, std::uint64_t stamp) const;
+    static void AppendRegions(std::uint64_t address, std::uint64_t bytes, std::vector<std::uint32_t>& regionIndices);
 
 private:
     struct Bucket {
@@ -56,11 +75,11 @@ private:
     std::unique_ptr<Bucket[]> buckets;
     std::unique_ptr<std::atomic<std::uint64_t>[]> regions;
     std::array<std::mutex, WriterStripes> stripes;
-    mutable std::atomic<std::uint64_t> notes{0};
-    mutable std::atomic<std::uint64_t> queries{0};
-    mutable std::atomic<std::uint64_t> regionSkips{0};
-    mutable std::atomic<std::uint64_t> changed{0};
-    mutable std::atomic<std::uint64_t> ownerExempt{0};
+    mutable StripedCount notes;
+    mutable StripedCount queries;
+    mutable StripedCount regionSkips;
+    mutable StripedCount changed;
+    mutable StripedCount ownerExempt;
 };
 
 inline constexpr std::uintptr_t ImageSetOwner = 2;

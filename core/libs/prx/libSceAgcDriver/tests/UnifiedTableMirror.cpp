@@ -141,6 +141,75 @@ void testUsesAreCoalescedSpans() {
     Expect(uses.size() == 2u && uses[0].memory.address < uses[1].memory.address && !uses[0].write, "elements over the same memory report one sampled use");
 }
 
+void testBoundedSpansMergeSmallestGaps() {
+    using Range = std::pair<std::uint64_t, std::uint64_t>;
+    const std::vector<Range> spans{{0x1000u, 0x2000u}, {0x2100u, 0x3000u}, {0x9000u, 0xa000u}, {0xa400u, 0xb000u}};
+    const auto two = Tables::BoundedSpans(spans, 2u);
+    Expect(two.size() == 2u && two[0] == Range{0x1000u, 0x3000u} && two[1] == Range{0x9000u, 0xb000u}, "the smallest gaps merge first");
+    const auto one = Tables::BoundedSpans(spans, 1u);
+    Expect(one.size() == 1u && one[0] == Range{0x1000u, 0xb000u}, "one span covers them all");
+    Expect(Tables::BoundedSpans(spans, 8u) == spans, "spans within the limit are kept");
+}
+
+void testChangedSpanRefillsInPlace() {
+    Fixture fixture;
+    const auto tables = Tables({1u, 2u, 3u});
+    std::string reason;
+    std::vector<ImageUse> uses;
+    const auto first = fixture.mirror.Build(tables, reason, &uses);
+    static_cast<void>(fixture.imageLog.Note(0x300000000ull + 3u * Events::RegionBytes, 0x100));
+    uses.clear();
+    const auto again = fixture.mirror.Build(tables, reason, &uses);
+    Expect(again == first && fixture.mirror.Counts().inPlace == 1u, "a changed span refills the cached entry in place");
+    Expect(fixture.mirror.Counts().elements == 4u && fixture.mirror.Counts().kept == 2u, "only the element over the changed span is filled again");
+    Expect(uses.size() == 3u, "the refilled entry reports its uses");
+    static_cast<void>(fixture.mirror.Build(tables, reason));
+    Expect(fixture.mirror.Counts().unchanged == 1u, "the refilled entry is unchanged afterwards");
+}
+
+void testInheritedTablesTakeOverTheirPredecessor() {
+    Fixture fixture;
+    std::string reason;
+    std::vector<ImageUse> uses;
+    const auto first = fixture.mirror.Build(Tables({1u, 2u, 3u}), reason);
+    static_cast<void>(fixture.imageLog.Note(0x300000000ull + 3u * Events::RegionBytes, 0x100));
+    const auto next = fixture.mirror.Build(Tables({1u, 2u, 3u}), reason, &uses);
+    Expect(next == first && fixture.mirror.Counts().inherited == 1u && fixture.mirror.Counts().inPlace == 1u, "new tables over a released predecessor take over its entry");
+    Expect(fixture.mirror.Counts().elements == 4u && fixture.mirror.Counts().kept == 2u, "only the element over the changed span is filled again");
+    Expect(fixture.mirror.Size() == 1u && uses.size() == 3u, "the released entry is moved, not copied");
+    const auto live = Tables({1u, 2u, 3u});
+    const auto held = fixture.mirror.Build(live, reason);
+    const auto changed = fixture.mirror.Build(Tables({1u, 5u, 3u}), reason);
+    Expect(changed != nullptr && changed != held && fixture.mirror.Counts().elements == 5u, "a differing request is filled and builds a new mirror");
+    Expect(fixture.mirror.Size() == 2u && fixture.mirror.Build(live, reason) == held, "a live predecessor keeps its own entry");
+}
+
+void testQuietRegionsSkipSpanQueries() {
+    Fixture fixture;
+    const auto tables = Tables({1u, 2u});
+    std::string reason;
+    static_cast<void>(fixture.mirror.Build(tables, reason));
+    const auto before = fixture.shared.Counts().queries + fixture.imageLog.Counts().queries;
+    static_cast<void>(fixture.shared.Note(0x400000000ull + 0x100000000ull, 0x100));
+    static_cast<void>(fixture.mirror.Build(tables, reason));
+    Expect(fixture.mirror.Counts().unchanged == 1u, "a write in another region keeps the mirror unchanged");
+    Expect(fixture.shared.Counts().queries + fixture.imageLog.Counts().queries == before, "quiet regions answer without a query per span");
+}
+
+void testNearbyWriteIsScannedOnce() {
+    Fixture fixture;
+    const auto tables = Tables({1u, 2u});
+    std::string reason;
+    const auto first = fixture.mirror.Build(tables, reason);
+    const auto queries = [&] { return fixture.shared.Counts().queries + fixture.imageLog.Counts().queries; };
+    static_cast<void>(fixture.imageLog.Note(0x300000000ull + Events::RegionBytes + 0x20000u, 0x100));
+    const auto before = queries();
+    Expect(fixture.mirror.Build(tables, reason) == first && fixture.mirror.Counts().unchanged == 1u, "a write beside the element images keeps the mirror unchanged");
+    const auto scanned = queries();
+    Expect(scanned > before && scanned - before <= 2u, "only the span in the written region is queried");
+    Expect(fixture.mirror.Build(tables, reason) == first && queries() == scanned, "the next build does not query the same write again");
+}
+
 void testOutsideCutsHoles() {
     const auto pieces = Tables::Outside({0x1000u, 0x5000u}, {{0x4000u, 0x6000u}, {0x2000u, 0x3000u}, {0x8000u, 0x9000u}});
     Expect(pieces.size() == 2u && pieces[0] == std::pair<std::uint64_t, std::uint64_t>{0x1000u, 0x2000u} && pieces[1] == std::pair<std::uint64_t, std::uint64_t>{0x3000u, 0x4000u}, "holes are cut out of the span in address order");
@@ -168,7 +237,6 @@ void testReleasedTablesAreDropped() {
         static_cast<void>(fixture.mirror.Build(Tables({1u + round % 3u, 2u, 3u}), reason));
     }
     Expect(fixture.mirror.Size() < floor, "entries of released tables do not pile up");
-    Expect(fixture.mirror.Counts().dropped != 0u, "the released entries are counted as dropped");
     Expect(fixture.mirror.Counts().inherited == 4u * floor - 1u, "each new table still inherits from the last one");
     const auto held = Tables({7u, 8u});
     const auto first = fixture.mirror.Build(held, reason);
@@ -182,6 +250,11 @@ void testReleasedTablesAreDropped() {
 
 int main() {
     testReleasedTablesAreDropped();
+    testBoundedSpansMergeSmallestGaps();
+    testQuietRegionsSkipSpanQueries();
+    testChangedSpanRefillsInPlace();
+    testInheritedTablesTakeOverTheirPredecessor();
+    testNearbyWriteIsScannedOnce();
     testMirrorAppendsSlots();
     testMirrorReusedForSameTables();
     testWritesToElementImagesRefill();

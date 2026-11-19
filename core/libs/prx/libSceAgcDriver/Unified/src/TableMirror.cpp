@@ -1,6 +1,7 @@
 #include "prx/libSceAgcDriver/Unified/include/TableMirror.hpp"
 #include "ImageTableAbi.hpp"
 #include <algorithm>
+#include <cstdlib>
 #include <unordered_set>
 
 namespace AgcDriver::Unified::Tables {
@@ -58,6 +59,27 @@ std::vector<std::pair<std::uint64_t, std::uint64_t>> CoalescedSpans(std::span<co
     return spans;
 }
 
+std::vector<std::pair<std::uint64_t, std::uint64_t>> BoundedSpans(std::span<const std::pair<std::uint64_t, std::uint64_t>> spans, std::size_t limit) {
+    std::vector<std::pair<std::uint64_t, std::uint64_t>> bounded(spans.begin(), spans.end());
+    if (limit == 0u || bounded.size() <= limit) return bounded;
+    std::vector<std::size_t> gaps(bounded.size() - 1u);
+    for (std::size_t index = 0; index < gaps.size(); ++index) gaps[index] = index;
+    std::sort(gaps.begin(), gaps.end(), [&](std::size_t left, std::size_t right) {
+        const auto leftGap = bounded[left + 1u].first - bounded[left].second;
+        const auto rightGap = bounded[right + 1u].first - bounded[right].second;
+        return leftGap != rightGap ? leftGap < rightGap : left < right;
+    });
+    std::vector<bool> merged(gaps.size(), false);
+    for (std::size_t index = 0; index < bounded.size() - limit; ++index) merged[gaps[index]] = true;
+    std::size_t kept = 0;
+    for (std::size_t index = 1; index < bounded.size(); ++index) {
+        if (merged[index - 1u]) bounded[kept].second = std::max(bounded[kept].second, bounded[index].second);
+        else bounded[++kept] = bounded[index];
+    }
+    bounded.resize(kept + 1u);
+    return bounded;
+}
+
 std::vector<std::pair<std::uint64_t, std::uint64_t>> Outside(std::pair<std::uint64_t, std::uint64_t> span, std::vector<std::pair<std::uint64_t, std::uint64_t>> holes) {
     std::sort(holes.begin(), holes.end());
     std::vector<std::pair<std::uint64_t, std::uint64_t>> pieces;
@@ -80,6 +102,16 @@ std::uint64_t mapKey(std::span<const std::uint32_t> map) {
     return hash;
 }
 
+bool refillsInPlace() {
+    static const bool inPlace = std::getenv("APS5_RECODE_FULL_MIRROR_REFILL") == nullptr;
+    return inPlace;
+}
+
+bool boundsUses() {
+    static const bool bounds = std::getenv("APS5_RECODE_EXACT_TABLE_USES") == nullptr;
+    return bounds;
+}
+
 bool sameRequest(const Heap::SlotRequest& left, const Heap::SlotRequest& right) {
     return left.kind == right.kind && left.flags == right.flags && left.words == right.words;
 }
@@ -94,7 +126,12 @@ bool overlapsAny(const Heap::Span& memory, std::span<const std::pair<std::uint64
 
 }
 
+bool TableMirror::regionsQuiet(const Cached& cached) const {
+    return !shared.RegionsChangedSince(cached.regions, cached.sharedStamp) && !images.RegionsChangedSince(cached.regions, cached.imagesStamp);
+}
+
 bool TableMirror::unchanged(const Cached& cached) const {
+    if (regionsQuiet(cached)) return true;
     return std::none_of(cached.spans.begin(), cached.spans.end(), [&](const auto& span) {
         const auto bytes = span.second - span.first;
         return shared.ChangedSince(span.first, bytes, cached.sharedStamp) || images.ChangedSince(span.first, bytes, cached.imagesStamp);
@@ -103,6 +140,7 @@ bool TableMirror::unchanged(const Cached& cached) const {
 
 std::vector<std::pair<std::uint64_t, std::uint64_t>> TableMirror::changedSpans(const Cached& cached) const {
     std::vector<std::pair<std::uint64_t, std::uint64_t>> changed;
+    if (regionsQuiet(cached)) return changed;
     for (const auto& span : cached.spans) {
         const auto bytes = span.second - span.first;
         if (shared.ChangedSince(span.first, bytes, cached.sharedStamp) || images.ChangedSince(span.first, bytes, cached.imagesStamp)) changed.push_back(span);
@@ -137,13 +175,113 @@ bool TableMirror::fill(const Cached* base, Cached& out, std::string& reason) {
         }
         counts.elements++;
     }
+    index(out);
+    return true;
+}
+
+void TableMirror::index(Cached& out) {
+    const auto count = out.requests.size();
     out.uses.clear();
-    for (std::size_t index = 0; index < count; ++index) {
-        if (out.memory[index].bytes != 0u) out.uses.push_back({out.memory[index], false});
+    for (std::size_t element = 0; element < count; ++element) {
+        if (out.memory[element].bytes != 0u) out.uses.push_back({out.memory[element], false});
     }
     out.spans = CoalescedSpans(out.uses);
+    out.regions.clear();
+    for (const auto& [begin, end] : out.spans) Events::ChangeLog::AppendRegions(begin, end - begin, out.regions);
+    std::sort(out.regions.begin(), out.regions.end());
+    out.regions.erase(std::unique(out.regions.begin(), out.regions.end()), out.regions.end());
     out.uses.clear();
-    for (const auto& [begin, end] : out.spans) out.uses.push_back({{begin, end - begin}, false});
+    for (const auto& [begin, end] : boundsUses() ? BoundedSpans(out.spans, TableUseSpans) : out.spans) out.uses.push_back({{begin, end - begin}, false});
+    std::vector<std::uint32_t> spanOf(count, NoSpan);
+    out.spanStarts.assign(out.spans.size() + 1u, 0u);
+    out.pending.clear();
+    for (std::size_t element = 0; element < count; ++element) {
+        if (out.placeholders[element]) out.pending.push_back(static_cast<std::uint32_t>(element));
+        const auto& memory = out.memory[element];
+        if (memory.bytes == 0u) continue;
+        const auto next = std::upper_bound(out.spans.begin(), out.spans.end(), memory.address, [](std::uint64_t address, const auto& span) { return address < span.first; });
+        if (next == out.spans.begin()) continue;
+        const auto span = static_cast<std::uint32_t>(std::prev(next) - out.spans.begin());
+        spanOf[element] = span;
+        out.spanStarts[span + 1u]++;
+    }
+    for (std::size_t span = 0; span < out.spans.size(); ++span) out.spanStarts[span + 1u] += out.spanStarts[span];
+    out.spanElements.assign(out.spanStarts.back(), 0u);
+    auto cursor = out.spanStarts;
+    for (std::size_t element = 0; element < count; ++element) {
+        if (spanOf[element] != NoSpan) out.spanElements[cursor[spanOf[element]]++] = static_cast<std::uint32_t>(element);
+    }
+    std::vector<std::pair<std::uint32_t, std::uint32_t>> regionSpan;
+    std::vector<std::uint32_t> touched;
+    for (std::size_t span = 0; span < out.spans.size(); ++span) {
+        touched.clear();
+        Events::ChangeLog::AppendRegions(out.spans[span].first, out.spans[span].second - out.spans[span].first, touched);
+        for (const auto region : touched) {
+            const auto position = std::lower_bound(out.regions.begin(), out.regions.end(), region) - out.regions.begin();
+            regionSpan.emplace_back(static_cast<std::uint32_t>(position), static_cast<std::uint32_t>(span));
+        }
+    }
+    std::sort(regionSpan.begin(), regionSpan.end());
+    regionSpan.erase(std::unique(regionSpan.begin(), regionSpan.end()), regionSpan.end());
+    out.regionStarts.assign(out.regions.size() + 1u, 0u);
+    for (const auto& [position, span] : regionSpan) out.regionStarts[position + 1u]++;
+    for (std::size_t position = 0; position < out.regions.size(); ++position) out.regionStarts[position + 1u] += out.regionStarts[position];
+    out.regionSpans.resize(regionSpan.size());
+    for (std::size_t index = 0; index < regionSpan.size(); ++index) out.regionSpans[index] = regionSpan[index].second;
+}
+
+TableMirror::SpanScan TableMirror::scanSpans(const Cached& entry) const {
+    SpanScan scan{shared.Serial(), images.Serial(), {}};
+    for (std::size_t position = 0; position < entry.regions.size(); ++position) {
+        const auto region = entry.regions[position];
+        if (!shared.RegionChangedSince(region, entry.sharedStamp) && !images.RegionChangedSince(region, entry.imagesStamp)) continue;
+        for (auto index = entry.regionStarts[position]; index < entry.regionStarts[position + 1u]; ++index) scan.spans.push_back(entry.regionSpans[index]);
+    }
+    if (scan.spans.empty()) return scan;
+    std::sort(scan.spans.begin(), scan.spans.end());
+    scan.spans.erase(std::unique(scan.spans.begin(), scan.spans.end()), scan.spans.end());
+    std::erase_if(scan.spans, [&](std::uint32_t span) {
+        const auto& [begin, end] = entry.spans[span];
+        return !shared.ChangedSince(begin, end - begin, entry.sharedStamp) && !images.ChangedSince(begin, end - begin, entry.imagesStamp);
+    });
+    return scan;
+}
+
+bool TableMirror::refillInPlace(Cached& entry, const SpanScan& scan, std::string& reason, bool& slotsChanged, std::span<const std::uint32_t> differing) {
+    std::vector<std::uint32_t> targets = entry.pending;
+    targets.insert(targets.end(), differing.begin(), differing.end());
+    for (const auto span : scan.spans) targets.insert(targets.end(), entry.spanElements.begin() + entry.spanStarts[span], entry.spanElements.begin() + entry.spanStarts[span + 1u]);
+    std::sort(targets.begin(), targets.end());
+    targets.erase(std::unique(targets.begin(), targets.end()), targets.end());
+    bool memoryMoved = false;
+    slotsChanged = false;
+    entry.complete = true;
+    for (const auto element : targets) {
+        Heap::Span memory{};
+        std::shared_ptr<const void> owner;
+        const auto placeholders = refill.Counts().placeholders;
+        const auto slot = refill.FillOne(entry.requests[element], reason, memory, owner);
+        if (slot == Heap::NoSlot) return false;
+        if (slot != entry.slots[element]) slotsChanged = true;
+        if (memory.address != entry.memory[element].address || memory.bytes != entry.memory[element].bytes) memoryMoved = true;
+        entry.slots[element] = slot;
+        entry.memory[element] = memory;
+        entry.owners[element] = std::move(owner);
+        entry.placeholders[element] = refill.Counts().placeholders != placeholders;
+        counts.elements++;
+    }
+    counts.kept += entry.requests.size() - targets.size();
+    entry.sharedStamp = scan.sharedStamp;
+    entry.imagesStamp = scan.imagesStamp;
+    if (memoryMoved) {
+        index(entry);
+    } else {
+        entry.pending.clear();
+        for (std::size_t element = 0; element < entry.placeholders.size(); ++element) {
+            if (entry.placeholders[element]) entry.pending.push_back(static_cast<std::uint32_t>(element));
+        }
+    }
+    entry.complete = entry.pending.empty();
     return true;
 }
 
@@ -154,12 +292,30 @@ std::shared_ptr<const Mirror> TableMirror::Build(const std::shared_ptr<const Sha
     }
     auto found = cache.find(tables.get());
     const bool same = found != cache.end() && found->second.tables.lock() == tables;
+    if (same && refillsInPlace()) {
+        auto& entry = found->second;
+        const auto scan = scanSpans(entry);
+        if (scan.spans.empty() && entry.complete) {
+            entry.sharedStamp = scan.sharedStamp;
+            entry.imagesStamp = scan.imagesStamp;
+            counts.unchanged++;
+            if (uses != nullptr) uses->insert(uses->end(), entry.uses.begin(), entry.uses.end());
+            return entry.mirror;
+        }
+        bool slotsChanged = false;
+        if (!refillInPlace(entry, scan, reason, slotsChanged)) return nullptr;
+        return publish(entry, *tables, slotsChanged, uses);
+    }
     if (same && found->second.complete && unchanged(found->second)) {
         counts.unchanged++;
         if (uses != nullptr) uses->insert(uses->end(), found->second.uses.begin(), found->second.uses.end());
         return found->second.mirror;
     }
     const auto key = mapKey(tables->map);
+    if (!same && refillsInPlace()) {
+        std::shared_ptr<const Mirror> inherited;
+        if (inherit(tables, key, reason, inherited, uses)) return inherited;
+    }
     const Cached* base = same ? &found->second : nullptr;
     if (base == nullptr) {
         if (const auto previous = predecessors.find(key); previous != predecessors.end()) {
@@ -201,6 +357,58 @@ std::shared_ptr<const Mirror> TableMirror::Build(const std::shared_ptr<const Sha
     predecessors[key] = tables.get();
     if (cache.size() >= pruneAt) prune();
     return mirror;
+}
+
+std::shared_ptr<const Mirror> TableMirror::publish(Cached& entry, const ShaderRecompiler::ResolvedImageTables& tables, bool slotsChanged, std::vector<Heap::ImageUse>* uses) {
+    if (slotsChanged || entry.mirror == nullptr) {
+        auto mirror = std::make_shared<Mirror>();
+        mirror->id = nextId++;
+        mirror->map = MirrorMap(tables.map, entry.slots);
+        for (const auto& owner : entry.owners) {
+            if (owner != nullptr) mirror->owners.push_back(owner);
+        }
+        entry.mirror = std::move(mirror);
+        counts.built++;
+    } else {
+        counts.reused++;
+    }
+    counts.inPlace++;
+    if (uses != nullptr) uses->insert(uses->end(), entry.uses.begin(), entry.uses.end());
+    return entry.mirror;
+}
+
+bool TableMirror::inherit(const std::shared_ptr<const ShaderRecompiler::ResolvedImageTables>& tables, std::uint64_t key, std::string& reason, std::shared_ptr<const Mirror>& out, std::vector<Heap::ImageUse>* uses) {
+    const auto previous = predecessors.find(key);
+    if (previous == predecessors.end()) return false;
+    const auto base = cache.find(previous->second);
+    if (base == cache.end() || base->second.map != tables->map) return false;
+    std::vector<Heap::SlotRequest> requests;
+    if (!ElementRequests(*tables, requests, reason)) {
+        out = nullptr;
+        return true;
+    }
+    if (requests.size() != base->second.requests.size()) return false;
+    std::vector<std::uint32_t> differing;
+    for (std::size_t element = 0; element < requests.size(); ++element) {
+        if (!sameRequest(requests[element], base->second.requests[element])) differing.push_back(static_cast<std::uint32_t>(element));
+    }
+    Cached entry;
+    if (base->second.tables.expired()) entry = std::move(cache.extract(base).mapped());
+    else entry = base->second;
+    entry.tables = tables;
+    entry.requests = std::move(requests);
+    bool slotsChanged = false;
+    if (!refillInPlace(entry, scanSpans(entry), reason, slotsChanged, differing)) {
+        out = nullptr;
+        return true;
+    }
+    counts.inherited++;
+    auto& stored = cache[tables.get()];
+    stored = std::move(entry);
+    predecessors[key] = tables.get();
+    out = publish(stored, *tables, slotsChanged, uses);
+    if (cache.size() >= pruneAt) prune();
+    return true;
 }
 
 void TableMirror::prune() {

@@ -10,6 +10,7 @@
 #include "prx/libSceAgcDriver/Unified/include/Refill.hpp"
 #include "prx/libSceAgcDriver/Unified/include/SlotPatch.hpp"
 #include "prx/libSceAgcDriver/Unified/include/TableMirror.hpp"
+#include "prx/libSceAgcDriver/Unified/include/TableResolutions.hpp"
 #include "prx/libSceAgcDriver/Unified/include/Targets.hpp"
 #include "prx/libSceAgcDriver/Unified/include/VulkanImages.hpp"
 #include "prx/libSceAgcDriver/Unified/include/VulkanHeap.hpp"
@@ -43,6 +44,11 @@ bool imagesRouted() {
     return enabled;
 }
 
+bool memoizesTables() {
+    static const bool enabled = std::getenv("APS5_RECODE_NO_TABLE_MEMO") == nullptr;
+    return enabled;
+}
+
 struct Totals {
     std::uint64_t draws = 0;
     std::uint64_t resolved = 0;
@@ -52,6 +58,16 @@ struct Totals {
     std::uint64_t slots = 0;
     std::uint64_t programNanoseconds = 0;
     std::uint64_t slotNanoseconds = 0;
+    std::uint64_t bufferNanoseconds = 0;
+    std::uint64_t requestNanoseconds = 0;
+    std::uint64_t fillNanoseconds = 0;
+    std::uint64_t tableNanoseconds = 0;
+    std::uint64_t mirrorNanoseconds = 0;
+    std::uint64_t tableMissNanoseconds = 0;
+    std::uint64_t tableMisses = 0;
+    std::uint64_t mirrorUnchangedNanoseconds = 0;
+    std::uint64_t mirrorInPlaceNanoseconds = 0;
+    std::uint64_t layoutNanoseconds = 0;
     std::uint64_t lockBusy = 0;
     std::uint64_t uses = 0;
     std::uint64_t incomplete = 0;
@@ -229,7 +245,10 @@ private:
         std::vector<Heap::ImageUse> tableUses;
         std::uint64_t tablePlaceholdersHere = 0;
         for (auto& stage : programs.stages) {
+            auto partStarted = std::chrono::steady_clock::now();
             bufferUses(*stage.variant, stage.capture->snapshot, draw.uses);
+            counts.bufferNanoseconds += elapsed(partStarted);
+            partStarted = std::chrono::steady_clock::now();
             std::vector<Heap::SlotRequest> requests;
             if (stage.result->directHeap) {
                 Heap::SlotStatistics statistics;
@@ -239,12 +258,15 @@ private:
                     return nullptr;
                 }
             }
+            counts.requestNanoseconds += elapsed(partStarted);
+            partStarted = std::chrono::steady_clock::now();
             ResolvedStage resolved{std::move(stage), {}};
             if (!refill->Fill(requests, resolved.slots, reason, &imageUses, &resolved.owners) ||!PatchSlots(*resolved.program.result, resolved.slots, resolved.program.words, reason)) {
                 refuse(counts, reason);
                 counts.slotNanoseconds += elapsed(slotsStarted);
                 return nullptr;
             }
+            counts.fillNanoseconds += elapsed(partStarted);
             counts.slots += resolved.slots.size();
             if (std::ranges::any_of(resolved.program.result->bindings, [](const ShaderRecompiler::DescriptorBinding& binding) { return binding.role == ShaderRecompiler::DescriptorRole::ImageTableMap; })) {
                 if (!resolved.program.result->directHeap) {
@@ -253,13 +275,32 @@ private:
                     return nullptr;
                 }
                 std::shared_ptr<const ShaderRecompiler::ResolvedImageTables> tables;
+                partStarted = std::chrono::steady_clock::now();
+                const auto resolutionsBefore = ShaderRecompiler::ResourceMaterializer::TableReuse().resolutions;
                 try {
-                    tables = ShaderRecompiler::ResourceMaterializer::ResolveImageTablesShared(resolved.program.variant->info.info, resolved.program.capture->snapshot, resolved.program.variant->artifact.variantId);
+                    const auto& info = resolved.program.variant->info.info;
+                    const auto& snapshot = resolved.program.capture->snapshot;
+                    const auto memoKey = resolved.program.variant->artifact.variantId;
+                    const auto resolveShared = [&] { return ShaderRecompiler::ResourceMaterializer::ResolveImageTablesShared(info, snapshot, memoKey); };
+                    tables = memoizesTables() && memoKey != 0u && !snapshot.tables.tables.empty() ? resolutions.Find(info, snapshot, memoKey, resolveShared) : resolveShared();
                 } catch (const std::exception& error) {
                     reason = std::string("image tables: ") + error.what();
                 }
+                const auto tableSpent = elapsed(partStarted);
+                counts.tableNanoseconds += tableSpent;
+                if (ShaderRecompiler::ResourceMaterializer::TableReuse().resolutions != resolutionsBefore) {
+                    counts.tableMisses++;
+                    counts.tableMissNanoseconds += tableSpent;
+                }
+                partStarted = std::chrono::steady_clock::now();
                 const auto tablePlaceholders = refill->Counts().placeholders;
+                const auto mirrorsBefore = mirror->Counts();
                 if (tables != nullptr) resolved.tableMap = mirror->Build(tables, reason, &tableUses);
+                const auto mirrorSpent = elapsed(partStarted);
+                counts.mirrorNanoseconds += mirrorSpent;
+                const auto mirrorsAfter = mirror->Counts();
+                if (mirrorsAfter.unchanged != mirrorsBefore.unchanged) counts.mirrorUnchangedNanoseconds += mirrorSpent;
+                else if (mirrorsAfter.inPlace != mirrorsBefore.inPlace) counts.mirrorInPlaceNanoseconds += mirrorSpent;
                 if (resolved.tableMap == nullptr) {
                     refuse(counts, reason);
                     counts.slotNanoseconds += elapsed(slotsStarted);
@@ -270,6 +311,7 @@ private:
             }
             draw.stages.push_back(std::move(resolved));
         }
+        const auto layoutStarted = std::chrono::steady_clock::now();
         std::vector<std::pair<std::uint64_t, std::uint64_t>> held;
         for (auto index = beforeTargets; index < beforeBuffers; ++index) held.emplace_back(draw.uses[index].address, draw.uses[index].address + draw.uses[index].size);
         for (const auto& use : tableUses) {
@@ -297,6 +339,7 @@ private:
             draw.complete = false;
             counts.placeholderDraws++;
         }
+        counts.layoutNanoseconds += elapsed(layoutStarted);
         counts.slotNanoseconds += elapsed(slotsStarted);
         counts.stages += draw.stages.size();
         counts.uses += draw.uses.size();
@@ -312,6 +355,8 @@ public:
         const auto perDraw = [&](std::uint64_t nanoseconds) { return totals.draws == 0 ? 0.0 : static_cast<double>(nanoseconds) / 1000.0 / static_cast<double>(totals.draws); };
         std::snprintf(text, sizeof(text), "[recode-resolve] %llu draws, %llu resolved, %llu refused, %llu without device; %llu stages, %llu slots; programs %.1f us, slots %.1f us per draw", static_cast<unsigned long long>(totals.draws), static_cast<unsigned long long>(totals.resolved), static_cast<unsigned long long>(totals.refused), static_cast<unsigned long long>(totals.noDevice), static_cast<unsigned long long>(totals.stages), static_cast<unsigned long long>(totals.slots), perDraw(totals.programNanoseconds), perDraw(totals.slotNanoseconds));
         std::string line = text;
+        std::snprintf(text, sizeof(text), " (buffers %.1f, requests %.1f, fill %.1f, image tables %.1f [%llu misses %.1f], mirror %.1f [unchanged %.1f, in place %.1f], layout %.1f)", perDraw(totals.bufferNanoseconds), perDraw(totals.requestNanoseconds), perDraw(totals.fillNanoseconds), perDraw(totals.tableNanoseconds), static_cast<unsigned long long>(totals.tableMisses), perDraw(totals.tableMissNanoseconds), perDraw(totals.mirrorNanoseconds), perDraw(totals.mirrorUnchangedNanoseconds), perDraw(totals.mirrorInPlaceNanoseconds), perDraw(totals.layoutNanoseconds));
+        line += text;
         if (refill != nullptr) {
             const auto refills = refill->Counts();
             const auto slotCounts = table->Counts();
@@ -320,7 +365,7 @@ public:
         }
         if (mirror != nullptr) {
             const auto mirrors = mirror->Counts();
-            std::snprintf(text, sizeof(text), "; tables %llu stages, mirrors %llu built, %llu reused, %llu unchanged, %llu inherited, %zu held, %llu dropped, %llu elements filled, %llu kept, %llu placeholders, %llu reads, %llu target holds", static_cast<unsigned long long>(totals.tableStages), static_cast<unsigned long long>(mirrors.built), static_cast<unsigned long long>(mirrors.reused), static_cast<unsigned long long>(mirrors.unchanged), static_cast<unsigned long long>(mirrors.inherited), mirror->Size(), static_cast<unsigned long long>(mirrors.dropped),static_cast<unsigned long long>(mirrors.elements), static_cast<unsigned long long>(mirrors.kept), static_cast<unsigned long long>(totals.tablePlaceholders), static_cast<unsigned long long>(totals.tableUses), static_cast<unsigned long long>(totals.tableTargetHolds));
+            std::snprintf(text, sizeof(text), "; tables %llu stages, mirrors %llu built, %llu reused, %llu unchanged, %llu refilled in place, %llu inherited, %zu held, %llu dropped, %llu elements filled, %llu kept, %llu placeholders, %llu reads, %llu target holds", static_cast<unsigned long long>(totals.tableStages), static_cast<unsigned long long>(mirrors.built), static_cast<unsigned long long>(mirrors.reused), static_cast<unsigned long long>(mirrors.unchanged), static_cast<unsigned long long>(mirrors.inPlace), static_cast<unsigned long long>(mirrors.inherited), mirror->Size(), static_cast<unsigned long long>(mirrors.dropped),static_cast<unsigned long long>(mirrors.elements), static_cast<unsigned long long>(mirrors.kept), static_cast<unsigned long long>(totals.tablePlaceholders), static_cast<unsigned long long>(totals.tableUses), static_cast<unsigned long long>(totals.tableTargetHolds));
             line += text;
             if (surfaces != nullptr) {
                 const auto surfaceCounts = surfaces->TakeCounts();
@@ -333,7 +378,10 @@ public:
                 line += text;
             }
             const auto reuse = ShaderRecompiler::ResourceMaterializer::TableReuse();
-            std::snprintf(text, sizeof(text), " (columns %llu, reused %llu unwritten, %llu compared, %llu words read)", static_cast<unsigned long long>(reuse.columns), static_cast<unsigned long long>(reuse.unwritten), static_cast<unsigned long long>(reuse.compared), static_cast<unsigned long long>(reuse.wordsRead));
+            std::snprintf(text, sizeof(text), " (columns %llu, reused %llu unwritten, %llu compared, %llu words read, %llu resolved, %llu shared)", static_cast<unsigned long long>(reuse.columns), static_cast<unsigned long long>(reuse.unwritten), static_cast<unsigned long long>(reuse.compared), static_cast<unsigned long long>(reuse.wordsRead), static_cast<unsigned long long>(reuse.resolutions), static_cast<unsigned long long>(reuse.resolutionsShared));
+            line += text;
+            const auto memoCounts = resolutions.Counts();
+            std::snprintf(text, sizeof(text), "; table memo %llu hits, %llu by content, %llu new, %llu changed, %llu samplers changed, %llu evicted, %llu held (%llu MiB)", static_cast<unsigned long long>(memoCounts.hits), static_cast<unsigned long long>(memoCounts.contentHits),static_cast<unsigned long long>(memoCounts.fresh), static_cast<unsigned long long>(memoCounts.changed), static_cast<unsigned long long>(memoCounts.samplersChanged), static_cast<unsigned long long>(memoCounts.evicted), static_cast<unsigned long long>(memoCounts.held), static_cast<unsigned long long>(memoCounts.bytes >> 20u));
             line += text;
         }
         std::snprintf(text, sizeof(text), "; per draw: decode %.1f, prepare %.1f, capture %.1f, materialize %.1f, variant %.1f us", perDraw(totals.phases[PhaseDecode]), perDraw(totals.phases[PhasePrepare]), perDraw(totals.phases[PhaseCapture]), perDraw(totals.phases[PhaseMaterialize]), perDraw(totals.phases[PhaseVariant]));
@@ -529,6 +577,7 @@ private:
     std::unique_ptr<Heap::Memo> memo;
     std::unique_ptr<Heap::Refill> refill;
     std::unique_ptr<Tables::TableMirror> mirror;
+    Tables::TableResolutions resolutions{Tables::ResolutionBytes, std::getenv("APS5_RECODE_TABLE_MEMO_BY_STORAGE") == nullptr};
     TemplateTable templates{templateBudget()};
     PacketTable<ResolvedDraw> handoff;
     PacketTable<ResolvedDraw> dispatchHandoff;
