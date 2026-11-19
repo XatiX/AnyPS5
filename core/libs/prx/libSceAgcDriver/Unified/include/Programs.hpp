@@ -5,6 +5,7 @@
 #include "prx/libSceAgcDriver/Unified/include/Operation.hpp"
 #include "Optimization/ResourceProgram.hpp"
 #include "CompiledVariant.hpp"
+#include <array>
 #include <memory>
 #include <string>
 #include <vector>
@@ -28,10 +29,20 @@ struct StageProgram {
     std::shared_ptr<const ShaderRecompiler::CompiledVariant> variant;
 };
 
+enum ProgramPhase : std::size_t {
+    PhaseDecode,
+    PhasePrepare,
+    PhaseCapture,
+    PhaseMaterialize,
+    PhaseVariant,
+    PhaseCount,
+};
+
 struct ProgramSet {
     DriverDetail::DrawDecode decode;
     std::vector<ShaderRecompiler::MemoryRegion> memory;
     std::vector<StageProgram> stages;
+    std::array<std::uint64_t, PhaseCount> nanoseconds{};
 };
 
 [[nodiscard]] ShaderRecompiler::SpirvTarget HeapTarget(const ShaderRecompiler::SpirvTarget& device);

@@ -6,6 +6,7 @@
 #include "prx/libSceAgcDriver/Graphics/include/Shaders.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/State.hpp"
 #include <algorithm>
+#include <chrono>
 #include <spirv/unified1/spirv.hpp>
 #include <cstdlib>
 #include <exception>
@@ -95,7 +96,16 @@ bool DecodePrograms(const ProgramInputs& inputs, DriverDetail::DrawDecode& decod
 bool BuildPrograms(const ProgramInputs& inputs, const DrawFacts& facts, ProgramSet& out, std::string& reason) try {
     out.stages.clear();
     out.memory.clear();
-    if (!DecodePrograms(inputs, out.decode, reason)) return false;
+    out.nanoseconds = {};
+    auto mark = std::chrono::steady_clock::now();
+    const auto lap = [&](ProgramPhase phase) {
+        const auto now = std::chrono::steady_clock::now();
+        out.nanoseconds[phase] += static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(now - mark).count());
+        mark = now;
+    };
+    const bool decoded = DecodePrograms(inputs, out.decode, reason);
+    lap(PhaseDecode);
+    if (!decoded) return false;
     const auto& decode = out.decode;
     const auto& programs = decode.programs;
     const auto& state = decode.state;
@@ -140,11 +150,15 @@ bool BuildPrograms(const ProgramInputs& inputs, const DrawFacts& facts, ProgramS
             {0, 0, pushCursor, budget},
             ShaderRecompiler::GraphicsCompileContext{program.firstUserSgpr, linked, Graphics::StageMeshConfiguration(state.stages, stage), state.stages.tessellation, {facts.indexAddress, facts.indexCount, facts.indexSize, facts.instanceCount}, std::nullopt},
         };
+        lap(PhaseDecode);
         auto invocation = DriverDetail::InvocationFor(*program.snapshot, program.codeOffset, request, false);
+        lap(PhasePrepare);
         const auto capture = DriverDetail::CaptureInvocation(shaderMemory, *program.snapshot, program.codeOffset, request, invocation);
+        lap(PhaseCapture);
         memory = shaderMemory.Regions();
         request.context.memory = memory;
         auto result = invocation.Materialize(*capture);
+        lap(PhaseMaterialize);
         if (result == nullptr) {
             reason = "materialize failed";
             return false;
@@ -158,6 +172,7 @@ bool BuildPrograms(const ProgramInputs& inputs, const DrawFacts& facts, ProgramS
             return false;
         }
         const auto source = ShaderRecompiler::PrepareShader(request);
+        lap(PhaseVariant);
         if (source == nullptr || source->artifact == nullptr) {
             reason = "compiled variant not reachable";
             return false;

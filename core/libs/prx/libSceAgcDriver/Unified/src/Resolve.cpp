@@ -31,6 +31,7 @@ struct Totals {
     std::uint64_t programNanoseconds = 0;
     std::uint64_t slotNanoseconds = 0;
     std::map<std::string, std::uint64_t> reasons;
+    std::array<std::uint64_t, PhaseCount> phases{};
 };
 
 class Resolver {
@@ -78,12 +79,14 @@ public:
         std::string reason;
         ProgramSet programs;
         const ProgramInputs inputs{state.Live(), *submission->shaders, *context, target, fixedSlots};
-        if (!BuildPrograms(inputs, operation.draw, programs, reason)) {
+        const bool built = BuildPrograms(inputs, operation.draw, programs, reason);
+        for (std::size_t phase = 0; phase < PhaseCount; ++phase) totals.phases[phase] += programs.nanoseconds[phase];
+        if (!built) {
             refuse(reason);
             totals.programNanoseconds += elapsed(started);
             return;
         }
-        const auto built = std::chrono::steady_clock::now();
+        const auto slotsStarted = std::chrono::steady_clock::now();
         totals.programNanoseconds += elapsed(started);
         if (!firstBuilt) {
             firstBuilt = true;
@@ -96,20 +99,20 @@ public:
                 Heap::SlotStatistics statistics;
                 if (!Heap::BuildSlotRequests(stage.variant->info, stage.capture->snapshot, requests, statistics, reason, false)) {
                     refuse(reason);
-                    totals.slotNanoseconds += elapsed(built);
+                    totals.slotNanoseconds += elapsed(slotsStarted);
                     return;
                 }
             }
             ResolvedStage resolved{std::move(stage), {}};
             if (!refill->Fill(requests, resolved.slots, reason)) {
                 refuse(reason);
-                totals.slotNanoseconds += elapsed(built);
+                totals.slotNanoseconds += elapsed(slotsStarted);
                 return;
             }
             totals.slots += resolved.slots.size();
             draw.stages.push_back(std::move(resolved));
         }
-        totals.slotNanoseconds += elapsed(built);
+        totals.slotNanoseconds += elapsed(slotsStarted);
         totals.stages += draw.stages.size();
         totals.resolved++;
     }
@@ -126,6 +129,8 @@ public:
             std::snprintf(text, sizeof(text), "; memo %llu hits, %llu lookups, %llu placeholders; heap %llu writes, %llu recycled, %llu full", static_cast<unsigned long long>(refills.memoHits), static_cast<unsigned long long>(refills.lookups), static_cast<unsigned long long>(refills.placeholders), static_cast<unsigned long long>(slotCounts.writes), static_cast<unsigned long long>(slotCounts.recycled), static_cast<unsigned long long>(slotCounts.full));
             line += text;
         }
+        std::snprintf(text, sizeof(text), "; per draw: decode %.1f, prepare %.1f, capture %.1f, materialize %.1f, variant %.1f us", perDraw(totals.phases[PhaseDecode]), perDraw(totals.phases[PhasePrepare]), perDraw(totals.phases[PhaseCapture]), perDraw(totals.phases[PhaseMaterialize]), perDraw(totals.phases[PhaseVariant]));
+        line += text;
         for (const auto& [reason, count] : totals.reasons) line += "; " + reason + " " + std::to_string(count);
         totals = {};
         return line;
