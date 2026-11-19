@@ -59,7 +59,11 @@ bool sameSurface(const Graphics::GuestTextureResource& target, const Graphics::G
 
 void TargetTable::Note(const std::shared_ptr<Graphics::StorageTexture>& texture) {
     if (texture == nullptr) return;
-    const auto address = texture->Descriptor().baseAddress;
+    Note(texture, texture->Descriptor().baseAddress);
+}
+
+void TargetTable::Note(std::weak_ptr<const Graphics::StorageTexture> texture, std::uint64_t address) {
+    if (texture.expired()) return;
     const auto stamp = Events::Shared().Serial();
     std::lock_guard lock(mutex);
     auto& entry = entries[address];
@@ -70,6 +74,7 @@ void TargetTable::Note(const std::shared_ptr<Graphics::StorageTexture>& texture)
 }
 
 std::shared_ptr<Graphics::StorageTexture> TargetTable::Find(std::uint64_t address, std::uint64_t bytes, std::span<const std::uint32_t, 8> words, std::string& reason) {
+    std::shared_ptr<Graphics::StorageTexture> texture;
     std::lock_guard lock(mutex);
     const auto found = entries.find(address);
     if (found == entries.end()) {
@@ -77,14 +82,14 @@ std::shared_ptr<Graphics::StorageTexture> TargetTable::Find(std::uint64_t addres
         reason = "no target at the address";
         return nullptr;
     }
-    auto texture = found->second.texture.lock();
+    texture = std::const_pointer_cast<Graphics::StorageTexture>(found->second.texture.lock());
     if (texture == nullptr) {
         entries.erase(found);
         counts.misses++;
         reason = "no target at the address";
         return nullptr;
     }
-    if (Events::Shared().ChangedSince(address, bytes, found->second.stamp)) {
+    if (Events::Shared().ChangedSince(address, bytes, found->second.stamp, Events::ImageSetOwner)) {
         entries.erase(found);
         counts.cpuWritten++;
         reason = "target written by the CPU";

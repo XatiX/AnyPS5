@@ -62,6 +62,7 @@
 #endif
 #if ANYPS5_UNIFIED
 #include "prx/libSceAgcDriver/Unified/include/Events.hpp"
+#include "prx/libSceAgcDriver/Unified/include/Targets.hpp"
 #endif
 
 namespace AgcDriver::Graphics {
@@ -6376,6 +6377,7 @@ void StorageTexture::BumpPendingSerial() {
 void StorageTexture::notePendingChange() const {
 #if ANYPS5_UNIFIED
     AgcDriver::Unified::Events::NoteImage(descriptor.baseAddress, guestBytes, reinterpret_cast<std::uintptr_t>(this));
+    AgcDriver::Unified::Images::Targets().Note(weak_from_this(), descriptor.baseAddress);
 #endif
 }
 

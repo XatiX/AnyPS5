@@ -29,12 +29,13 @@ struct TargetCounts {
 class TargetTable {
 public:
     void Note(const std::shared_ptr<Graphics::StorageTexture>& texture);
+    void Note(std::weak_ptr<const Graphics::StorageTexture> texture, std::uint64_t address);
     [[nodiscard]] std::shared_ptr<Graphics::StorageTexture> Find(std::uint64_t address, std::uint64_t bytes, std::span<const std::uint32_t, 8> words, std::string& reason);
     [[nodiscard]] TargetCounts TakeCounts();
 
 private:
     struct Entry {
-        std::weak_ptr<Graphics::StorageTexture> texture;
+        std::weak_ptr<const Graphics::StorageTexture> texture;
         std::uint64_t stamp = 0;
     };
 
