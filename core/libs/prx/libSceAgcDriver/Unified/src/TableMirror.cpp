@@ -1,6 +1,7 @@
 #include "prx/libSceAgcDriver/Unified/include/TableMirror.hpp"
 #include "ImageTableAbi.hpp"
 #include <algorithm>
+#include <unordered_set>
 
 namespace AgcDriver::Unified::Tables {
 
@@ -198,7 +199,18 @@ std::shared_ptr<const Mirror> TableMirror::Build(const std::shared_ptr<const Sha
     }
     cache[tables.get()] = std::move(next);
     predecessors[key] = tables.get();
+    if (cache.size() >= pruneAt) prune();
     return mirror;
+}
+
+void TableMirror::prune() {
+    std::unordered_set<const void*> named;
+    named.reserve(predecessors.size());
+    for (const auto& [key, tables] : predecessors) named.insert(tables);
+    const auto before = cache.size();
+    std::erase_if(cache, [&](const auto& entry) { return entry.second.tables.expired() && !named.contains(entry.first); });
+    counts.dropped += before - cache.size();
+    pruneAt = std::max(MirrorPruneFloor, cache.size() * 2u);
 }
 
 }

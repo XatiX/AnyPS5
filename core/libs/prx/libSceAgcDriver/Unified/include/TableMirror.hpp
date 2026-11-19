@@ -15,6 +15,7 @@
 namespace AgcDriver::Unified::Tables {
 
 inline constexpr std::size_t MirrorCacheBound = 4096;
+inline constexpr std::size_t MirrorPruneFloor = 64;
 
 struct Mirror {
     std::uint64_t id = 0;
@@ -30,6 +31,7 @@ struct MirrorCounts {
     std::uint64_t kept = 0;
     std::uint64_t inherited = 0;
     std::uint64_t clears = 0;
+    std::uint64_t dropped = 0;
 };
 
 [[nodiscard]] bool ElementRequests(const ShaderRecompiler::ResolvedImageTables& tables, std::vector<Heap::SlotRequest>& requests, std::string& reason);
@@ -44,6 +46,7 @@ public:
 
     [[nodiscard]] std::shared_ptr<const Mirror> Build(const std::shared_ptr<const ShaderRecompiler::ResolvedImageTables>& tables, std::string& reason, std::vector<Heap::ImageUse>* uses = nullptr);
     [[nodiscard]] MirrorCounts Counts() const { return counts; }
+    [[nodiscard]] std::size_t Size() const { return cache.size(); }
 
 private:
     struct Cached {
@@ -65,6 +68,7 @@ private:
     [[nodiscard]] bool unchanged(const Cached& cached) const;
     [[nodiscard]] std::vector<std::pair<std::uint64_t, std::uint64_t>> changedSpans(const Cached& cached) const;
     [[nodiscard]] bool fill(const Cached* base, Cached& out, std::string& reason);
+    void prune();
 
     Heap::Refill& refill;
     const Events::ChangeLog& shared;
@@ -72,6 +76,7 @@ private:
     std::unordered_map<const void*, Cached> cache;
     std::unordered_map<std::uint64_t, const void*> predecessors;
     std::uint64_t nextId = 1;
+    std::size_t pruneAt = MirrorPruneFloor;
     MirrorCounts counts;
 };
 

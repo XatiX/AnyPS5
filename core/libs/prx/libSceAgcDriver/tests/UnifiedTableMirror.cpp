@@ -160,9 +160,28 @@ void testMirrorRefusesStorageAndSamplers() {
     Expect(fixture.mirror.Build(nullptr, reason) == nullptr, "missing tables are refused");
 }
 
+void testReleasedTablesAreDropped() {
+    constexpr auto floor = static_cast<std::uint32_t>(AgcDriver::Unified::Tables::MirrorPruneFloor);
+    Fixture fixture;
+    std::string reason;
+    for (std::uint32_t round = 0; round < 4u * floor; ++round) {
+        static_cast<void>(fixture.mirror.Build(Tables({1u + round % 3u, 2u, 3u}), reason));
+    }
+    Expect(fixture.mirror.Size() < floor, "entries of released tables do not pile up");
+    Expect(fixture.mirror.Counts().dropped != 0u, "the released entries are counted as dropped");
+    Expect(fixture.mirror.Counts().inherited == 4u * floor - 1u, "each new table still inherits from the last one");
+    const auto held = Tables({7u, 8u});
+    const auto first = fixture.mirror.Build(held, reason);
+    for (std::uint32_t round = 0; round < 2u * floor; ++round) {
+        static_cast<void>(fixture.mirror.Build(Tables({1u, 2u, 3u}), reason));
+    }
+    Expect(fixture.mirror.Build(held, reason) == first && fixture.mirror.Counts().unchanged != 0u, "live tables keep their entry");
+}
+
 }
 
 int main() {
+    testReleasedTablesAreDropped();
     testMirrorAppendsSlots();
     testMirrorReusedForSameTables();
     testWritesToElementImagesRefill();
