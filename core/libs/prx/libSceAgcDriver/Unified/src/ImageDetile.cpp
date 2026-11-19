@@ -129,7 +129,7 @@ bool SurfaceDetiler::recordThroughBuffer(Graphics::Recorder& recorder, VkCommand
             region.bufferRowLength = rowTexels;
             region.bufferImageHeight = 0u;
             region.imageSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, level, layer, 1u};
-            region.imageExtent = {std::max(mip.width, 1u), std::max(mip.height, 1u), 1u};
+            region.imageExtent = {std::max(resource.width >> level, 1u), std::max(resource.height >> level, 1u), 1u};
             regions.push_back(region);
         }
     }
