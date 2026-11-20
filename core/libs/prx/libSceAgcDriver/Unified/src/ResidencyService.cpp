@@ -406,6 +406,20 @@ std::uint64_t ResidencyService::TranslateMapped(std::uint64_t address, std::uint
     return device;
 }
 
+std::pair<std::uint64_t, std::uint64_t> ResidencyService::MappedPrefix(std::uint64_t address, std::uint64_t size, bool write) const {
+    if (!Attached() || size == 0) return {0u, 0u};
+    std::lock_guard lock(mutex);
+    if (!pages) return {0u, 0u};
+    const auto device = pages->Lookup(address, write);
+    if (device == 0) return {0u, 0u};
+    const auto lastPage = (address + size - 1) >> GpuPageBits;
+    for (auto page = (address >> GpuPageBits) + 1; page <= lastPage; ++page) {
+        const auto guest = page << GpuPageBits;
+        if (pages->Lookup(guest, write) != device + (guest - address)) return {device, guest - address};
+    }
+    return {device, size};
+}
+
 std::shared_ptr<Graphics::Buffer> ResidencyService::staging(std::size_t bytes) {
     const auto rounded = std::bit_ceil(std::max(bytes, StagingMinBytes));
     std::size_t idle = 0;

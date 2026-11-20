@@ -186,6 +186,7 @@ struct Totals {
     std::uint64_t knownCopied = 0;
     std::uint64_t knownPointers = 0;
     std::uint64_t knownRefused = 0;
+    std::uint64_t knownPrefixes = 0;
     std::uint64_t knownSkipped = 0;
     std::uint64_t knownWritten = 0;
     std::uint64_t knownWriteLookups = 0;
@@ -258,6 +259,11 @@ bool overlaps(std::span<const std::pair<std::uint64_t, std::uint64_t>> left, std
 
 bool servesFaultPages() {
     static const bool serves = std::getenv("APS5_RECODE_NO_FAULT_SERVE") == nullptr;
+    return serves;
+}
+
+bool servesKnownPrefixes() {
+    static const bool serves = std::getenv("APS5_RECODE_NO_KNOWN_PREFIX") == nullptr;
     return serves;
 }
 
@@ -669,7 +675,7 @@ public:
         line += "; passes " + std::to_string(totals.passesBegun) + " begun, " + std::to_string(totals.passesContinued) + " draws continued, " + std::to_string(totals.passFeedback) + " broken by a target read";
         line += "; target memo " + std::to_string(totals.targetMemoHits) + " hits, " + std::to_string(totals.targetMemoMisses) + " misses; " + std::to_string(totals.deferredReads) + " draws with reads bound at record";
         line += "; residency updates landed " + std::to_string(totals.residencyLands);
-        line += "; known buffers " + std::to_string(totals.knownServed) + " served, " + std::to_string(totals.knownMapped) + " mapped (" + std::to_string(totals.knownPaged) + " paged in), " + std::to_string(totals.knownCopied) + " copied (" + std::to_string(totals.knownGpuWritten) + " GPU-written ranges not copied), " + std::to_string(totals.knownRefused) + " unresolved, " + std::to_string(totals.knownSkipped) + " skipped (" + std::to_string(totals.knownPointers) + " of them pointers); known writes " + std::to_string(totals.knownWritten) + " direct (" + std::to_string(totals.knownWriteBytes >> 10u) + " KiB landed), " + std::to_string(totals.knownWriteLookups) + " through the page table, " + std::to_string(totals.copyBacks) + " copied back to their import after the dispatch (" + std::to_string(totals.copyBackBytes >> 20u) + " MiB, " + std::to_string(totals.copyBackCovered >> 10u) + " KiB of written pieces not landed, " + std::to_string(totals.importsReturned) + " chunks returned from their import, " + std::to_string(totals.residencyRefreshes) + " residency refreshes before the dispatch)";
+        line += "; known buffers " + std::to_string(totals.knownServed) + " served, " + std::to_string(totals.knownMapped) + " mapped (" + std::to_string(totals.knownPaged) + " paged in), " + std::to_string(totals.knownCopied) + " copied (" + std::to_string(totals.knownGpuWritten) + " GPU-written ranges not copied), " + std::to_string(totals.knownRefused) + " unresolved, " + std::to_string(totals.knownPrefixes) + " bound to their mapped prefix, " + std::to_string(totals.knownSkipped) + " skipped (" + std::to_string(totals.knownPointers) + " of them pointers); known writes " + std::to_string(totals.knownWritten) + " direct (" + std::to_string(totals.knownWriteBytes >> 10u) + " KiB landed), " + std::to_string(totals.knownWriteLookups) + " through the page table, " + std::to_string(totals.copyBacks) + " copied back to their import after the dispatch (" + std::to_string(totals.copyBackBytes >> 20u) + " MiB, " + std::to_string(totals.copyBackCovered >> 10u) + " KiB of written pieces not landed, " + std::to_string(totals.importsReturned) + " chunks returned from their import, " + std::to_string(totals.residencyRefreshes) + " residency refreshes before the dispatch)";
         line += "; draw inputs " + std::to_string(totals.inputsResident) + " resident, " + std::to_string(totals.inputsImported) + " imported, " + std::to_string(totals.inputsWritten) + " after CPU writes (" + std::to_string(totals.inputsCopied) + " copied into the ring), " + std::to_string(totals.inputsGpuWritten) + " GPU-written, " + std::to_string(totals.inputsAliased) + " aliased, " + std::to_string(totals.inputsMerged) + " served with an overlapping input";
         std::snprintf(text, sizeof(text), "; draw phases surfaces %.1f ms, targets %.1f ms, pipelines %.1f ms, owned uploads %.1f ms", static_cast<double>(totals.surfaceNanoseconds) / 1e6, static_cast<double>(totals.targetNanoseconds) / 1e6, static_cast<double>(totals.graphicsPipelineNanoseconds) / 1e6, static_cast<double>(totals.uploadNanoseconds) / 1e6);
         line += text;
@@ -957,15 +963,31 @@ private:
         }
     }
 
-    std::uint64_t serveKnownWrite(std::uint64_t address, std::uint64_t bytes, std::uint64_t serial, bool copiedBackWrite) {
+    std::uint64_t serveKnownWrite(std::uint64_t address, std::uint64_t& bytes, std::uint64_t serial, bool copiedBackWrite) {
         auto& residency = ResidencyService::Get();
         if (residency.WrittenImportThroughout(address, bytes)) return residency.TranslateMapped(address, bytes, true);
+        if (servesKnownPrefixes() && residency.WrittenImportAny(address, bytes)) {
+            const auto [device, length] = residency.MappedPrefix(address, bytes, true);
+            if (device != 0u && length < bytes && residency.WrittenImportThroughout(address, length)) {
+                totals.knownPrefixes++;
+                bytes = length;
+                return device;
+            }
+        }
         if (bytes > (copiedBackWrite ? KnownBufferLimitBytes : KnownWriteLimitBytes)) return 0u;
         auto mapped = residency.TranslateMapped(address, bytes, true);
         if (mapped == 0u && bytes <= KnownWriteLimitBytes && servesFaultPages()) {
             if (const auto pages = residency.UnmappedPages(address, bytes); !pages.empty()) {
                 Shadow::ServeFaultPages(pages);
                 mapped = residency.TranslateMapped(address, bytes, true);
+            }
+        }
+        if (mapped == 0u && servesKnownPrefixes()) {
+            const auto [device, length] = residency.MappedPrefix(address, bytes, true);
+            if (device != 0u) {
+                totals.knownPrefixes++;
+                mapped = device;
+                bytes = length;
             }
         }
         if (mapped == 0u || copiedBackWrite) return mapped;
@@ -1143,10 +1165,11 @@ private:
                 continue;
             }
             if (index < infos.size() && infos[index].written) {
-                const auto mapped = serveKnownWrite(address, bytes, serial, queueCopyBack(context, address, bytes));
+                auto served = bytes;
+                const auto mapped = serveKnownWrite(address, served, serial, queueCopyBack(context, address, bytes));
                 if (mapped != 0u) totals.knownWritten++;
                 else totals.knownWriteLookups++;
-                write(mapped, mapped != 0u ? bytes : 0u);
+                write(mapped, mapped != 0u ? served : 0u);
                 continue;
             }
             if (const auto copied = copyKnownBuffer(address, bytes, serial, completed); copied != 0u) {
@@ -1174,6 +1197,13 @@ private:
                 totals.knownMapped++;
                 write(mapped, bytes);
                 continue;
+            }
+            if (servesKnownPrefixes()) {
+                if (const auto [device, length] = ResidencyService::Get().MappedPrefix(address, bytes); device != 0u) {
+                    totals.knownPrefixes++;
+                    write(device, length);
+                    continue;
+                }
             }
             totals.knownRefused++;
             write(zero, 0u);
