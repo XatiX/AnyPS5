@@ -249,9 +249,49 @@ public:
     }
 
     std::shared_ptr<Images::Surface> BindDeferredRecord(const Heap::SlotRequest& request, std::uint32_t& slot) {
-        static const bool records = std::getenv("APS5_RECODE_NO_STORAGE_RECORDS") == nullptr;
-        if (!records || table == nullptr || surfaces == nullptr) return nullptr;
+        if (table == nullptr) return nullptr;
+        auto record = storageRecordFor(request);
+        if (record == nullptr) return nullptr;
+        return BindRecordSlot(request, std::move(record), slot);
+    }
+
+    static bool StorageRecordShape(const Heap::SlotRequest& request) {
+        if (!storageRecordsOn() || (request.flags & (Heap::RequestFlag::Atomic | Heap::RequestFlag::Atomic64)) != 0u || (request.flags & Heap::RequestFlag::UintView) == 0u) return false;
+        const auto shape = (request.kind - Heap::LastSampledKind - 1u) % StorageShapes;
+        return shape == Image2DShape || shape == Image2DArrayShape;
+    }
+
+    std::shared_ptr<Images::Surface> BindRecordSlot(const Heap::SlotRequest& request, std::shared_ptr<Images::Surface> record, std::uint32_t& slot) {
+        if (table == nullptr || record == nullptr) return nullptr;
+        auto* vulkan = dynamic_cast<Images::VulkanSurface*>(record->device.get());
+        if (vulkan == nullptr) return noteRecordRefusal("storage surface without a Vulkan image");
+        std::string why;
+        try {
+            const auto shape = (request.kind - Heap::LastSampledKind - 1u) % StorageShapes;
+            const auto resource = Graphics::DecodeTextureResource(request.words);
+            const auto mip = std::min(request.flags >> Heap::RequestFlag::MipShift, std::max(resource.mipCount, 1u) - 1u);
+            const auto view = vulkan->ShapedStorageView(mip, shape == Image2DArrayShape, (request.flags & Heap::RequestFlag::UintView) != 0u, why);
+            if (view == VK_NULL_HANDLE) return noteRecordRefusal(why);
+            slot = table->ImageSlot(request.kind, {reinterpret_cast<std::uint64_t>(view), static_cast<std::uint32_t>(VK_IMAGE_LAYOUT_GENERAL), record});
+            if (slot == Heap::NoSlot) return noteRecordRefusal("image heap full");
+        } catch (const std::exception& error) {
+            return noteRecordRefusal(std::string("storage record: ") + error.what());
+        }
+        std::lock_guard lock(recordMutex);
+        storageRecords++;
+        return record;
+    }
+
+private:
+    static bool storageRecordsOn() {
+        static const bool records = std::getenv("APS5_RECODE_STORAGE_RECORDS") != nullptr;
+        return records;
+    }
+
+    std::shared_ptr<Images::Surface> storageRecordFor(const Heap::SlotRequest& request) {
+        if (!storageRecordsOn() || surfaces == nullptr) return nullptr;
         if ((request.flags & (Heap::RequestFlag::Atomic | Heap::RequestFlag::Atomic64)) != 0u) return noteRecordRefusal("atomic storage");
+        if ((request.flags & Heap::RequestFlag::UintView) == 0u) return noteRecordRefusal("typed storage view");
         const auto shape = (request.kind - Heap::LastSampledKind - 1u) % StorageShapes;
         if (shape != Image2DShape && shape != Image2DArrayShape) return noteRecordRefusal("storage shape");
         std::string why;
@@ -260,35 +300,22 @@ public:
         const auto found = surfaces->Find(key->surface, request.words, why);
         if (!found.has_value()) return noteRecordRefusal("storage surface: " + why);
         if (found->surface == nullptr) return noteRecordRefusal("storage written by another owner");
-        auto* vulkan = dynamic_cast<Images::VulkanSurface*>(found->surface->device.get());
-        if (vulkan == nullptr) return noteRecordRefusal("storage surface without a Vulkan image");
-        try {
-            const auto resource = Graphics::DecodeTextureResource(request.words);
-            const auto mip = std::min(request.flags >> Heap::RequestFlag::MipShift, std::max(resource.mipCount, 1u) - 1u);
-            const auto view = vulkan->ShapedStorageView(mip, shape == Image2DArrayShape, (request.flags & Heap::RequestFlag::UintView) != 0u, why);
-            if (view == VK_NULL_HANDLE) return noteRecordRefusal(why);
-            slot = table->ImageSlot(request.kind, {reinterpret_cast<std::uint64_t>(view), static_cast<std::uint32_t>(VK_IMAGE_LAYOUT_GENERAL), found->surface});
-            if (slot == Heap::NoSlot) return noteRecordRefusal("image heap full");
-        } catch (const std::exception& error) {
-            return noteRecordRefusal(std::string("storage record: ") + error.what());
-        }
-        std::lock_guard lock(recordMutex);
-        storageRecords++;
         return found->surface;
     }
 
-private:
     std::shared_ptr<Images::Surface> noteRecordRefusal(const std::string& why) {
         std::lock_guard lock(recordMutex);
         storageRecordRefusals++;
-        if (recordRefusalReasons.insert(why).second) std::fprintf(stderr, "[recode-resolve] first storage record refusal: %s\n", why.c_str());
+        if (recordRefusalReasons.size() < 24u || recordRefusalReasons.contains(why)) {
+            if (recordRefusalReasons[why]++ == 0u) std::fprintf(stderr, "[recode-resolve] first storage record refusal: %s\n", why.c_str());
+        }
         return nullptr;
     }
 
     std::mutex recordMutex;
     std::uint64_t storageRecords = 0;
     std::uint64_t storageRecordRefusals = 0;
-    std::set<std::string> recordRefusalReasons;
+    std::map<std::string, std::uint64_t> recordRefusalReasons;
 
     std::shared_ptr<const ResolvedDraw> resolve(const Operation& operation, const DecodeState& state) {
         totals.draws++;
@@ -526,6 +553,7 @@ public:
         {
             std::lock_guard recordLock(recordMutex);
             line += "; storage images on recode surfaces " + std::to_string(storageRecords) + ", " + std::to_string(storageRecordRefusals) + " refused";
+            for (const auto& [why, count] : recordRefusalReasons) line += " [" + why + " " + std::to_string(count) + "]";
         }
         const auto packets = handoff.TakeCounts();
         std::snprintf(text, sizeof(text), "; hand-off %llu offered (%llu refused), %llu found, %llu refused, %llu waited, %llu missed, %llu released, %llu dropped, %llu pending", static_cast<unsigned long long>(packets.offered), static_cast<unsigned long long>(packets.refusedOffers), static_cast<unsigned long long>(packets.found), static_cast<unsigned long long>(packets.refused), static_cast<unsigned long long>(packets.waited), static_cast<unsigned long long>(packets.missed), static_cast<unsigned long long>(packets.released), static_cast<unsigned long long>(packets.dropped), static_cast<unsigned long long>(packets.pending));
@@ -695,7 +723,8 @@ private:
                 deferred.deferred = true;
                 if ((request.flags & Heap::RequestFlag::Written) != 0u) {
                     const GuestUse use{deferred.memory.address, deferred.memory.bytes, true};
-                    noteTargetWrites(std::span<const GuestUse>(&use, 1));
+                    if (const auto record = storageRecordFor(request)) static_cast<void>(Events::GpuWrites().Note(record->key.address, record->key.bytes, Images::OwnerOf(*record)));
+                    else noteTargetWrites(std::span<const GuestUse>(&use, 1));
                     std::lock_guard lock(storageWrittenMutex);
                     const std::pair range{deferred.memory.address, deferred.memory.address + deferred.memory.bytes};
                     if (std::ranges::find(storageWritten, range) == storageWritten.end()) storageWritten.push_back(range);
@@ -881,6 +910,14 @@ std::shared_ptr<Graphics::StorageTexture> BindDeferredImage(const Graphics::Cont
 
 std::shared_ptr<Images::Surface> BindDeferredRecord(const Heap::SlotRequest& request, std::uint32_t& slot) {
     return shared().BindDeferredRecord(request, slot);
+}
+
+std::shared_ptr<Images::Surface> BindRecordSlot(const Heap::SlotRequest& request, std::shared_ptr<Images::Surface> record, std::uint32_t& slot) {
+    return shared().BindRecordSlot(request, std::move(record), slot);
+}
+
+bool StorageRecordShape(const Heap::SlotRequest& request) {
+    return Resolver::StorageRecordShape(request);
 }
 
 std::shared_ptr<const void> BindDeferredSampled(const Graphics::Context& context, const Heap::SlotRequest& request, std::uint32_t& slot, std::string& reason) {

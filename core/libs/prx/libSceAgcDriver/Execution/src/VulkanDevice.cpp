@@ -119,6 +119,7 @@ void ResetCheckpointSnapshots() noexcept;
 #include "prx/libSceAgcDriver/Unified/include/Shadow.hpp"
 #include "prx/libSceAgcDriver/Unified/include/Events.hpp"
 #include "prx/libSceAgcDriver/Unified/include/ResidencyService.hpp"
+#include "prx/libSceAgcDriver/Unified/include/DrawRecorder.hpp"
 #endif
 
 #ifndef _WIN32
@@ -3952,6 +3953,9 @@ ResidentPresent ResidentPresentable(const Graphics::Context& context, const Grap
 }
 
 std::shared_ptr<Graphics::StorageTexture> PresentableResident(const Graphics::Context& context, const DisplayBuffer& buffer, VkFilter& filter, bool& pending, bool& convert, std::uint32_t& layer) {
+#if ANYPS5_UNIFIED
+    Unified::Record::PublishRecords(context, buffer.address, DisplayBufferSize(buffer));
+#endif
     auto resident = Graphics::StorageTexture::FindPendingSlice(buffer.address, DisplayBufferSize(buffer));
     pending = resident != nullptr;
     convert = false;

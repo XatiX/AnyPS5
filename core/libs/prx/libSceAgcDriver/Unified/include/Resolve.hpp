@@ -68,6 +68,8 @@ void Consume(const Operation& operation, const DecodeState& state);
 [[nodiscard]] Images::SurfaceTable* Surfaces();
 [[nodiscard]] std::shared_ptr<Graphics::StorageTexture> BindDeferredImage(const Graphics::Context& context, const Heap::SlotRequest& request, std::uint32_t& slot, std::string& reason);
 [[nodiscard]] std::shared_ptr<Images::Surface> BindDeferredRecord(const Heap::SlotRequest& request, std::uint32_t& slot);
+[[nodiscard]] std::shared_ptr<Images::Surface> BindRecordSlot(const Heap::SlotRequest& request, std::shared_ptr<Images::Surface> record, std::uint32_t& slot);
+[[nodiscard]] bool StorageRecordShape(const Heap::SlotRequest& request);
 [[nodiscard]] std::shared_ptr<const void> BindDeferredSampled(const Graphics::Context& context, const Heap::SlotRequest& request, std::uint32_t& slot, std::string& reason);
 
 }

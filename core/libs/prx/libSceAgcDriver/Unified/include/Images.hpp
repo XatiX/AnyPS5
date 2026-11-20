@@ -39,6 +39,7 @@ struct ViewKey {
     std::uint32_t baseArray = 0;
     std::uint32_t lastArray = 0;
     std::uint32_t swizzle = 0;
+    std::uint32_t format = 0;
     bool operator==(const ViewKey&) const = default;
 };
 
@@ -49,6 +50,7 @@ struct ImageKey {
 
 [[nodiscard]] std::optional<ImageKey> KeyOf(std::span<const std::uint32_t, 8> words, std::string& reason);
 [[nodiscard]] std::optional<ImageKey> KeyOf(const Graphics::GuestTextureResource& resource, std::string& reason);
+[[nodiscard]] bool SameBacking(const SurfaceKey& left, const SurfaceKey& right);
 
 enum class State : std::uint8_t { Pending, Ready, Stale };
 
@@ -99,6 +101,7 @@ struct TableCounts {
     std::uint64_t evicted = 0;
     std::uint64_t ownWrites = 0;
     std::uint64_t ownServed = 0;
+    std::uint64_t aliasServed = 0;
 };
 
 class SurfaceTable {
@@ -109,6 +112,8 @@ public:
     [[nodiscard]] std::optional<Found> FindResource(const SurfaceKey& key, const Graphics::GuestTextureResource& resource, std::string& reason);
     [[nodiscard]] std::vector<std::shared_ptr<Surface>> TakeWork();
     void MarkReady(Surface& surface, std::uint64_t stamp, std::uint64_t imageStamp);
+    [[nodiscard]] std::shared_ptr<Surface> Adopt(const SurfaceKey& key, std::span<const std::uint32_t, 8> words, std::string& reason);
+    [[nodiscard]] std::shared_ptr<Surface> AdoptResource(const SurfaceKey& key, const Graphics::GuestTextureResource& resource, std::string& reason);
     void MarkGpuWritten(Surface& surface);
     void ClearGpuNewer(Surface& surface);
     [[nodiscard]] std::vector<std::shared_ptr<Surface>> Overlapping(std::uint64_t address, std::uint64_t bytes) const;
@@ -125,6 +130,8 @@ private:
     void evict();
     template<typename TCreate>
     std::optional<Found> findWith(const SurfaceKey& key, TCreate&& create, std::string& reason);
+    template<typename TCreate>
+    std::shared_ptr<Surface> adoptWith(const SurfaceKey& key, TCreate&& create, std::string& reason);
 
     SurfaceDevice& device;
     const Events::ChangeLog& shared;
@@ -132,6 +139,7 @@ private:
     mutable std::mutex mutex;
     std::unordered_map<SurfaceKey, std::shared_ptr<Surface>, KeyHash> surfaces;
     std::vector<std::shared_ptr<Surface>> work;
+    std::vector<std::shared_ptr<Surface>> newer;
     TableCounts counts;
     std::uint64_t budget = 0;
     std::uint64_t heldBytes = 0;

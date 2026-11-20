@@ -1,9 +1,11 @@
 #include "prx/libSceAgcDriver/Unified/include/VulkanImages.hpp"
+#include "prx/libSceAgcDriver/Graphics/include/Resources.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/TextureDetiler.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/TextureFormat.hpp"
 #include "RuntimeAbi.hpp"
 #include <algorithm>
 #include <exception>
+#include <vector>
 
 namespace AgcDriver::Unified::Images {
 
@@ -91,18 +93,29 @@ std::uint64_t VulkanSurface::View(const ViewKey& view, std::uint32_t kind, std::
     const auto lastLevel = std::clamp(view.lastLevel, baseLevel, levels - 1u);
     const auto baseLayer = volume ? 0u : std::min(view.baseArray, layers - 1u);
     const auto layerCount = type == VK_IMAGE_VIEW_TYPE_2D_ARRAY ? std::max(std::min(view.lastArray, layers - 1u), baseLayer) - baseLayer + 1u : 1u;
-    const auto key = std::make_tuple(baseLevel, lastLevel, baseLayer, layerCount, view.swizzle, static_cast<std::uint32_t>(type));
+    const auto guestFormat = view.format != 0u && !compressed ? view.format : resource.format;
+    auto viewFormat = format;
+    auto viewIdentity = identity;
+    if (guestFormat != resource.format) {
+        viewFormat = Graphics::SampledTextureFormat(context, guestFormat);
+        if (viewFormat == VK_FORMAT_UNDEFINED) {
+            reason = "image view format";
+            return 0;
+        }
+        viewIdentity = Graphics::IsConvertedTextureFormat(guestFormat) && viewFormat != VK_FORMAT_B10G11R11_UFLOAT_PACK32;
+    }
+    const auto key = std::make_tuple(baseLevel, lastLevel, baseLayer, layerCount, view.swizzle, static_cast<std::uint32_t>(type), static_cast<std::uint32_t>(viewFormat));
     std::lock_guard lock(mutex);
     if (const auto found = views.find(key); found != views.end()) return reinterpret_cast<std::uint64_t>(found->second);
     VkComponentMapping components{};
     VkComponentSwizzle* channels[] = {&components.r, &components.g, &components.b, &components.a};
-    for (std::uint32_t channel = 0; channel < 4u && !identity; ++channel) {
+    for (std::uint32_t channel = 0; channel < 4u && !viewIdentity; ++channel) {
         const auto select = swizzleOf((view.swizzle >> (channel * 4u)) & 0xfu);
         if (!select.has_value()) {
             reason = "invalid image channel selector";
             return 0;
         }
-        *channels[channel] = Graphics::TextureComponentChannel(resource.format, *select);
+        *channels[channel] = Graphics::TextureComponentChannel(guestFormat, *select);
     }
     VkImageViewUsageCreateInfo usage{VK_STRUCTURE_TYPE_IMAGE_VIEW_USAGE_CREATE_INFO};
     usage.usage = VK_IMAGE_USAGE_SAMPLED_BIT;
@@ -110,7 +123,7 @@ std::uint64_t VulkanSurface::View(const ViewKey& view, std::uint32_t kind, std::
     info.pNext = compressed ? nullptr : &usage;
     info.image = image;
     info.viewType = type;
-    info.format = format;
+    info.format = viewFormat;
     info.components = components;
     info.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, baseLevel, lastLevel - baseLevel + 1u, baseLayer, layerCount};
     VkImageView created = VK_NULL_HANDLE;
@@ -138,6 +151,35 @@ VkImageView VulkanSurface::StorageView(std::uint32_t level, std::uint32_t layer,
     Graphics::Check(context.Function<PFN_vkCreateImageView>("vkCreateImageView")(context.device, &info, nullptr, &created), "vkCreateImageView recode surface storage");
     storageViews.emplace(key, created);
     return created;
+}
+
+void VulkanSurface::EnsureGeneral(VkCommandBuffer commands) {
+    if (initialized) return;
+    VkImageMemoryBarrier barrier{VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER};
+    barrier.srcAccessMask = 0;
+    barrier.dstAccessMask = VK_ACCESS_MEMORY_READ_BIT | VK_ACCESS_MEMORY_WRITE_BIT;
+    barrier.oldLayout = VK_IMAGE_LAYOUT_UNDEFINED;
+    barrier.newLayout = VK_IMAGE_LAYOUT_GENERAL;
+    barrier.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+    barrier.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+    barrier.image = image;
+    barrier.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0u, VK_REMAINING_MIP_LEVELS, 0u, VK_REMAINING_ARRAY_LAYERS};
+    context.Resolved(&Graphics::DeviceFunctions::cmdPipelineBarrier, "vkCmdPipelineBarrier")(commands, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, 0, 0, nullptr, 0, nullptr, 1, &barrier);
+    initialized = true;
+}
+
+void CopyImageContent(const Graphics::Context& context, VkCommandBuffer commands, VkImage source, VkImage destination, std::uint32_t width, std::uint32_t height, std::uint32_t levels, std::uint32_t layers) {
+    std::vector<VkImageCopy> regions;
+    for (std::uint32_t level = 0; level < levels; ++level) {
+        VkImageCopy region{};
+        region.srcSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, level, 0u, layers};
+        region.dstSubresource = region.srcSubresource;
+        region.extent = {std::max(width >> level, 1u), std::max(height >> level, 1u), 1u};
+        regions.push_back(region);
+    }
+    Graphics::RecordMemoryBarrier(context, commands, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_ACCESS_MEMORY_WRITE_BIT, VK_ACCESS_TRANSFER_READ_BIT | VK_ACCESS_TRANSFER_WRITE_BIT);
+    context.Function<PFN_vkCmdCopyImage>("vkCmdCopyImage")(commands, source, VK_IMAGE_LAYOUT_GENERAL, destination, VK_IMAGE_LAYOUT_GENERAL, static_cast<std::uint32_t>(regions.size()), regions.data());
+    Graphics::RecordMemoryBarrier(context, commands, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_ACCESS_TRANSFER_WRITE_BIT, VK_ACCESS_MEMORY_READ_BIT | VK_ACCESS_MEMORY_WRITE_BIT);
 }
 
 VkImageView VulkanSurface::AttachmentView(VkFormat viewFormat, std::uint32_t level, std::uint32_t layer, std::uint32_t layers, std::string& reason) {

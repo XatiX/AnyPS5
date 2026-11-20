@@ -30,6 +30,7 @@ public:
     [[nodiscard]] bool Initialized() const { return initialized; }
     [[nodiscard]] bool Compressed() const { return compressed; }
     void SetInitialized() { initialized = true; }
+    void EnsureGeneral(VkCommandBuffer commands);
 
 private:
     const Graphics::Context& context;
@@ -42,12 +43,14 @@ private:
     bool compressed = false;
     bool identity = false;
     std::mutex mutex;
-    std::map<std::tuple<std::uint32_t, std::uint32_t, std::uint32_t, std::uint32_t, std::uint32_t, std::uint32_t>, VkImageView> views;
+    std::map<std::tuple<std::uint32_t, std::uint32_t, std::uint32_t, std::uint32_t, std::uint32_t, std::uint32_t, std::uint32_t>, VkImageView> views;
     std::map<std::tuple<std::uint32_t, std::uint32_t, std::uint32_t>, VkImageView> storageViews;
     std::map<std::tuple<std::uint32_t, bool, bool>, VkImageView> shapedStorageViews;
     std::map<std::tuple<std::uint32_t, std::uint32_t, std::uint32_t, std::uint32_t>, VkImageView> attachmentViews;
     bool attachable = false;
 };
+
+void CopyImageContent(const Graphics::Context& context, VkCommandBuffer commands, VkImage source, VkImage destination, std::uint32_t width, std::uint32_t height, std::uint32_t levels, std::uint32_t layers);
 
 class VulkanSurfaceDevice final : public SurfaceDevice {
 public:
