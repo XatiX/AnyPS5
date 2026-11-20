@@ -1557,7 +1557,8 @@ private:
                 failure = error.what();
             }
             const auto built = elapsed(started);
-            Downgrades::NoteBuild(job->codeAddress, built, job->result != nullptr ? job->result->spirv.size() * sizeof(std::uint32_t) : 0u);
+            if (job->result != nullptr) Downgrades::DumpModule(job->codeAddress, job->result->spirv.ContentHash().low, std::span<const std::uint32_t>(job->result->spirv.data(), job->result->spirv.size()));
+            Downgrades::NoteBuild(job->codeAddress, built, job->result != nullptr ? job->result->spirv.size() * sizeof(std::uint32_t) : 0u, job->result != nullptr ? job->result->spirv.ContentHash().low : 0u, job->key.size() > 2u ? Downgrades::HashCode(std::as_bytes(std::span(job->key).subspan(2))) : 0u);
             {
                 std::lock_guard lock(pipelineMutex);
                 buildingPipelines.erase(job->key);

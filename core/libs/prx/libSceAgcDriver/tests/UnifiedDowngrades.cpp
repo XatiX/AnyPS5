@@ -74,12 +74,13 @@ void testListedHash() {
 void testCompileRows() {
     Ledger ledger;
     ledger.NoteCompile(1u, 5'000'000u);
-    ledger.NoteBuild(2u, 9'000'000u, 4096u);
-    ledger.NoteBuild(2u, 1'000'000u, 1024u);
+    ledger.NoteBuild(2u, 9'000'000u, 4096u, 7u, 1u);
+    ledger.NoteBuild(2u, 1'000'000u, 1024u, 8u, 1u);
     ledger.NoteWork(3u, Work::Draw, 0u);
     const auto rows = ledger.CompileRows(8u);
     Expect(rows.size() == 2u && rows[0].hash == 2u && rows[1].hash == 1u, "compile rows list programs that waited or built, costliest first");
     Expect(rows[0].builds == 2u && rows[0].buildNanoseconds == 10'000'000u && rows[0].spirvBytes == 4096u, "builds add up and keep the largest module");
+    Expect(rows[0].modules.size() == 2u && rows[0].layouts.size() == 1u, "distinct modules and layouts are counted");
     Expect(ledger.Rows().empty(), "compile time alone is not a downgrade");
     Expect(ledger.CompileRows(1u).size() == 1u, "compile rows honour their limit");
 }

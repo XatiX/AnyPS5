@@ -167,13 +167,15 @@ void Ledger::NoteCompile(std::uint64_t hash, std::uint64_t nanoseconds) {
     row.compiles++;
 }
 
-void Ledger::NoteBuild(std::uint64_t hash, std::uint64_t nanoseconds, std::uint64_t spirvBytes) {
+void Ledger::NoteBuild(std::uint64_t hash, std::uint64_t nanoseconds, std::uint64_t spirvBytes, std::uint64_t module, std::uint64_t layout) {
     std::lock_guard lock(mutex);
     auto& row = rows[hash];
     row.hash = hash;
     row.buildNanoseconds += nanoseconds;
     row.builds++;
     row.spirvBytes = std::max(row.spirvBytes, spirvBytes);
+    row.modules.insert(module);
+    row.layouts.insert(layout);
 }
 
 std::vector<Row> Ledger::CompileRows(std::size_t limit) const {
@@ -321,9 +323,9 @@ void NoteCompile(std::uint64_t codeAddress, std::uint64_t nanoseconds) {
     ledger().NoteCompile(ProgramHash(codeAddress), nanoseconds);
 }
 
-void NoteBuild(std::uint64_t codeAddress, std::uint64_t nanoseconds, std::uint64_t spirvBytes) {
+void NoteBuild(std::uint64_t codeAddress, std::uint64_t nanoseconds, std::uint64_t spirvBytes, std::uint64_t module, std::uint64_t layout) {
     if (!Active()) return;
-    ledger().NoteBuild(ProgramHash(codeAddress), nanoseconds, spirvBytes);
+    ledger().NoteBuild(ProgramHash(codeAddress), nanoseconds, spirvBytes, module, layout);
 }
 
 void NoteGroups(std::uint64_t codeAddress, std::uint64_t groups) {
@@ -366,6 +368,24 @@ ProgramScope::~ProgramScope() {
     currentProgram = previous;
 }
 
+void DumpModule(std::uint64_t codeAddress, std::uint64_t module, std::span<const std::uint32_t> words) {
+    static const char* list = std::getenv("APS5_RECODE_DUMP_MODULES");
+    static const char* directory = std::getenv("APS5_RECODE_DUMP_DIR");
+    if (list == nullptr || directory == nullptr || *list == '\0') return;
+    const auto hash = ProgramHash(codeAddress);
+    if (!ListedHash(list, hash)) return;
+    char path[1024];
+    std::snprintf(path, sizeof(path), "%s/%016llx-%016llx.spv", directory, static_cast<unsigned long long>(hash), static_cast<unsigned long long>(module));
+    auto* file = std::fopen(path, "wb");
+    if (file == nullptr) {
+        std::fprintf(stderr, "[recode-program] cannot write %s\n", path);
+        return;
+    }
+    std::fwrite(words.data(), sizeof(std::uint32_t), words.size(), file);
+    std::fclose(file);
+    std::fprintf(stderr, "[recode-program] wrote module %s (%zu bytes)\n", path, words.size_bytes());
+}
+
 void NotePipeline(std::uint64_t pipeline, std::uint64_t codeAddress) {
     if (!Active()) return;
     static std::mutex mutex;
@@ -400,7 +420,7 @@ void Report() {
         buildCount += row.builds;
     }
     std::fprintf(stderr, "[recode-compile] at %lld s: %llu ms waiting on %llu pipeline builds, %llu ms building %llu compute pipelines (one builder thread), %zu programs\n", static_cast<long long>(seconds), static_cast<unsigned long long>(compileTotal / 1000000u), static_cast<unsigned long long>(compileCount), static_cast<unsigned long long>(buildTotal / 1000000u), static_cast<unsigned long long>(buildCount), compiled.size());
-    for (std::size_t index = 0; index < compiled.size() && index < 12u; ++index) std::fprintf(stderr, "[recode-compile] %016llx waited %llu ms/%llu built %llu ms/%llu spirv %llu KiB draws %llu dispatches %llu\n", static_cast<unsigned long long>(compiled[index].hash), static_cast<unsigned long long>(compiled[index].compileNanoseconds / 1000000u), static_cast<unsigned long long>(compiled[index].compiles), static_cast<unsigned long long>(compiled[index].buildNanoseconds / 1000000u), static_cast<unsigned long long>(compiled[index].builds), static_cast<unsigned long long>(compiled[index].spirvBytes >> 10u), static_cast<unsigned long long>(compiled[index].draws), static_cast<unsigned long long>(compiled[index].dispatches));
+    for (std::size_t index = 0; index < compiled.size() && index < 12u; ++index) std::fprintf(stderr, "[recode-compile] %016llx waited %llu ms/%llu built %llu ms/%llu (%zu modules, %zu layouts) spirv %llu KiB draws %llu dispatches %llu\n", static_cast<unsigned long long>(compiled[index].hash), static_cast<unsigned long long>(compiled[index].compileNanoseconds / 1000000u), static_cast<unsigned long long>(compiled[index].compiles), static_cast<unsigned long long>(compiled[index].buildNanoseconds / 1000000u), static_cast<unsigned long long>(compiled[index].builds), compiled[index].modules.size(), compiled[index].layouts.size(), static_cast<unsigned long long>(compiled[index].spirvBytes >> 10u), static_cast<unsigned long long>(compiled[index].draws), static_cast<unsigned long long>(compiled[index].dispatches));
     if (!settings().strict) return;
     std::array<std::size_t, static_cast<std::size_t>(Severity::Count)> worst{};
     for (const auto& row : ledger().Rows()) worst[static_cast<std::size_t>(row.Worst())]++;
