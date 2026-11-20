@@ -1,6 +1,5 @@
 #include "Translation/TranslationContext.hpp"
 #include "Recompiler.hpp"
-#include <atomic>
 #include <cstdlib>
 #include <cstring>
 #include <stdexcept>
@@ -75,15 +74,15 @@ void TranslationContext::TranslateInstruction(const RdnaInstruction& decoded) {
 }
 
 namespace {
-std::atomic<bool> g_debugProbeActive{false};
+thread_local bool g_debugProbeActive = false;
 }
 
 void SetDebugProbeActive(bool active) {
-    g_debugProbeActive.store(active);
+    g_debugProbeActive = active;
 }
 
 bool DebugProbeActive() {
-    return g_debugProbeActive.load();
+    return g_debugProbeActive;
 }
 
 bool RayTracingStrict() {
