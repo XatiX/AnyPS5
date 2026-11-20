@@ -72,6 +72,7 @@ void NoteGroups(std::uint64_t codeAddress, std::uint64_t groups);
 void Note(std::uint64_t codeAddress, Kind kind, std::uint32_t binding = 0, std::string_view detail = {});
 void NoteHashed(std::uint64_t hash, Kind kind, std::uint32_t binding = 0, std::string_view detail = {});
 void NoteCurrent(Kind kind, std::uint32_t binding = 0, std::string_view detail = {});
+void NotePipeline(std::uint64_t pipeline, std::uint64_t codeAddress);
 void Report();
 
 class ProgramScope {

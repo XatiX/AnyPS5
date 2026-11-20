@@ -321,6 +321,17 @@ ProgramScope::~ProgramScope() {
     currentProgram = previous;
 }
 
+void NotePipeline(std::uint64_t pipeline, std::uint64_t codeAddress) {
+    if (!Active()) return;
+    static std::mutex mutex;
+    static std::unordered_map<std::uint64_t, std::uint64_t> seen;
+    {
+        std::lock_guard lock(mutex);
+        if (!seen.emplace(pipeline, codeAddress).second) return;
+    }
+    std::fprintf(stderr, "[recode-pipeline] 0x%llx hash %016llx\n", static_cast<unsigned long long>(pipeline), static_cast<unsigned long long>(ProgramHash(codeAddress)));
+}
+
 void NoteCurrent(Kind kind, std::uint32_t binding, std::string_view detail) {
     if (!Active() || currentProgram == 0u) return;
     Note(currentProgram, kind, binding, detail);
