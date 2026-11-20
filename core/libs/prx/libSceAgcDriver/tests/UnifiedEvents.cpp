@@ -68,6 +68,31 @@ void testAliasingIsConservative() {
     Expect(log.ChangedSince(Base, BucketBytes * (BucketCount + 1), stamp), "a range wider than the table is changed whenever anything moved");
 }
 
+void testLargeWritesStampBlocks() {
+    ChangeLog log;
+    const auto blockBytes = BucketBytes * BucketsPerBlock;
+    const auto start = Base + blockBytes - BucketBytes;
+    const auto stamp = log.Serial();
+    log.Note(start, blockBytes * 3 + BucketBytes * 2, 0x40);
+    Expect(log.ChangedSince(start, 4, stamp), "the leading partial bucket of a large write is changed");
+    Expect(log.ChangedSince(Base + blockBytes * 2 + 0x100, 4, stamp), "a bucket inside a whole block of a large write is changed");
+    Expect(log.ChangedSince(Base + blockBytes * 4, 4, stamp), "the trailing partial bucket of a large write is changed");
+    Expect(!log.ChangedSince(Base + blockBytes * 4 + BucketBytes, 4, stamp), "the bucket after a large write is unchanged");
+    Expect(!log.ChangedSince(Base, 4, stamp), "a bucket before a large write in its first block is unchanged");
+    Expect(!log.ChangedSince(Base + blockBytes * 2, BucketBytes, stamp, 0x40), "the owner of a block write is exempt");
+    Expect(log.ChangedOwner(Base + blockBytes * 2, BucketBytes, stamp) == 0x40, "a block write reports its owner");
+    log.Note(Base + blockBytes * 2 + 0x100, 4, 0x80);
+    log.Note(Base + blockBytes * 2, blockBytes, 0x40);
+    Expect(log.ChangedSince(Base + blockBytes * 2, BucketBytes, stamp, 0x40), "a foreign bucket write under an owner's block write is not hidden");
+    const auto later = log.Serial();
+    log.Note(Base + blockBytes * 2, blockBytes, 0x40);
+    Expect(!log.ChangedSince(Base + blockBytes * 2, blockBytes, later, 0x40), "an owner's later block write over an old foreign bucket write is exempt");
+    Expect(log.ChangedSince(Base + blockBytes * 2, blockBytes, later), "a reader without an owner sees the later block write");
+    log.Note(Base + blockBytes * 2 + BucketBytes * 3, 4);
+    Expect(log.ChangedSince(Base + blockBytes * 2, blockBytes, later, 0x40), "a CPU bucket write inside an owner's block is seen");
+    Expect(log.ChangedOwner(Base + blockBytes * 2 + BucketBytes * 3, 4, later) == 0, "the later bucket write's owner is reported over the block's");
+}
+
 void testConcurrentWritersAndReaders() {
     ChangeLog log;
     const auto stamp = log.Serial();
@@ -101,6 +126,7 @@ int main() {
     testWriteSpanningBuckets();
     testOwnerRule();
     testAliasingIsConservative();
+    testLargeWritesStampBlocks();
     testConcurrentWritersAndReaders();
     if (failures != 0) {
         std::fprintf(stderr, "%d failure(s)\n", failures);

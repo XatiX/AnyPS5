@@ -15,6 +15,8 @@ namespace AgcDriver::Unified::Events {
 
 inline constexpr std::uint64_t BucketBytes = 0x10000;
 inline constexpr std::size_t BucketCount = std::size_t{1} << 18u;
+inline constexpr std::uint64_t BucketsPerBlock = 16;
+inline constexpr std::size_t BlockCount = BucketCount / BucketsPerBlock;
 inline constexpr std::uint64_t RegionBytes = 0x400000;
 inline constexpr std::size_t RegionCount = std::size_t{1} << 12u;
 inline constexpr std::size_t WriterStripes = 256;
@@ -68,13 +70,18 @@ private:
         std::uint64_t epochByOthers = 0;
     };
     static std::size_t bucketOf(std::uint64_t address) { return static_cast<std::size_t>(address / BucketBytes) & (BucketCount - 1); }
+    static std::size_t blockOf(std::uint64_t bucket) { return static_cast<std::size_t>(bucket / BucketsPerBlock) & (BlockCount - 1); }
     static std::size_t regionOf(std::uint64_t address) { return static_cast<std::size_t>(address / RegionBytes) & (RegionCount - 1); }
+    static void noteBucket(Bucket& bucket, std::uint64_t epoch, std::uintptr_t owner);
+    static bool moved(const Seen& seen, std::uint64_t stamp, std::uintptr_t owner, bool& exempted);
     Seen read(const Bucket& bucket) const;
 
     std::atomic<std::uint64_t> serial{0};
     std::unique_ptr<Bucket[]> buckets;
+    std::unique_ptr<Bucket[]> blocks;
     std::unique_ptr<std::atomic<std::uint64_t>[]> regions;
     std::array<std::mutex, WriterStripes> stripes;
+    std::array<std::mutex, WriterStripes> blockStripes;
     mutable StripedCount notes;
     mutable StripedCount queries;
     mutable StripedCount regionSkips;
