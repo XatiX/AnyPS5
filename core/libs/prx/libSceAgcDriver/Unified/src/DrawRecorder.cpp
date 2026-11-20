@@ -120,6 +120,12 @@ struct FaultBuffer {
     std::uint64_t serial = 0;
 };
 
+struct KnownWrite {
+    std::uint64_t serial = 0;
+    std::uint64_t address = 0;
+    std::uint64_t bytes = 0;
+};
+
 struct Totals {
     std::uint64_t recorded = 0;
     std::uint64_t refused = 0;
@@ -172,6 +178,9 @@ struct Totals {
     std::uint64_t knownPointers = 0;
     std::uint64_t knownRefused = 0;
     std::uint64_t knownSkipped = 0;
+    std::uint64_t knownWritten = 0;
+    std::uint64_t knownWriteLookups = 0;
+    std::uint64_t knownWriteBytes = 0;
     std::uint64_t inputsResident = 0;
     std::uint64_t inputsImported = 0;
     std::uint64_t inputsWritten = 0;
@@ -313,6 +322,7 @@ void countInput(Totals& totals, InputSource source) {
 
 constexpr std::uint64_t KnownBufferLimitBytes = 256ull << 20u;
 constexpr std::uint64_t KnownCopyLimitBytes = 64ull << 10u;
+constexpr std::uint64_t KnownWriteLimitBytes = 1ull << 20u;
 constexpr std::uint64_t InputCopyLimitBytes = 64ull << 10u;
 constexpr std::uint32_t PagesPerChunk = static_cast<std::uint32_t>(ChunkBytes / PageBytes);
 
@@ -578,7 +588,7 @@ public:
         line += "; passes " + std::to_string(totals.passesBegun) + " begun, " + std::to_string(totals.passesContinued) + " draws continued, " + std::to_string(totals.passFeedback) + " broken by a target read";
         line += "; target memo " + std::to_string(totals.targetMemoHits) + " hits, " + std::to_string(totals.targetMemoMisses) + " misses; " + std::to_string(totals.deferredReads) + " draws with reads bound at record";
         line += "; residency updates landed " + std::to_string(totals.residencyLands);
-        line += "; known buffers " + std::to_string(totals.knownServed) + " served, " + std::to_string(totals.knownMapped) + " mapped (" + std::to_string(totals.knownPaged) + " paged in), " + std::to_string(totals.knownCopied) + " copied, " + std::to_string(totals.knownRefused) + " unresolved, " + std::to_string(totals.knownSkipped) + " skipped (" + std::to_string(totals.knownPointers) + " of them pointers)";
+        line += "; known buffers " + std::to_string(totals.knownServed) + " served, " + std::to_string(totals.knownMapped) + " mapped (" + std::to_string(totals.knownPaged) + " paged in), " + std::to_string(totals.knownCopied) + " copied, " + std::to_string(totals.knownRefused) + " unresolved, " + std::to_string(totals.knownSkipped) + " skipped (" + std::to_string(totals.knownPointers) + " of them pointers); known writes " + std::to_string(totals.knownWritten) + " direct (" + std::to_string(totals.knownWriteBytes >> 10u) + " KiB landed), " + std::to_string(totals.knownWriteLookups) + " through the page table";
         line += "; draw inputs " + std::to_string(totals.inputsResident) + " resident, " + std::to_string(totals.inputsImported) + " imported, " + std::to_string(totals.inputsWritten) + " after CPU writes (" + std::to_string(totals.inputsCopied) + " copied into the ring), " + std::to_string(totals.inputsGpuWritten) + " GPU-written, " + std::to_string(totals.inputsAliased) + " aliased, " + std::to_string(totals.inputsMerged) + " served with an overlapping input";
         std::snprintf(text, sizeof(text), "; draw phases surfaces %.1f ms, targets %.1f ms, pipelines %.1f ms, owned uploads %.1f ms", static_cast<double>(totals.surfaceNanoseconds) / 1e6, static_cast<double>(totals.targetNanoseconds) / 1e6, static_cast<double>(totals.graphicsPipelineNanoseconds) / 1e6, static_cast<double>(totals.uploadNanoseconds) / 1e6);
         line += text;
@@ -702,6 +712,50 @@ private:
         if (copied) Graphics::RecordMemoryBarrier(context, commands, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT | VK_PIPELINE_STAGE_HOST_BIT, VK_ACCESS_TRANSFER_WRITE_BIT, VK_ACCESS_MEMORY_READ_BIT | VK_ACCESS_MEMORY_WRITE_BIT | VK_ACCESS_HOST_READ_BIT);
     }
 
+    void landWritten(std::uint64_t begin, std::uint64_t size) {
+        auto& residency = ResidencyService::Get();
+        for (auto at = begin; at < begin + size;) {
+            const auto chunk = at & ~(ChunkBytes - 1u);
+            const auto next = std::min(begin + size, chunk + ChunkBytes);
+            if (residency.WrittenImport(chunk)) {
+                totals.writtenOnImports++;
+            } else {
+                landing.emplace_back(at, next - at);
+                totals.writtenLate++;
+                for (auto page = (at - chunk) / PageBytes; page <= (next - 1u - chunk) / PageBytes; ++page) writtenPages[chunk] |= 1u << page;
+                if (switchesWrittenChunks()) switches.insert(chunk);
+            }
+            at = next;
+        }
+    }
+
+    void landKnownWrites(std::uint64_t completed) {
+        while (!knownWrites.empty() && knownWrites.front().serial <= completed) {
+            const auto& written = knownWrites.front();
+            if (!ResidencyService::Get().WrittenImportThroughout(written.address, written.bytes)) {
+                landWritten(written.address, written.bytes);
+                totals.knownWriteBytes += written.bytes;
+            }
+            knownWrites.pop_front();
+        }
+    }
+
+    std::uint64_t serveKnownWrite(std::uint64_t address, std::uint64_t bytes, std::uint64_t serial) {
+        auto& residency = ResidencyService::Get();
+        if (residency.WrittenImportThroughout(address, bytes)) return residency.TranslateMapped(address, bytes, true);
+        if (bytes > KnownWriteLimitBytes) return 0u;
+        auto mapped = residency.TranslateMapped(address, bytes, true);
+        if (mapped == 0u && servesFaultPages()) {
+            std::vector<std::uint64_t> pages;
+            for (auto page = address & ~(GpuPageBytes - 1u); page < address + bytes; page += GpuPageBytes) pages.push_back(page);
+            Shadow::ServeFaultPages(pages);
+            mapped = residency.TranslateMapped(address, bytes, true);
+        }
+        if (mapped == 0u) return 0u;
+        if (knownWrites.empty() || knownWrites.back().serial != serial || knownWrites.back().address != address || knownWrites.back().bytes != bytes) knownWrites.push_back({serial, address, bytes});
+        return mapped;
+    }
+
     void readFaults(Graphics::Buffer& buffer) {
         namespace Abi = ShaderRecompiler::BdaAbi;
         auto bytes = buffer.Bytes();
@@ -711,22 +765,7 @@ private:
         std::vector<std::pair<std::uint64_t, std::uint64_t>> written;
         if (Abi::ForEachWrittenRange(words, [&](std::uint64_t begin, std::size_t size) { written.emplace_back(begin, size); })) {
             totals.writtenRanges += written.size();
-            auto& residency = ResidencyService::Get();
-            for (const auto& [begin, size] : written) {
-                for (auto at = begin; at < begin + size;) {
-                    const auto chunk = at & ~(ChunkBytes - 1u);
-                    const auto next = std::min(begin + size, chunk + ChunkBytes);
-                    if (residency.WrittenImport(chunk)) {
-                        totals.writtenOnImports++;
-                    } else {
-                        landing.emplace_back(at, next - at);
-                        totals.writtenLate++;
-                        for (auto page = (at - chunk) / PageBytes; page <= (next - 1u - chunk) / PageBytes; ++page) writtenPages[chunk] |= 1u << page;
-                        if (switchesWrittenChunks()) switches.insert(chunk);
-                    }
-                    at = next;
-                }
-            }
+            for (const auto& [begin, size] : written) landWritten(begin, size);
         }
         Abi::Fault report{};
         std::memcpy(&report, bytes.data(), sizeof(report));
@@ -868,6 +907,7 @@ private:
         const auto& layout = stage.program.variant->info.bindings;
         const auto& known = stage.program.capture != nullptr ? stage.program.capture->snapshot.knownBuffers : none;
         const auto& infos = stage.program.variant->info.info.knownBuffers;
+        landKnownWrites(completed);
         for (std::uint32_t index = 0; index < layout.knownBufferCount; ++index) {
             const auto dword = layout.KnownBufferDword() + index * ShaderRecompiler::KnownBufferDwords;
             const auto write = [&](std::uint64_t device, std::uint64_t bytes) {
@@ -881,6 +921,13 @@ private:
             if (address == 0u || bytes == 0u) {
                 totals.knownSkipped++;
                 write(zero, 0u);
+                continue;
+            }
+            if (index < infos.size() && infos[index].written) {
+                const auto mapped = serveKnownWrite(address, bytes, serial);
+                if (mapped != 0u) totals.knownWritten++;
+                else totals.knownWriteLookups++;
+                write(mapped, mapped != 0u ? bytes : 0u);
                 continue;
             }
             if (const auto copied = copyKnownBuffer(address, bytes, serial, completed); copied != 0u) {
@@ -1647,6 +1694,7 @@ private:
     std::vector<std::pair<std::uint64_t, std::uint64_t>> passTargets;
     TargetMemo targetMemo;
     std::deque<FaultBuffer> faults;
+    std::deque<KnownWrite> knownWrites;
     std::set<std::uint64_t> switches;
     std::unordered_map<std::uint64_t, std::uint32_t> writtenPages;
     std::vector<std::shared_ptr<Graphics::Buffer>> spareFaults;

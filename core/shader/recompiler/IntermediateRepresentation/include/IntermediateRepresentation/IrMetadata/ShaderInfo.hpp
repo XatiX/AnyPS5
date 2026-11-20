@@ -12,6 +12,7 @@ namespace ShaderRecompiler {
 struct KnownBuffer {
     std::uint32_t source = 0;
     std::uint32_t pointerBytes = 0;
+    bool written = false;
 
     [[nodiscard]] bool Pointer() const { return pointerBytes != 0u; }
     bool operator==(const KnownBuffer& other) const = default;

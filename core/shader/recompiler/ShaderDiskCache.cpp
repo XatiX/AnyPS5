@@ -794,6 +794,7 @@ void encodeShaderInfo(Writer& writer, const ShaderInfo& info) {
     writer.List(info.knownBuffers, [](Writer& out, const KnownBuffer& known) {
         out.Value(known.source);
         out.Value(known.pointerBytes);
+        out.Value(known.written);
     });
     writer.List(info.images, [](Writer& out, const ImageResource& image) {
         out.Value(image.source);
@@ -912,9 +913,10 @@ void decodeShaderInfo(Reader& reader, ShaderInfo& info) {
         in.Value(buffer.scalar);
         in.Value(buffer.typedAlignment);
     });
-    reader.List(info.knownBuffers, 8, [](Reader& in, KnownBuffer& known) {
+    reader.List(info.knownBuffers, 9, [](Reader& in, KnownBuffer& known) {
         in.Value(known.source);
         in.Value(known.pointerBytes);
+        in.Value(known.written);
     });
     reader.List(info.images, 77, [](Reader& in, ImageResource& image) {
         in.Value(image.source);

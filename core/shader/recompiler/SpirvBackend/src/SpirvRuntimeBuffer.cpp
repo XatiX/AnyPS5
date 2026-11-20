@@ -372,9 +372,9 @@ std::uint32_t byteBuffers(SpirvEmitterState& state) {
     return variable;
 }
 
-void writeBuffer(SpirvValueEmitContext& context, const IrValue& instruction, std::uint32_t address, std::uint32_t value, std::uint32_t bits = 32u) {
+void writeBuffer(SpirvValueEmitContext& context, const IrValue& instruction, std::uint32_t base, std::uint32_t address, std::uint32_t value, std::uint32_t bits = 32u) {
     if (context.Memory(instruction).gpuDescriptor) {
-        EmitBdaWrite(context, instruction, address, value, bits);
+        EmitKnownBdaWrite(context, instruction, base, address, value, bits);
         return;
     }
     auto& state = context.state;
@@ -493,10 +493,10 @@ std::uint32_t formatted(SpirvValueEmitContext& context, const IrValue& instructi
                 if (info.packedBitfield) {
                     packed = EmitOrU32(state, packed, Binary(state, spv::OpShiftLeftLogical, u32, EmitAndConstant(state, encoded, (1u << info.componentBits[component]) - 1u), ConstantU32(state, info.componentBitOffset[component])));
                 } else {
-                    writeBuffer(context, instruction, addresses[component].guest, encoded, info.componentBits[component]);
+                    writeBuffer(context, instruction, resource.base, addresses[component].guest, encoded, info.componentBits[component]);
                 }
             }
-            if (info.packedBitfield) writeBuffer(context, instruction, addresses[0].guest, packed);
+            if (info.packedBitfield) writeBuffer(context, instruction, resource.base, addresses[0].guest, packed);
         });
         return ConstantU32(state, 0u);
     }
@@ -672,7 +672,7 @@ std::uint32_t genericFormattedStore(SpirvValueEmitContext& context, const IrValu
         auto guest = addresses[0].guest;
         for (std::uint32_t index = 1u; index < 4u; ++index) guest = Select(state, u64, equal(state, component, constant(index)), addresses[index].guest, guest);
         for (const auto storeBits : {8u, 16u, 32u}) {
-            EmitIfCondition(state, equal(state, width, constant(storeBits)), [&] { writeBuffer(context, instruction, guest, value, storeBits); });
+            EmitIfCondition(state, equal(state, width, constant(storeBits)), [&] { writeBuffer(context, instruction, resource.base, guest, value, storeBits); });
         }
         state.module.AddFunction(spv::OpBranch, continuation);
         EmitLabel(state, continuation);
@@ -1139,7 +1139,7 @@ void EmitRuntimeBufferStore(SpirvValueEmitContext& context, const IrValue& instr
         const auto writeComponents = [&] {
             for (std::uint32_t component = 0; component < components; ++component) {
                 const auto access = address(context, instruction, resource, component * 4u, memory.dataBits / 8u);
-                EmitIfCondition(state, access.inBounds, [&] { writeBuffer(context, instruction, access.guest, values[component], memory.dataBits); });
+                EmitIfCondition(state, access.inBounds, [&] { writeBuffer(context, instruction, resource.base, access.guest, values[component], memory.dataBits); });
             }
         };
         const auto pair = coherentPair(context, instruction, resource, components);

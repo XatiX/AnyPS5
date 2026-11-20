@@ -844,6 +844,51 @@ void EmitBdaWrite(SpirvValueEmitContext& ctx, const IrValue& inst, std::uint32_t
     });
 }
 
+void EmitKnownBdaWrite(SpirvValueEmitContext& ctx, const IrValue& inst, std::uint32_t base, std::uint32_t address, std::uint32_t value, std::uint32_t bits) {
+    auto& state = ctx.state;
+    const auto anchor = KnownBdaAnchor(state, ctx.Memory(inst));
+    if (!anchor || (bits != 8u && bits != 16u && bits != 32u)) {
+        EmitBdaWrite(ctx, inst, address, value, bits);
+        return;
+    }
+    const auto u32 = TypeU32(state);
+    const auto u64 = TypeScalarU64(state);
+    const auto boolean = TypeBool(state);
+    const auto bytes = bits / 8u;
+    const auto accessMask = BdaAccessMask(state, inst);
+    const auto relative = Unary(state, spv::OpUConvert, u32, Binary(state, spv::OpISub, u64, address, base));
+    std::uint32_t translated = 0;
+    const auto inside = BdaAnchorHolds(state, *anchor, relative, 0, bytes, translated);
+    const auto served = Binary(state, spv::OpINotEqual, boolean, anchor->device, BdaConstant(state, 0u));
+    const auto storeBytes = [&] {
+        const auto byteType = state.module.Type(spv::OpTypeInt, 8u, 0u);
+        const auto bytePointer = TypePointer(state, spv::StorageClassPhysicalStorageBuffer, byteType);
+        for (std::uint32_t byte = 0; byte < bytes; ++byte) {
+            const auto element = byte == 0u ? translated : Binary(state, spv::OpIAdd, u64, translated, BdaConstant(state, byte));
+            const auto pointer = state.module.AllocateId();
+            state.module.AddFunction(spv::OpConvertUToPtr, bytePointer, pointer, element);
+            const auto shifted = byte == 0u ? value : Binary(state, spv::OpShiftRightLogical, u32, value, ConstantU32(state, byte * 8u));
+            state.module.AddFunction(spv::OpStore, pointer, Unary(state, spv::OpUConvert, byteType, shifted), accessMask, 1u);
+        }
+    };
+    EmitIfCondition(state, served, [&] {
+        EmitIfCondition(state, inside, [&] {
+            if (bits != 32u) {
+                storeBytes();
+                return;
+            }
+            const auto unaligned = BdaAddressUnaligned(state, translated);
+            EmitIfCondition(state, unaligned, storeBytes);
+            EmitIfCondition(state, Unary(state, spv::OpLogicalNot, boolean, unaligned), [&] {
+                const auto pointer = state.module.AllocateId();
+                state.module.AddFunction(spv::OpConvertUToPtr, TypePhysicalU32Pointer(state), pointer, translated);
+                state.module.AddFunction(spv::OpStore, pointer, value, accessMask, 4u);
+            });
+        });
+    });
+    EmitIfCondition(state, Unary(state, spv::OpLogicalNot, boolean, served), [&] { EmitBdaWrite(ctx, inst, address, value, bits); });
+}
+
 void DefineBdaByteWriteFunctions(SpirvEmitterState& state) {
     const auto u32 = TypeU32(state);
     const auto u64 = TypeScalarU64(state);

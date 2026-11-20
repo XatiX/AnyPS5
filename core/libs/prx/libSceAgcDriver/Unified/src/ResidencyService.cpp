@@ -268,6 +268,17 @@ bool ResidencyService::WrittenImport(std::uint64_t chunk) const {
     return writtenImports.contains(chunk);
 }
 
+bool ResidencyService::WrittenImportThroughout(std::uint64_t address, std::uint64_t size) const {
+    if (!Attached() || size == 0) return false;
+    std::lock_guard lock(mutex);
+    const auto first = address & ~(ChunkBytes - 1);
+    auto found = writtenImports.lower_bound(first);
+    for (auto chunk = first; chunk < address + size; chunk += ChunkBytes, ++found) {
+        if (found == writtenImports.end() || found->first != chunk) return false;
+    }
+    return true;
+}
+
 std::shared_ptr<Graphics::Buffer> ResidencyService::PageTableBuffer() const {
     if (!Attached()) return nullptr;
     std::lock_guard lock(mutex);
@@ -335,17 +346,17 @@ std::optional<DeviceSpan> ResidencyService::Translate(std::uint64_t address, std
     return ledger->Translate(address, size);
 }
 
-std::uint64_t ResidencyService::TranslateMapped(std::uint64_t address, std::uint64_t size) const {
+std::uint64_t ResidencyService::TranslateMapped(std::uint64_t address, std::uint64_t size, bool write) const {
     if (!Attached() || size == 0) return 0;
     std::lock_guard lock(mutex);
     if (!pages) return 0;
-    const auto device = pages->Lookup(address);
+    const auto device = pages->Lookup(address, write);
     if (device == 0) return 0;
     const auto firstPage = address >> GpuPageBits;
     const auto lastPage = (address + size - 1) >> GpuPageBits;
     for (auto page = firstPage + 1; page <= lastPage; ++page) {
         const auto guest = page << GpuPageBits;
-        if (pages->Lookup(guest) != device + (guest - address)) return 0;
+        if (pages->Lookup(guest, write) != device + (guest - address)) return 0;
     }
     return device;
 }
