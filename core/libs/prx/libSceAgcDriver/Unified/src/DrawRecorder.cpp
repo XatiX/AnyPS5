@@ -172,8 +172,8 @@ struct Totals {
     std::uint64_t dispatchExisting = 0;
     std::uint64_t dispatchNanoseconds = 0;
     std::uint64_t pipelinesQueued = 0;
-    std::uint64_t pipelinesBuilt = 0;
-    std::uint64_t pipelineNanoseconds = 0;
+    std::uint64_t pipelineWaits = 0;
+    std::uint64_t pipelineWaitNanoseconds = 0;
     std::uint64_t surfaceNanoseconds = 0;
     std::uint64_t targetNanoseconds = 0;
     std::uint64_t graphicsPipelineNanoseconds = 0;
@@ -271,6 +271,11 @@ bool bindsGds() {
 bool recordsMipTailTargets() {
     static const bool records = std::getenv("APS5_RECODE_NO_MIP_TAIL_TARGETS") == nullptr;
     return records;
+}
+
+bool buildsPipelinesAhead() {
+    static const bool ahead = std::getenv("APS5_RECODE_ASYNC_COMPUTE_PIPELINES") != nullptr;
+    return ahead;
 }
 
 bool recordsIndirectDispatches() {
@@ -505,7 +510,10 @@ struct PipelineJob {
     VkPipelineCreateFlags flags = 0;
     VkPipelineShaderStageCreateFlags stageFlags = 0;
     std::uint32_t subgroupSize = 0;
+    VulkanDevice* owner = nullptr;
 };
+
+constexpr std::uint64_t UnsavedBuildNanoseconds = 5'000'000'000u;
 
 bool dispatchPrecheck(const Resolve::ResolvedDraw& dispatch, std::string& reason) {
     if (dispatch.stages.size() != 1u || dispatch.stages.front().program.stage != ShaderRecompiler::ShaderStage::Compute) {
@@ -587,9 +595,9 @@ public:
         return false;
     }
 
-    bool DispatchPrecheck(const Context& context, const VulkanDevice& owner, const Resolve::ResolvedDraw& dispatch, std::string& reason) {
-        std::lock_guard lock(mutex);
-        if (dispatchPrecheck(dispatch, reason) && pipelineReady(context, owner, dispatch, reason)) return true;
+    bool DispatchPrecheck(const Context& context, VulkanDevice& owner, const Resolve::ResolvedDraw& dispatch, std::string& reason) {
+        std::unique_lock lock(mutex);
+        if (dispatchPrecheck(dispatch, reason) && pipelineReady(context, owner, dispatch, lock, reason)) return true;
         totals.dispatchExisting++;
         const auto key = "existing path dispatch: " + reason.substr(0, 45);
         if (totals.reasons.size() < 24u || totals.reasons.contains(key)) totals.reasons[key]++;
@@ -617,6 +625,7 @@ public:
 
     std::string Line() {
         std::lock_guard lock(mutex);
+        const auto pipelineCounts = takePipelineCounts();
         char text[384];
         const auto draws = totals.recorded + totals.refused;
         const auto ring = space.has_value() ? space->TakeCounts() : RingCounts{};
@@ -631,11 +640,11 @@ public:
         line += "; draw inputs " + std::to_string(totals.inputsResident) + " resident, " + std::to_string(totals.inputsImported) + " imported, " + std::to_string(totals.inputsWritten) + " after CPU writes (" + std::to_string(totals.inputsCopied) + " copied into the ring), " + std::to_string(totals.inputsGpuWritten) + " GPU-written, " + std::to_string(totals.inputsAliased) + " aliased, " + std::to_string(totals.inputsMerged) + " served with an overlapping input";
         std::snprintf(text, sizeof(text), "; draw phases surfaces %.1f ms, targets %.1f ms, pipelines %.1f ms, owned uploads %.1f ms", static_cast<double>(totals.surfaceNanoseconds) / 1e6, static_cast<double>(totals.targetNanoseconds) / 1e6, static_cast<double>(totals.graphicsPipelineNanoseconds) / 1e6, static_cast<double>(totals.uploadNanoseconds) / 1e6);
         line += text;
-        std::snprintf(text, sizeof(text), "; dispatches %llu recorded (%llu indirect, %llu storage images written), %llu to the existing path, %.1f us per dispatch; compute pipelines %zu held, %llu queued, %llu built in %.1f ms, %zu building, %zu failed", static_cast<unsigned long long>(totals.dispatches), static_cast<unsigned long long>(totals.indirectDispatches), static_cast<unsigned long long>(totals.storageWrites), static_cast<unsigned long long>(totals.dispatchExisting), totals.dispatches == 0 ? 0.0 : static_cast<double>(totals.dispatchNanoseconds) / 1000.0 / static_cast<double>(totals.dispatches), computePipelines.size(), static_cast<unsigned long long>(totals.pipelinesQueued), static_cast<unsigned long long>(totals.pipelinesBuilt), static_cast<double>(totals.pipelineNanoseconds) / 1e6, buildingPipelines.size(), failedPipelines.size());
+        std::snprintf(text, sizeof(text), "; dispatches %llu recorded (%llu indirect, %llu storage images written), %llu to the existing path, %.1f us per dispatch; compute pipelines %zu held, %llu queued, %llu built in %.1f ms, %zu building, %zu failed", static_cast<unsigned long long>(totals.dispatches), static_cast<unsigned long long>(totals.indirectDispatches), static_cast<unsigned long long>(totals.storageWrites), static_cast<unsigned long long>(totals.dispatchExisting), totals.dispatches == 0 ? 0.0 : static_cast<double>(totals.dispatchNanoseconds) / 1000.0 / static_cast<double>(totals.dispatches), pipelineCounts.held, static_cast<unsigned long long>(totals.pipelinesQueued), static_cast<unsigned long long>(pipelineCounts.built), static_cast<double>(pipelineCounts.nanoseconds) / 1e6, pipelineCounts.building, pipelineCounts.failed);
         line += text;
         std::snprintf(text, sizeof(text), "; table maps %llu hits, %llu uploads (%.1f MiB), %llu retired, %zu held (%.1f MiB)", static_cast<unsigned long long>(totals.mapHits), static_cast<unsigned long long>(totals.mapUploads), static_cast<double>(totals.mapUploadBytes) / 1048576.0, static_cast<unsigned long long>(totals.mapRetired), maps.size(), static_cast<double>(mapBytes) / 1048576.0);
         line += text;
-        line += "; GDS bound " + std::to_string(totals.gdsBindings) + " times";
+        line += "; GDS bound " + std::to_string(totals.gdsBindings) + " times; dispatches waited for their pipeline " + std::to_string(totals.pipelineWaits) + " times (" + std::to_string(totals.pipelineWaitNanoseconds / 1000000u) + " ms)";
         std::snprintf(text, sizeof(text), "; fault buffers %zu in flight, %llu read: %llu faults (%llu unmapped), %llu fault pages served, %llu written ranges (%llu pieces landed late), %llu written overflows", faults.size(), static_cast<unsigned long long>(totals.faultReads), static_cast<unsigned long long>(totals.faults), static_cast<unsigned long long>(totals.unmappedFaults), static_cast<unsigned long long>(totals.faultPages), static_cast<unsigned long long>(totals.writtenRanges), static_cast<unsigned long long>(totals.writtenLate), static_cast<unsigned long long>(totals.writtenOverflows));
         line += text;
         std::snprintf(text, sizeof(text), "; GPU-written chunks %llu switched to their import from the written bitmap (%.1f MiB copied over), %llu from other GPU writes, %llu refused, %llu written pieces already on an import", static_cast<unsigned long long>(totals.importSwitches), static_cast<double>(totals.switchBytes) / 1048576.0, static_cast<unsigned long long>(totals.writtenSwitches), static_cast<unsigned long long>(totals.switchRefused), static_cast<unsigned long long>(totals.writtenOnImports));
@@ -1285,22 +1294,61 @@ private:
         return made;
     }
 
-    bool pipelineReady(const Context& context, const VulkanDevice& owner, const Resolve::ResolvedDraw& dispatch, std::string& reason) {
-        auto key = pipelineKey(dispatch);
+    bool pipelineReady(const Context& context, VulkanDevice& owner, const Resolve::ResolvedDraw& dispatch, std::unique_lock<std::mutex>& lock, std::string& reason) {
+        const auto key = pipelineKey(dispatch);
+        std::unique_lock pipelineLock(pipelineMutex);
         if (computePipelines.contains(key)) return true;
+        if (!queuePipeline(context, owner, dispatch, key, reason)) return false;
+        if (buildsPipelinesAhead()) return false;
+        const auto started = std::chrono::steady_clock::now();
+        lock.unlock();
+        pipelinesDone.wait(pipelineLock, [&] { return !buildingPipelines.contains(key); });
+        pipelineLock.unlock();
+        lock.lock();
+        pipelineLock.lock();
+        totals.pipelineWaits++;
+        totals.pipelineWaitNanoseconds += elapsed(started);
+        if (computePipelines.contains(key)) return true;
+        if (const auto failed = failedPipelines.find(key); failed != failedPipelines.end()) reason = "compute pipeline failed: " + failed->second;
+        return false;
+    }
+
+    struct PipelineCounts {
+        std::size_t held = 0;
+        std::size_t building = 0;
+        std::size_t failed = 0;
+        std::uint64_t built = 0;
+        std::uint64_t nanoseconds = 0;
+    };
+
+    PipelineCounts takePipelineCounts() {
+        std::lock_guard pipelineLock(pipelineMutex);
+        PipelineCounts counts{computePipelines.size(), buildingPipelines.size(), failedPipelines.size(), builtPipelines, buildNanoseconds};
+        builtPipelines = 0;
+        buildNanoseconds = 0;
+        return counts;
+    }
+
+    std::shared_ptr<ComputePipeline> builtPipeline(const std::vector<std::uint64_t>& key) {
+        std::lock_guard pipelineLock(pipelineMutex);
+        const auto found = computePipelines.find(key);
+        return found != computePipelines.end() ? found->second : nullptr;
+    }
+
+    bool queuePipeline(const Context& context, VulkanDevice& owner, const Resolve::ResolvedDraw& dispatch, std::vector<std::uint64_t> key, std::string& reason) {
         if (const auto failed = failedPipelines.find(key); failed != failedPipelines.end()) {
             reason = "compute pipeline failed: " + failed->second;
             return false;
         }
         reason = "compute pipeline building";
-        if (buildingPipelines.contains(key)) return false;
+        if (buildingPipelines.contains(key)) return true;
         const auto* heap = Resolve::HeapDevice();
         if (heap == nullptr) {
             reason = "no heap";
             return false;
         }
         const auto& result = dispatch.stages.front().program.result;
-        PipelineJob job{key, context, result, setLayout(context, dispatch, 0), heap->Layout(), emptySetLayout(context), owner.computePipelineFlags(), 0u, owner.computeSubgroupSize(*result)};
+        PipelineJob job{key, context, result, setLayout(context, dispatch, 0), heap->Layout(), emptySetLayout(context), owner.computePipelineFlags(), 0u, owner.computeSubgroupSize(*result), &owner};
         try {
             job.stageFlags = owner.computeStageFlags(*result);
         } catch (const std::exception& error) {
@@ -1313,14 +1361,14 @@ private:
         totals.pipelinesQueued++;
         if (!builder.joinable()) builder = std::thread([this] { buildPipelines(); });
         jobsReady.notify_one();
-        return false;
+        return true;
     }
 
     void buildPipelines() {
         for (;;) {
             std::optional<PipelineJob> job;
             {
-                std::unique_lock lock(mutex);
+                std::unique_lock lock(pipelineMutex);
                 jobsReady.wait(lock, [&] { return !pipelineJobs.empty(); });
                 job.emplace(std::move(pipelineJobs.front()));
                 pipelineJobs.pop_front();
@@ -1333,15 +1381,24 @@ private:
             } catch (const std::exception& error) {
                 failure = error.what();
             }
-            std::lock_guard lock(mutex);
-            buildingPipelines.erase(job->key);
-            totals.pipelineNanoseconds += elapsed(started);
-            if (made != nullptr) {
-                computePipelines.emplace(std::move(job->key), std::move(made));
-                totals.pipelinesBuilt++;
-            } else {
-                if (seen.insert("pipeline: " + failure.substr(0, 50)).second) std::fprintf(stderr, "[recode-record] first compute pipeline failure: %s\n", failure.c_str());
-                failedPipelines.emplace(std::move(job->key), std::move(failure));
+            const auto built = elapsed(started);
+            {
+                std::lock_guard lock(pipelineMutex);
+                buildingPipelines.erase(job->key);
+                buildNanoseconds += built;
+                if (made != nullptr) {
+                    computePipelines.emplace(std::move(job->key), std::move(made));
+                    builtPipelines++;
+                } else {
+                    if (pipelineFailuresSeen.insert(failure.substr(0, 50)).second) std::fprintf(stderr, "[recode-record] first compute pipeline failure: %s\n", failure.c_str());
+                    failedPipelines.emplace(std::move(job->key), std::move(failure));
+                }
+                pipelinesDone.notify_all();
+            }
+            unsavedBuildNanoseconds += made != nullptr ? built : 0u;
+            if (unsavedBuildNanoseconds >= UnsavedBuildNanoseconds && job->owner != nullptr) {
+                job->owner->SavePipelineCache();
+                unsavedBuildNanoseconds = 0;
             }
         }
     }
@@ -1414,12 +1471,11 @@ private:
         drainSurfaces(context, *recorder);
         const auto& stage = dispatch.stages.front();
         const auto main = setLayout(context, dispatch, 0);
-        const auto found = computePipelines.find(pipelineKey(dispatch));
-        if (found == computePipelines.end()) {
+        const auto pipeline = builtPipeline(pipelineKey(dispatch));
+        if (pipeline == nullptr) {
             reason = "compute pipeline not ready";
             return false;
         }
-        const auto pipeline = found->second;
 
         recorder->OpenBatch();
         const auto serial = recorder->OpenBatchSerial();
@@ -1929,7 +1985,13 @@ private:
     std::set<std::vector<std::uint64_t>> buildingPipelines;
     std::map<std::vector<std::uint64_t>, std::string> failedPipelines;
     std::deque<PipelineJob> pipelineJobs;
+    std::set<std::string> pipelineFailuresSeen;
+    std::uint64_t builtPipelines = 0;
+    std::uint64_t buildNanoseconds = 0;
+    std::uint64_t unsavedBuildNanoseconds = 0;
+    std::mutex pipelineMutex;
     std::condition_variable jobsReady;
+    std::condition_variable pipelinesDone;
     std::thread builder;
     VkDescriptorSetLayout emptyLayout = VK_NULL_HANDLE;
     Totals totals;
@@ -1963,7 +2025,7 @@ bool RecordResolved(const Context& context, const Resolve::ResolvedDraw& draw, c
     return shared().Record(context, draw, parameters, reason);
 }
 
-bool RecordDispatchPrecheck(const Context& context, const VulkanDevice& owner, const Resolve::ResolvedDraw& dispatch, std::string& reason) {
+bool RecordDispatchPrecheck(const Context& context, VulkanDevice& owner, const Resolve::ResolvedDraw& dispatch, std::string& reason) {
     return shared().DispatchPrecheck(context, owner, dispatch, reason);
 }
 
