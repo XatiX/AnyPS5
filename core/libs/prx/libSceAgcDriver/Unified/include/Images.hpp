@@ -12,6 +12,10 @@
 #include <unordered_map>
 #include <vector>
 
+namespace AgcDriver::Graphics {
+struct GuestTextureResource;
+}
+
 namespace AgcDriver::Unified::Images {
 
 struct SurfaceKey {
@@ -44,6 +48,7 @@ struct ImageKey {
 };
 
 [[nodiscard]] std::optional<ImageKey> KeyOf(std::span<const std::uint32_t, 8> words, std::string& reason);
+[[nodiscard]] std::optional<ImageKey> KeyOf(const Graphics::GuestTextureResource& resource, std::string& reason);
 
 enum class State : std::uint8_t { Pending, Ready, Stale };
 
@@ -58,6 +63,7 @@ class SurfaceDevice {
 public:
     virtual ~SurfaceDevice() = default;
     [[nodiscard]] virtual std::shared_ptr<DeviceSurface> Create(const SurfaceKey& key, std::span<const std::uint32_t, 8> words, std::string& reason) = 0;
+    [[nodiscard]] virtual std::shared_ptr<DeviceSurface> CreateFromResource(const SurfaceKey& key, const Graphics::GuestTextureResource& resource, std::string& reason);
 };
 
 struct Surface {
@@ -100,6 +106,7 @@ public:
     SurfaceTable(SurfaceDevice& device, const Events::ChangeLog& shared, const Events::ChangeLog& gpuWrites, std::uint64_t budgetBytes = 0) : device(device), shared(shared), gpuWrites(gpuWrites), budget(budgetBytes) {}
 
     [[nodiscard]] std::optional<Found> Find(const SurfaceKey& key, std::span<const std::uint32_t, 8> words, std::string& reason);
+    [[nodiscard]] std::optional<Found> FindResource(const SurfaceKey& key, const Graphics::GuestTextureResource& resource, std::string& reason);
     [[nodiscard]] std::vector<std::shared_ptr<Surface>> TakeWork();
     void MarkReady(Surface& surface, std::uint64_t stamp, std::uint64_t imageStamp);
     void MarkGpuWritten(Surface& surface);
@@ -116,6 +123,8 @@ private:
     };
 
     void evict();
+    template<typename TCreate>
+    std::optional<Found> findWith(const SurfaceKey& key, TCreate&& create, std::string& reason);
 
     SurfaceDevice& device;
     const Events::ChangeLog& shared;

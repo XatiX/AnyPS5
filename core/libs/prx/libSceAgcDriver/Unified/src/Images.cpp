@@ -8,12 +8,21 @@ namespace AgcDriver::Unified::Images {
 
 std::optional<ImageKey> KeyOf(std::span<const std::uint32_t, 8> words, std::string& reason) {
     Graphics::GuestTextureResource resource{};
-    std::uint64_t bytes = 0;
     try {
         resource = Graphics::DecodeTextureResource(words);
-        bytes = Graphics::SurfaceGuestBytes(resource);
     } catch (const std::exception& error) {
         reason = std::string("image decode: ") + error.what();
+        return std::nullopt;
+    }
+    return KeyOf(resource, reason);
+}
+
+std::optional<ImageKey> KeyOf(const Graphics::GuestTextureResource& resource, std::string& reason) {
+    std::uint64_t bytes = 0;
+    try {
+        bytes = Graphics::SurfaceGuestBytes(resource);
+    } catch (const std::exception& error) {
+        reason = std::string("image size: ") + error.what();
         return std::nullopt;
     }
     if (resource.baseAddress == 0u || bytes == 0u) {
@@ -52,7 +61,21 @@ std::size_t SurfaceTable::KeyHash::operator()(const SurfaceKey& key) const {
     return static_cast<std::size_t>(hash);
 }
 
+std::shared_ptr<DeviceSurface> SurfaceDevice::CreateFromResource(const SurfaceKey&, const Graphics::GuestTextureResource&, std::string& reason) {
+    reason = "surface device cannot create from a resource";
+    return nullptr;
+}
+
 std::optional<Found> SurfaceTable::Find(const SurfaceKey& key, std::span<const std::uint32_t, 8> words, std::string& reason) {
+    return findWith(key, [&](std::string& why) { return device.Create(key, words, why); }, reason);
+}
+
+std::optional<Found> SurfaceTable::FindResource(const SurfaceKey& key, const Graphics::GuestTextureResource& resource, std::string& reason) {
+    return findWith(key, [&](std::string& why) { return device.CreateFromResource(key, resource, why); }, reason);
+}
+
+template<typename TCreate>
+std::optional<Found> SurfaceTable::findWith(const SurfaceKey& key, TCreate&& create, std::string& reason) {
     std::lock_guard lock(mutex);
     counts.lookups++;
     const auto found = surfaces.find(key);
@@ -84,7 +107,7 @@ std::optional<Found> SurfaceTable::Find(const SurfaceKey& key, std::span<const s
         else counts.pending++;
         return Found{surface, surface->state == State::Ready};
     }
-    auto created = device.Create(key, words, reason);
+    auto created = create(reason);
     if (created == nullptr) {
         counts.refused++;
         return std::nullopt;

@@ -38,7 +38,8 @@ VulkanSurface::VulkanSurface(const Graphics::Context& context, const Graphics::G
     info.arrayLayers = volume ? 1u : std::max(this->geometry.imageLayers, 1u);
     info.samples = VK_SAMPLE_COUNT_1_BIT;
     info.tiling = VK_IMAGE_TILING_OPTIMAL;
-    info.usage = VK_IMAGE_USAGE_SAMPLED_BIT | (compressed ? 0u : VK_IMAGE_USAGE_STORAGE_BIT) | VK_IMAGE_USAGE_TRANSFER_DST_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT;
+    attachable = !compressed && !volume;
+    info.usage = VK_IMAGE_USAGE_SAMPLED_BIT | (compressed ? 0u : VK_IMAGE_USAGE_STORAGE_BIT) | (attachable ? VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT : 0u) | VK_IMAGE_USAGE_TRANSFER_DST_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT;
     info.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
     info.initialLayout = VK_IMAGE_LAYOUT_UNDEFINED;
     Graphics::Check(context.Function<PFN_vkCreateImage>("vkCreateImage")(context.device, &info, nullptr, &image), "vkCreateImage recode surface");
@@ -61,6 +62,7 @@ VulkanSurface::~VulkanSurface() {
     for (const auto& [key, view] : views) destroyView(context.device, view, nullptr);
     for (const auto& [key, view] : storageViews) destroyView(context.device, view, nullptr);
     for (const auto& [key, view] : shapedStorageViews) destroyView(context.device, view, nullptr);
+    for (const auto& [key, view] : attachmentViews) destroyView(context.device, view, nullptr);
     if (image != VK_NULL_HANDLE) context.Function<PFN_vkDestroyImage>("vkDestroyImage")(context.device, image, nullptr);
     if (memory != VK_NULL_HANDLE) context.Function<PFN_vkFreeMemory>("vkFreeMemory")(context.device, memory, nullptr);
 }
@@ -138,6 +140,37 @@ VkImageView VulkanSurface::StorageView(std::uint32_t level, std::uint32_t layer,
     return created;
 }
 
+VkImageView VulkanSurface::AttachmentView(VkFormat viewFormat, std::uint32_t level, std::uint32_t layer, std::uint32_t layers, std::string& reason) {
+    if (!attachable) {
+        reason = "surface is not attachable";
+        return VK_NULL_HANDLE;
+    }
+    const auto levels = static_cast<std::uint32_t>(std::max<std::size_t>(geometry.mips.size(), 1u));
+    const auto imageLayers = std::max(geometry.imageLayers, 1u);
+    if (level >= levels || layers == 0u || layer + layers > imageLayers) {
+        reason = "attachment outside the surface";
+        return VK_NULL_HANDLE;
+    }
+    const auto key = std::make_tuple(static_cast<std::uint32_t>(viewFormat), level, layer, layers);
+    std::lock_guard lock(mutex);
+    if (const auto found = attachmentViews.find(key); found != attachmentViews.end()) return found->second;
+    VkImageViewUsageCreateInfo usage{VK_STRUCTURE_TYPE_IMAGE_VIEW_USAGE_CREATE_INFO};
+    usage.usage = VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT;
+    VkImageViewCreateInfo info{VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO};
+    info.pNext = &usage;
+    info.image = image;
+    info.viewType = layers > 1u ? VK_IMAGE_VIEW_TYPE_2D_ARRAY : VK_IMAGE_VIEW_TYPE_2D;
+    info.format = viewFormat;
+    info.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, level, 1u, layer, layers};
+    VkImageView created = VK_NULL_HANDLE;
+    if (context.Function<PFN_vkCreateImageView>("vkCreateImageView")(context.device, &info, nullptr, &created) != VK_SUCCESS) {
+        reason = "vkCreateImageView recode attachment";
+        return VK_NULL_HANDLE;
+    }
+    attachmentViews.emplace(key, created);
+    return created;
+}
+
 VkImageView VulkanSurface::ShapedStorageView(std::uint32_t level, bool array, bool uintView, std::string& reason) {
     if (compressed) {
         reason = "storage view of a compressed surface";
@@ -177,9 +210,17 @@ VkImageView VulkanSurface::ShapedStorageView(std::uint32_t level, bool array, bo
     return created;
 }
 
-std::shared_ptr<DeviceSurface> VulkanSurfaceDevice::Create(const SurfaceKey&, std::span<const std::uint32_t, 8> words, std::string& reason) {
+std::shared_ptr<DeviceSurface> VulkanSurfaceDevice::Create(const SurfaceKey& key, std::span<const std::uint32_t, 8> words, std::string& reason) {
     try {
-        const auto resource = Graphics::DecodeTextureResource(words);
+        return CreateFromResource(key, Graphics::DecodeTextureResource(words), reason);
+    } catch (const std::exception& error) {
+        reason = std::string("surface: ") + error.what();
+        return nullptr;
+    }
+}
+
+std::shared_ptr<DeviceSurface> VulkanSurfaceDevice::CreateFromResource(const SurfaceKey&, const Graphics::GuestTextureResource& resource, std::string& reason) {
+    try {
         if (resource.dimension != Graphics::TextureDimension::k2D && resource.dimension != Graphics::TextureDimension::k2DArray && resource.dimension != Graphics::TextureDimension::kCube && resource.dimension != Graphics::TextureDimension::k3D) {
             reason = "surface dimension";
             return nullptr;
