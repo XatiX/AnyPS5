@@ -55,6 +55,14 @@ bool ResidentUploads::Prepare(std::uint64_t address, std::uint64_t size, std::ui
     return residency.Translate(address, size).has_value();
 }
 
+bool ResidentUploads::PrepareFilled(std::uint64_t address, std::uint64_t size, std::uint64_t frame) {
+    if (size == 0) return true;
+    std::lock_guard lock(mutex);
+    if (!residency.Owns(address, size)) return false;
+    static_cast<void>(residency.MakeResident(address, size, frame));
+    return residency.Translate(address, size).has_value();
+}
+
 std::vector<PendingUpload> ResidentUploads::Take() {
     std::lock_guard lock(mutex);
     std::vector<PendingUpload> taken;

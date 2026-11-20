@@ -437,7 +437,7 @@ public:
         if (refill != nullptr) {
             const auto refills = refill->Counts();
             const auto slotCounts = table->Counts();
-            std::snprintf(text, sizeof(text), "; memo %llu hits, %llu lookups, %llu placeholders; heap %llu writes, %llu recycled, %llu full", static_cast<unsigned long long>(refills.memoHits), static_cast<unsigned long long>(refills.lookups), static_cast<unsigned long long>(refills.placeholders), static_cast<unsigned long long>(slotCounts.writes), static_cast<unsigned long long>(slotCounts.recycled), static_cast<unsigned long long>(slotCounts.full));
+            std::snprintf(text, sizeof(text), "; memo %llu hits, %llu lookups, %llu placeholders, %llu deferred to record; heap %llu writes, %llu recycled, %llu full", static_cast<unsigned long long>(refills.memoHits), static_cast<unsigned long long>(refills.lookups), static_cast<unsigned long long>(refills.placeholders), static_cast<unsigned long long>(refills.deferred), static_cast<unsigned long long>(slotCounts.writes), static_cast<unsigned long long>(slotCounts.recycled), static_cast<unsigned long long>(slotCounts.full));
             line += text;
         }
         if (mirror != nullptr) {
@@ -563,7 +563,13 @@ private:
             std::unique_lock gpuLock(GuestMemory::GpuMutex(), std::try_to_lock);
             if (!gpuLock.owns_lock()) {
                 totals.lockBusy++;
-                return std::nullopt;
+                static const bool defersBusy = std::getenv("APS5_RECODE_NO_BUSY_DEFER") == nullptr;
+                if (!defersBusy) return std::nullopt;
+                const auto resource = Graphics::DecodeTextureResource(request.words);
+                Heap::ResolvedImage deferred;
+                deferred.memory = {resource.baseAddress, Graphics::SurfaceGuestBytes(resource)};
+                deferred.deferred = true;
+                return deferred;
             }
             texture = Graphics::CachedSampledTexture(*context, request.words);
         }

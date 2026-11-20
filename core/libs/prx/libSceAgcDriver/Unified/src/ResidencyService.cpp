@@ -269,14 +269,35 @@ bool ResidencyService::WrittenImportAny(std::uint64_t address, std::uint64_t siz
     return found != writtenImports.end() && found->first < address + size;
 }
 
+std::vector<std::uint64_t> ResidencyService::UnmappedPages(std::uint64_t address, std::uint64_t size) const {
+    std::vector<std::uint64_t> missing;
+    if (!Attached() || size == 0) return missing;
+    std::lock_guard lock(mutex);
+    if (!pages) return missing;
+    for (auto page = address & ~(GpuPageBytes - 1); page < address + size; page += GpuPageBytes) {
+        if (pages->Lookup(page) == 0) missing.push_back(page);
+    }
+    return missing;
+}
+
 std::optional<DeviceSpan> ResidencyService::ReturnWrittenImport(std::uint64_t chunk) {
     if (!Attached()) return std::nullopt;
     std::lock_guard lock(mutex);
     if (!pages) return std::nullopt;
     const auto found = writtenImports.find(chunk);
     if (found == writtenImports.end()) return std::nullopt;
-    const auto bound = ledger->Translate(chunk, GpuPageBytes);
-    if (!bound) return std::nullopt;
+    auto bound = ledger->Translate(chunk, GpuPageBytes);
+    if (!bound) {
+        if (!ledger->Owns(chunk, GpuPageBytes)) {
+            ledger->RemoveUnboundInside(chunk, GpuPageBytes);
+            if (!ledger->Add(chunk, GpuPageBytes)) return std::nullopt;
+        }
+        if (!uploads->PrepareFilled(chunk, GpuPageBytes, frame.load(std::memory_order_relaxed))) return std::nullopt;
+        bound = ledger->Translate(chunk, GpuPageBytes);
+        if (!bound) return std::nullopt;
+        served.try_emplace(chunk, chunk + GpuPageBytes);
+        ++writtenImportsBound;
+    }
     if (pages->Lookup(chunk) == found->second) {
         pages->Unmap(chunk, GpuPageBytes);
         pages->Map(chunk, GpuPageBytes, bound->address, GpuPagePermissions);
@@ -502,9 +523,9 @@ std::string ResidencyService::Line() const {
         static_cast<unsigned long long>(recordedUploads), static_cast<unsigned long long>(recordedBytes >> 20), static_cast<unsigned long long>(stagingCreated), static_cast<unsigned long long>(stagingReused), static_cast<unsigned long long>(stagingPool.size()), static_cast<unsigned long long>(stagingHeld >> 20), static_cast<unsigned long long>(served.size()), static_cast<unsigned long long>(serveRefusals), static_cast<unsigned long long>(ownerRanges));
     if (!pages) return line;
     char table[768];
-    std::snprintf(table, sizeof(table), "[recode-page-table] leaves %u of %u, updates %llu (%llu MiB), leaves dropped %llu, shared pages %llu; imports mapped %llu pages, %llu spaces, %llu pages of retired imports dropped; fault pages served %llu, already mapped %llu, refused %llu; read backs %llu (%llu KiB), not resident %llu KiB; GPU-written chunks on their import %llu (%llu forgotten, %llu returned)\n", pages->Leaves(), PageTableLeafCapacity,
+    std::snprintf(table, sizeof(table), "[recode-page-table] leaves %u of %u, updates %llu (%llu MiB), leaves dropped %llu, shared pages %llu; imports mapped %llu pages, %llu spaces, %llu pages of retired imports dropped; fault pages served %llu, already mapped %llu, refused %llu; read backs %llu (%llu KiB), not resident %llu KiB; GPU-written chunks on their import %llu (%llu forgotten, %llu returned, %llu of them bound on return)\n", pages->Leaves(), PageTableLeafCapacity,
         static_cast<unsigned long long>(pageUpdates), static_cast<unsigned long long>(pageUpdateBytes >> 20), static_cast<unsigned long long>(pageLeavesDropped), static_cast<unsigned long long>(ledgerCounts.sharedPages),
-        static_cast<unsigned long long>(importPages.size()), static_cast<unsigned long long>(importMaps), static_cast<unsigned long long>(importPagesForgotten), static_cast<unsigned long long>(faultPagesServed), static_cast<unsigned long long>(faultPagesMapped), static_cast<unsigned long long>(faultPagesRefused), static_cast<unsigned long long>(readBacks), static_cast<unsigned long long>(readBackBytes >> 10), static_cast<unsigned long long>(readBackMissedBytes >> 10), static_cast<unsigned long long>(writtenImports.size()), static_cast<unsigned long long>(writtenImportsForgotten), static_cast<unsigned long long>(writtenImportsReturned));
+        static_cast<unsigned long long>(importPages.size()), static_cast<unsigned long long>(importMaps), static_cast<unsigned long long>(importPagesForgotten), static_cast<unsigned long long>(faultPagesServed), static_cast<unsigned long long>(faultPagesMapped), static_cast<unsigned long long>(faultPagesRefused), static_cast<unsigned long long>(readBacks), static_cast<unsigned long long>(readBackBytes >> 10), static_cast<unsigned long long>(readBackMissedBytes >> 10), static_cast<unsigned long long>(writtenImports.size()), static_cast<unsigned long long>(writtenImportsForgotten), static_cast<unsigned long long>(writtenImportsReturned), static_cast<unsigned long long>(writtenImportsBound));
     return std::string(line) + table;
 }
 
