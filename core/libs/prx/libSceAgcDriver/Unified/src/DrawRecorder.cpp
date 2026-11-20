@@ -136,6 +136,8 @@ struct Totals {
     std::uint64_t passesBegun = 0;
     std::uint64_t passesContinued = 0;
     std::uint64_t passFeedback = 0;
+    std::uint64_t targetMemoHits = 0;
+    std::uint64_t targetMemoMisses = 0;
     std::uint64_t residencyLands = 0;
     std::uint64_t faults = 0;
     std::uint64_t unmappedFaults = 0;
@@ -183,6 +185,31 @@ bool mergesPasses() {
     static const bool merges = std::getenv("APS5_RECODE_NO_PASS_MERGE") == nullptr;
     return merges;
 }
+
+bool memoizesTargets() {
+    static const bool memoizes = std::getenv("APS5_RECODE_NO_TARGET_MEMO") == nullptr;
+    return memoizes;
+}
+
+struct TargetMemo {
+    bool valid = false;
+    std::uint64_t recorder = 0;
+    std::uint64_t generation = 0;
+    std::uint64_t epoch = 0;
+    std::uint64_t proof = 0;
+    std::uint64_t pending = 0;
+    std::uint64_t depthSerial = 0;
+    std::uint64_t depthReleased = 0;
+    std::vector<Graphics::ColorTarget> colors;
+    std::vector<std::weak_ptr<Graphics::StorageTexture>> residents;
+    std::vector<std::uint64_t> versions;
+    std::vector<VkImageView> views;
+    std::optional<Graphics::DepthTarget> depth;
+    bool depthWrite = false;
+    bool stencilTest = false;
+    bool stencilWritten = false;
+    VkImageView depthView = VK_NULL_HANDLE;
+};
 
 bool overlaps(std::span<const std::pair<std::uint64_t, std::uint64_t>> left, std::span<const std::pair<std::uint64_t, std::uint64_t>> right) {
     for (const auto& [begin, end] : left) {
@@ -512,6 +539,7 @@ public:
         line += "; linear target stores " + std::to_string(totals.linearStores);
         line += "; batch moved before the pass " + std::to_string(totals.batchMoves);
         line += "; passes " + std::to_string(totals.passesBegun) + " begun, " + std::to_string(totals.passesContinued) + " draws continued, " + std::to_string(totals.passFeedback) + " broken by a target read";
+        line += "; target memo " + std::to_string(totals.targetMemoHits) + " hits, " + std::to_string(totals.targetMemoMisses) + " misses";
         line += "; residency updates landed " + std::to_string(totals.residencyLands);
         line += "; known buffers " + std::to_string(totals.knownServed) + " served, " + std::to_string(totals.knownMapped) + " mapped (" + std::to_string(totals.knownPaged) + " paged in), " + std::to_string(totals.knownCopied) + " copied, " + std::to_string(totals.knownRefused) + " unresolved, " + std::to_string(totals.knownSkipped) + " skipped (" + std::to_string(totals.knownPointers) + " of them pointers)";
         line += "; draw inputs " + std::to_string(totals.inputsResident) + " resident, " + std::to_string(totals.inputsImported) + " imported, " + std::to_string(totals.inputsWritten) + " after CPU writes (" + std::to_string(totals.inputsCopied) + " copied into the ring), " + std::to_string(totals.inputsGpuWritten) + " GPU-written, " + std::to_string(totals.inputsAliased) + " aliased";
@@ -1190,23 +1218,32 @@ private:
         std::vector<std::shared_ptr<void>> owners;
         std::vector<std::shared_ptr<Graphics::StorageTexture>> residents;
         phase = std::chrono::steady_clock::now();
-        for (const auto& color : state.colors) {
-            if (Graphics::AttachmentProxyFormat(context, color.format) != VK_FORMAT_UNDEFINED) {
-                reason = "proxied color format";
-                return false;
+        const bool memoUsable = std::exchange(targetMemo.valid, false);
+        if (memoUsable && targetsFromMemo(context, *recorder, state, views, owners, residents)) {
+            totals.targetMemoHits++;
+        } else {
+            if (memoizesTargets()) totals.targetMemoMisses++;
+            views.clear();
+            owners.clear();
+            residents.clear();
+            for (const auto& color : state.colors) {
+                if (Graphics::AttachmentProxyFormat(context, color.format) != VK_FORMAT_UNDEFINED) {
+                    reason = "proxied color format";
+                    return false;
+                }
+                auto resident = Graphics::CachedStorageSurface(context, Graphics::SurfaceForTarget(color));
+                if (resident == nullptr || !resident->Attachable()) {
+                    reason = "color target not resident";
+                    return false;
+                }
+                views.push_back(resident->AttachmentView(color.format, color.mip, color.depthSlice, color.layers, color.arraySlice));
+                Images::Targets().Note(resident);
+                owners.push_back(resident);
+                residents.push_back(std::move(resident));
             }
-            auto resident = Graphics::CachedStorageSurface(context, Graphics::SurfaceForTarget(color));
-            if (resident == nullptr || !resident->Attachable()) {
-                reason = "color target not resident";
-                return false;
+            if (state.depth) {
+                views.push_back(Graphics::DepthSurfaceViewWithStencilWriteIntent(context, *state.depth, state.depthWrite, state.stencilTest, writesStencil(state)));
             }
-            views.push_back(resident->AttachmentView(color.format, color.mip, color.depthSlice, color.layers, color.arraySlice));
-            Images::Targets().Note(resident);
-            owners.push_back(resident);
-            residents.push_back(std::move(resident));
-        }
-        if (state.depth) {
-            views.push_back(Graphics::DepthSurfaceViewWithStencilWriteIntent(context, *state.depth, state.depthWrite, state.stencilTest, writesStencil(state)));
         }
         Graphics::PipelineSetLayouts sets;
         sets.main = setLayout(context, draw, 0);
@@ -1446,7 +1483,51 @@ private:
             if (storeNow[index]) Graphics::StorageTexture::FlushPending(residents[index]->Descriptor().baseAddress, static_cast<std::size_t>(residents[index]->GuestBytes()), nullptr, "linear target");
         }
         totals.linearStores += static_cast<std::uint64_t>(std::ranges::count(storeNow, true));
+        if (memoizesTargets()) rememberTargets(*recorder, state, views, residents);
         return true;
+    }
+
+    bool targetsFromMemo(const Context& context, const Graphics::Recorder& recorder, const Graphics::State& state, std::vector<VkImageView>& views, std::vector<std::shared_ptr<void>>& owners, std::vector<std::shared_ptr<Graphics::StorageTexture>>& residents) {
+        const auto& memo = targetMemo;
+        if (recorder.Id() != memo.recorder || !recorder.RenderPassOpen() || recorder.RenderPassGeneration() != memo.generation) return false;
+        if (GuestMemory::CollectEpoch() != memo.epoch || GuestMemory::ProofSerial() != memo.proof || Graphics::StorageTexture::PendingSerial() != memo.pending) return false;
+        if (state.colors.size() != memo.colors.size() || !std::equal(state.colors.begin(), state.colors.end(), memo.colors.begin())) return false;
+        if (state.depth.has_value() != memo.depth.has_value()) return false;
+        if (state.depth && (!(*state.depth == *memo.depth) || state.depthWrite != memo.depthWrite || state.stencilTest != memo.stencilTest || writesStencil(state) != memo.stencilWritten || Graphics::DepthSurfacesSerial() != memo.depthSerial || Graphics::DepthSurfacesReleased() != memo.depthReleased)) return false;
+        for (std::size_t index = 0; index < memo.residents.size(); ++index) {
+            auto resident = memo.residents[index].lock();
+            if (resident == nullptr || resident->Version() != memo.versions[index] || !Graphics::StorageImageCached(context, resident.get()) || !Graphics::StorageImageServesKeys(*resident, Graphics::SurfaceForTarget(state.colors[index]).dccAddress)) return false;
+            views.push_back(memo.views[index]);
+            owners.push_back(resident);
+            residents.push_back(std::move(resident));
+        }
+        if (state.depth) views.push_back(memo.depthView);
+        return true;
+    }
+
+    void rememberTargets(const Graphics::Recorder& recorder, const Graphics::State& state, std::span<const VkImageView> views, std::span<const std::shared_ptr<Graphics::StorageTexture>> residents) {
+        auto& memo = targetMemo;
+        const auto epoch = GuestMemory::CollectEpoch();
+        const bool eligible = epoch != 0 && recorder.RenderPassOpen() && views.size() == residents.size() + (state.depth ? 1u : 0u) && (!state.depth || state.depth->samples == 1u) && std::ranges::all_of(state.colors, [](const Graphics::ColorTarget& color) { return color.samples == 1u && !color.staged && color.partialWriteMask == 0u; }) && std::ranges::all_of(residents, [](const std::shared_ptr<Graphics::StorageTexture>& resident) { return resident->Cached() && resident->Descriptor().tileMode != Graphics::TextureTileMode::kLinear; });
+        if (!eligible) return;
+        memo.valid = true;
+        memo.recorder = recorder.Id();
+        memo.generation = recorder.RenderPassGeneration();
+        memo.epoch = epoch;
+        memo.proof = GuestMemory::ProofSerial();
+        memo.pending = Graphics::StorageTexture::PendingSerial();
+        memo.depthSerial = Graphics::DepthSurfacesSerial();
+        memo.depthReleased = Graphics::DepthSurfacesReleased();
+        memo.colors.assign(state.colors.begin(), state.colors.end());
+        memo.residents.assign(residents.begin(), residents.end());
+        memo.versions.clear();
+        for (const auto& resident : residents) memo.versions.push_back(resident->Version());
+        memo.views.assign(views.begin(), views.begin() + static_cast<std::ptrdiff_t>(residents.size()));
+        memo.depth = state.depth;
+        memo.depthWrite = state.depthWrite;
+        memo.stencilTest = state.stencilTest;
+        memo.stencilWritten = state.depth ? writesStencil(state) : false;
+        memo.depthView = state.depth ? views.back() : VK_NULL_HANDLE;
     }
 
     std::mutex mutex;
@@ -1455,6 +1536,7 @@ private:
     std::shared_ptr<Graphics::Buffer> ring;
     std::uint64_t ringAddress = 0;
     std::vector<std::pair<std::uint64_t, std::uint64_t>> passTargets;
+    TargetMemo targetMemo;
     std::deque<FaultBuffer> faults;
     std::set<std::uint64_t> switches;
     std::unordered_map<std::uint64_t, std::uint32_t> writtenPages;
