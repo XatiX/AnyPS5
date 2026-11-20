@@ -54,6 +54,11 @@ struct DeviceSpan {
     std::uint64_t bytes = 0;
 };
 
+struct ResidentPiece {
+    std::uint64_t guest = 0;
+    DeviceSpan device;
+};
+
 struct ResidencyCounts {
     std::uint64_t ranges = 0;
     std::uint64_t pools = 0;
@@ -81,6 +86,7 @@ public:
     [[nodiscard]] bool Owns(std::uint64_t address, std::uint64_t size) const;
     std::vector<GuestSpan> MakeResident(std::uint64_t address, std::uint64_t size, std::uint64_t frame);
     [[nodiscard]] std::optional<DeviceSpan> Translate(std::uint64_t address, std::uint64_t size) const;
+    [[nodiscard]] std::vector<ResidentPiece> ResidentPieces(std::uint64_t address, std::uint64_t size) const;
     [[nodiscard]] std::optional<DeviceSpan> Base(std::uint64_t address) const;
     void Touch(std::uint64_t address, std::uint64_t frame);
     std::size_t RemoveUnboundInside(std::uint64_t address, std::uint64_t size);

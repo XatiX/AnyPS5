@@ -150,6 +150,22 @@ void testUploadsFollowResidency() {
     Expect(!uploads.Prepare(guest.base + 2 * ChunkBytes, 2 * ChunkBytes, 2), "a span past the range is refused");
 }
 
+void testDirtyRangesAcrossRangeEdgesUploadTheirResidentPart() {
+    FakeDevice device;
+    Residency residency(device, 0);
+    ResidentUploads uploads(residency);
+    GuestBlock guest;
+    residency.Add(guest.base + 0x2000, 0x2000);
+    Expect(uploads.Prepare(guest.base + 0x2000, 0x2000, 1), "a range inside one chunk is made resident");
+    static_cast<void>(uploads.Take());
+    std::memset(guest.At(0x1000), 0x11, 0x4000);
+    const std::vector<DirtyRange> dirty{{guest.base + 0x1000, 0x4000}};
+    uploads.NoteDirty(dirty);
+    const auto taken = uploads.Take();
+    Expect(taken.size() == 1 && taken[0].guest == guest.base + 0x2000 && taken[0].offset == 0x2000 && taken[0].bytes.size() == 0x2000 && taken[0].bytes[0] == std::byte{0x11}, "a dirty range wider than the served range uploads the served part");
+    Expect(uploads.Counts().skippedBytes == 0x2000, "only the pages outside the served range are skipped");
+}
+
 void testEvictionDropsPendingUploads() {
     FakeDevice device;
     Residency residency(device, ChunkBytes);
@@ -256,6 +272,7 @@ int main() {
     testServedRangeReplacesUnboundRanges();
     testFullUploadsReadCommittedPagesOnly();
     testUploadsFollowResidency();
+    testDirtyRangesAcrossRangeEdgesUploadTheirResidentPart();
     testEvictionDropsPendingUploads();
     testAddBindsNothing();
     testMakeResidentBindsCoveringChunks();

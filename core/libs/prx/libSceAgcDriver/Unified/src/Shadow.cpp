@@ -156,14 +156,14 @@ std::string memoryLine() {
     const auto protect = MemoryCore::Get().Protection().Counts();
     const auto consumes = totals.consumes.load(std::memory_order_relaxed);
     const auto nanoseconds = totals.consumeNanoseconds.load(std::memory_order_relaxed);
-    char line[896];
-    std::snprintf(line, sizeof(line), "[recode-memory] registered %llu ranges %llu MiB, %llu outside the arena; backend accesses %llu, unknown memory %llu; consumes %llu, dirty ranges %llu, dirty %llu MiB, consume %.1f us avg %.1f us max; write faults opened %llu, host writes opened %llu, driver pages settled %llu, stale %llu, gpu-owned %llu, foreign %llu; kept busy %llu, rearmed %llu, busy unchanged %llu; protect calls %llu (%llu MiB), split %llu, skipped %llu MiB, failures %llu\n",
+    char line[1024];
+    std::snprintf(line, sizeof(line), "[recode-memory] registered %llu ranges %llu MiB, %llu outside the arena; backend accesses %llu, unknown memory %llu; consumes %llu, dirty ranges %llu, dirty %llu MiB, consume %.1f us avg %.1f us max; write faults opened %llu, host writes opened %llu, driver pages settled %llu, stale %llu, gpu-owned %llu, foreign %llu; kept busy %llu, rearmed %llu, busy unchanged %llu, changed while rearming %llu; protect calls %llu (%llu MiB), split %llu, skipped %llu MiB, failures %llu\n",
         static_cast<unsigned long long>(totals.registrations.load(std::memory_order_relaxed)), static_cast<unsigned long long>(totals.registeredBytes.load(std::memory_order_relaxed) >> 20), static_cast<unsigned long long>(totals.outsideArena.load(std::memory_order_relaxed)),
         static_cast<unsigned long long>(totals.accesses.load(std::memory_order_relaxed)), static_cast<unsigned long long>(totals.unknownAccesses.load(std::memory_order_relaxed)),
         static_cast<unsigned long long>(consumes), static_cast<unsigned long long>(totals.ranges.load(std::memory_order_relaxed)), static_cast<unsigned long long>(totals.dirtyBytes.load(std::memory_order_relaxed) >> 20),
         consumes == 0 ? 0.0 : static_cast<double>(nanoseconds) / static_cast<double>(consumes) / 1000.0, static_cast<double>(totals.maxConsumeNanoseconds.exchange(0, std::memory_order_relaxed)) / 1000.0,
         static_cast<unsigned long long>(core.writesOpened), static_cast<unsigned long long>(core.hostWritesOpened), static_cast<unsigned long long>(core.driverPagesSettled), static_cast<unsigned long long>(core.staleFaults), static_cast<unsigned long long>(core.gpuOwnedFaults), static_cast<unsigned long long>(core.foreignFaults),
-        static_cast<unsigned long long>(table.keptBusy), static_cast<unsigned long long>(table.rearmed), static_cast<unsigned long long>(table.unchangedBusy),
+        static_cast<unsigned long long>(table.keptBusy), static_cast<unsigned long long>(table.rearmed), static_cast<unsigned long long>(table.unchangedBusy), static_cast<unsigned long long>(core.rearmedChanged),
         static_cast<unsigned long long>(protect.calls), static_cast<unsigned long long>(protect.bytes >> 20), static_cast<unsigned long long>(protect.splitCalls), static_cast<unsigned long long>(protect.skippedBytes >> 20), static_cast<unsigned long long>(protect.failures));
     const auto events = Events::Shared().Counts();
     char eventLine[384];
@@ -490,6 +490,45 @@ void LandGpuWrites(GuestRanges ranges) {
     const auto pieces = ResidencyService::Get().ReadBack(ranges);
     auto& core = MemoryCore::Get();
     for (const auto& piece : pieces) core.LandGpuWrite(piece.guest, piece.bytes, GuestMemory::OwnStoreTarget(piece.guest, piece.bytes.size()));
+}
+
+bool ResidentDrawInputs() {
+    static const bool resident = [] {
+        if (std::getenv("APS5_RECODE_RESIDENT_INPUTS") == nullptr) return false;
+        GuestMemory::SetGpuWriteHook([](std::uint64_t address, std::uint64_t bytes) {
+            const std::array written{std::pair{address, address + bytes}};
+            NoteGpuWrites(written);
+        });
+        return true;
+    }();
+    return resident;
+}
+
+void NoteGpuWrites(GuestRanges ranges) {
+    if (ranges.empty() || !ResidentDrawInputs() || !memoryInstalled()) return;
+    static std::mutex markedMutex;
+    static auto& marked = *new std::map<std::uint64_t, std::uint64_t>();
+    std::lock_guard lock(markedMutex);
+    for (auto [begin, end] : ranges) {
+        if (end <= begin) continue;
+        begin &= ~(PageBytes - 1);
+        end = (end + PageBytes - 1) & ~(PageBytes - 1);
+        auto next = marked.upper_bound(begin);
+        if (next != marked.begin()) {
+            const auto previous = std::prev(next);
+            if (previous->second >= end) continue;
+            if (previous->second >= begin) {
+                begin = previous->first;
+                next = marked.erase(previous);
+            }
+        }
+        while (next != marked.end() && next->first <= end) {
+            end = std::max(end, next->second);
+            next = marked.erase(next);
+        }
+        marked.emplace(begin, end);
+        MemoryCore::Get().Pages().NoteGpuWritten(begin, end - begin);
+    }
 }
 
 bool OwnedUploadsPending() {

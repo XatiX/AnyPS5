@@ -1,4 +1,5 @@
 #include "prx/libSceAgcDriver/Unified/include/DrawRecorder.hpp"
+#include "prx/libkernel/include/Api.hpp"
 #include "prx/libSceAgcDriver/Execution/include/GuestMemory.hpp"
 #include "prx/libSceAgcDriver/Execution/include/VulkanDevice.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/DepthSurface.hpp"
@@ -100,6 +101,8 @@ void noteFaultToken(const Context& context, Graphics::Recorder& recorder, VkComm
 }
 
 constexpr std::uint64_t RingBytes = 64ull << 20u;
+constexpr std::uint64_t RingZeroBytes = 256;
+constexpr std::uint64_t KnownReadableBytes = 32;
 constexpr std::uint32_t PoolSets = 512;
 constexpr std::uint32_t PoolBuffers = 4096;
 constexpr std::uint64_t MapBudgetBytes = 256ull << 20u;
@@ -156,6 +159,11 @@ struct Totals {
     std::uint64_t knownPointers = 0;
     std::uint64_t knownRefused = 0;
     std::uint64_t knownSkipped = 0;
+    std::uint64_t inputsResident = 0;
+    std::uint64_t inputsImported = 0;
+    std::uint64_t inputsWritten = 0;
+    std::uint64_t inputsGpuWritten = 0;
+    std::uint64_t inputsAliased = 0;
     std::map<std::string, std::uint64_t> reasons;
 };
 
@@ -180,6 +188,50 @@ bool overlaps(std::span<const std::pair<std::uint64_t, std::uint64_t>> left, std
 bool servesFaultPages() {
     static const bool serves = std::getenv("APS5_RECODE_NO_FAULT_SERVE") == nullptr;
     return serves;
+}
+
+struct DrawInput {
+    VkBuffer buffer = VK_NULL_HANDLE;
+    VkDeviceSize offset = 0;
+};
+
+enum class InputSource : std::uint8_t { Imported, Resident, Written, GpuWritten, Aliased };
+
+std::optional<DrawInput> importedInput(const Context& context, std::uint64_t address, std::uint64_t bytes) {
+    const auto* import = Graphics::HostImportFor(context, address, static_cast<std::size_t>(bytes));
+    if (import == nullptr) return std::nullopt;
+    return DrawInput{import->buffer, Graphics::HostImportOffset(*import, address)};
+}
+
+std::optional<DrawInput> drawInput(const Context& context, std::uint64_t address, std::uint64_t bytes, InputSource& source) {
+    source = InputSource::Imported;
+    auto& pages = MemoryCore::Get().Pages();
+    if (!Shadow::ResidentDrawInputs()) return importedInput(context, address, bytes);
+    if (pages.GpuWrittenIn(address, bytes) || !pages.GpuOwnedIn(address, bytes).empty()) {
+        source = InputSource::GpuWritten;
+    } else if (DirectMemoryAliased_nid_postfix(static_cast<std::uintptr_t>(address), static_cast<std::size_t>(bytes))) {
+        source = InputSource::Aliased;
+    } else {
+        Shadow::OwnedSpan span;
+        if (Shadow::ServeOwned(context, address, bytes, &span) && span.handle != 0u) {
+            if (pages.CleanIn(address, bytes)) {
+                source = InputSource::Resident;
+                return DrawInput{reinterpret_cast<VkBuffer>(static_cast<std::uintptr_t>(span.handle)), static_cast<VkDeviceSize>(address - span.origin)};
+            }
+            source = InputSource::Written;
+        }
+    }
+    return importedInput(context, address, bytes);
+}
+
+void countInput(Totals& totals, InputSource source) {
+    switch (source) {
+        case InputSource::Resident: ++totals.inputsResident; break;
+        case InputSource::Written: ++totals.inputsWritten; break;
+        case InputSource::GpuWritten: ++totals.inputsGpuWritten; break;
+        case InputSource::Aliased: ++totals.inputsAliased; break;
+        case InputSource::Imported: ++totals.inputsImported; break;
+    }
 }
 
 constexpr std::uint64_t KnownBufferLimitBytes = 256ull << 20u;
@@ -442,6 +494,7 @@ public:
         line += "; passes " + std::to_string(totals.passesBegun) + " begun, " + std::to_string(totals.passesContinued) + " draws continued, " + std::to_string(totals.passFeedback) + " broken by a target read";
         line += "; residency updates landed " + std::to_string(totals.residencyLands);
         line += "; known buffers " + std::to_string(totals.knownServed) + " served, " + std::to_string(totals.knownMapped) + " mapped (" + std::to_string(totals.knownPaged) + " paged in), " + std::to_string(totals.knownCopied) + " copied, " + std::to_string(totals.knownRefused) + " unresolved, " + std::to_string(totals.knownSkipped) + " skipped (" + std::to_string(totals.knownPointers) + " of them pointers)";
+        line += "; draw inputs " + std::to_string(totals.inputsResident) + " resident, " + std::to_string(totals.inputsImported) + " imported, " + std::to_string(totals.inputsWritten) + " imported after CPU writes, " + std::to_string(totals.inputsGpuWritten) + " GPU-written, " + std::to_string(totals.inputsAliased) + " aliased";
         std::snprintf(text, sizeof(text), "; draw phases surfaces %.1f ms, targets %.1f ms, pipelines %.1f ms, owned uploads %.1f ms", static_cast<double>(totals.surfaceNanoseconds) / 1e6, static_cast<double>(totals.targetNanoseconds) / 1e6, static_cast<double>(totals.graphicsPipelineNanoseconds) / 1e6, static_cast<double>(totals.uploadNanoseconds) / 1e6);
         line += text;
         std::snprintf(text, sizeof(text), "; dispatches %llu recorded, %llu to the existing path, %.1f us per dispatch; compute pipelines %zu held, %llu queued, %llu built in %.1f ms, %zu building, %zu failed", static_cast<unsigned long long>(totals.dispatches), static_cast<unsigned long long>(totals.dispatchExisting), totals.dispatches == 0 ? 0.0 : static_cast<double>(totals.dispatchNanoseconds) / 1000.0 / static_cast<double>(totals.dispatches), computePipelines.size(), static_cast<unsigned long long>(totals.pipelinesQueued), static_cast<unsigned long long>(totals.pipelinesBuilt), static_cast<double>(totals.pipelineNanoseconds) / 1e6, buildingPipelines.size(), failedPipelines.size());
@@ -474,7 +527,8 @@ private:
         alignment = std::max<std::uint64_t>(context.limits.minStorageBufferOffsetAlignment, 16u);
         const auto ringMemory = ResidencyService::ShaderReadMemory(context, RingBytes);
         const VkBufferUsageFlags addressable = context.bufferDeviceAddress ? VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT : 0u;
-        ring = std::make_shared<Graphics::Buffer>(context, RingBytes, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_INDIRECT_BUFFER_BIT | addressable, ringMemory);
+        ring = std::make_shared<Graphics::Buffer>(context, RingBytes + RingZeroBytes, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_INDIRECT_BUFFER_BIT | addressable, ringMemory);
+        std::memset(ring->Bytes().data() + RingBytes, 0, RingZeroBytes);
         ringAddress = addressable != 0u ? ring->DeviceAddress() : 0u;
         space.emplace(RingBytes, alignment);
         std::fprintf(stderr, "[recode-record] ring %llu MiB, alignment %llu, %s memory\n", static_cast<unsigned long long>(RingBytes >> 20u), static_cast<unsigned long long>(alignment), (ringMemory & VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT) != 0 ? "device" : "host");
@@ -659,9 +713,10 @@ private:
 
     template<typename TPut>
     void serveKnownBuffers(const Context& context, const Resolve::ResolvedStage& stage, std::uint64_t serial, std::uint64_t completed, TPut&& put) {
-        if (stage.program.variant == nullptr || stage.program.capture == nullptr) return;
+        if (stage.program.variant == nullptr) return;
+        static const std::vector<ShaderRecompiler::DescriptorValue> none;
         const auto& layout = stage.program.variant->info.bindings;
-        const auto& known = stage.program.capture->snapshot.knownBuffers;
+        const auto& known = stage.program.capture != nullptr ? stage.program.capture->snapshot.knownBuffers : none;
         const auto& infos = stage.program.variant->info.info.knownBuffers;
         for (std::uint32_t index = 0; index < layout.knownBufferCount; ++index) {
             const auto dword = layout.KnownBufferDword() + index * ShaderRecompiler::KnownBufferDwords;
@@ -672,9 +727,10 @@ private:
             };
             const auto [address, bytes] = index < known.size() ? Resolve::KnownBufferSpan(index < infos.size() ? infos[index] : ShaderRecompiler::KnownBuffer{}, known[index]) : std::pair<std::uint64_t, std::uint64_t>{0u, 0u};
             if (index < infos.size() && infos[index].Pointer()) totals.knownPointers++;
+            const auto zero = ringAddress != 0u ? ringAddress + RingBytes : 0u;
             if (address == 0u || bytes == 0u) {
                 totals.knownSkipped++;
-                write(0u, 0u);
+                write(zero, 0u);
                 continue;
             }
             if (const auto copied = copyKnownBuffer(address, bytes, serial, completed); copied != 0u) {
@@ -682,13 +738,15 @@ private:
                 write(copied, bytes);
                 continue;
             }
+            const auto reach = std::max(bytes, KnownReadableBytes);
             Shadow::OwnedSpan span;
-            if (bytes <= KnownBufferLimitBytes && Shadow::ServeOwned(context, address, bytes, &span) && span.address != 0u) {
+            if (bytes <= KnownBufferLimitBytes && ((reach != bytes && Shadow::ServeOwned(context, address, reach, &span)) || Shadow::ServeOwned(context, address, bytes, &span)) && span.address != 0u) {
                 totals.knownServed++;
                 write(span.address, bytes);
                 continue;
             }
-            auto mapped = ResidencyService::Get().TranslateMapped(address, bytes);
+            auto mapped = ResidencyService::Get().TranslateMapped(address, reach);
+            if (mapped == 0u && reach != bytes) mapped = ResidencyService::Get().TranslateMapped(address, bytes);
             if (mapped == 0u && bytes <= KnownBufferLimitBytes && servesFaultPages()) {
                 std::vector<std::uint64_t> pages;
                 for (auto page = address & ~(GpuPageBytes - 1u); page < address + bytes; page += GpuPageBytes) pages.push_back(page);
@@ -702,7 +760,7 @@ private:
                 continue;
             }
             totals.knownRefused++;
-            write(0u, 0u);
+            write(zero, 0u);
         }
     }
 
@@ -1009,14 +1067,16 @@ private:
                 }
                 const auto address = vertexAddress(attribute);
                 const auto bytes = Graphics::VertexBufferExtent(attribute);
-                const auto* import = Graphics::HostImportFor(context, address, bytes);
-                if (import == nullptr) {
+                InputSource source = InputSource::Imported;
+                const auto input = drawInput(context, address, bytes, source);
+                if (!input) {
                     reason = "vertex buffer not imported";
                     return false;
                 }
+                countInput(totals, source);
                 recorder->NotePendingRead(address, bytes, Graphics::Recorder::ReadKind::DrawInput);
-                vertexBuffers.push_back(import->buffer);
-                vertexOffsets.push_back(Graphics::HostImportOffset(*import, address));
+                vertexBuffers.push_back(input->buffer);
+                vertexOffsets.push_back(input->offset);
             }
         }
         std::vector<VkImageView> views;
@@ -1133,14 +1193,16 @@ private:
             }
             totals.indirect++;
         }
-        const Graphics::HostImport* indexImport = nullptr;
+        std::optional<DrawInput> indexInput;
         if (parameters.indexed) {
             const auto bytes = static_cast<std::size_t>(parameters.indexCount) * parameters.indexSize;
-            indexImport = bytes == 0u ? nullptr : Graphics::HostImportFor(context, parameters.indexAddress, bytes);
-            if (indexImport == nullptr) {
+            InputSource source = InputSource::Imported;
+            if (bytes != 0u) indexInput = drawInput(context, parameters.indexAddress, bytes, source);
+            if (!indexInput) {
                 reason = "indices not imported";
                 return false;
             }
+            countInput(totals, source);
             recorder->NotePendingRead(parameters.indexAddress, bytes, Graphics::Recorder::ReadKind::DrawInput);
         }
 
@@ -1168,6 +1230,7 @@ private:
             else if (use.write) passWrites.push_back(range);
             else passReads.push_back(range);
         }
+        if (!passWrites.empty()) Shadow::NoteGpuWrites(passWrites);
         std::vector<std::pair<VkImage, bool>> attachments;
         for (const auto& resident : residents) attachments.emplace_back(resident->Image(), true);
         Graphics::PassAccess access{passReads, passWrites, {}, attachments};
@@ -1211,7 +1274,7 @@ private:
         pipeline->PushConstants(commands, Graphics::PushConstantStages(shaders), block);
 
         if (!vertexBuffers.empty()) context.Resolved(&Graphics::DeviceFunctions::cmdBindVertexBuffers, "vkCmdBindVertexBuffers")(commands, 0, static_cast<std::uint32_t>(vertexBuffers.size()), vertexBuffers.data(), vertexOffsets.data());
-        if (indexImport != nullptr) context.Resolved(&Graphics::DeviceFunctions::cmdBindIndexBuffer, "vkCmdBindIndexBuffer")(commands, indexImport->buffer, Graphics::HostImportOffset(*indexImport, parameters.indexAddress), parameters.indexSize == 2u ? VK_INDEX_TYPE_UINT16 : VK_INDEX_TYPE_UINT32);
+        if (indexInput) context.Resolved(&Graphics::DeviceFunctions::cmdBindIndexBuffer, "vkCmdBindIndexBuffer")(commands, indexInput->buffer, indexInput->offset, parameters.indexSize == 2u ? VK_INDEX_TYPE_UINT16 : VK_INDEX_TYPE_UINT32);
         noteFaultToken(context, *recorder, commands, draw.stages, FaultStage::graphics, parameters.indirect ? "indirect" : (parameters.indexed ? "indexed" : "draw"), parameters.indexCount, parameters.instanceCount);
         std::uint64_t timedProgram = 0;
         for (const auto& one : draw.stages) {

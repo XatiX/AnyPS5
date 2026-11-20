@@ -184,6 +184,34 @@ std::optional<DeviceSpan> Residency::Translate(std::uint64_t address, std::uint6
     return DeviceSpan{range.buffer.handle, offset, range.buffer.address + offset, size};
 }
 
+std::vector<ResidentPiece> Residency::ResidentPieces(std::uint64_t address, std::uint64_t size) const {
+    std::vector<ResidentPiece> pieces;
+    if (size == 0 || address > std::numeric_limits<std::uint64_t>::max() - size) return pieces;
+    const auto end = address + size;
+    std::lock_guard lock(mutex);
+    auto it = ranges.upper_bound(address);
+    if (it != ranges.begin() && std::prev(it)->second.end > address) --it;
+    for (; it != ranges.end() && it->first < end; ++it) {
+        const auto& range = it->second;
+        const auto stop = std::min(end, range.end);
+        for (auto cursor = std::max(address, it->first); cursor < stop;) {
+            const auto index = static_cast<std::size_t>((cursor - range.origin) / ChunkBytes);
+            const auto chunkEnd = std::min(stop, range.origin + (index + 1) * ChunkBytes);
+            if (range.chunks[index]) {
+                const bool extends = !pieces.empty() && pieces.back().device.handle == range.buffer.handle && pieces.back().guest + pieces.back().device.bytes == cursor;
+                if (extends) {
+                    pieces.back().device.bytes += chunkEnd - cursor;
+                } else {
+                    const auto offset = cursor - range.origin;
+                    pieces.push_back({cursor, {range.buffer.handle, offset, range.buffer.address + offset, chunkEnd - cursor}});
+                }
+            }
+            cursor = chunkEnd;
+        }
+    }
+    return pieces;
+}
+
 std::optional<DeviceSpan> Residency::Base(std::uint64_t address) const {
     std::lock_guard lock(mutex);
     const auto it = rangeOf(address);

@@ -317,6 +317,43 @@ std::vector<DirtyRange> PageTable::GpuOwnedIn(std::uint64_t address, std::uint64
     return ranges;
 }
 
+bool PageTable::CleanIn(std::uint64_t address, std::uint64_t size) const {
+    if (size == 0) return false;
+    std::lock_guard lock(mutex);
+    const auto end = endPage(address, size);
+    for (auto page = firstPage(address); page < end; ++page) {
+        const auto* region = regionOf(page);
+        const auto slot = slotOf(page);
+        if (region == nullptr || region->states[slot] != PageState::CpuClean || (region->gpuWritten[slot / 64] & (std::uint64_t{1} << (slot % 64))) != 0) return false;
+    }
+    return true;
+}
+
+void PageTable::NoteGpuWritten(std::uint64_t address, std::uint64_t size) {
+    std::lock_guard lock(mutex);
+    const auto end = endPage(address, size);
+    for (auto page = firstPage(address); page < end; ++page) {
+        auto* region = regionOf(page, true);
+        const auto slot = slotOf(page);
+        auto& word = region->gpuWritten[slot / 64];
+        const auto bit = std::uint64_t{1} << (slot % 64);
+        if ((word & bit) != 0) continue;
+        word |= bit;
+        ++counts.gpuWrittenPages;
+    }
+}
+
+bool PageTable::GpuWrittenIn(std::uint64_t address, std::uint64_t size) const {
+    std::lock_guard lock(mutex);
+    const auto end = endPage(address, size);
+    for (auto page = firstPage(address); page < end; ++page) {
+        const auto* region = regionOf(page);
+        const auto slot = slotOf(page);
+        if (region != nullptr && (region->gpuWritten[slot / 64] & (std::uint64_t{1} << (slot % 64))) != 0) return true;
+    }
+    return false;
+}
+
 std::vector<ProtectionChange> PageTable::Reclaim(std::uint64_t address, std::uint64_t size, bool forWrite) {
     std::lock_guard lock(mutex);
     std::vector<ProtectionChange> changes;

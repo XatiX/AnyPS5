@@ -88,6 +88,25 @@ void testBusyPagesStayOpen() {
     Expect(changes.size() == 1 && changes[0].protection == Protection::ReadOnly && table.StateOf(Base) == PageState::CpuClean, "a busy page is armed again after its consumes run out");
 }
 
+void testCleanInNeedsEveryPageArmed() {
+    PageTable table;
+    static_cast<void>(table.Register(Base, 4 * PageBytes));
+    Expect(!table.CleanIn(Base, 4 * PageBytes), "registered pages are not clean before their first consume");
+    std::vector<ProtectionChange> changes;
+    static_cast<void>(table.ConsumeDirty(changes));
+    Expect(table.CleanIn(Base + 0x10, 4 * PageBytes - 0x20), "consumed pages are clean");
+    Expect(!table.CleanIn(Base, 5 * PageBytes), "an untracked page is not clean");
+    Expect(table.HandleWrite(Base + 3 * PageBytes, changes), "a write to a clean page is handled");
+    Expect(!table.CleanIn(Base, 4 * PageBytes) && table.CleanIn(Base, 3 * PageBytes), "a written page makes only its range unclean");
+    static_cast<void>(table.MarkGpuOwned(Base, PageBytes));
+    Expect(!table.CleanIn(Base, PageBytes), "a GPU-owned page is not clean");
+    Expect(!table.CleanIn(Base + PageBytes, 0), "an empty range is not clean");
+    Expect(table.CleanIn(Base + PageBytes, PageBytes) && !table.GpuWrittenIn(Base + PageBytes, PageBytes), "an armed page is clean before the GPU writes it");
+    table.NoteGpuWritten(Base + PageBytes + 0x20, 0x10);
+    Expect(table.GpuWrittenIn(Base, 3 * PageBytes) && !table.CleanIn(Base + PageBytes, PageBytes), "a GPU write makes its page unclean");
+    Expect(!table.GpuWrittenIn(Base + 2 * PageBytes, PageBytes) && table.Counts().gpuWrittenPages == 1, "only the written page is marked");
+}
+
 void testGpuOwnedPagesReclaim() {
     PageTable table;
     static_cast<void>(table.Register(Base, 4 * PageBytes));
@@ -315,6 +334,7 @@ int main() {
     testGapsMergeOnlyOverCpuPages();
     testBusyPagesStayOpen();
     testGpuOwnedPagesReclaim();
+    testCleanInNeedsEveryPageArmed();
     if (failures != 0) {
         std::fprintf(stderr, "%d failure(s)\n", failures);
         return 1;
