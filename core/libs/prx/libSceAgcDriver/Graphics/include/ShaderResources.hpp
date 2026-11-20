@@ -371,6 +371,7 @@ public:
     std::vector<std::pair<std::uint64_t, std::uint64_t>> ProofRanges() const;
     bool ProofRangesRegistered() const { return proofRangesRegistered; }
     void KeepStorageImageBytes(Recorder& recorder) const;
+    std::size_t RefreshStorageChangedOutsideWatch();
     const std::vector<std::uint64_t>& MultisampleSources() const { return multisampleSources; }
     static bool NeverReusable(std::span<const CompiledShader> shaders);
     static std::uint64_t DepthGuardRefusals();
