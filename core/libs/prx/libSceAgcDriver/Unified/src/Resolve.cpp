@@ -32,6 +32,7 @@ namespace {
 
 constexpr std::uint32_t StorageShapes = 7u;
 constexpr std::uint32_t Image2DShape = 2u;
+constexpr std::uint32_t Image2DArrayShape = 3u;
 constexpr std::uint32_t MultisampleShape = 4u;
 constexpr std::uint32_t MultisampleArrayShape = 5u;
 
@@ -247,7 +248,48 @@ public:
         }
     }
 
+    std::shared_ptr<Images::Surface> BindDeferredRecord(const Heap::SlotRequest& request, std::uint32_t& slot) {
+        static const bool records = std::getenv("APS5_RECODE_NO_STORAGE_RECORDS") == nullptr;
+        if (!records || table == nullptr || surfaces == nullptr) return nullptr;
+        if ((request.flags & (Heap::RequestFlag::Atomic | Heap::RequestFlag::Atomic64)) != 0u) return noteRecordRefusal("atomic storage");
+        const auto shape = (request.kind - Heap::LastSampledKind - 1u) % StorageShapes;
+        if (shape != Image2DShape && shape != Image2DArrayShape) return noteRecordRefusal("storage shape");
+        std::string why;
+        const auto key = Images::KeyOf(request.words, why);
+        if (!key.has_value()) return noteRecordRefusal("storage key: " + why);
+        const auto found = surfaces->Find(key->surface, request.words, why);
+        if (!found.has_value()) return noteRecordRefusal("storage surface: " + why);
+        if (found->surface == nullptr) return noteRecordRefusal("storage written by another owner");
+        auto* vulkan = dynamic_cast<Images::VulkanSurface*>(found->surface->device.get());
+        if (vulkan == nullptr) return noteRecordRefusal("storage surface without a Vulkan image");
+        try {
+            const auto resource = Graphics::DecodeTextureResource(request.words);
+            const auto mip = std::min(request.flags >> Heap::RequestFlag::MipShift, std::max(resource.mipCount, 1u) - 1u);
+            const auto view = vulkan->ShapedStorageView(mip, shape == Image2DArrayShape, (request.flags & Heap::RequestFlag::UintView) != 0u, why);
+            if (view == VK_NULL_HANDLE) return noteRecordRefusal(why);
+            slot = table->ImageSlot(request.kind, {reinterpret_cast<std::uint64_t>(view), static_cast<std::uint32_t>(VK_IMAGE_LAYOUT_GENERAL), found->surface});
+            if (slot == Heap::NoSlot) return noteRecordRefusal("image heap full");
+        } catch (const std::exception& error) {
+            return noteRecordRefusal(std::string("storage record: ") + error.what());
+        }
+        std::lock_guard lock(recordMutex);
+        storageRecords++;
+        return found->surface;
+    }
+
 private:
+    std::shared_ptr<Images::Surface> noteRecordRefusal(const std::string& why) {
+        std::lock_guard lock(recordMutex);
+        storageRecordRefusals++;
+        if (recordRefusalReasons.insert(why).second) std::fprintf(stderr, "[recode-resolve] first storage record refusal: %s\n", why.c_str());
+        return nullptr;
+    }
+
+    std::mutex recordMutex;
+    std::uint64_t storageRecords = 0;
+    std::uint64_t storageRecordRefusals = 0;
+    std::set<std::string> recordRefusalReasons;
+
     std::shared_ptr<const ResolvedDraw> resolve(const Operation& operation, const DecodeState& state) {
         totals.draws++;
         const auto* submission = state.CurrentSubmission();
@@ -481,6 +523,10 @@ public:
         std::snprintf(text, sizeof(text), "; per draw: decode %.1f, prepare %.1f, capture %.1f, materialize %.1f, variant %.1f us", perDraw(totals.phases[PhaseDecode]), perDraw(totals.phases[PhasePrepare]), perDraw(totals.phases[PhaseCapture]), perDraw(totals.phases[PhaseMaterialize]), perDraw(totals.phases[PhaseVariant]));
         line += text;
         line += "; gpu lock busy " + std::to_string(totals.lockBusy);
+        {
+            std::lock_guard recordLock(recordMutex);
+            line += "; storage images on recode surfaces " + std::to_string(storageRecords) + ", " + std::to_string(storageRecordRefusals) + " refused";
+        }
         const auto packets = handoff.TakeCounts();
         std::snprintf(text, sizeof(text), "; hand-off %llu offered (%llu refused), %llu found, %llu refused, %llu waited, %llu missed, %llu released, %llu dropped, %llu pending", static_cast<unsigned long long>(packets.offered), static_cast<unsigned long long>(packets.refusedOffers), static_cast<unsigned long long>(packets.found), static_cast<unsigned long long>(packets.refused), static_cast<unsigned long long>(packets.waited), static_cast<unsigned long long>(packets.missed), static_cast<unsigned long long>(packets.released), static_cast<unsigned long long>(packets.dropped), static_cast<unsigned long long>(packets.pending));
         line += text;
@@ -831,6 +877,10 @@ Images::SurfaceTable* Surfaces() {
 
 std::shared_ptr<Graphics::StorageTexture> BindDeferredImage(const Graphics::Context& context, const Heap::SlotRequest& request, std::uint32_t& slot, std::string& reason) {
     return shared().BindDeferred(context, request, slot, reason);
+}
+
+std::shared_ptr<Images::Surface> BindDeferredRecord(const Heap::SlotRequest& request, std::uint32_t& slot) {
+    return shared().BindDeferredRecord(request, slot);
 }
 
 std::shared_ptr<const void> BindDeferredSampled(const Graphics::Context& context, const Heap::SlotRequest& request, std::uint32_t& slot, std::string& reason) {

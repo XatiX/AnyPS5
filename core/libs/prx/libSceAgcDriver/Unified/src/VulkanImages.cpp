@@ -60,6 +60,7 @@ VulkanSurface::~VulkanSurface() {
     const auto destroyView = context.Function<PFN_vkDestroyImageView>("vkDestroyImageView");
     for (const auto& [key, view] : views) destroyView(context.device, view, nullptr);
     for (const auto& [key, view] : storageViews) destroyView(context.device, view, nullptr);
+    for (const auto& [key, view] : shapedStorageViews) destroyView(context.device, view, nullptr);
     if (image != VK_NULL_HANDLE) context.Function<PFN_vkDestroyImage>("vkDestroyImage")(context.device, image, nullptr);
     if (memory != VK_NULL_HANDLE) context.Function<PFN_vkFreeMemory>("vkFreeMemory")(context.device, memory, nullptr);
 }
@@ -134,6 +135,45 @@ VkImageView VulkanSurface::StorageView(std::uint32_t level, std::uint32_t layer,
     VkImageView created = VK_NULL_HANDLE;
     Graphics::Check(context.Function<PFN_vkCreateImageView>("vkCreateImageView")(context.device, &info, nullptr, &created), "vkCreateImageView recode surface storage");
     storageViews.emplace(key, created);
+    return created;
+}
+
+VkImageView VulkanSurface::ShapedStorageView(std::uint32_t level, bool array, bool uintView, std::string& reason) {
+    if (compressed) {
+        reason = "storage view of a compressed surface";
+        return VK_NULL_HANDLE;
+    }
+    if (!uintView) {
+        reason = "typed storage view";
+        return VK_NULL_HANDLE;
+    }
+    const bool volume = resource.dimension == Graphics::TextureDimension::k3D;
+    if (volume) {
+        reason = "storage view of a volume";
+        return VK_NULL_HANDLE;
+    }
+    const auto levels = static_cast<std::uint32_t>(std::max<std::size_t>(geometry.mips.size(), 1u));
+    if (level >= levels) {
+        reason = "storage view past the levels";
+        return VK_NULL_HANDLE;
+    }
+    const auto key = std::make_tuple(level, array, uintView);
+    std::lock_guard lock(mutex);
+    if (const auto found = shapedStorageViews.find(key); found != shapedStorageViews.end()) return found->second;
+    VkImageViewUsageCreateInfo usage{VK_STRUCTURE_TYPE_IMAGE_VIEW_USAGE_CREATE_INFO};
+    usage.usage = VK_IMAGE_USAGE_STORAGE_BIT;
+    VkImageViewCreateInfo info{VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO};
+    info.pNext = &usage;
+    info.image = image;
+    info.viewType = array ? VK_IMAGE_VIEW_TYPE_2D_ARRAY : VK_IMAGE_VIEW_TYPE_2D;
+    info.format = uintView ? Graphics::TextureDetiler::ImageElementFormat(Graphics::BytesPerElement(resource.format)) : format;
+    info.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, level, 1u, 0u, array ? std::max(geometry.imageLayers, 1u) : 1u};
+    VkImageView created = VK_NULL_HANDLE;
+    if (context.Function<PFN_vkCreateImageView>("vkCreateImageView")(context.device, &info, nullptr, &created) != VK_SUCCESS) {
+        reason = "vkCreateImageView recode storage";
+        return VK_NULL_HANDLE;
+    }
+    shapedStorageViews.emplace(key, created);
     return created;
 }
 

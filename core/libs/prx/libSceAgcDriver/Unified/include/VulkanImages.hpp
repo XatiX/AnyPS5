@@ -21,6 +21,7 @@ public:
     [[nodiscard]] std::uint64_t View(const ViewKey& view, std::uint32_t kind, std::string& reason) override;
     [[nodiscard]] std::uint32_t Layout() const override { return VK_IMAGE_LAYOUT_GENERAL; }
     [[nodiscard]] VkImageView StorageView(std::uint32_t level, std::uint32_t layer, std::uint32_t elementBytes);
+    [[nodiscard]] VkImageView ShapedStorageView(std::uint32_t level, bool array, bool uintView, std::string& reason);
     [[nodiscard]] VkImage Image() const { return image; }
     [[nodiscard]] const Graphics::GuestTextureResource& Resource() const { return resource; }
     [[nodiscard]] const Graphics::SurfaceGeometry& Geometry() const { return geometry; }
@@ -41,6 +42,7 @@ private:
     std::mutex mutex;
     std::map<std::tuple<std::uint32_t, std::uint32_t, std::uint32_t, std::uint32_t, std::uint32_t, std::uint32_t>, VkImageView> views;
     std::map<std::tuple<std::uint32_t, std::uint32_t, std::uint32_t>, VkImageView> storageViews;
+    std::map<std::tuple<std::uint32_t, bool, bool>, VkImageView> shapedStorageViews;
 };
 
 class VulkanSurfaceDevice final : public SurfaceDevice {

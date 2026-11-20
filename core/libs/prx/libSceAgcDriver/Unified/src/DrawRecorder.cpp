@@ -193,6 +193,7 @@ struct Totals {
     std::uint64_t copyBackCovered = 0;
     std::uint64_t importsReturned = 0;
     std::uint64_t residencyRefreshes = 0;
+    std::uint64_t recordWrites = 0;
     std::uint64_t indirectDispatches = 0;
     std::uint64_t gdsBindings = 0;
     std::uint64_t knownGpuWritten = 0;
@@ -658,6 +659,7 @@ public:
         line += text;
         std::snprintf(text, sizeof(text), "; table maps %llu hits, %llu uploads (%.1f MiB), %llu retired, %zu held (%.1f MiB)", static_cast<unsigned long long>(totals.mapHits), static_cast<unsigned long long>(totals.mapUploads), static_cast<double>(totals.mapUploadBytes) / 1048576.0, static_cast<unsigned long long>(totals.mapRetired), maps.size(), static_cast<double>(mapBytes) / 1048576.0);
         line += text;
+        line += "; storage writes to recode surfaces " + std::to_string(totals.recordWrites);
         line += "; fill and copy kernels recorded " + std::to_string(recordedFills.load(std::memory_order_relaxed)) + " and " + std::to_string(recordedCopies.load(std::memory_order_relaxed));
         line += "; GDS bound " + std::to_string(totals.gdsBindings) + " times;dispatches waited for their pipeline " + std::to_string(totals.pipelineWaits) + " times (" + std::to_string(totals.pipelineWaitNanoseconds / 1000000u) + " ms)";
         std::snprintf(text, sizeof(text), "; fault buffers %zu in flight, %llu read: %llu faults (%llu unmapped), %llu fault pages served, %llu written ranges (%llu pieces landed late), %llu written overflows", faults.size(), static_cast<unsigned long long>(totals.faultReads), static_cast<unsigned long long>(totals.faults), static_cast<unsigned long long>(totals.unmappedFaults), static_cast<unsigned long long>(totals.faultPages), static_cast<unsigned long long>(totals.writtenRanges), static_cast<unsigned long long>(totals.writtenLate), static_cast<unsigned long long>(totals.writtenOverflows));
@@ -1444,6 +1446,7 @@ private:
     }
 
     bool recordDispatch(const Context& context, const Resolve::ResolvedDraw& dispatch, const std::array<std::uint32_t, 3>& groups, std::string& reason) {
+        writtenRecords.clear();
         if (dispatch.stages.size() != 1u || dispatch.stages.front().deferredImages.empty()) return recordBound(context, dispatch, groups, {}, reason);
         auto bound = dispatch;
         auto& stage = bound.stages.front();
@@ -1456,6 +1459,12 @@ private:
                 if (owner == nullptr) return false;
                 stage.slots[deferred.index] = slot;
                 if (context.recorder != nullptr) context.recorder->Keep(std::const_pointer_cast<void>(owner));
+                continue;
+            }
+            if (auto record = Resolve::BindDeferredRecord(deferred.request, slot)) {
+                stage.slots[deferred.index] = slot;
+                if (context.recorder != nullptr) context.recorder->Keep(record);
+                if ((deferred.request.flags & Heap::RequestFlag::Written) != 0u) writtenRecords.push_back(std::move(record));
                 continue;
             }
             auto texture = Resolve::BindDeferredImage(context, deferred.request, slot, reason);
@@ -1581,12 +1590,23 @@ private:
             static_cast<void>(Graphics::DepthSurfaceStoreBack(context, *texture));
             totals.storageWrites++;
         }
-        if (!written.empty()) GuestMemory::BreakProofs();
+        if (!written.empty() || !writtenRecords.empty()) GuestMemory::BreakProofs();
+        auto* surfaceTable = Resolve::Surfaces();
+        for (const auto& record : writtenRecords) {
+            const auto owner = Images::OwnerOf(*record);
+            static_cast<void>(Events::GpuWrites().Note(record->key.address, record->key.bytes, owner));
+            static_cast<void>(Events::Shared().Note(record->key.address, record->key.bytes, owner));
+            if (surfaceTable != nullptr) surfaceTable->MarkGpuWritten(*record);
+            totals.recordWrites++;
+        }
         std::vector<std::pair<std::uint64_t, std::uint64_t>> writtenRanges;
         for (std::size_t index = 0; index < dispatch.uses.size(); ++index) {
             const auto& use = dispatch.uses[index];
-            if (use.write) writtenRanges.emplace_back(use.address, use.address + use.size);
+            if (!use.write) continue;
+            if (std::ranges::any_of(writtenRecords, [&](const std::shared_ptr<Images::Surface>& record) { return record->key.address <= use.address && use.address + use.size <= record->key.address + record->key.bytes; })) continue;
+            writtenRanges.emplace_back(use.address, use.address + use.size);
         }
+        writtenRecords.clear();
         if (!writtenRanges.empty()) Events::NoteRanges(writtenRanges);
         if (marksDispatchWrites()) {
             for (const auto& [begin, end] : writtenRanges) MemoryCore::Get().Pages().NoteGpuWritten(begin, end - begin);
@@ -2007,6 +2027,7 @@ private:
     std::deque<FaultBuffer> faults;
     std::deque<KnownWrite> knownWrites;
     std::vector<CopyBack> copyBacks;
+    std::vector<std::shared_ptr<Images::Surface>> writtenRecords;
     std::map<std::uint64_t, std::vector<std::pair<std::uint64_t, std::uint64_t>>> copiedBack;
     bool copyingBack = false;
     std::set<std::uint64_t> switches;

@@ -31,6 +31,7 @@ struct Mirror;
 
 namespace AgcDriver::Unified::Images {
 class SurfaceTable;
+struct Surface;
 }
 
 namespace AgcDriver::Unified::Resolve {
@@ -66,6 +67,7 @@ void Consume(const Operation& operation, const DecodeState& state);
 [[nodiscard]] const Heap::VulkanHeapDevice* HeapDevice();
 [[nodiscard]] Images::SurfaceTable* Surfaces();
 [[nodiscard]] std::shared_ptr<Graphics::StorageTexture> BindDeferredImage(const Graphics::Context& context, const Heap::SlotRequest& request, std::uint32_t& slot, std::string& reason);
+[[nodiscard]] std::shared_ptr<Images::Surface> BindDeferredRecord(const Heap::SlotRequest& request, std::uint32_t& slot);
 [[nodiscard]] std::shared_ptr<const void> BindDeferredSampled(const Graphics::Context& context, const Heap::SlotRequest& request, std::uint32_t& slot, std::string& reason);
 
 }
