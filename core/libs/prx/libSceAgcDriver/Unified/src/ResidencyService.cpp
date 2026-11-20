@@ -269,6 +269,17 @@ bool ResidencyService::WrittenImportAny(std::uint64_t address, std::uint64_t siz
     return found != writtenImports.end() && found->first < address + size;
 }
 
+std::vector<std::uint64_t> ResidencyService::UnmappedPages(std::uint64_t address, std::uint64_t size) const {
+    std::vector<std::uint64_t> missing;
+    if (!Attached() || size == 0) return missing;
+    std::lock_guard lock(mutex);
+    if (!pages) return missing;
+    for (auto page = address & ~(GpuPageBytes - 1); page < address + size; page += GpuPageBytes) {
+        if (pages->Lookup(page) == 0) missing.push_back(page);
+    }
+    return missing;
+}
+
 std::optional<DeviceSpan> ResidencyService::ReturnWrittenImport(std::uint64_t chunk) {
     if (!Attached()) return std::nullopt;
     std::lock_guard lock(mutex);

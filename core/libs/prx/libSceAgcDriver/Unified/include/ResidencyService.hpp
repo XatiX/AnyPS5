@@ -47,6 +47,7 @@ public:
     [[nodiscard]] bool WrittenImport(std::uint64_t chunk) const;
     [[nodiscard]] bool WrittenImportThroughout(std::uint64_t address, std::uint64_t size) const;
     [[nodiscard]] bool WrittenImportAny(std::uint64_t address, std::uint64_t size) const;
+    [[nodiscard]] std::vector<std::uint64_t> UnmappedPages(std::uint64_t address, std::uint64_t size) const;
     std::optional<DeviceSpan> ReturnWrittenImport(std::uint64_t chunk);
     [[nodiscard]] std::shared_ptr<Graphics::Buffer> PageTableBuffer() const;
     std::vector<PendingUpload> ReadBack(std::span<const std::pair<std::uint64_t, std::uint64_t>> ranges);

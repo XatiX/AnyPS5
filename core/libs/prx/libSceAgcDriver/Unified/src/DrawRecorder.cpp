@@ -866,10 +866,10 @@ private:
         if (bytes > (copiedBackWrite ? KnownBufferLimitBytes : KnownWriteLimitBytes)) return 0u;
         auto mapped = residency.TranslateMapped(address, bytes, true);
         if (mapped == 0u && bytes <= KnownWriteLimitBytes && servesFaultPages()) {
-            std::vector<std::uint64_t> pages;
-            for (auto page = address & ~(GpuPageBytes - 1u); page < address + bytes; page += GpuPageBytes) pages.push_back(page);
-            Shadow::ServeFaultPages(pages);
-            mapped = residency.TranslateMapped(address, bytes, true);
+            if (const auto pages = residency.UnmappedPages(address, bytes); !pages.empty()) {
+                Shadow::ServeFaultPages(pages);
+                mapped = residency.TranslateMapped(address, bytes, true);
+            }
         }
         if (mapped == 0u || copiedBackWrite) return mapped;
         if (knownWrites.empty() || knownWrites.back().serial != serial || knownWrites.back().address != address || knownWrites.back().bytes != bytes) knownWrites.push_back({serial, address, bytes});
@@ -1067,11 +1067,11 @@ private:
             auto mapped = ResidencyService::Get().TranslateMapped(address, reach);
             if (mapped == 0u && reach != bytes) mapped = ResidencyService::Get().TranslateMapped(address, bytes);
             if (mapped == 0u && bytes <= KnownBufferLimitBytes && servesFaultPages()) {
-                std::vector<std::uint64_t> pages;
-                for (auto page = address & ~(GpuPageBytes - 1u); page < address + bytes; page += GpuPageBytes) pages.push_back(page);
-                Shadow::ServeFaultPages(pages);
-                mapped = ResidencyService::Get().TranslateMapped(address, bytes);
-                if (mapped != 0u) totals.knownPaged++;
+                if (const auto pages = ResidencyService::Get().UnmappedPages(address, bytes); !pages.empty()) {
+                    Shadow::ServeFaultPages(pages);
+                    mapped = ResidencyService::Get().TranslateMapped(address, bytes);
+                    if (mapped != 0u) totals.knownPaged++;
+                }
             }
             if (mapped != 0u) {
                 totals.knownMapped++;
