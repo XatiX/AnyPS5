@@ -207,8 +207,8 @@ void report() {
         line += part;
     }
     const auto order = front().Ordering().Counts();
-    char tail[160];
-    std::snprintf(tail, sizeof(tail), " waits: edges %llu released %llu pending %llu superseded %llu always %llu\n", static_cast<unsigned long long>(order.edges), static_cast<unsigned long long>(order.released), static_cast<unsigned long long>(order.pending), static_cast<unsigned long long>(order.superseded), static_cast<unsigned long long>(order.alwaysPass));
+    char tail[256];
+    std::snprintf(tail, sizeof(tail), " waits: edges %llu (across queues %llu) released %llu pending %llu (behind another queue's store %llu) superseded %llu always %llu\n", static_cast<unsigned long long>(order.edges), static_cast<unsigned long long>(order.crossEdges), static_cast<unsigned long long>(order.released), static_cast<unsigned long long>(order.pending), static_cast<unsigned long long>(order.crossPending), static_cast<unsigned long long>(order.superseded), static_cast<unsigned long long>(order.alwaysPass));
     line += tail;
     const auto driver = PacketCounters::Sum();
     char compare[256];

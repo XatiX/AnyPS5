@@ -18,8 +18,10 @@ Order::Verdict Order::Resolve(Operation& wait) {
     if (found != stores.end() && satisfies(found->second, wait)) {
         wait.after = {found->second.queue, found->second.sequence};
         ++counts.edges;
+        if (found->second.queue != wait.queue) ++counts.crossEdges;
         return Verdict::Edge;
     }
+    if (found != stores.end() && found->second.queue != wait.queue) ++counts.crossPending;
     counts.superseded += std::erase_if(pending, [&](const Operation& held) { return held.queue == wait.queue; });
     pending.push_back(wait);
     ++counts.pending;

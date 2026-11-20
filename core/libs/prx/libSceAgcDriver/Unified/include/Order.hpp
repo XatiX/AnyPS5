@@ -11,6 +11,8 @@ namespace AgcDriver::Unified {
 
 struct OrderCounts {
     std::uint64_t edges = 0;
+    std::uint64_t crossEdges = 0;
+    std::uint64_t crossPending = 0;
     std::uint64_t alwaysPass = 0;
     std::uint64_t pending = 0;
     std::uint64_t released = 0;
