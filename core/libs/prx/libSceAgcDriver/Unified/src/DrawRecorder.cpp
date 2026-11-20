@@ -264,6 +264,9 @@ bool copiesBackDispatchWrites() {
     return copies;
 }
 
+std::atomic<std::uint64_t> recordedFills{0};
+std::atomic<std::uint64_t> recordedCopies{0};
+
 bool refreshesBeforeCopyBack() {
     static const bool refreshes = std::getenv("APS5_RECODE_NO_COPY_BACK_REFRESH") == nullptr;
     return refreshes;
@@ -655,7 +658,8 @@ public:
         line += text;
         std::snprintf(text, sizeof(text), "; table maps %llu hits, %llu uploads (%.1f MiB), %llu retired, %zu held (%.1f MiB)", static_cast<unsigned long long>(totals.mapHits), static_cast<unsigned long long>(totals.mapUploads), static_cast<double>(totals.mapUploadBytes) / 1048576.0, static_cast<unsigned long long>(totals.mapRetired), maps.size(), static_cast<double>(mapBytes) / 1048576.0);
         line += text;
-        line += "; GDS bound " + std::to_string(totals.gdsBindings) + " times; dispatches waited for their pipeline " + std::to_string(totals.pipelineWaits) + " times (" + std::to_string(totals.pipelineWaitNanoseconds / 1000000u) + " ms)";
+        line += "; fill and copy kernels recorded " + std::to_string(recordedFills.load(std::memory_order_relaxed)) + " and " + std::to_string(recordedCopies.load(std::memory_order_relaxed));
+        line += "; GDS bound " + std::to_string(totals.gdsBindings) + " times;dispatches waited for their pipeline " + std::to_string(totals.pipelineWaits) + " times (" + std::to_string(totals.pipelineWaitNanoseconds / 1000000u) + " ms)";
         std::snprintf(text, sizeof(text), "; fault buffers %zu in flight, %llu read: %llu faults (%llu unmapped), %llu fault pages served, %llu written ranges (%llu pieces landed late), %llu written overflows", faults.size(), static_cast<unsigned long long>(totals.faultReads), static_cast<unsigned long long>(totals.faults), static_cast<unsigned long long>(totals.unmappedFaults), static_cast<unsigned long long>(totals.faultPages), static_cast<unsigned long long>(totals.writtenRanges), static_cast<unsigned long long>(totals.writtenLate), static_cast<unsigned long long>(totals.writtenOverflows));
         line += text;
         std::snprintf(text, sizeof(text), "; GPU-written chunks %llu switched to their import from the written bitmap (%.1f MiB copied over), %llu from other GPU writes, %llu refused, %llu written pieces already on an import", static_cast<unsigned long long>(totals.importSwitches), static_cast<double>(totals.switchBytes) / 1048576.0, static_cast<unsigned long long>(totals.writtenSwitches), static_cast<unsigned long long>(totals.switchRefused), static_cast<unsigned long long>(totals.writtenOnImports));
@@ -2049,6 +2053,15 @@ bool RecordActive() {
         return value != nullptr && std::string_view(value) == "record";
     }();
     return enabled;
+}
+
+bool RecordsKernels(std::uint32_t queue) {
+    static const bool records = std::getenv("APS5_RECODE_NO_KERNEL_RECORD") == nullptr;
+    return records && RecordActive() && Resolve::DispatchesRoutedOn(queue);
+}
+
+void NoteKernel(Kernel kernel) {
+    (kernel == Kernel::Fill ? recordedFills : recordedCopies).fetch_add(1, std::memory_order_relaxed);
 }
 
 bool IdleStores() {
