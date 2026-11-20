@@ -1496,6 +1496,11 @@ bool RecordActive() {
     return enabled;
 }
 
+bool IdleStores() {
+    static const bool idle = !RecordActive() || std::getenv("APS5_RECODE_IDLE_STORE") != nullptr;
+    return idle;
+}
+
 bool RecordPrecheck(const Resolve::ResolvedDraw& draw, const Pm4::DrawParameters& parameters, std::vector<std::pair<std::uint64_t, std::uint64_t>>& reads, std::string& reason) {
     return shared().Precheck(draw, parameters, reads, reason);
 }

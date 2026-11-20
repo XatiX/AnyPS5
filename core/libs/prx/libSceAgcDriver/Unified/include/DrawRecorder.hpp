@@ -15,6 +15,7 @@ class VulkanDevice;
 namespace AgcDriver::Unified::Record {
 
 [[nodiscard]] bool RecordActive();
+[[nodiscard]] bool IdleStores();
 bool RecordPrecheck(const Resolve::ResolvedDraw& draw, const Pm4::DrawParameters& parameters, std::vector<std::pair<std::uint64_t, std::uint64_t>>& reads, std::string& reason);
 bool RecordResolved(const Graphics::Context& context, const Resolve::ResolvedDraw& draw, const Pm4::DrawParameters& parameters, std::string& reason);
 bool RecordDispatchPrecheck(const Graphics::Context& context, const VulkanDevice& owner, const Resolve::ResolvedDraw& dispatch, std::string& reason);
