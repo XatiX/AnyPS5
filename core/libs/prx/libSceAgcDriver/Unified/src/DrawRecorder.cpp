@@ -189,6 +189,7 @@ struct Totals {
     std::uint64_t knownRefused = 0;
     std::uint64_t knownPrefixes = 0;
     std::uint64_t importExtensions = 0;
+    std::uint64_t knownSwitches = 0;
     std::uint64_t knownSkipped = 0;
     std::uint64_t knownWritten = 0;
     std::uint64_t knownWriteLookups = 0;
@@ -198,6 +199,7 @@ struct Totals {
     std::uint64_t copyBackCovered = 0;
     std::uint64_t importsReturned = 0;
     std::uint64_t residencyRefreshes = 0;
+    std::uint64_t refreshKeptPages = 0;
     std::uint64_t recordWrites = 0;
     std::uint64_t recordTargetDraws = 0;
     std::uint64_t recordAdoptions = 0;
@@ -297,6 +299,11 @@ bool recordsTargets() {
 bool refreshesBeforeCopyBack() {
     static const bool refreshes = std::getenv("APS5_RECODE_NO_COPY_BACK_REFRESH") == nullptr;
     return refreshes;
+}
+
+bool keepsGpuWrittenPages() {
+    static const bool keeps = std::getenv("APS5_RECODE_REFRESH_GPU_WRITTEN") == nullptr;
+    return keeps;
 }
 
 bool bindsGds() {
@@ -701,7 +708,7 @@ public:
         line += "; passes " + std::to_string(totals.passesBegun) + " begun, " + std::to_string(totals.passesContinued) + " draws continued, " + std::to_string(totals.passFeedback) + " broken by a target read";
         line += "; target memo " + std::to_string(totals.targetMemoHits) + " hits, " + std::to_string(totals.targetMemoMisses) + " misses; " + std::to_string(totals.deferredReads) + " draws with reads bound at record";
         line += "; residency updates landed " + std::to_string(totals.residencyLands);
-        line += "; known buffers " + std::to_string(totals.knownServed) + " served, " + std::to_string(totals.knownMapped) + " mapped (" + std::to_string(totals.knownPaged) + " paged in), " + std::to_string(totals.knownCopied) + " copied (" + std::to_string(totals.knownGpuWritten) + " GPU-written ranges not copied), " + std::to_string(totals.knownRefused) + " unresolved, " + std::to_string(totals.knownPrefixes) + " bound to their mapped prefix (" + std::to_string(totals.importExtensions) + " unmapped chunks mapped to their written import), " + std::to_string(totals.knownSkipped) + " skipped (" + std::to_string(totals.knownPointers) + " of them pointers); known writes " + std::to_string(totals.knownWritten) + " direct (" + std::to_string(totals.knownWriteBytes >> 10u) + " KiB landed), " + std::to_string(totals.knownWriteLookups) + " through the page table, " + std::to_string(totals.copyBacks) + " copied back to their import after the dispatch (" + std::to_string(totals.copyBackBytes >> 20u) + " MiB, " + std::to_string(totals.copyBackCovered >> 10u) + " KiB of written pieces not landed, " + std::to_string(totals.importsReturned) + " chunks returned from their import, " + std::to_string(totals.residencyRefreshes) + " residency refreshes before the dispatch)";
+        line += "; known buffers " + std::to_string(totals.knownServed) + " served, " + std::to_string(totals.knownMapped) + " mapped (" + std::to_string(totals.knownPaged) + " paged in), " + std::to_string(totals.knownCopied) + " copied (" + std::to_string(totals.knownGpuWritten) + " GPU-written ranges not copied), " + std::to_string(totals.knownRefused) + " unresolved, " + std::to_string(totals.knownPrefixes) + " bound to their mapped prefix (" + std::to_string(totals.importExtensions) + " chunks moved to their written import to make a known buffer contiguous, " + std::to_string(totals.knownSwitches) + " of them from residency), " + std::to_string(totals.knownSkipped) + " skipped (" + std::to_string(totals.knownPointers) + " of them pointers); known writes " + std::to_string(totals.knownWritten) + " direct (" + std::to_string(totals.knownWriteBytes >> 10u) + " KiB landed), " + std::to_string(totals.knownWriteLookups) + " through the page table, " + std::to_string(totals.copyBacks) + " copied back to their import after the dispatch (" + std::to_string(totals.copyBackBytes >> 20u) + " MiB, " + std::to_string(totals.copyBackCovered >> 10u) + " KiB of written pieces not landed, " + std::to_string(totals.importsReturned) + " chunks returned from their import, " + std::to_string(totals.residencyRefreshes) + " residency refreshes before the dispatch, " + std::to_string(totals.refreshKeptPages) + " GPU-written pages kept from them)";
         line += "; draw inputs " + std::to_string(totals.inputsResident) + " resident, " + std::to_string(totals.inputsImported) + " imported, " + std::to_string(totals.inputsWritten) + " after CPU writes (" + std::to_string(totals.inputsCopied) + " copied into the ring), " + std::to_string(totals.inputsGpuWritten) + " GPU-written, " + std::to_string(totals.inputsAliased) + " aliased, " + std::to_string(totals.inputsMerged) + " served with an overlapping input";
         std::snprintf(text, sizeof(text), "; draw phases surfaces %.1f ms, targets %.1f ms, pipelines %.1f ms, owned uploads %.1f ms", static_cast<double>(totals.surfaceNanoseconds) / 1e6, static_cast<double>(totals.targetNanoseconds) / 1e6, static_cast<double>(totals.graphicsPipelineNanoseconds) / 1e6, static_cast<double>(totals.uploadNanoseconds) / 1e6);
         line += text;
@@ -873,13 +880,29 @@ private:
         auto& residency = ResidencyService::Get();
         std::vector<std::pair<std::uint64_t, VkBufferCopy>> regions;
         const auto end = address + bytes;
+        const auto add = [&](std::uint64_t from, std::uint64_t to) {
+            const auto span = residency.Translate(from, to - from);
+            if (!span) return;
+            const auto source = Graphics::HostImportOffset(import, from);
+            if (!regions.empty() && regions.back().first == span->handle && regions.back().second.srcOffset + regions.back().second.size == source && regions.back().second.dstOffset + regions.back().second.size == span->offset) regions.back().second.size += to - from;
+            else regions.push_back({span->handle, VkBufferCopy{source, span->offset, to - from}});
+        };
         for (auto at = address; at < end;) {
-            const auto next = std::min(end, (at & ~(ChunkBytes - 1u)) + ChunkBytes);
-            if (!residency.WrittenImport(at & ~(ChunkBytes - 1u))) {
-                if (const auto span = residency.Translate(at, next - at)) {
-                    const auto source = Graphics::HostImportOffset(import, at);
-                    if (!regions.empty() && regions.back().first == span->handle && regions.back().second.srcOffset + regions.back().second.size == source && regions.back().second.dstOffset + regions.back().second.size == span->offset) regions.back().second.size += next - at;
-                    else regions.push_back({span->handle, VkBufferCopy{source, span->offset, next - at}});
+            const auto chunk = at & ~(ChunkBytes - 1u);
+            const auto next = std::min(end, chunk + ChunkBytes);
+            if (!residency.WrittenImport(chunk)) {
+                const auto found = keepsGpuWrittenPages() ? writtenPages.find(chunk) : writtenPages.end();
+                const std::uint32_t newer = found != writtenPages.end() ? found->second : 0u;
+                if (newer == 0u) {
+                    add(at, next);
+                } else {
+                    for (auto from = at; from < next;) {
+                        const auto page = static_cast<std::uint32_t>((from - chunk) / PageBytes);
+                        const auto to = std::min(next, chunk + (page + 1u) * PageBytes);
+                        if ((newer & (1u << page)) != 0u) totals.refreshKeptPages++;
+                        else add(from, to);
+                        from = to;
+                    }
                 }
             }
             at = next;
@@ -955,6 +978,7 @@ private:
             }
             covered.emplace_back(back.address, end);
             ends.emplace_back(back.address, end);
+            if (keepsGpuWrittenPages()) clearResidencyNewer(back.address, end);
             totals.copyBacks++;
         }
         flush();
@@ -991,18 +1015,33 @@ private:
 
     bool extendWrittenImports(const Context& context, std::uint64_t address, std::uint64_t bytes) {
         auto& residency = ResidencyService::Get();
-        if (!servesKnownPrefixes() || !residency.WrittenImportAny(address, bytes) || residency.WrittenImportThroughout(address, bytes)) return false;
-        const auto* import = Graphics::HostImportFor(context, address, static_cast<std::size_t>(bytes));
-        if (import == nullptr) return false;
+        if (!servesKnownPrefixes() || residency.WrittenImportThroughout(address, bytes) || residency.TranslateMapped(address, bytes) != 0u) return false;
+        const auto* import = Graphics::HostImportFor(context, address, 1u);
+        if (import == nullptr || context.recorder == nullptr) return false;
         bool extended = false;
+        std::vector<std::uint64_t> moving;
         for (auto chunk = address & ~(ChunkBytes - 1u); chunk < address + bytes; chunk += ChunkBytes) {
             if (chunk < import->base || chunk + ChunkBytes > import->base + import->bytes || residency.WrittenImport(chunk)) continue;
-            if (residency.UnmappedPages(chunk, ChunkBytes).size() != ChunkBytes / GpuPageBytes) continue;
+            if (residency.UnmappedPages(chunk, ChunkBytes).size() != ChunkBytes / GpuPageBytes) {
+                moving.push_back(chunk);
+                continue;
+            }
             if (residency.MapWrittenImport(chunk, import->address + (chunk - import->base))) {
                 totals.importExtensions++;
                 extended = true;
             }
         }
+        if (moving.empty()) return extended;
+        const auto commands = context.recorder->Commands();
+        bool copied = false;
+        for (const auto chunk : moving) {
+            if (!switchChunk(context, commands, chunk, true, copied)) continue;
+            writtenPages.erase(chunk);
+            totals.importExtensions++;
+            totals.knownSwitches++;
+            extended = true;
+        }
+        if (copied) Graphics::RecordMemoryBarrier(context, commands, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT | VK_PIPELINE_STAGE_HOST_BIT, VK_ACCESS_TRANSFER_WRITE_BIT, VK_ACCESS_MEMORY_READ_BIT | VK_ACCESS_MEMORY_WRITE_BIT | VK_ACCESS_HOST_READ_BIT);
         return extended;
     }
 
@@ -1287,6 +1326,7 @@ private:
         if (!Downgrades::Active()) return;
         char text[96];
         std::snprintf(text, sizeof(text), "0x%llx+0x%llx served 0x%llx", static_cast<unsigned long long>(address), static_cast<unsigned long long>(bytes), static_cast<unsigned long long>(served));
+        if (kind == Downgrades::Kind::KnownPrefix && served * 2u < bytes) kind = Downgrades::Kind::KnownShort;
         Downgrades::Note(stage.program.codeAddress, kind, index, text);
     }
 
@@ -1557,7 +1597,8 @@ private:
                 failure = error.what();
             }
             const auto built = elapsed(started);
-            Downgrades::NoteBuild(job->codeAddress, built, job->result != nullptr ? job->result->spirv.size() * sizeof(std::uint32_t) : 0u);
+            if (job->result != nullptr) Downgrades::DumpModule(job->codeAddress, job->result->spirv.ContentHash().low, std::span<const std::uint32_t>(job->result->spirv.data(), job->result->spirv.size()));
+            Downgrades::NoteBuild(job->codeAddress, built, job->result != nullptr ? job->result->spirv.size() * sizeof(std::uint32_t) : 0u, job->result != nullptr ? job->result->spirv.ContentHash().low : 0u, job->key.size() > 2u ? Downgrades::HashCode(std::as_bytes(std::span(job->key).subspan(2))) : 0u);
             {
                 std::lock_guard lock(pipelineMutex);
                 buildingPipelines.erase(job->key);
@@ -1706,7 +1747,7 @@ private:
         const auto commands = recorder->Commands();
         Graphics::RecordMemoryBarrier(context, commands, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT | VK_PIPELINE_STAGE_HOST_BIT, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT | (indirect ? VK_PIPELINE_STAGE_DRAW_INDIRECT_BIT : 0u), VK_ACCESS_SHADER_WRITE_BIT | VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT | VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT | VK_ACCESS_TRANSFER_WRITE_BIT | VK_ACCESS_HOST_WRITE_BIT, VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT | (indirect ? VK_ACCESS_INDIRECT_COMMAND_READ_BIT : 0u));
         context.BindComputePipeline(commands, pipeline->pipeline);
-        Downgrades::NotePipeline(reinterpret_cast<std::uint64_t>(pipeline->pipeline), stage.program.codeAddress);
+        Downgrades::NotePipeline(reinterpret_cast<std::uint64_t>(pipeline->pipeline), stage.program.codeAddress, stage.program.result != nullptr ? stage.program.result->spirv.ContentHash().low : 0u);
         const auto bind = context.Resolved(&Graphics::DeviceFunctions::cmdBindDescriptorSets, "vkCmdBindDescriptorSets");
         bind(commands, VK_PIPELINE_BIND_POINT_COMPUTE, pipeline->layout, ShaderRecompiler::RuntimeAbi::DescriptorSet, 1, &set, 0, nullptr);
         const VkDescriptorSet heapSet = heap->Set();
@@ -1756,7 +1797,36 @@ private:
         if (marksDispatchWrites()) {
             for (const auto& [begin, end] : writtenRanges) MemoryCore::Get().Pages().NoteGpuWritten(begin, end - begin);
         }
+        if (keepsGpuWrittenPages()) {
+            for (const auto& [begin, end] : writtenRanges) markResidencyNewer(begin, end);
+            if (const auto covered = copiedBack.find(serial); covered != copiedBack.end()) {
+                for (const auto& [begin, end] : covered->second) clearResidencyNewer(begin, end);
+            }
+        }
         return true;
+    }
+
+    void markResidencyNewer(std::uint64_t begin, std::uint64_t end) {
+        auto& residency = ResidencyService::Get();
+        for (auto at = begin; at < end;) {
+            const auto chunk = at & ~(ChunkBytes - 1u);
+            const auto next = std::min(end, chunk + ChunkBytes);
+            if (!residency.WrittenImport(chunk)) {
+                auto& mask = writtenPages[chunk];
+                for (auto page = (at - chunk) / PageBytes; page <= (next - 1u - chunk) / PageBytes; ++page) mask |= 1u << page;
+            }
+            at = next;
+        }
+    }
+
+    void clearResidencyNewer(std::uint64_t begin, std::uint64_t end) {
+        for (auto page = (begin + PageBytes - 1u) & ~(PageBytes - 1u); page + PageBytes <= end; page += PageBytes) {
+            const auto chunk = page & ~(ChunkBytes - 1u);
+            const auto found = writtenPages.find(chunk);
+            if (found == writtenPages.end()) continue;
+            found->second &= ~(1u << ((page - chunk) / PageBytes));
+            if (found->second == 0u && !switches.contains(chunk)) writtenPages.erase(found);
+        }
     }
 
     std::uint32_t fragmentOutputs(std::span<const Graphics::CompiledShader> shaders) {

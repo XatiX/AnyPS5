@@ -5,6 +5,7 @@
 #include <cstdint>
 #include <map>
 #include <mutex>
+#include <set>
 #include <span>
 #include <string>
 #include <string_view>
@@ -25,6 +26,8 @@ enum class Kind : std::uint32_t {
     UpstreamSampled,
     UpstreamStorage,
     UpstreamTarget,
+    TemplateMismatch,
+    KnownShort,
     Count,
 };
 
@@ -48,6 +51,8 @@ struct Row {
     std::uint64_t buildNanoseconds = 0;
     std::uint64_t builds = 0;
     std::uint64_t spirvBytes = 0;
+    std::set<std::uint64_t> modules;
+    std::set<std::uint64_t> layouts;
     std::map<std::pair<Kind, std::uint32_t>, std::uint64_t> counts;
     std::map<std::pair<Kind, std::uint32_t>, std::string> details;
     [[nodiscard]] std::uint64_t Total() const;
@@ -59,7 +64,7 @@ public:
     void NoteWork(std::uint64_t hash, Work work, std::uint64_t groups);
     void NoteGroups(std::uint64_t hash, std::uint64_t groups);
     void NoteCompile(std::uint64_t hash, std::uint64_t nanoseconds);
-    void NoteBuild(std::uint64_t hash, std::uint64_t nanoseconds, std::uint64_t spirvBytes);
+    void NoteBuild(std::uint64_t hash, std::uint64_t nanoseconds, std::uint64_t spirvBytes, std::uint64_t module, std::uint64_t layout);
     [[nodiscard]] std::vector<Row> CompileRows(std::size_t limit) const;
     bool Note(std::uint64_t hash, Kind kind, std::uint32_t binding, std::string_view detail);
     [[nodiscard]] std::vector<Row> Rows() const;
@@ -78,11 +83,12 @@ private:
 void NoteWork(std::uint64_t codeAddress, Work work, std::uint64_t groups = 0);
 void NoteGroups(std::uint64_t codeAddress, std::uint64_t groups);
 void NoteCompile(std::uint64_t codeAddress, std::uint64_t nanoseconds);
-void NoteBuild(std::uint64_t codeAddress, std::uint64_t nanoseconds, std::uint64_t spirvBytes);
+void NoteBuild(std::uint64_t codeAddress, std::uint64_t nanoseconds, std::uint64_t spirvBytes, std::uint64_t module, std::uint64_t layout);
 void Note(std::uint64_t codeAddress, Kind kind, std::uint32_t binding = 0, std::string_view detail = {});
 void NoteHashed(std::uint64_t hash, Kind kind, std::uint32_t binding = 0, std::string_view detail = {});
 void NoteCurrent(Kind kind, std::uint32_t binding = 0, std::string_view detail = {});
-void NotePipeline(std::uint64_t pipeline, std::uint64_t codeAddress);
+void NotePipeline(std::uint64_t pipeline, std::uint64_t codeAddress, std::uint64_t module);
+void DumpModule(std::uint64_t codeAddress, std::uint64_t module, std::span<const std::uint32_t> words);
 void Report();
 
 class ProgramScope {
