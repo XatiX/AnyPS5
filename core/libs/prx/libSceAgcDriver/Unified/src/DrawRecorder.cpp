@@ -162,6 +162,7 @@ struct Totals {
     std::uint64_t inputsResident = 0;
     std::uint64_t inputsImported = 0;
     std::uint64_t inputsWritten = 0;
+    std::uint64_t inputsCopied = 0;
     std::uint64_t inputsGpuWritten = 0;
     std::uint64_t inputsAliased = 0;
     std::map<std::string, std::uint64_t> reasons;
@@ -236,6 +237,12 @@ void countInput(Totals& totals, InputSource source) {
 
 constexpr std::uint64_t KnownBufferLimitBytes = 256ull << 20u;
 constexpr std::uint64_t KnownCopyLimitBytes = 64ull << 10u;
+constexpr std::uint64_t InputCopyLimitBytes = 64ull << 10u;
+
+bool copiesInputs() {
+    static const bool copies = std::getenv("APS5_RECODE_NO_INPUT_COPIES") == nullptr;
+    return copies;
+}
 
 bool shaderDataBinding(const Resolve::ResolvedStage& stage, std::uint32_t index) {
     const auto& bindings = stage.program.result->bindings;
@@ -494,7 +501,7 @@ public:
         line += "; passes " + std::to_string(totals.passesBegun) + " begun, " + std::to_string(totals.passesContinued) + " draws continued, " + std::to_string(totals.passFeedback) + " broken by a target read";
         line += "; residency updates landed " + std::to_string(totals.residencyLands);
         line += "; known buffers " + std::to_string(totals.knownServed) + " served, " + std::to_string(totals.knownMapped) + " mapped (" + std::to_string(totals.knownPaged) + " paged in), " + std::to_string(totals.knownCopied) + " copied, " + std::to_string(totals.knownRefused) + " unresolved, " + std::to_string(totals.knownSkipped) + " skipped (" + std::to_string(totals.knownPointers) + " of them pointers)";
-        line += "; draw inputs " + std::to_string(totals.inputsResident) + " resident, " + std::to_string(totals.inputsImported) + " imported, " + std::to_string(totals.inputsWritten) + " imported after CPU writes, " + std::to_string(totals.inputsGpuWritten) + " GPU-written, " + std::to_string(totals.inputsAliased) + " aliased";
+        line += "; draw inputs " + std::to_string(totals.inputsResident) + " resident, " + std::to_string(totals.inputsImported) + " imported, " + std::to_string(totals.inputsWritten) + " after CPU writes (" + std::to_string(totals.inputsCopied) + " copied into the ring), " + std::to_string(totals.inputsGpuWritten) + " GPU-written, " + std::to_string(totals.inputsAliased) + " aliased";
         std::snprintf(text, sizeof(text), "; draw phases surfaces %.1f ms, targets %.1f ms, pipelines %.1f ms, owned uploads %.1f ms", static_cast<double>(totals.surfaceNanoseconds) / 1e6, static_cast<double>(totals.targetNanoseconds) / 1e6, static_cast<double>(totals.graphicsPipelineNanoseconds) / 1e6, static_cast<double>(totals.uploadNanoseconds) / 1e6);
         line += text;
         std::snprintf(text, sizeof(text), "; dispatches %llu recorded, %llu to the existing path, %.1f us per dispatch; compute pipelines %zu held, %llu queued, %llu built in %.1f ms, %zu building, %zu failed", static_cast<unsigned long long>(totals.dispatches), static_cast<unsigned long long>(totals.dispatchExisting), totals.dispatches == 0 ? 0.0 : static_cast<double>(totals.dispatchNanoseconds) / 1000.0 / static_cast<double>(totals.dispatches), computePipelines.size(), static_cast<unsigned long long>(totals.pipelinesQueued), static_cast<unsigned long long>(totals.pipelinesBuilt), static_cast<double>(totals.pipelineNanoseconds) / 1e6, buildingPipelines.size(), failedPipelines.size());
@@ -527,7 +534,7 @@ private:
         alignment = std::max<std::uint64_t>(context.limits.minStorageBufferOffsetAlignment, 16u);
         const auto ringMemory = ResidencyService::ShaderReadMemory(context, RingBytes);
         const VkBufferUsageFlags addressable = context.bufferDeviceAddress ? VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT : 0u;
-        ring = std::make_shared<Graphics::Buffer>(context, RingBytes + RingZeroBytes, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_INDIRECT_BUFFER_BIT | addressable, ringMemory);
+        ring = std::make_shared<Graphics::Buffer>(context, RingBytes + RingZeroBytes, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_INDIRECT_BUFFER_BIT | VK_BUFFER_USAGE_VERTEX_BUFFER_BIT | VK_BUFFER_USAGE_INDEX_BUFFER_BIT | addressable, ringMemory);
         std::memset(ring->Bytes().data() + RingBytes, 0, RingZeroBytes);
         ringAddress = addressable != 0u ? ring->DeviceAddress() : 0u;
         space.emplace(RingBytes, alignment);
@@ -740,7 +747,7 @@ private:
             }
             const auto reach = std::max(bytes, KnownReadableBytes);
             Shadow::OwnedSpan span;
-            if (bytes <= KnownBufferLimitBytes && ((reach != bytes && Shadow::ServeOwned(context, address, reach, &span)) || Shadow::ServeOwned(context, address, bytes, &span)) && span.address != 0u) {
+            if (bytes <= KnownBufferLimitBytes && !MemoryCore::Get().Pages().GpuWrittenIn(address, reach) && ((reach != bytes && Shadow::ServeOwned(context, address, reach, &span)) || Shadow::ServeOwned(context, address, bytes, &span)) && span.address != 0u) {
                 totals.knownServed++;
                 write(span.address, bytes);
                 continue;
@@ -764,14 +771,33 @@ private:
         }
     }
 
+    std::optional<std::uint64_t> ringCopy(std::uint64_t address, std::uint64_t bytes, std::uint64_t serial, std::uint64_t completed) {
+        if (!GuestArena::GuestArenaContains_nid_postfix(reinterpret_cast<const void*>(address), static_cast<std::size_t>(bytes))) return std::nullopt;
+        const auto committed = GuestMemory::CommittedRanges(address, static_cast<std::size_t>(bytes));
+        if (committed.size() != 1u || committed.front().first > address || committed.front().second < address + bytes) return std::nullopt;
+        if (!MemoryCore::Get().Pages().GpuOwnedIn(address, bytes).empty()) return std::nullopt;
+        return ringWrite(std::span(reinterpret_cast<const std::byte*>(address), static_cast<std::size_t>(bytes)), serial, completed);
+    }
+
     std::uint64_t copyKnownBuffer(std::uint64_t address, std::uint64_t bytes, std::uint64_t serial, std::uint64_t completed) {
         if (ringAddress == 0u || bytes > KnownCopyLimitBytes) return 0u;
-        if (!GuestArena::GuestArenaContains_nid_postfix(reinterpret_cast<const void*>(address), static_cast<std::size_t>(bytes))) return 0u;
-        const auto committed = GuestMemory::CommittedRanges(address, static_cast<std::size_t>(bytes));
-        if (committed.size() != 1u || committed.front().first > address || committed.front().second < address + bytes) return 0u;
-        if (!MemoryCore::Get().Pages().GpuOwnedIn(address, bytes).empty()) return 0u;
-        const auto offset = ringWrite(std::span(reinterpret_cast<const std::byte*>(address), static_cast<std::size_t>(bytes)), serial, completed);
+        const auto offset = ringCopy(address, bytes, serial, completed);
         return offset.has_value() ? ringAddress + *offset : 0u;
+    }
+
+    struct InputCopy {
+        std::uint64_t address = 0;
+        std::uint64_t bytes = 0;
+        std::size_t slot = 0;
+    };
+
+    std::optional<DrawInput> copiedInput(std::span<const InputCopy> done, std::span<const VkDeviceSize> offsets, std::uint64_t address, std::uint64_t bytes, std::uint64_t serial, std::uint64_t completed) {
+        for (const auto& copy : done) {
+            if (copy.address <= address && address + bytes <= copy.address + copy.bytes) return DrawInput{ring->Handle(), offsets[copy.slot] + (address - copy.address)};
+        }
+        const auto offset = ringCopy(address, bytes, serial, completed);
+        if (!offset.has_value()) return std::nullopt;
+        return DrawInput{ring->Handle(), *offset};
     }
 
     void servePushKnownBuffers(const Context& context, const Resolve::ResolvedStage& stage, std::span<std::byte> block, std::uint64_t serial, std::uint64_t completed) {
@@ -1057,6 +1083,7 @@ private:
         Graphics::VertexInputLayout vertexInput;
         std::vector<VkBuffer> vertexBuffers;
         std::vector<VkDeviceSize> vertexOffsets;
+        std::vector<InputCopy> inputCopies;
         if (!attributes.empty()) {
             vertexInput = Graphics::BuildVertexInputLayout(context, attributes);
             for (std::size_t index = 0; index < attributes.size(); ++index) {
@@ -1074,6 +1101,7 @@ private:
                     return false;
                 }
                 countInput(totals, source);
+                if (source == InputSource::Written && copiesInputs() && bytes <= InputCopyLimitBytes) inputCopies.push_back({address, bytes, vertexBuffers.size()});
                 recorder->NotePendingRead(address, bytes, Graphics::Recorder::ReadKind::DrawInput);
                 vertexBuffers.push_back(input->buffer);
                 vertexOffsets.push_back(input->offset);
@@ -1122,6 +1150,15 @@ private:
         recorder->OpenBatch();
         const auto serial = recorder->OpenBatchSerial();
         const auto completed = recorder->CompletedThrough();
+        std::vector<InputCopy> copiedInputs;
+        for (const auto& copy : inputCopies) {
+            const auto input = copiedInput(copiedInputs, vertexOffsets, copy.address, copy.bytes, serial, completed);
+            if (!input) continue;
+            vertexBuffers[copy.slot] = input->buffer;
+            vertexOffsets[copy.slot] = input->offset;
+            copiedInputs.push_back(copy);
+            totals.inputsCopied++;
+        }
         std::array<VkDescriptorSet, 2> descriptorSets{};
         std::shared_ptr<Graphics::Buffer> pageTable;
         for (std::uint32_t set = 0; set < (sets.split ? 2u : 1u); ++set) {
@@ -1203,6 +1240,12 @@ private:
                 return false;
             }
             countInput(totals, source);
+            if (source == InputSource::Written && copiesInputs() && bytes <= InputCopyLimitBytes) {
+                if (const auto copied = copiedInput(copiedInputs, vertexOffsets, parameters.indexAddress, bytes, serial, completed)) {
+                    indexInput = copied;
+                    totals.inputsCopied++;
+                }
+            }
             recorder->NotePendingRead(parameters.indexAddress, bytes, Graphics::Recorder::ReadKind::DrawInput);
         }
 

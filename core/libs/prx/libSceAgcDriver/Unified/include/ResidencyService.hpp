@@ -39,7 +39,7 @@ public:
     bool Prepare(std::uint64_t address, std::uint64_t size);
     [[nodiscard]] std::optional<DeviceSpan> Translate(std::uint64_t address, std::uint64_t size) const;
     [[nodiscard]] std::uint64_t TranslateMapped(std::uint64_t address, std::uint64_t size) const;
-    std::optional<DeviceSpan> Serve(std::uint64_t address, std::uint64_t size, std::span<const std::pair<std::uint64_t, std::uint64_t>> committed);
+    std::optional<DeviceSpan> Serve(std::uint64_t address, std::uint64_t size, std::span<const std::pair<std::uint64_t, std::uint64_t>> committed, std::uint64_t owner = 0, std::uint64_t ownerSize = 0);
     bool ServeFaultPage(std::uint64_t page, std::uint64_t allocation, std::uint64_t allocationBytes, std::span<const std::pair<std::uint64_t, std::uint64_t>> committed);
     void MapImports(std::uint64_t serial, std::shared_ptr<const std::vector<ShaderRecompiler::BdaAbi::Range>> ranges);
     void ForgetImport(std::uint64_t base, std::uint64_t bytes, std::uint64_t deviceBegin, std::uint64_t deviceEnd);
@@ -81,6 +81,7 @@ private:
     std::uint64_t importPagesForgotten = 0;
     std::uint64_t faultPagesMapped = 0;
     std::uint64_t serveRefusals = 0;
+    std::uint64_t ownerRanges = 0;
     std::atomic<std::uint64_t> frame{1};
     std::atomic<bool> attached{false};
     std::atomic<bool> refused{false};
