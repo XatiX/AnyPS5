@@ -191,6 +191,8 @@ struct Totals {
     std::uint64_t copyBackBytes = 0;
     std::uint64_t copyBackCovered = 0;
     std::uint64_t importsReturned = 0;
+    std::uint64_t lateCopies = 0;
+    std::uint64_t lateCopyBytes = 0;
     std::uint64_t inputsResident = 0;
     std::uint64_t inputsImported = 0;
     std::uint64_t inputsWritten = 0;
@@ -256,6 +258,11 @@ bool switchesWrittenChunks() {
 
 bool copiesBackDispatchWrites() {
     static const bool copies = std::getenv("APS5_RECODE_NO_COPY_BACK") == nullptr;
+    return copies;
+}
+
+bool copiesLateWrites() {
+    static const bool copies = std::getenv("APS5_RECODE_NO_LATE_COPY") == nullptr;
     return copies;
 }
 
@@ -550,7 +557,7 @@ public:
         bool recorded = false;
         try {
             recorded = record(context, draw, parameters, reason);
-            landWrites();
+            landWrites(context);
         } catch (const std::exception& error) {
             reason = std::string("record failed: ") + error.what();
         }
@@ -578,7 +585,7 @@ public:
         bool recorded = false;
         try {
             recorded = recordDispatch(context, dispatch, groups, reason);
-            landWrites();
+            landWrites(context);
         } catch (const std::exception& error) {
             reason = std::string("record failed: ") + error.what();
         }
@@ -611,7 +618,7 @@ public:
         line += text;
         std::snprintf(text, sizeof(text), "; table maps %llu hits, %llu uploads (%.1f MiB), %llu retired, %zu held (%.1f MiB)", static_cast<unsigned long long>(totals.mapHits), static_cast<unsigned long long>(totals.mapUploads), static_cast<double>(totals.mapUploadBytes) / 1048576.0, static_cast<unsigned long long>(totals.mapRetired), maps.size(), static_cast<double>(mapBytes) / 1048576.0);
         line += text;
-        std::snprintf(text, sizeof(text), "; fault buffers %zu in flight, %llu read: %llu faults (%llu unmapped), %llu fault pages served, %llu written ranges (%llu pieces landed late), %llu written overflows", faults.size(), static_cast<unsigned long long>(totals.faultReads), static_cast<unsigned long long>(totals.faults), static_cast<unsigned long long>(totals.unmappedFaults), static_cast<unsigned long long>(totals.faultPages), static_cast<unsigned long long>(totals.writtenRanges), static_cast<unsigned long long>(totals.writtenLate), static_cast<unsigned long long>(totals.writtenOverflows));
+        std::snprintf(text, sizeof(text), "; fault buffers %zu in flight, %llu read: %llu faults (%llu unmapped), %llu fault pages served, %llu written ranges (%llu pieces landed late, %llu of them copied to their import on the GPU timeline, %llu KiB), %llu written overflows", faults.size(), static_cast<unsigned long long>(totals.faultReads), static_cast<unsigned long long>(totals.faults), static_cast<unsigned long long>(totals.unmappedFaults), static_cast<unsigned long long>(totals.faultPages), static_cast<unsigned long long>(totals.writtenRanges), static_cast<unsigned long long>(totals.writtenLate), static_cast<unsigned long long>(totals.lateCopies), static_cast<unsigned long long>(totals.lateCopyBytes >> 10u), static_cast<unsigned long long>(totals.writtenOverflows));
         line += text;
         std::snprintf(text, sizeof(text), "; GPU-written chunks %llu switched to their import from the written bitmap (%.1f MiB copied over), %llu from other GPU writes, %llu refused, %llu written pieces already on an import", static_cast<unsigned long long>(totals.importSwitches), static_cast<double>(totals.switchBytes) / 1048576.0, static_cast<unsigned long long>(totals.writtenSwitches), static_cast<unsigned long long>(totals.switchRefused), static_cast<unsigned long long>(totals.writtenOnImports));
         line += text;
@@ -668,10 +675,43 @@ private:
         });
     }
 
-    void landWrites() {
+    bool copyLate(const Context& context, std::uint64_t address, std::uint64_t bytes, std::vector<std::pair<VkBuffer, std::pair<VkBuffer, VkBufferCopy>>>& regions) {
+        const auto* import = Graphics::HostImportFor(context, address, static_cast<std::size_t>(bytes));
+        if (import == nullptr || address < import->base || address + bytes > import->base + import->bytes) return false;
+        const auto span = ResidencyService::Get().Translate(address, bytes);
+        if (!span) return false;
+        regions.push_back({reinterpret_cast<VkBuffer>(static_cast<std::uintptr_t>(span->handle)), {import->buffer, VkBufferCopy{span->offset, Graphics::HostImportOffset(*import, address), bytes}}});
+        return true;
+    }
+
+    void landWrites(const Context& context) {
         if (landing.empty()) return;
-        const auto written = std::move(landing);
+        auto written = std::move(landing);
         landing.clear();
+        if (copiesLateWrites() && context.recorder != nullptr) {
+            std::vector<std::pair<VkBuffer, std::pair<VkBuffer, VkBufferCopy>>> regions;
+            std::vector<std::pair<std::uint64_t, std::uint64_t>> copied;
+            std::erase_if(written, [&](const auto& piece) {
+                if (!copyLate(context, piece.first, piece.second, regions)) return false;
+                copied.emplace_back(piece.first, piece.first + piece.second);
+                return true;
+            });
+            if (!regions.empty()) {
+                const auto commands = context.recorder->Commands();
+                const auto copy = context.Function<PFN_vkCmdCopyBuffer>("vkCmdCopyBuffer");
+                Graphics::RecordMemoryBarrier(context, commands, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_ACCESS_SHADER_WRITE_BIT | VK_ACCESS_TRANSFER_WRITE_BIT, VK_ACCESS_TRANSFER_READ_BIT | VK_ACCESS_TRANSFER_WRITE_BIT);
+                for (const auto& [source, target] : regions) copy(commands, source, target.first, 1, &target.second);
+                Graphics::RecordMemoryBarrier(context, commands, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT | VK_PIPELINE_STAGE_HOST_BIT, VK_ACCESS_TRANSFER_WRITE_BIT, VK_ACCESS_MEMORY_READ_BIT | VK_ACCESS_MEMORY_WRITE_BIT | VK_ACCESS_HOST_READ_BIT);
+                totals.lateCopies += regions.size();
+                for (const auto& [begin, end] : copied) {
+                    totals.lateCopyBytes += end - begin;
+                    Events::Shared().Note(begin, end - begin);
+                    MemoryCore::Get().Pages().NoteGpuWritten(begin, end - begin);
+                }
+            }
+            if (written.empty()) return;
+        }
+        for (const auto& [begin, size] : written) markSwitch(begin, size);
         Shadow::LandGpuWrites(written);
         std::vector<std::pair<std::uint64_t, std::uint64_t>> ends;
         ends.reserve(written.size());
@@ -737,11 +777,15 @@ private:
             } else {
                 landing.emplace_back(at, next - at);
                 totals.writtenLate++;
-                for (auto page = (at - chunk) / PageBytes; page <= (next - 1u - chunk) / PageBytes; ++page) writtenPages[chunk] |= 1u << page;
-                if (switchesWrittenChunks()) switches.insert(chunk);
             }
             at = next;
         }
+    }
+
+    void markSwitch(std::uint64_t begin, std::uint64_t size) {
+        const auto chunk = begin & ~(ChunkBytes - 1u);
+        for (auto page = (begin - chunk) / PageBytes; page <= (begin + size - 1u - chunk) / PageBytes; ++page) writtenPages[chunk] |= 1u << page;
+        if (switchesWrittenChunks()) switches.insert(chunk);
     }
 
     void landKnownWrites(std::uint64_t completed) {
