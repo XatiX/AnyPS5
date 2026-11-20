@@ -192,6 +192,7 @@ struct Totals {
     std::uint64_t copyBackBytes = 0;
     std::uint64_t copyBackCovered = 0;
     std::uint64_t importsReturned = 0;
+    std::uint64_t residencyRefreshes = 0;
     std::uint64_t indirectDispatches = 0;
     std::uint64_t gdsBindings = 0;
     std::uint64_t knownGpuWritten = 0;
@@ -263,6 +264,11 @@ bool copiesBackDispatchWrites() {
     return copies;
 }
 
+bool refreshesBeforeCopyBack() {
+    static const bool refreshes = std::getenv("APS5_RECODE_NO_COPY_BACK_REFRESH") == nullptr;
+    return refreshes;
+}
+
 bool bindsGds() {
     static const bool binds = std::getenv("APS5_RECODE_NO_GDS") == nullptr;
     return binds;
@@ -271,6 +277,11 @@ bool bindsGds() {
 bool recordsMipTailTargets() {
     static const bool records = std::getenv("APS5_RECODE_NO_MIP_TAIL_TARGETS") == nullptr;
     return records;
+}
+
+bool marksDispatchWrites() {
+    static const bool marks = std::getenv("APS5_RECODE_NO_DISPATCH_WRITTEN_PAGES") == nullptr;
+    return marks;
 }
 
 bool buildsPipelinesAhead() {
@@ -636,7 +647,7 @@ public:
         line += "; passes " + std::to_string(totals.passesBegun) + " begun, " + std::to_string(totals.passesContinued) + " draws continued, " + std::to_string(totals.passFeedback) + " broken by a target read";
         line += "; target memo " + std::to_string(totals.targetMemoHits) + " hits, " + std::to_string(totals.targetMemoMisses) + " misses; " + std::to_string(totals.deferredReads) + " draws with reads bound at record";
         line += "; residency updates landed " + std::to_string(totals.residencyLands);
-        line += "; known buffers " + std::to_string(totals.knownServed) + " served, " + std::to_string(totals.knownMapped) + " mapped (" + std::to_string(totals.knownPaged) + " paged in), " + std::to_string(totals.knownCopied) + " copied (" + std::to_string(totals.knownGpuWritten) + " GPU-written ranges not copied), " + std::to_string(totals.knownRefused) + " unresolved, " + std::to_string(totals.knownSkipped) + " skipped (" + std::to_string(totals.knownPointers) + " of them pointers); known writes " + std::to_string(totals.knownWritten) + " direct (" + std::to_string(totals.knownWriteBytes >> 10u) + " KiB landed), " + std::to_string(totals.knownWriteLookups) + " through the page table, " + std::to_string(totals.copyBacks) + " copied back to their import after the dispatch (" + std::to_string(totals.copyBackBytes >> 20u) + " MiB, " + std::to_string(totals.copyBackCovered >> 10u) + " KiB of written pieces not landed, " + std::to_string(totals.importsReturned) + " chunks returned from their import)";
+        line += "; known buffers " + std::to_string(totals.knownServed) + " served, " + std::to_string(totals.knownMapped) + " mapped (" + std::to_string(totals.knownPaged) + " paged in), " + std::to_string(totals.knownCopied) + " copied (" + std::to_string(totals.knownGpuWritten) + " GPU-written ranges not copied), " + std::to_string(totals.knownRefused) + " unresolved, " + std::to_string(totals.knownSkipped) + " skipped (" + std::to_string(totals.knownPointers) + " of them pointers); known writes " + std::to_string(totals.knownWritten) + " direct (" + std::to_string(totals.knownWriteBytes >> 10u) + " KiB landed), " + std::to_string(totals.knownWriteLookups) + " through the page table, " + std::to_string(totals.copyBacks) + " copied back to their import after the dispatch (" + std::to_string(totals.copyBackBytes >> 20u) + " MiB, " + std::to_string(totals.copyBackCovered >> 10u) + " KiB of written pieces not landed, " + std::to_string(totals.importsReturned) + " chunks returned from their import, " + std::to_string(totals.residencyRefreshes) + " residency refreshes before the dispatch)";
         line += "; draw inputs " + std::to_string(totals.inputsResident) + " resident, " + std::to_string(totals.inputsImported) + " imported, " + std::to_string(totals.inputsWritten) + " after CPU writes (" + std::to_string(totals.inputsCopied) + " copied into the ring), " + std::to_string(totals.inputsGpuWritten) + " GPU-written, " + std::to_string(totals.inputsAliased) + " aliased, " + std::to_string(totals.inputsMerged) + " served with an overlapping input";
         std::snprintf(text, sizeof(text), "; draw phases surfaces %.1f ms, targets %.1f ms, pipelines %.1f ms, owned uploads %.1f ms", static_cast<double>(totals.surfaceNanoseconds) / 1e6, static_cast<double>(totals.targetNanoseconds) / 1e6, static_cast<double>(totals.graphicsPipelineNanoseconds) / 1e6, static_cast<double>(totals.uploadNanoseconds) / 1e6);
         line += text;
@@ -794,8 +805,33 @@ private:
         const auto* import = Graphics::HostImportFor(context, address, static_cast<std::size_t>(bytes));
         if (import == nullptr || address < import->base || address + bytes > import->base + import->bytes) return false;
         returnImports(context, address, bytes, *import);
+        if (refreshesBeforeCopyBack()) refreshResidency(context, address, bytes, *import);
         copyBacks.push_back({address, bytes, import});
         return true;
+    }
+
+    void refreshResidency(const Context& context, std::uint64_t address, std::uint64_t bytes, const Graphics::HostImport& import) {
+        auto& residency = ResidencyService::Get();
+        std::vector<std::pair<std::uint64_t, VkBufferCopy>> regions;
+        const auto end = address + bytes;
+        for (auto at = address; at < end;) {
+            const auto next = std::min(end, (at & ~(ChunkBytes - 1u)) + ChunkBytes);
+            if (!residency.WrittenImport(at & ~(ChunkBytes - 1u))) {
+                if (const auto span = residency.Translate(at, next - at)) {
+                    const auto source = Graphics::HostImportOffset(import, at);
+                    if (!regions.empty() && regions.back().first == span->handle && regions.back().second.srcOffset + regions.back().second.size == source && regions.back().second.dstOffset + regions.back().second.size == span->offset) regions.back().second.size += next - at;
+                    else regions.push_back({span->handle, VkBufferCopy{source, span->offset, next - at}});
+                }
+            }
+            at = next;
+        }
+        if (regions.empty()) return;
+        const auto commands = context.recorder->Commands();
+        Graphics::RecordMemoryBarrier(context, commands, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_ACCESS_SHADER_WRITE_BIT | VK_ACCESS_TRANSFER_WRITE_BIT | VK_ACCESS_SHADER_READ_BIT, VK_ACCESS_TRANSFER_READ_BIT | VK_ACCESS_TRANSFER_WRITE_BIT);
+        const auto copy = context.Function<PFN_vkCmdCopyBuffer>("vkCmdCopyBuffer");
+        for (const auto& [handle, region] : regions) copy(commands, import.buffer, reinterpret_cast<VkBuffer>(static_cast<std::uintptr_t>(handle)), 1, &region);
+        Graphics::RecordMemoryBarrier(context, commands, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_ACCESS_TRANSFER_WRITE_BIT, VK_ACCESS_MEMORY_READ_BIT | VK_ACCESS_MEMORY_WRITE_BIT);
+        totals.residencyRefreshes += regions.size();
     }
 
     void returnImports(const Context& context, std::uint64_t address, std::uint64_t bytes, const Graphics::HostImport& import) {
@@ -1548,6 +1584,9 @@ private:
             if (use.write) writtenRanges.emplace_back(use.address, use.address + use.size);
         }
         if (!writtenRanges.empty()) Events::NoteRanges(writtenRanges);
+        if (marksDispatchWrites()) {
+            for (const auto& [begin, end] : writtenRanges) MemoryCore::Get().Pages().NoteGpuWritten(begin, end - begin);
+        }
         return true;
     }
 
