@@ -38,6 +38,7 @@
 #include <exception>
 #include <map>
 #include <mutex>
+#include <numeric>
 #include <optional>
 #include <set>
 #include <unordered_map>
@@ -177,6 +178,7 @@ struct Totals {
     std::uint64_t inputsCopied = 0;
     std::uint64_t inputsGpuWritten = 0;
     std::uint64_t inputsAliased = 0;
+    std::uint64_t inputsMerged = 0;
     std::map<std::string, std::uint64_t> reasons;
 };
 
@@ -265,6 +267,38 @@ std::optional<DrawInput> drawInput(const Context& context, std::uint64_t address
         }
     }
     return importedInput(context, address, bytes);
+}
+
+struct InputRange {
+    std::uint64_t begin = 0;
+    std::uint64_t end = 0;
+    std::size_t merged = 0;
+};
+
+bool mergesInputs() {
+    static const bool merges = std::getenv("APS5_RECODE_NO_INPUT_MERGE") == nullptr;
+    return merges;
+}
+
+std::vector<std::pair<std::uint64_t, std::uint64_t>> mergeInputs(std::vector<InputRange>& ranges) {
+    std::vector<std::pair<std::uint64_t, std::uint64_t>> unions;
+    if (!mergesInputs()) {
+        for (auto& range : ranges) {
+            range.merged = unions.size();
+            unions.emplace_back(range.begin, range.end);
+        }
+        return unions;
+    }
+    std::vector<std::size_t> order(ranges.size());
+    std::iota(order.begin(), order.end(), std::size_t{0});
+    std::ranges::sort(order, {}, [&](std::size_t index) { return ranges[index].begin; });
+    for (const auto index : order) {
+        auto& range = ranges[index];
+        if (!unions.empty() && range.begin < unions.back().second) unions.back().second = std::max(unions.back().second, range.end);
+        else unions.emplace_back(range.begin, range.end);
+        range.merged = unions.size() - 1;
+    }
+    return unions;
 }
 
 void countInput(Totals& totals, InputSource source) {
@@ -545,7 +579,7 @@ public:
         line += "; target memo " + std::to_string(totals.targetMemoHits) + " hits, " + std::to_string(totals.targetMemoMisses) + " misses; " + std::to_string(totals.deferredReads) + " draws with reads bound at record";
         line += "; residency updates landed " + std::to_string(totals.residencyLands);
         line += "; known buffers " + std::to_string(totals.knownServed) + " served, " + std::to_string(totals.knownMapped) + " mapped (" + std::to_string(totals.knownPaged) + " paged in), " + std::to_string(totals.knownCopied) + " copied, " + std::to_string(totals.knownRefused) + " unresolved, " + std::to_string(totals.knownSkipped) + " skipped (" + std::to_string(totals.knownPointers) + " of them pointers)";
-        line += "; draw inputs " + std::to_string(totals.inputsResident) + " resident, " + std::to_string(totals.inputsImported) + " imported, " + std::to_string(totals.inputsWritten) + " after CPU writes (" + std::to_string(totals.inputsCopied) + " copied into the ring), " + std::to_string(totals.inputsGpuWritten) + " GPU-written, " + std::to_string(totals.inputsAliased) + " aliased";
+        line += "; draw inputs " + std::to_string(totals.inputsResident) + " resident, " + std::to_string(totals.inputsImported) + " imported, " + std::to_string(totals.inputsWritten) + " after CPU writes (" + std::to_string(totals.inputsCopied) + " copied into the ring), " + std::to_string(totals.inputsGpuWritten) + " GPU-written, " + std::to_string(totals.inputsAliased) + " aliased, " + std::to_string(totals.inputsMerged) + " served with an overlapping input";
         std::snprintf(text, sizeof(text), "; draw phases surfaces %.1f ms, targets %.1f ms, pipelines %.1f ms, owned uploads %.1f ms", static_cast<double>(totals.surfaceNanoseconds) / 1e6, static_cast<double>(totals.targetNanoseconds) / 1e6, static_cast<double>(totals.graphicsPipelineNanoseconds) / 1e6, static_cast<double>(totals.uploadNanoseconds) / 1e6);
         line += text;
         std::snprintf(text, sizeof(text), "; dispatches %llu recorded (%llu storage images written), %llu to the existing path, %.1f us per dispatch; compute pipelines %zu held, %llu queued, %llu built in %.1f ms, %zu building, %zu failed", static_cast<unsigned long long>(totals.dispatches), static_cast<unsigned long long>(totals.storageWrites), static_cast<unsigned long long>(totals.dispatchExisting), totals.dispatches == 0 ? 0.0 : static_cast<double>(totals.dispatchNanoseconds) / 1000.0 / static_cast<double>(totals.dispatches), computePipelines.size(), static_cast<unsigned long long>(totals.pipelinesQueued), static_cast<unsigned long long>(totals.pipelinesBuilt), static_cast<double>(totals.pipelineNanoseconds) / 1e6, buildingPipelines.size(), failedPipelines.size());
@@ -897,15 +931,22 @@ private:
     struct InputCopy {
         std::uint64_t address = 0;
         std::uint64_t bytes = 0;
-        std::size_t slot = 0;
+        std::size_t merged = 0;
     };
 
-    std::optional<DrawInput> copiedInput(std::span<const InputCopy> done, std::span<const VkDeviceSize> offsets, std::uint64_t address, std::uint64_t bytes, std::uint64_t serial, std::uint64_t completed) {
+    struct CopiedSpan {
+        std::uint64_t address = 0;
+        std::uint64_t bytes = 0;
+        VkDeviceSize offset = 0;
+    };
+
+    std::optional<DrawInput> copiedInput(std::vector<CopiedSpan>& done, std::uint64_t address, std::uint64_t bytes, std::uint64_t serial, std::uint64_t completed) {
         for (const auto& copy : done) {
-            if (copy.address <= address && address + bytes <= copy.address + copy.bytes) return DrawInput{ring->Handle(), offsets[copy.slot] + (address - copy.address)};
+            if (copy.address <= address && address + bytes <= copy.address + copy.bytes) return DrawInput{ring->Handle(), copy.offset + (address - copy.address)};
         }
         const auto offset = ringCopy(address, bytes, serial, completed);
         if (!offset.has_value()) return std::nullopt;
+        done.push_back({address, bytes, *offset});
         return DrawInput{ring->Handle(), *offset};
     }
 
@@ -1245,6 +1286,7 @@ private:
         std::vector<VkBuffer> vertexBuffers;
         std::vector<VkDeviceSize> vertexOffsets;
         std::vector<InputCopy> inputCopies;
+        std::vector<InputRange> inputRanges;
         if (!attributes.empty()) {
             vertexInput = Graphics::BuildVertexInputLayout(context, attributes);
             for (std::size_t index = 0; index < attributes.size(); ++index) {
@@ -1254,19 +1296,30 @@ private:
                     return false;
                 }
                 const auto address = vertexAddress(attribute);
-                const auto bytes = Graphics::VertexBufferExtent(attribute);
+                inputRanges.push_back({address, address + Graphics::VertexBufferExtent(attribute), 0});
+            }
+            const auto unions = mergeInputs(inputRanges);
+            std::vector<DrawInput> unionInputs;
+            std::vector<InputSource> unionSources;
+            for (std::size_t index = 0; index < unions.size(); ++index) {
+                const auto& [begin, end] = unions[index];
                 InputSource source = InputSource::Imported;
-                const auto input = drawInput(context, address, bytes, source);
+                const auto input = drawInput(context, begin, end - begin, source);
                 if (!input) {
                     reason = "vertex buffer not imported";
                     return false;
                 }
-                countInput(totals, source);
-                if (source == InputSource::Written && copiesInputs() && bytes <= InputCopyLimitBytes) inputCopies.push_back({address, bytes, vertexBuffers.size()});
-                recorder->NotePendingRead(address, bytes, Graphics::Recorder::ReadKind::DrawInput);
-                vertexBuffers.push_back(input->buffer);
-                vertexOffsets.push_back(input->offset);
+                if (source == InputSource::Written && copiesInputs() && end - begin <= InputCopyLimitBytes) inputCopies.push_back({begin, end - begin, index});
+                recorder->NotePendingRead(begin, end - begin, Graphics::Recorder::ReadKind::DrawInput);
+                unionInputs.push_back(*input);
+                unionSources.push_back(source);
             }
+            for (const auto& range : inputRanges) {
+                countInput(totals, unionSources[range.merged]);
+                vertexBuffers.push_back(unionInputs[range.merged].buffer);
+                vertexOffsets.push_back(unionInputs[range.merged].offset + (range.begin - unions[range.merged].first));
+            }
+            totals.inputsMerged += inputRanges.size() - unions.size();
         }
         std::vector<VkImageView> views;
         std::vector<std::shared_ptr<void>> owners;
@@ -1320,14 +1373,16 @@ private:
         recorder->OpenBatch();
         const auto serial = recorder->OpenBatchSerial();
         const auto completed = recorder->CompletedThrough();
-        std::vector<InputCopy> copiedInputs;
+        std::vector<CopiedSpan> copiedInputs;
         for (const auto& copy : inputCopies) {
-            const auto input = copiedInput(copiedInputs, vertexOffsets, copy.address, copy.bytes, serial, completed);
+            const auto input = copiedInput(copiedInputs, copy.address, copy.bytes, serial, completed);
             if (!input) continue;
-            vertexBuffers[copy.slot] = input->buffer;
-            vertexOffsets[copy.slot] = input->offset;
-            copiedInputs.push_back(copy);
-            totals.inputsCopied++;
+            for (std::size_t index = 0; index < inputRanges.size(); ++index) {
+                if (inputRanges[index].merged != copy.merged) continue;
+                vertexBuffers[index] = input->buffer;
+                vertexOffsets[index] = input->offset + (inputRanges[index].begin - copy.address);
+                totals.inputsCopied++;
+            }
         }
         std::array<VkDescriptorSet, 2> descriptorSets{};
         std::shared_ptr<Graphics::Buffer> pageTable;
@@ -1411,7 +1466,7 @@ private:
             }
             countInput(totals, source);
             if (source == InputSource::Written && copiesInputs() && bytes <= InputCopyLimitBytes) {
-                if (const auto copied = copiedInput(copiedInputs, vertexOffsets, parameters.indexAddress, bytes, serial, completed)) {
+                if (const auto copied = copiedInput(copiedInputs, parameters.indexAddress, bytes, serial, completed)) {
                     indexInput = copied;
                     totals.inputsCopied++;
                 }

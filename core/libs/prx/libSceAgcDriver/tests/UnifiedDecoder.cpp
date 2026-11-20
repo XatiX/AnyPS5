@@ -166,6 +166,7 @@ void testWaitEdgesFollowLabelStores() {
     Expect(order.Resolve(met) == Order::Verdict::Edge && met.after.queue == 0x20 && met.after.sequence == 5, "a wait already met by a decoded store depends on that store");
     auto later = waitFor(0, 2, 0x1000, 8);
     Expect(order.Resolve(later) == Order::Verdict::Pending && order.PendingWaits() == 1, "a wait no decoded store meets is pending");
+    Expect(order.Counts().crossEdges == 1 && order.Counts().crossPending == 1, "edges and pending waits behind another queue's store are counted");
     Expect(order.Note(labelAt(0, 3, 0x1000, 8)).empty(), "a store from the waiting queue itself does not release the wait");
     const auto released = order.Note(labelAt(0x20, 6, 0x1000, 8));
     Expect(released.size() == 1 && released[0].sequence == 2 && released[0].after.queue == 0x20 && released[0].after.sequence == 6, "a store from another queue releases the pending wait with an edge");
