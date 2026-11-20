@@ -46,6 +46,8 @@ public:
     bool MapWrittenImport(std::uint64_t chunk, std::uint64_t target);
     [[nodiscard]] bool WrittenImport(std::uint64_t chunk) const;
     [[nodiscard]] bool WrittenImportThroughout(std::uint64_t address, std::uint64_t size) const;
+    [[nodiscard]] bool WrittenImportAny(std::uint64_t address, std::uint64_t size) const;
+    std::optional<DeviceSpan> ReturnWrittenImport(std::uint64_t chunk);
     [[nodiscard]] std::shared_ptr<Graphics::Buffer> PageTableBuffer() const;
     std::vector<PendingUpload> ReadBack(std::span<const std::pair<std::uint64_t, std::uint64_t>> ranges);
     [[nodiscard]] bool Pending() const;
@@ -80,6 +82,7 @@ private:
     std::map<std::uint64_t, std::uint64_t> importPages;
     std::map<std::uint64_t, std::uint64_t> writtenImports;
     std::uint64_t writtenImportsForgotten = 0;
+    std::uint64_t writtenImportsReturned = 0;
     std::deque<std::shared_ptr<const std::vector<ShaderRecompiler::BdaAbi::Range>>> importSpaces;
     std::uint64_t importSerial = 0;
     std::uint64_t importMaps = 0;
