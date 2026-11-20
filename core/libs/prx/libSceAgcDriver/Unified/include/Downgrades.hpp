@@ -26,6 +26,7 @@ enum class Kind : std::uint32_t {
     UpstreamSampled,
     UpstreamStorage,
     UpstreamTarget,
+    TemplateMismatch,
     Count,
 };
 
@@ -85,7 +86,7 @@ void NoteBuild(std::uint64_t codeAddress, std::uint64_t nanoseconds, std::uint64
 void Note(std::uint64_t codeAddress, Kind kind, std::uint32_t binding = 0, std::string_view detail = {});
 void NoteHashed(std::uint64_t hash, Kind kind, std::uint32_t binding = 0, std::string_view detail = {});
 void NoteCurrent(Kind kind, std::uint32_t binding = 0, std::string_view detail = {});
-void NotePipeline(std::uint64_t pipeline, std::uint64_t codeAddress);
+void NotePipeline(std::uint64_t pipeline, std::uint64_t codeAddress, std::uint64_t module);
 void DumpModule(std::uint64_t codeAddress, std::uint64_t module, std::span<const std::uint32_t> words);
 void Report();
 

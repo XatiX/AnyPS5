@@ -142,9 +142,12 @@ bool materializeStage(const ProgramInputs& inputs, ShaderRecompiler::RecompileRe
         }
         if (inputs.verifyTemplates) {
             const auto full = invocation.MaterializeUnshared(*capture);
-            if (const auto* difference = ShaderRecompiler::TemplateWordsDifference(*shape, words, *full)) {
+            const auto* difference = ShaderRecompiler::TemplateWordsDifference(*shape, words, *full);
+            const bool moduleDiffers = full != nullptr && result != nullptr && !(full->spirv.ContentHash() == result->spirv.ContentHash());
+            if (difference != nullptr || moduleDiffers) {
                 out.templateMismatches++;
-                out.templateMismatch = difference;
+                out.templateMismatch = difference != nullptr ? difference : "module";
+                Downgrades::Note(snapshot.codeAddress + codeOffset * sizeof(std::uint32_t), Downgrades::Kind::TemplateMismatch, moduleDiffers ? 1u : 0u, difference != nullptr ? difference : "template module differs from a full materialize");
             }
         }
     } else {

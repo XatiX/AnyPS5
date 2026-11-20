@@ -95,6 +95,7 @@ std::string_view KindName(Kind kind) {
         case Kind::UpstreamSampled: return "upstream-sampled";
         case Kind::UpstreamStorage: return "upstream-storage";
         case Kind::UpstreamTarget: return "upstream-target";
+        case Kind::TemplateMismatch: return "template-mismatch";
         default: return "unknown";
     }
 }
@@ -104,7 +105,8 @@ Severity SeverityOf(Kind kind) {
         case Kind::Dropped:
         case Kind::KnownRefused:
         case Kind::KnownWriteRefused:
-        case Kind::PageFault: return Severity::Severe;
+        case Kind::PageFault:
+        case Kind::TemplateMismatch: return Severity::Severe;
         case Kind::ExistingPath:
         case Kind::StorageRecordMissing:
         case Kind::UpstreamSampled:
@@ -386,7 +388,7 @@ void DumpModule(std::uint64_t codeAddress, std::uint64_t module, std::span<const
     std::fprintf(stderr, "[recode-program] wrote module %s (%zu bytes)\n", path, words.size_bytes());
 }
 
-void NotePipeline(std::uint64_t pipeline, std::uint64_t codeAddress) {
+void NotePipeline(std::uint64_t pipeline, std::uint64_t codeAddress, std::uint64_t module) {
     if (!Active()) return;
     static std::mutex mutex;
     static std::unordered_map<std::uint64_t, std::uint64_t> seen;
@@ -394,7 +396,8 @@ void NotePipeline(std::uint64_t pipeline, std::uint64_t codeAddress) {
         std::lock_guard lock(mutex);
         if (!seen.emplace(pipeline, codeAddress).second) return;
     }
-    std::fprintf(stderr, "[recode-pipeline] 0x%llx hash %016llx\n", static_cast<unsigned long long>(pipeline), static_cast<unsigned long long>(ProgramHash(codeAddress)));
+    const auto seconds = std::chrono::duration_cast<std::chrono::seconds>(std::chrono::steady_clock::now() - started()).count();
+    std::fprintf(stderr, "[recode-pipeline] 0x%llx hash %016llx module %016llx first bound at %lld s\n", static_cast<unsigned long long>(pipeline), static_cast<unsigned long long>(ProgramHash(codeAddress)), static_cast<unsigned long long>(module), static_cast<long long>(seconds));
 }
 
 void NoteCurrent(Kind kind, std::uint32_t binding, std::string_view detail) {

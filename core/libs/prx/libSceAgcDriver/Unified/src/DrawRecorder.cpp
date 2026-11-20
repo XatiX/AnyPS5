@@ -1707,7 +1707,7 @@ private:
         const auto commands = recorder->Commands();
         Graphics::RecordMemoryBarrier(context, commands, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT | VK_PIPELINE_STAGE_HOST_BIT, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT | (indirect ? VK_PIPELINE_STAGE_DRAW_INDIRECT_BIT : 0u), VK_ACCESS_SHADER_WRITE_BIT | VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT | VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT | VK_ACCESS_TRANSFER_WRITE_BIT | VK_ACCESS_HOST_WRITE_BIT, VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT | (indirect ? VK_ACCESS_INDIRECT_COMMAND_READ_BIT : 0u));
         context.BindComputePipeline(commands, pipeline->pipeline);
-        Downgrades::NotePipeline(reinterpret_cast<std::uint64_t>(pipeline->pipeline), stage.program.codeAddress);
+        Downgrades::NotePipeline(reinterpret_cast<std::uint64_t>(pipeline->pipeline), stage.program.codeAddress, stage.program.result != nullptr ? stage.program.result->spirv.ContentHash().low : 0u);
         const auto bind = context.Resolved(&Graphics::DeviceFunctions::cmdBindDescriptorSets, "vkCmdBindDescriptorSets");
         bind(commands, VK_PIPELINE_BIND_POINT_COMPUTE, pipeline->layout, ShaderRecompiler::RuntimeAbi::DescriptorSet, 1, &set, 0, nullptr);
         const VkDescriptorSet heapSet = heap->Set();
