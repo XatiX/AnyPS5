@@ -12,6 +12,9 @@
 #include <algorithm>
 #include <chrono>
 #include <cstdlib>
+#if ANYPS5_UNIFIED
+#include "prx/libSceAgcDriver/Unified/include/DrawRecorder.hpp"
+#endif
 
 namespace AgcDriver::DriverDetail {
 
@@ -173,7 +176,11 @@ void Driver::run(std::uint32_t id) noexcept {
     StartWorkerSampler(id);
     Submission submission;
     static const bool profile = std::getenv("APS5_PROFILE_DRAW") != nullptr;
+#if ANYPS5_UNIFIED
+    static const bool idleStore = std::getenv("APS5_NO_IDLE_STORE") == nullptr && Unified::Record::IdleStores();
+#else
     static const bool idleStore = std::getenv("APS5_NO_IDLE_STORE") == nullptr;
+#endif
     auto& costs = submissionCosts(id);
     try {
         PerformanceTrace::BindThread(role);
