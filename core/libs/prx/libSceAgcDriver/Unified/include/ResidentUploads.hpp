@@ -36,6 +36,7 @@ public:
 
     void NoteDirty(std::span<const DirtyRange> ranges);
     bool Prepare(std::uint64_t address, std::uint64_t size, std::uint64_t frame);
+    bool PrepareFilled(std::uint64_t address, std::uint64_t size, std::uint64_t frame);
     std::vector<PendingUpload> Take();
     [[nodiscard]] bool Pending() const;
     std::vector<GuestSpan> Evict(std::uint64_t frame);

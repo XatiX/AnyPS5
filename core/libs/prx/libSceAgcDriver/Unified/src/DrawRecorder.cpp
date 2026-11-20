@@ -756,7 +756,7 @@ private:
     }
 
     bool queueCopyBack(const Context& context, std::uint64_t address, std::uint64_t bytes) {
-        if (!copyingBack || bytes > KnownBufferLimitBytes || ResidencyService::Get().WrittenImportThroughout(address, bytes)) return false;
+        if (!copyingBack || bytes > KnownBufferLimitBytes) return false;
         const auto* import = Graphics::HostImportFor(context, address, static_cast<std::size_t>(bytes));
         if (import == nullptr || address < import->base || address + bytes > import->base + import->bytes) return false;
         returnImports(context, address, bytes, *import);
