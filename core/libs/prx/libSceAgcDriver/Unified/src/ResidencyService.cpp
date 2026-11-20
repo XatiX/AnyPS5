@@ -119,11 +119,15 @@ void ResidencyService::NoteDirty(std::span<const DirtyRange> ranges) {
     }
 }
 
-std::optional<DeviceSpan> ResidencyService::Serve(std::uint64_t address, std::uint64_t size, std::span<const std::pair<std::uint64_t, std::uint64_t>> committed) {
+std::optional<DeviceSpan> ResidencyService::Serve(std::uint64_t address, std::uint64_t size, std::span<const std::pair<std::uint64_t, std::uint64_t>> committed, std::uint64_t owner, std::uint64_t ownerSize) {
     if (!Attached() || size == 0) return std::nullopt;
     std::lock_guard lock(mutex);
     const auto end = address + size;
-    if (!served.contains(address)) {
+    if (!ledger->Owns(address, size)) {
+        if (ownerSize != 0 && owner <= address && end - owner <= ownerSize) {
+            ledger->RemoveUnboundInside(owner, ownerSize);
+            if (ledger->Add(owner, ownerSize)) ++ownerRanges;
+        }
         if (!ledger->Owns(address, size)) {
             ledger->RemoveUnboundInside(address, size);
             if (!ledger->Add(address, size)) {
@@ -131,15 +135,13 @@ std::optional<DeviceSpan> ResidencyService::Serve(std::uint64_t address, std::ui
                 return std::nullopt;
             }
         }
-        served.emplace(address, end);
     }
+    if (auto [at, added] = served.try_emplace(address, end); !added) at->second = std::max(at->second, end);
     const auto now = frame.load(std::memory_order_relaxed);
     for (const auto& [from, to] : committed) {
         const auto first = std::max(from, address);
         const auto last = std::min(to, end);
         if (first < last && !uploads->Prepare(first, last - first, now)) {
-            served.erase(address);
-            ledger->Remove(address);
             ++serveRefusals;
             return std::nullopt;
         }
@@ -423,12 +425,12 @@ std::string ResidencyService::Line() const {
     const auto uploadCounts = uploads->Counts();
     std::uint64_t stagingHeld = 0;
     for (const auto& buffer : stagingPool) stagingHeld += buffer->Bytes().size();
-    char line[640];
-    std::snprintf(line, sizeof(line), "[recode-residency] ranges %llu, pools %llu, bound %llu MiB of %llu MiB budget, chunks bound %llu, evicted %llu, refused %llu; uploads dirty %llu (%llu MiB) full %llu (%llu MiB) not resident %llu MiB; recorded %llu (%llu MiB); staging %llu created, %llu reused, %llu held (%llu MiB); served %llu, serves refused %llu\n",
+    char line[768];
+    std::snprintf(line, sizeof(line), "[recode-residency] ranges %llu, pools %llu, bound %llu MiB of %llu MiB budget, chunks bound %llu, evicted %llu, refused %llu; uploads dirty %llu (%llu MiB) full %llu (%llu MiB) not resident %llu MiB; recorded %llu (%llu MiB); staging %llu created, %llu reused, %llu held (%llu MiB); served %llu, serves refused %llu, allocation ranges %llu\n",
         static_cast<unsigned long long>(ledgerCounts.ranges), static_cast<unsigned long long>(ledgerCounts.pools), static_cast<unsigned long long>(ledgerCounts.boundBytes >> 20), static_cast<unsigned long long>(ledgerCounts.budget >> 20),
         static_cast<unsigned long long>(ledgerCounts.bound), static_cast<unsigned long long>(ledgerCounts.evicted), static_cast<unsigned long long>(ledgerCounts.refused),
         static_cast<unsigned long long>(uploadCounts.dirtyUploads), static_cast<unsigned long long>(uploadCounts.dirtyBytes >> 20), static_cast<unsigned long long>(uploadCounts.fullUploads), static_cast<unsigned long long>(uploadCounts.fullBytes >> 20), static_cast<unsigned long long>(uploadCounts.skippedBytes >> 20),
-        static_cast<unsigned long long>(recordedUploads), static_cast<unsigned long long>(recordedBytes >> 20), static_cast<unsigned long long>(stagingCreated), static_cast<unsigned long long>(stagingReused), static_cast<unsigned long long>(stagingPool.size()), static_cast<unsigned long long>(stagingHeld >> 20), static_cast<unsigned long long>(served.size()), static_cast<unsigned long long>(serveRefusals));
+        static_cast<unsigned long long>(recordedUploads), static_cast<unsigned long long>(recordedBytes >> 20), static_cast<unsigned long long>(stagingCreated), static_cast<unsigned long long>(stagingReused), static_cast<unsigned long long>(stagingPool.size()), static_cast<unsigned long long>(stagingHeld >> 20), static_cast<unsigned long long>(served.size()), static_cast<unsigned long long>(serveRefusals), static_cast<unsigned long long>(ownerRanges));
     if (!pages) return line;
     char table[512];
     std::snprintf(table, sizeof(table), "[recode-page-table] leaves %u of %u, updates %llu (%llu MiB), leaves dropped %llu, shared pages %llu; imports mapped %llu pages, %llu spaces, %llu pages of retired imports dropped; fault pages served %llu, already mapped %llu, refused %llu; read backs %llu (%llu KiB), not resident %llu KiB\n", pages->Leaves(), PageTableLeafCapacity,

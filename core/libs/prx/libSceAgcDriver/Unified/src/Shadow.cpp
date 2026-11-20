@@ -380,6 +380,24 @@ void coreNoteWritten(std::uintptr_t address, std::size_t bytes) {
 
 const GuestMemory::CoreWriteHooks coreWriteHooks{coreCoversWrites, coreCollectWrites, coreNoteWritten};
 
+std::pair<std::uint64_t, std::uint64_t> allocationAround(std::uint64_t first, std::uint64_t last) {
+    static const bool whole = std::getenv("APS5_RECODE_NO_ALLOCATION_RANGES") == nullptr;
+    if (!whole) return {first, last};
+    std::uint64_t address = 0;
+    std::uint64_t bytes = 0;
+    bool readable = false;
+    if (auto found = GuestAllocations::GuestAllocationsLookup_nid_postfix(static_cast<std::uintptr_t>(first), false)) {
+        address = found->address;
+        bytes = found->bytes;
+        readable = found->readable;
+    }
+    const auto begin = address & ~(PageBytes - 1);
+    const auto end = (address + bytes + PageBytes - 1) & ~(PageBytes - 1);
+    if (bytes == 0 || !readable || begin > first || last > end) return {first, last};
+    if (!GuestArena::GuestArenaContains_nid_postfix(reinterpret_cast<const void*>(begin), static_cast<std::size_t>(end - begin))) return {first, last};
+    return {begin, end};
+}
+
 }
 
 bool ServesOwned() {
@@ -418,18 +436,21 @@ bool ServeOwned(const Graphics::Context& context, std::uint64_t address, std::ui
     }
     if (!GuestArena::GuestArenaContains_nid_postfix(reinterpret_cast<const void*>(first), static_cast<std::size_t>(last - first))) return false;
     const auto start = std::chrono::steady_clock::now();
-    const auto committed = GuestMemory::CommittedRanges(first, static_cast<std::size_t>(last - first));
+    const auto [owner, ownerEnd] = allocationAround(first, last);
+    const auto from = std::max(owner, first & ~(GpuPageBytes - 1));
+    const auto to = std::min(ownerEnd, (last + GpuPageBytes - 1) & ~(GpuPageBytes - 1));
+    const auto committed = GuestMemory::CommittedRanges(from, static_cast<std::size_t>(to - from));
     auto& core = MemoryCore::Get();
-    core.Reserve(first, last - first);
-    for (const auto& [from, to] : committed) core.MakeResident(from, to - from);
-    const auto base = service.Serve(first, last - first, committed);
+    core.Reserve(from, to - from);
+    for (const auto& [begin, end] : committed) core.MakeResident(begin, end - begin);
+    const auto base = service.Serve(from, to - from, committed, owner, ownerEnd - owner);
     totals.ownedWalks.fetch_add(1, std::memory_order_relaxed);
     totals.ownedWalkNanoseconds.fetch_add(nanosecondsSince(start), std::memory_order_relaxed);
     if (!base) {
         served.erase(first);
         return false;
     }
-    const OwnedSpan whole{base->handle, base->address, first - base->offset};
+    const OwnedSpan whole{base->handle, base->address + (first - from), from - base->offset};
     served[first] = {last, frame, service.Removals(), whole};
     *span = whole;
     span->address += address - first;
@@ -494,7 +515,7 @@ void LandGpuWrites(GuestRanges ranges) {
 
 bool ResidentDrawInputs() {
     static const bool resident = [] {
-        if (std::getenv("APS5_RECODE_RESIDENT_INPUTS") == nullptr) return false;
+        if (std::getenv("APS5_RECODE_IMPORTED_INPUTS") != nullptr) return false;
         GuestMemory::SetGpuWriteHook([](std::uint64_t address, std::uint64_t bytes) {
             const std::array written{std::pair{address, address + bytes}};
             NoteGpuWrites(written);
