@@ -35,12 +35,29 @@ constexpr std::uint32_t Image2DShape = 2u;
 constexpr std::uint32_t MultisampleShape = 4u;
 constexpr std::uint32_t MultisampleArrayShape = 5u;
 
-bool dispatchesRouted() {
-    static const bool enabled = [] {
+enum class DispatchRoute : std::uint8_t { None, Graphics, Compute, All };
+
+DispatchRoute dispatchRoute() {
+    static const DispatchRoute route = [] {
         const auto* value = std::getenv("APS5_RECODE_DISPATCH");
-        return value != nullptr && std::string_view(value) == "1";
+        if (value == nullptr) return DispatchRoute::None;
+        const std::string_view text(value);
+        if (text == "1") return DispatchRoute::Graphics;
+        if (text == "compute") return DispatchRoute::Compute;
+        if (text == "all") return DispatchRoute::All;
+        return DispatchRoute::None;
     }();
-    return enabled;
+    return route;
+}
+
+bool dispatchesRouted() {
+    return dispatchRoute() != DispatchRoute::None;
+}
+
+bool routesQueue(std::uint32_t queue) {
+    const auto route = dispatchRoute();
+    if (route == DispatchRoute::All) return true;
+    return queue == 0u ? route == DispatchRoute::Graphics : route == DispatchRoute::Compute;
 }
 
 bool imagesRouted() {
@@ -145,7 +162,7 @@ public:
 
     void Consume(const Operation& operation, const DecodeState& state) {
         if (IsDispatch(operation.kind)) {
-            if (!dispatchesRouted() || operation.queue != 0u) return;
+            if (!routesQueue(operation.queue)) return;
             std::shared_ptr<const ResolvedDraw> dispatch;
             {
                 std::lock_guard lock(mutex);
@@ -794,6 +811,10 @@ PacketTable<ResolvedDraw>& ResolvedDraws() {
 
 bool DispatchesActive() {
     return Active() && dispatchesRouted();
+}
+
+bool DispatchesRoutedOn(std::uint32_t queue) {
+    return Active() && routesQueue(queue);
 }
 
 PacketTable<ResolvedDraw>& ResolvedDispatches() {

@@ -57,6 +57,7 @@ struct ResolvedDraw {
 
 [[nodiscard]] bool Active();
 [[nodiscard]] bool DispatchesActive();
+[[nodiscard]] bool DispatchesRoutedOn(std::uint32_t queue);
 void Attach(const std::shared_ptr<VulkanDevice>& device);
 void Consume(const Operation& operation, const DecodeState& state);
 [[nodiscard]] std::string Line();

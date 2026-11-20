@@ -1,6 +1,7 @@
 #include "prx/libSceAgcDriver/Unified/include/DrawRecorder.hpp"
 #include "prx/libkernel/include/Api.hpp"
 #include "prx/libSceAgcDriver/Execution/include/GuestMemory.hpp"
+#include "prx/libSceAgcDriver/Execution/include/Pm4.hpp"
 #include "prx/libSceAgcDriver/Execution/include/VulkanDevice.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/DepthSurface.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/Draw.hpp"
@@ -171,8 +172,8 @@ struct Totals {
     std::uint64_t dispatchExisting = 0;
     std::uint64_t dispatchNanoseconds = 0;
     std::uint64_t pipelinesQueued = 0;
-    std::uint64_t pipelinesBuilt = 0;
-    std::uint64_t pipelineNanoseconds = 0;
+    std::uint64_t pipelineWaits = 0;
+    std::uint64_t pipelineWaitNanoseconds = 0;
     std::uint64_t surfaceNanoseconds = 0;
     std::uint64_t targetNanoseconds = 0;
     std::uint64_t graphicsPipelineNanoseconds = 0;
@@ -191,8 +192,9 @@ struct Totals {
     std::uint64_t copyBackBytes = 0;
     std::uint64_t copyBackCovered = 0;
     std::uint64_t importsReturned = 0;
-    std::uint64_t lateCopies = 0;
-    std::uint64_t lateCopyBytes = 0;
+    std::uint64_t indirectDispatches = 0;
+    std::uint64_t gdsBindings = 0;
+    std::uint64_t knownGpuWritten = 0;
     std::uint64_t inputsResident = 0;
     std::uint64_t inputsImported = 0;
     std::uint64_t inputsWritten = 0;
@@ -261,9 +263,29 @@ bool copiesBackDispatchWrites() {
     return copies;
 }
 
-bool copiesLateWrites() {
-    static const bool copies = std::getenv("APS5_RECODE_NO_LATE_COPY") == nullptr;
-    return copies;
+bool bindsGds() {
+    static const bool binds = std::getenv("APS5_RECODE_NO_GDS") == nullptr;
+    return binds;
+}
+
+bool recordsMipTailTargets() {
+    static const bool records = std::getenv("APS5_RECODE_NO_MIP_TAIL_TARGETS") == nullptr;
+    return records;
+}
+
+bool buildsPipelinesAhead() {
+    static const bool ahead = std::getenv("APS5_RECODE_ASYNC_COMPUTE_PIPELINES") != nullptr;
+    return ahead;
+}
+
+bool recordsIndirectDispatches() {
+    static const bool records = std::getenv("APS5_RECODE_NO_INDIRECT_DISPATCHES") == nullptr;
+    return records;
+}
+
+bool refusesGpuWrittenCopies() {
+    static const bool refuses = std::getenv("APS5_RECODE_COPY_GPU_WRITTEN_KNOWN") == nullptr;
+    return refuses;
 }
 
 struct DrawInput {
@@ -405,7 +427,7 @@ bool precheck(const Resolve::ResolvedDraw& draw, const Pm4::DrawParameters& para
             reason = "multisampled color target";
             return false;
         }
-        if (color.mipTail) {
+        if (color.mipTail && !recordsMipTailTargets()) {
             reason = "color target in a mip tail";
             return false;
         }
@@ -423,8 +445,8 @@ bool precheck(const Resolve::ResolvedDraw& draw, const Pm4::DrawParameters& para
             reason = "buffer array binding";
             return false;
         }
-        if (binding.source == Bindings::Source::Guest || binding.source == Bindings::Source::Gds) {
-            reason = "guest or GDS buffer binding";
+        if (binding.source == Bindings::Source::Guest || (binding.source == Bindings::Source::Gds && !bindsGds())) {
+            reason = binding.source == Bindings::Source::Gds ? "GDS buffer binding" : "guest buffer binding";
             return false;
         }
         if (binding.source == Bindings::Source::TableMap && draw.stages.at(binding.stage).tableMap == nullptr) {
@@ -488,7 +510,10 @@ struct PipelineJob {
     VkPipelineCreateFlags flags = 0;
     VkPipelineShaderStageCreateFlags stageFlags = 0;
     std::uint32_t subgroupSize = 0;
+    VulkanDevice* owner = nullptr;
 };
+
+constexpr std::uint64_t UnsavedBuildNanoseconds = 5'000'000'000u;
 
 bool dispatchPrecheck(const Resolve::ResolvedDraw& dispatch, std::string& reason) {
     if (dispatch.stages.size() != 1u || dispatch.stages.front().program.stage != ShaderRecompiler::ShaderStage::Compute) {
@@ -499,7 +524,7 @@ bool dispatchPrecheck(const Resolve::ResolvedDraw& dispatch, std::string& reason
         reason = "placeholder images";
         return false;
     }
-    if (dispatch.operation.dispatch.indirect) {
+    if (dispatch.operation.dispatch.indirect && (dispatch.operation.dispatch.indirectAddress == 0u || !recordsIndirectDispatches())) {
         reason = "indirect dispatch";
         return false;
     }
@@ -521,8 +546,8 @@ bool dispatchPrecheck(const Resolve::ResolvedDraw& dispatch, std::string& reason
             reason = "buffer array binding";
             return false;
         }
-        if (binding.source == Bindings::Source::Guest || binding.source == Bindings::Source::Gds) {
-            reason = "guest or GDS buffer binding";
+        if (binding.source == Bindings::Source::Guest || (binding.source == Bindings::Source::Gds && !bindsGds())) {
+            reason = binding.source == Bindings::Source::Gds ? "GDS buffer binding" : "guest buffer binding";
             return false;
         }
         if (binding.source == Bindings::Source::TableMap && dispatch.stages.front().tableMap == nullptr) {
@@ -557,7 +582,7 @@ public:
         bool recorded = false;
         try {
             recorded = record(context, draw, parameters, reason);
-            landWrites(context);
+            landWrites();
         } catch (const std::exception& error) {
             reason = std::string("record failed: ") + error.what();
         }
@@ -570,9 +595,9 @@ public:
         return false;
     }
 
-    bool DispatchPrecheck(const Context& context, const VulkanDevice& owner, const Resolve::ResolvedDraw& dispatch, std::string& reason) {
-        std::lock_guard lock(mutex);
-        if (dispatchPrecheck(dispatch, reason) && pipelineReady(context, owner, dispatch, reason)) return true;
+    bool DispatchPrecheck(const Context& context, VulkanDevice& owner, const Resolve::ResolvedDraw& dispatch, std::string& reason) {
+        std::unique_lock lock(mutex);
+        if (dispatchPrecheck(dispatch, reason) && pipelineReady(context, owner, dispatch, lock, reason)) return true;
         totals.dispatchExisting++;
         const auto key = "existing path dispatch: " + reason.substr(0, 45);
         if (totals.reasons.size() < 24u || totals.reasons.contains(key)) totals.reasons[key]++;
@@ -585,7 +610,7 @@ public:
         bool recorded = false;
         try {
             recorded = recordDispatch(context, dispatch, groups, reason);
-            landWrites(context);
+            landWrites();
         } catch (const std::exception& error) {
             reason = std::string("record failed: ") + error.what();
         }
@@ -600,6 +625,7 @@ public:
 
     std::string Line() {
         std::lock_guard lock(mutex);
+        const auto pipelineCounts = takePipelineCounts();
         char text[384];
         const auto draws = totals.recorded + totals.refused;
         const auto ring = space.has_value() ? space->TakeCounts() : RingCounts{};
@@ -610,15 +636,16 @@ public:
         line += "; passes " + std::to_string(totals.passesBegun) + " begun, " + std::to_string(totals.passesContinued) + " draws continued, " + std::to_string(totals.passFeedback) + " broken by a target read";
         line += "; target memo " + std::to_string(totals.targetMemoHits) + " hits, " + std::to_string(totals.targetMemoMisses) + " misses; " + std::to_string(totals.deferredReads) + " draws with reads bound at record";
         line += "; residency updates landed " + std::to_string(totals.residencyLands);
-        line += "; known buffers " + std::to_string(totals.knownServed) + " served, " + std::to_string(totals.knownMapped) + " mapped (" + std::to_string(totals.knownPaged) + " paged in), " + std::to_string(totals.knownCopied) + " copied, " + std::to_string(totals.knownRefused) + " unresolved, " + std::to_string(totals.knownSkipped) + " skipped (" + std::to_string(totals.knownPointers) + " of them pointers); known writes " + std::to_string(totals.knownWritten) + " direct (" + std::to_string(totals.knownWriteBytes >> 10u) + " KiB landed), " + std::to_string(totals.knownWriteLookups) + " through the page table, " + std::to_string(totals.copyBacks) + " copied back to their import after the dispatch (" + std::to_string(totals.copyBackBytes >> 20u) + " MiB, " + std::to_string(totals.copyBackCovered >> 10u) + " KiB of written pieces not landed, " + std::to_string(totals.importsReturned) + " chunks returned from their import)";
+        line += "; known buffers " + std::to_string(totals.knownServed) + " served, " + std::to_string(totals.knownMapped) + " mapped (" + std::to_string(totals.knownPaged) + " paged in), " + std::to_string(totals.knownCopied) + " copied (" + std::to_string(totals.knownGpuWritten) + " GPU-written ranges not copied), " + std::to_string(totals.knownRefused) + " unresolved, " + std::to_string(totals.knownSkipped) + " skipped (" + std::to_string(totals.knownPointers) + " of them pointers); known writes " + std::to_string(totals.knownWritten) + " direct (" + std::to_string(totals.knownWriteBytes >> 10u) + " KiB landed), " + std::to_string(totals.knownWriteLookups) + " through the page table, " + std::to_string(totals.copyBacks) + " copied back to their import after the dispatch (" + std::to_string(totals.copyBackBytes >> 20u) + " MiB, " + std::to_string(totals.copyBackCovered >> 10u) + " KiB of written pieces not landed, " + std::to_string(totals.importsReturned) + " chunks returned from their import)";
         line += "; draw inputs " + std::to_string(totals.inputsResident) + " resident, " + std::to_string(totals.inputsImported) + " imported, " + std::to_string(totals.inputsWritten) + " after CPU writes (" + std::to_string(totals.inputsCopied) + " copied into the ring), " + std::to_string(totals.inputsGpuWritten) + " GPU-written, " + std::to_string(totals.inputsAliased) + " aliased, " + std::to_string(totals.inputsMerged) + " served with an overlapping input";
         std::snprintf(text, sizeof(text), "; draw phases surfaces %.1f ms, targets %.1f ms, pipelines %.1f ms, owned uploads %.1f ms", static_cast<double>(totals.surfaceNanoseconds) / 1e6, static_cast<double>(totals.targetNanoseconds) / 1e6, static_cast<double>(totals.graphicsPipelineNanoseconds) / 1e6, static_cast<double>(totals.uploadNanoseconds) / 1e6);
         line += text;
-        std::snprintf(text, sizeof(text), "; dispatches %llu recorded (%llu storage images written), %llu to the existing path, %.1f us per dispatch; compute pipelines %zu held, %llu queued, %llu built in %.1f ms, %zu building, %zu failed", static_cast<unsigned long long>(totals.dispatches), static_cast<unsigned long long>(totals.storageWrites), static_cast<unsigned long long>(totals.dispatchExisting), totals.dispatches == 0 ? 0.0 : static_cast<double>(totals.dispatchNanoseconds) / 1000.0 / static_cast<double>(totals.dispatches), computePipelines.size(), static_cast<unsigned long long>(totals.pipelinesQueued), static_cast<unsigned long long>(totals.pipelinesBuilt), static_cast<double>(totals.pipelineNanoseconds) / 1e6, buildingPipelines.size(), failedPipelines.size());
+        std::snprintf(text, sizeof(text), "; dispatches %llu recorded (%llu indirect, %llu storage images written), %llu to the existing path, %.1f us per dispatch; compute pipelines %zu held, %llu queued, %llu built in %.1f ms, %zu building, %zu failed", static_cast<unsigned long long>(totals.dispatches), static_cast<unsigned long long>(totals.indirectDispatches), static_cast<unsigned long long>(totals.storageWrites), static_cast<unsigned long long>(totals.dispatchExisting), totals.dispatches == 0 ? 0.0 : static_cast<double>(totals.dispatchNanoseconds) / 1000.0 / static_cast<double>(totals.dispatches), pipelineCounts.held, static_cast<unsigned long long>(totals.pipelinesQueued), static_cast<unsigned long long>(pipelineCounts.built), static_cast<double>(pipelineCounts.nanoseconds) / 1e6, pipelineCounts.building, pipelineCounts.failed);
         line += text;
         std::snprintf(text, sizeof(text), "; table maps %llu hits, %llu uploads (%.1f MiB), %llu retired, %zu held (%.1f MiB)", static_cast<unsigned long long>(totals.mapHits), static_cast<unsigned long long>(totals.mapUploads), static_cast<double>(totals.mapUploadBytes) / 1048576.0, static_cast<unsigned long long>(totals.mapRetired), maps.size(), static_cast<double>(mapBytes) / 1048576.0);
         line += text;
-        std::snprintf(text, sizeof(text), "; fault buffers %zu in flight, %llu read: %llu faults (%llu unmapped), %llu fault pages served, %llu written ranges (%llu pieces landed late, %llu of them copied to their import on the GPU timeline, %llu KiB), %llu written overflows", faults.size(), static_cast<unsigned long long>(totals.faultReads), static_cast<unsigned long long>(totals.faults), static_cast<unsigned long long>(totals.unmappedFaults), static_cast<unsigned long long>(totals.faultPages), static_cast<unsigned long long>(totals.writtenRanges), static_cast<unsigned long long>(totals.writtenLate), static_cast<unsigned long long>(totals.lateCopies), static_cast<unsigned long long>(totals.lateCopyBytes >> 10u), static_cast<unsigned long long>(totals.writtenOverflows));
+        line += "; GDS bound " + std::to_string(totals.gdsBindings) + " times; dispatches waited for their pipeline " + std::to_string(totals.pipelineWaits) + " times (" + std::to_string(totals.pipelineWaitNanoseconds / 1000000u) + " ms)";
+        std::snprintf(text, sizeof(text), "; fault buffers %zu in flight, %llu read: %llu faults (%llu unmapped), %llu fault pages served, %llu written ranges (%llu pieces landed late), %llu written overflows", faults.size(), static_cast<unsigned long long>(totals.faultReads), static_cast<unsigned long long>(totals.faults), static_cast<unsigned long long>(totals.unmappedFaults), static_cast<unsigned long long>(totals.faultPages), static_cast<unsigned long long>(totals.writtenRanges), static_cast<unsigned long long>(totals.writtenLate), static_cast<unsigned long long>(totals.writtenOverflows));
         line += text;
         std::snprintf(text, sizeof(text), "; GPU-written chunks %llu switched to their import from the written bitmap (%.1f MiB copied over), %llu from other GPU writes, %llu refused, %llu written pieces already on an import", static_cast<unsigned long long>(totals.importSwitches), static_cast<double>(totals.switchBytes) / 1048576.0, static_cast<unsigned long long>(totals.writtenSwitches), static_cast<unsigned long long>(totals.switchRefused), static_cast<unsigned long long>(totals.writtenOnImports));
         line += text;
@@ -675,43 +702,10 @@ private:
         });
     }
 
-    bool copyLate(const Context& context, std::uint64_t address, std::uint64_t bytes, std::vector<std::pair<VkBuffer, std::pair<VkBuffer, VkBufferCopy>>>& regions) {
-        const auto* import = Graphics::HostImportFor(context, address, static_cast<std::size_t>(bytes));
-        if (import == nullptr || address < import->base || address + bytes > import->base + import->bytes) return false;
-        const auto span = ResidencyService::Get().Translate(address, bytes);
-        if (!span) return false;
-        regions.push_back({reinterpret_cast<VkBuffer>(static_cast<std::uintptr_t>(span->handle)), {import->buffer, VkBufferCopy{span->offset, Graphics::HostImportOffset(*import, address), bytes}}});
-        return true;
-    }
-
-    void landWrites(const Context& context) {
+    void landWrites() {
         if (landing.empty()) return;
-        auto written = std::move(landing);
+        const auto written = std::move(landing);
         landing.clear();
-        if (copiesLateWrites() && context.recorder != nullptr) {
-            std::vector<std::pair<VkBuffer, std::pair<VkBuffer, VkBufferCopy>>> regions;
-            std::vector<std::pair<std::uint64_t, std::uint64_t>> copied;
-            std::erase_if(written, [&](const auto& piece) {
-                if (!copyLate(context, piece.first, piece.second, regions)) return false;
-                copied.emplace_back(piece.first, piece.first + piece.second);
-                return true;
-            });
-            if (!regions.empty()) {
-                const auto commands = context.recorder->Commands();
-                const auto copy = context.Function<PFN_vkCmdCopyBuffer>("vkCmdCopyBuffer");
-                Graphics::RecordMemoryBarrier(context, commands, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_ACCESS_SHADER_WRITE_BIT | VK_ACCESS_TRANSFER_WRITE_BIT, VK_ACCESS_TRANSFER_READ_BIT | VK_ACCESS_TRANSFER_WRITE_BIT);
-                for (const auto& [source, target] : regions) copy(commands, source, target.first, 1, &target.second);
-                Graphics::RecordMemoryBarrier(context, commands, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT | VK_PIPELINE_STAGE_HOST_BIT, VK_ACCESS_TRANSFER_WRITE_BIT, VK_ACCESS_MEMORY_READ_BIT | VK_ACCESS_MEMORY_WRITE_BIT | VK_ACCESS_HOST_READ_BIT);
-                totals.lateCopies += regions.size();
-                for (const auto& [begin, end] : copied) {
-                    totals.lateCopyBytes += end - begin;
-                    Events::Shared().Note(begin, end - begin);
-                    MemoryCore::Get().Pages().NoteGpuWritten(begin, end - begin);
-                }
-            }
-            if (written.empty()) return;
-        }
-        for (const auto& [begin, size] : written) markSwitch(begin, size);
         Shadow::LandGpuWrites(written);
         std::vector<std::pair<std::uint64_t, std::uint64_t>> ends;
         ends.reserve(written.size());
@@ -777,15 +771,11 @@ private:
             } else {
                 landing.emplace_back(at, next - at);
                 totals.writtenLate++;
+                for (auto page = (at - chunk) / PageBytes; page <= (next - 1u - chunk) / PageBytes; ++page) writtenPages[chunk] |= 1u << page;
+                if (switchesWrittenChunks()) switches.insert(chunk);
             }
             at = next;
         }
-    }
-
-    void markSwitch(std::uint64_t begin, std::uint64_t size) {
-        const auto chunk = begin & ~(ChunkBytes - 1u);
-        for (auto page = (begin - chunk) / PageBytes; page <= (begin + size - 1u - chunk) / PageBytes; ++page) writtenPages[chunk] |= 1u << page;
-        if (switchesWrittenChunks()) switches.insert(chunk);
     }
 
     void landKnownWrites(std::uint64_t completed) {
@@ -1137,6 +1127,10 @@ private:
 
     std::uint64_t copyKnownBuffer(std::uint64_t address, std::uint64_t bytes, std::uint64_t serial, std::uint64_t completed) {
         if (ringAddress == 0u || bytes > KnownCopyLimitBytes) return 0u;
+        if (refusesGpuWrittenCopies() && MemoryCore::Get().Pages().GpuWrittenIn(address, bytes)) {
+            totals.knownGpuWritten++;
+            return 0u;
+        }
         const auto offset = ringCopy(address, bytes, serial, completed);
         return offset.has_value() ? ringAddress + *offset : 0u;
     }
@@ -1218,7 +1212,21 @@ private:
                     info = {mapBuffer(context, *mirror, serial, completed)->Handle(), 0, VK_WHOLE_SIZE};
                     break;
                 }
-                default: reason = "guest or GDS buffer binding"; return false;
+                case Bindings::Source::Gds: {
+                    const auto gds = Pm4::GdsAddress();
+                    const auto* import = Graphics::HostImportFor(context, gds, Pm4::GdsBytes);
+                    if (import == nullptr) {
+                        reason = "GDS not imported";
+                        return false;
+                    }
+                    info = {import->buffer, Graphics::HostImportOffset(*import, gds), Pm4::GdsBytes};
+                    const std::array written{std::pair{gds, gds + Pm4::GdsBytes}};
+                    Events::NoteRanges(written);
+                    if (context.recorder != nullptr) context.recorder->NotePendingWrite(gds, Pm4::GdsBytes);
+                    totals.gdsBindings++;
+                    break;
+                }
+                default: reason = "guest buffer binding"; return false;
             }
             infos.push_back(info);
             VkWriteDescriptorSet write{VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET};
@@ -1286,22 +1294,61 @@ private:
         return made;
     }
 
-    bool pipelineReady(const Context& context, const VulkanDevice& owner, const Resolve::ResolvedDraw& dispatch, std::string& reason) {
-        auto key = pipelineKey(dispatch);
+    bool pipelineReady(const Context& context, VulkanDevice& owner, const Resolve::ResolvedDraw& dispatch, std::unique_lock<std::mutex>& lock, std::string& reason) {
+        const auto key = pipelineKey(dispatch);
+        std::unique_lock pipelineLock(pipelineMutex);
         if (computePipelines.contains(key)) return true;
+        if (!queuePipeline(context, owner, dispatch, key, reason)) return false;
+        if (buildsPipelinesAhead()) return false;
+        const auto started = std::chrono::steady_clock::now();
+        lock.unlock();
+        pipelinesDone.wait(pipelineLock, [&] { return !buildingPipelines.contains(key); });
+        pipelineLock.unlock();
+        lock.lock();
+        pipelineLock.lock();
+        totals.pipelineWaits++;
+        totals.pipelineWaitNanoseconds += elapsed(started);
+        if (computePipelines.contains(key)) return true;
+        if (const auto failed = failedPipelines.find(key); failed != failedPipelines.end()) reason = "compute pipeline failed: " + failed->second;
+        return false;
+    }
+
+    struct PipelineCounts {
+        std::size_t held = 0;
+        std::size_t building = 0;
+        std::size_t failed = 0;
+        std::uint64_t built = 0;
+        std::uint64_t nanoseconds = 0;
+    };
+
+    PipelineCounts takePipelineCounts() {
+        std::lock_guard pipelineLock(pipelineMutex);
+        PipelineCounts counts{computePipelines.size(), buildingPipelines.size(), failedPipelines.size(), builtPipelines, buildNanoseconds};
+        builtPipelines = 0;
+        buildNanoseconds = 0;
+        return counts;
+    }
+
+    std::shared_ptr<ComputePipeline> builtPipeline(const std::vector<std::uint64_t>& key) {
+        std::lock_guard pipelineLock(pipelineMutex);
+        const auto found = computePipelines.find(key);
+        return found != computePipelines.end() ? found->second : nullptr;
+    }
+
+    bool queuePipeline(const Context& context, VulkanDevice& owner, const Resolve::ResolvedDraw& dispatch, std::vector<std::uint64_t> key, std::string& reason) {
         if (const auto failed = failedPipelines.find(key); failed != failedPipelines.end()) {
             reason = "compute pipeline failed: " + failed->second;
             return false;
         }
         reason = "compute pipeline building";
-        if (buildingPipelines.contains(key)) return false;
+        if (buildingPipelines.contains(key)) return true;
         const auto* heap = Resolve::HeapDevice();
         if (heap == nullptr) {
             reason = "no heap";
             return false;
         }
         const auto& result = dispatch.stages.front().program.result;
-        PipelineJob job{key, context, result, setLayout(context, dispatch, 0), heap->Layout(), emptySetLayout(context), owner.computePipelineFlags(), 0u, owner.computeSubgroupSize(*result)};
+        PipelineJob job{key, context, result, setLayout(context, dispatch, 0), heap->Layout(), emptySetLayout(context), owner.computePipelineFlags(), 0u, owner.computeSubgroupSize(*result), &owner};
         try {
             job.stageFlags = owner.computeStageFlags(*result);
         } catch (const std::exception& error) {
@@ -1314,14 +1361,14 @@ private:
         totals.pipelinesQueued++;
         if (!builder.joinable()) builder = std::thread([this] { buildPipelines(); });
         jobsReady.notify_one();
-        return false;
+        return true;
     }
 
     void buildPipelines() {
         for (;;) {
             std::optional<PipelineJob> job;
             {
-                std::unique_lock lock(mutex);
+                std::unique_lock lock(pipelineMutex);
                 jobsReady.wait(lock, [&] { return !pipelineJobs.empty(); });
                 job.emplace(std::move(pipelineJobs.front()));
                 pipelineJobs.pop_front();
@@ -1334,15 +1381,24 @@ private:
             } catch (const std::exception& error) {
                 failure = error.what();
             }
-            std::lock_guard lock(mutex);
-            buildingPipelines.erase(job->key);
-            totals.pipelineNanoseconds += elapsed(started);
-            if (made != nullptr) {
-                computePipelines.emplace(std::move(job->key), std::move(made));
-                totals.pipelinesBuilt++;
-            } else {
-                if (seen.insert("pipeline: " + failure.substr(0, 50)).second) std::fprintf(stderr, "[recode-record] first compute pipeline failure: %s\n", failure.c_str());
-                failedPipelines.emplace(std::move(job->key), std::move(failure));
+            const auto built = elapsed(started);
+            {
+                std::lock_guard lock(pipelineMutex);
+                buildingPipelines.erase(job->key);
+                buildNanoseconds += built;
+                if (made != nullptr) {
+                    computePipelines.emplace(std::move(job->key), std::move(made));
+                    builtPipelines++;
+                } else {
+                    if (pipelineFailuresSeen.insert(failure.substr(0, 50)).second) std::fprintf(stderr, "[recode-record] first compute pipeline failure: %s\n", failure.c_str());
+                    failedPipelines.emplace(std::move(job->key), std::move(failure));
+                }
+                pipelinesDone.notify_all();
+            }
+            unsavedBuildNanoseconds += made != nullptr ? built : 0u;
+            if (unsavedBuildNanoseconds >= UnsavedBuildNanoseconds && job->owner != nullptr) {
+                job->owner->SavePipelineCache();
+                unsavedBuildNanoseconds = 0;
             }
         }
     }
@@ -1372,6 +1428,31 @@ private:
         return recordBound(context, bound, groups, written, reason);
     }
 
+    bool placeDispatchArguments(const Context& context, Graphics::Recorder& recorder, std::uint64_t address, std::uint64_t serial, std::uint64_t completed, VkBuffer& buffer, VkDeviceSize& offset, std::string& reason) {
+        constexpr std::size_t bytes = 3u * sizeof(std::uint32_t);
+        const auto* source = reinterpret_cast<const std::byte*>(address);
+        if (!Graphics::Recorder::SnapshotWriteOverlaps(address, bytes) && recorder.PendingLeaseSerial(address, bytes) == 0u && !MemoryCore::Get().Pages().GpuWrittenIn(address, bytes) && GuestMemory::Accessible(source, bytes, false)) {
+            const auto placed = ringWrite(std::span(source, bytes), serial, completed);
+            if (!placed.has_value()) {
+                reason = "ring full";
+                return false;
+            }
+            buffer = ring->Handle();
+            offset = *placed;
+            totals.snapshotArguments++;
+            return true;
+        }
+        const auto* import = Graphics::HostImportFor(context, address, bytes);
+        if (import == nullptr) {
+            reason = "indirect arguments not imported";
+            return false;
+        }
+        recorder.NotePendingRead(address, bytes, Graphics::Recorder::ReadKind::Indirect);
+        buffer = import->buffer;
+        offset = Graphics::HostImportOffset(*import, address);
+        return true;
+    }
+
     bool recordBound(const Context& context, const Resolve::ResolvedDraw& dispatch, const std::array<std::uint32_t, 3>& groups, std::span<const std::shared_ptr<Graphics::StorageTexture>> written, std::string& reason) {
         auto* recorder = context.recorder;
         const auto* heap = Resolve::HeapDevice();
@@ -1380,7 +1461,8 @@ private:
             return false;
         }
         if (!attach(context, reason) || !dispatchPrecheck(dispatch, reason)) return false;
-        for (std::uint32_t axis = 0; axis < 3; ++axis) {
+        const bool indirect = dispatch.operation.dispatch.indirect;
+        for (std::uint32_t axis = 0; axis < 3 && !indirect; ++axis) {
             if (groups[axis] > context.limits.maxComputeWorkGroupCount[axis]) {
                 reason = "group count past the device limit";
                 return false;
@@ -1389,12 +1471,11 @@ private:
         drainSurfaces(context, *recorder);
         const auto& stage = dispatch.stages.front();
         const auto main = setLayout(context, dispatch, 0);
-        const auto found = computePipelines.find(pipelineKey(dispatch));
-        if (found == computePipelines.end()) {
+        const auto pipeline = builtPipeline(pipelineKey(dispatch));
+        if (pipeline == nullptr) {
             reason = "compute pipeline not ready";
             return false;
         }
-        const auto pipeline = found->second;
 
         recorder->OpenBatch();
         const auto serial = recorder->OpenBatchSerial();
@@ -1416,6 +1497,12 @@ private:
             copyBacks.clear();
             return false;
         }
+        VkBuffer argumentBuffer = VK_NULL_HANDLE;
+        VkDeviceSize argumentOffset = 0;
+        if (indirect && !placeDispatchArguments(context, *recorder, dispatch.operation.dispatch.indirectAddress, serial, completed, argumentBuffer, argumentOffset, reason)) {
+            copyBacks.clear();
+            return false;
+        }
 
         if (Shadow::OwnedUploadsPending()) {
             std::vector<std::shared_ptr<void>> kept;
@@ -1425,16 +1512,21 @@ private:
         if (recorder->HasQueuedKeyStores()) recorder->FlushKeyStores();
         if (recorder->HasQueuedStores()) recorder->FlushStores();
         const auto commands = recorder->Commands();
-        Graphics::RecordMemoryBarrier(context, commands, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT | VK_PIPELINE_STAGE_HOST_BIT, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_ACCESS_SHADER_WRITE_BIT | VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT | VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT | VK_ACCESS_TRANSFER_WRITE_BIT | VK_ACCESS_HOST_WRITE_BIT, VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT);
+        Graphics::RecordMemoryBarrier(context, commands, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT | VK_PIPELINE_STAGE_HOST_BIT, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT | (indirect ? VK_PIPELINE_STAGE_DRAW_INDIRECT_BIT : 0u), VK_ACCESS_SHADER_WRITE_BIT | VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT | VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT | VK_ACCESS_TRANSFER_WRITE_BIT | VK_ACCESS_HOST_WRITE_BIT, VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT | (indirect ? VK_ACCESS_INDIRECT_COMMAND_READ_BIT : 0u));
         context.BindComputePipeline(commands, pipeline->pipeline);
         const auto bind = context.Resolved(&Graphics::DeviceFunctions::cmdBindDescriptorSets, "vkCmdBindDescriptorSets");
         bind(commands, VK_PIPELINE_BIND_POINT_COMPUTE, pipeline->layout, ShaderRecompiler::RuntimeAbi::DescriptorSet, 1, &set, 0, nullptr);
         const VkDescriptorSet heapSet = heap->Set();
         bind(commands, VK_PIPELINE_BIND_POINT_COMPUTE, pipeline->layout, ShaderRecompiler::RuntimeAbi::DirectHeapSet, 1, &heapSet, 0, nullptr);
         if (!push.empty()) context.Function<PFN_vkCmdPushConstants>("vkCmdPushConstants")(commands, pipeline->layout, VK_SHADER_STAGE_COMPUTE_BIT, 0, Graphics::ComputePushConstantBytes, block.data());
-        noteFaultToken(context, *recorder, commands, dispatch.stages, FaultStage::compute, "dispatch", groups[0], groups[1] * groups[2]);
+        noteFaultToken(context, *recorder, commands, dispatch.stages, FaultStage::compute, indirect ? "dispatch indirect" : "dispatch", groups[0], groups[1] * groups[2]);
         const auto dispatchTiming = recorder->BeginGpuTiming(DispatchTimingKey);
-        context.Resolved(&Graphics::DeviceFunctions::cmdDispatch, "vkCmdDispatch")(commands, groups[0], groups[1], groups[2]);
+        if (indirect) {
+            context.Resolved(&Graphics::DeviceFunctions::cmdDispatchIndirect, "vkCmdDispatchIndirect")(commands, argumentBuffer, argumentOffset);
+            totals.indirectDispatches++;
+        } else {
+            context.Resolved(&Graphics::DeviceFunctions::cmdDispatch, "vkCmdDispatch")(commands, groups[0], groups[1], groups[2]);
+        }
         recorder->EndGpuTiming(dispatchTiming);
         Graphics::RecordMemoryBarrier(context, commands, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT | VK_PIPELINE_STAGE_HOST_BIT, VK_ACCESS_SHADER_WRITE_BIT, VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT | VK_ACCESS_UNIFORM_READ_BIT | VK_ACCESS_TRANSFER_READ_BIT | VK_ACCESS_TRANSFER_WRITE_BIT | VK_ACCESS_INDIRECT_COMMAND_READ_BIT | VK_ACCESS_INDEX_READ_BIT | VK_ACCESS_VERTEX_ATTRIBUTE_READ_BIT | VK_ACCESS_COLOR_ATTACHMENT_READ_BIT | VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_READ_BIT | VK_ACCESS_HOST_READ_BIT);
         recordCopyBacks(context, commands, serial);
@@ -1893,7 +1985,13 @@ private:
     std::set<std::vector<std::uint64_t>> buildingPipelines;
     std::map<std::vector<std::uint64_t>, std::string> failedPipelines;
     std::deque<PipelineJob> pipelineJobs;
+    std::set<std::string> pipelineFailuresSeen;
+    std::uint64_t builtPipelines = 0;
+    std::uint64_t buildNanoseconds = 0;
+    std::uint64_t unsavedBuildNanoseconds = 0;
+    std::mutex pipelineMutex;
     std::condition_variable jobsReady;
+    std::condition_variable pipelinesDone;
     std::thread builder;
     VkDescriptorSetLayout emptyLayout = VK_NULL_HANDLE;
     Totals totals;
@@ -1927,7 +2025,7 @@ bool RecordResolved(const Context& context, const Resolve::ResolvedDraw& draw, c
     return shared().Record(context, draw, parameters, reason);
 }
 
-bool RecordDispatchPrecheck(const Context& context, const VulkanDevice& owner, const Resolve::ResolvedDraw& dispatch, std::string& reason) {
+bool RecordDispatchPrecheck(const Context& context, VulkanDevice& owner, const Resolve::ResolvedDraw& dispatch, std::string& reason) {
     return shared().DispatchPrecheck(context, owner, dispatch, reason);
 }
 
