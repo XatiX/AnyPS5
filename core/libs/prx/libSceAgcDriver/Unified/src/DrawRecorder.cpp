@@ -16,6 +16,7 @@
 #include "prx/libSceAgcDriver/Graphics/include/TextureFormat.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/VertexInput.hpp"
 #include "prx/libSceAgcDriver/Unified/include/DataRing.hpp"
+#include "prx/libSceAgcDriver/Unified/include/Downgrades.hpp"
 #include "prx/libSceAgcDriver/Unified/include/Events.hpp"
 #include "prx/libSceAgcDriver/Unified/include/ImageDetile.hpp"
 #include "prx/libSceAgcDriver/Unified/include/MemoryCore.hpp"
@@ -186,6 +187,8 @@ struct Totals {
     std::uint64_t knownCopied = 0;
     std::uint64_t knownPointers = 0;
     std::uint64_t knownRefused = 0;
+    std::uint64_t knownPrefixes = 0;
+    std::uint64_t importExtensions = 0;
     std::uint64_t knownSkipped = 0;
     std::uint64_t knownWritten = 0;
     std::uint64_t knownWriteLookups = 0;
@@ -258,6 +261,11 @@ bool overlaps(std::span<const std::pair<std::uint64_t, std::uint64_t>> left, std
 
 bool servesFaultPages() {
     static const bool serves = std::getenv("APS5_RECODE_NO_FAULT_SERVE") == nullptr;
+    return serves;
+}
+
+bool servesKnownPrefixes() {
+    static const bool serves = std::getenv("APS5_RECODE_NO_KNOWN_PREFIX") == nullptr;
     return serves;
 }
 
@@ -598,10 +606,27 @@ std::span<const std::uint32_t> wordsOf(const Resolve::ResolvedStage& stage, std:
     return stage.program.result->bindings.at(index).guestDescriptor;
 }
 
+void noteStages(const Resolve::ResolvedDraw& draw, Downgrades::Kind kind, std::string_view detail) {
+    if (!Downgrades::Active()) return;
+    for (const auto& stage : draw.stages) Downgrades::Note(stage.program.codeAddress, kind, 0, detail);
+}
+
+void noteStagesWork(const Resolve::ResolvedDraw& draw, Downgrades::Work work, std::uint64_t groups) {
+    if (!Downgrades::Active()) return;
+    for (const auto& stage : draw.stages) Downgrades::NoteWork(stage.program.codeAddress, work, groups);
+}
+
+bool excludedStages(const Resolve::ResolvedDraw& draw, std::string& reason) {
+    if (!std::ranges::any_of(draw.stages, [](const Resolve::ResolvedStage& stage) { return Downgrades::Excluded(stage.program.codeAddress); })) return false;
+    reason = "excluded by APS5_RECODE_EXCLUDE";
+    return true;
+}
+
 class DrawRecorder {
 public:
     bool Precheck(const Resolve::ResolvedDraw& draw, const Pm4::DrawParameters& parameters, std::vector<std::pair<std::uint64_t, std::uint64_t>>& reads, std::string& reason) {
-        if (precheck(draw, parameters, &reads, reason)) return true;
+        if (!excludedStages(draw, reason) && precheck(draw, parameters, &reads, reason)) return true;
+        noteStages(draw, Downgrades::Kind::ExistingPath, reason);
         std::lock_guard lock(mutex);
         totals.existing++;
         const auto key = "existing path: " + reason.substr(0, 45);
@@ -622,15 +647,18 @@ public:
         totals.nanoseconds += elapsed(started);
         if (recorded) {
             totals.recorded++;
+            noteStagesWork(draw, Downgrades::Work::Draw, 0);
             return true;
         }
+        noteStages(draw, Downgrades::Kind::Dropped, reason);
         refuse(reason);
         return false;
     }
 
     bool DispatchPrecheck(const Context& context, VulkanDevice& owner, const Resolve::ResolvedDraw& dispatch, std::string& reason) {
         std::unique_lock lock(mutex);
-        if (dispatchPrecheck(dispatch, reason) && pipelineReady(context, owner, dispatch, lock, reason)) return true;
+        if (!excludedStages(dispatch, reason) && dispatchPrecheck(dispatch, reason) && pipelineReady(context, owner, dispatch, lock, reason)) return true;
+        noteStages(dispatch, Downgrades::Kind::ExistingPath, reason);
         totals.dispatchExisting++;
         const auto key = "existing path dispatch: " + reason.substr(0, 45);
         if (totals.reasons.size() < 24u || totals.reasons.contains(key)) totals.reasons[key]++;
@@ -650,8 +678,11 @@ public:
         totals.dispatchNanoseconds += elapsed(started);
         if (recorded) {
             totals.dispatches++;
+            const bool indirect = dispatch.operation.dispatch.indirect;
+            noteStagesWork(dispatch, indirect ? Downgrades::Work::IndirectDispatch : Downgrades::Work::Dispatch, indirect ? 0u : static_cast<std::uint64_t>(groups[0]) * groups[1] * groups[2]);
             return true;
         }
+        noteStages(dispatch, Downgrades::Kind::Dropped, reason);
         refuse("dispatch " + reason);
         return false;
     }
@@ -669,7 +700,7 @@ public:
         line += "; passes " + std::to_string(totals.passesBegun) + " begun, " + std::to_string(totals.passesContinued) + " draws continued, " + std::to_string(totals.passFeedback) + " broken by a target read";
         line += "; target memo " + std::to_string(totals.targetMemoHits) + " hits, " + std::to_string(totals.targetMemoMisses) + " misses; " + std::to_string(totals.deferredReads) + " draws with reads bound at record";
         line += "; residency updates landed " + std::to_string(totals.residencyLands);
-        line += "; known buffers " + std::to_string(totals.knownServed) + " served, " + std::to_string(totals.knownMapped) + " mapped (" + std::to_string(totals.knownPaged) + " paged in), " + std::to_string(totals.knownCopied) + " copied (" + std::to_string(totals.knownGpuWritten) + " GPU-written ranges not copied), " + std::to_string(totals.knownRefused) + " unresolved, " + std::to_string(totals.knownSkipped) + " skipped (" + std::to_string(totals.knownPointers) + " of them pointers); known writes " + std::to_string(totals.knownWritten) + " direct (" + std::to_string(totals.knownWriteBytes >> 10u) + " KiB landed), " + std::to_string(totals.knownWriteLookups) + " through the page table, " + std::to_string(totals.copyBacks) + " copied back to their import after the dispatch (" + std::to_string(totals.copyBackBytes >> 20u) + " MiB, " + std::to_string(totals.copyBackCovered >> 10u) + " KiB of written pieces not landed, " + std::to_string(totals.importsReturned) + " chunks returned from their import, " + std::to_string(totals.residencyRefreshes) + " residency refreshes before the dispatch)";
+        line += "; known buffers " + std::to_string(totals.knownServed) + " served, " + std::to_string(totals.knownMapped) + " mapped (" + std::to_string(totals.knownPaged) + " paged in), " + std::to_string(totals.knownCopied) + " copied (" + std::to_string(totals.knownGpuWritten) + " GPU-written ranges not copied), " + std::to_string(totals.knownRefused) + " unresolved, " + std::to_string(totals.knownPrefixes) + " bound to their mapped prefix (" + std::to_string(totals.importExtensions) + " unmapped chunks mapped to their written import), " + std::to_string(totals.knownSkipped) + " skipped (" + std::to_string(totals.knownPointers) + " of them pointers); known writes " + std::to_string(totals.knownWritten) + " direct (" + std::to_string(totals.knownWriteBytes >> 10u) + " KiB landed), " + std::to_string(totals.knownWriteLookups) + " through the page table, " + std::to_string(totals.copyBacks) + " copied back to their import after the dispatch (" + std::to_string(totals.copyBackBytes >> 20u) + " MiB, " + std::to_string(totals.copyBackCovered >> 10u) + " KiB of written pieces not landed, " + std::to_string(totals.importsReturned) + " chunks returned from their import, " + std::to_string(totals.residencyRefreshes) + " residency refreshes before the dispatch)";
         line += "; draw inputs " + std::to_string(totals.inputsResident) + " resident, " + std::to_string(totals.inputsImported) + " imported, " + std::to_string(totals.inputsWritten) + " after CPU writes (" + std::to_string(totals.inputsCopied) + " copied into the ring), " + std::to_string(totals.inputsGpuWritten) + " GPU-written, " + std::to_string(totals.inputsAliased) + " aliased, " + std::to_string(totals.inputsMerged) + " served with an overlapping input";
         std::snprintf(text, sizeof(text), "; draw phases surfaces %.1f ms, targets %.1f ms, pipelines %.1f ms, owned uploads %.1f ms", static_cast<double>(totals.surfaceNanoseconds) / 1e6, static_cast<double>(totals.targetNanoseconds) / 1e6, static_cast<double>(totals.graphicsPipelineNanoseconds) / 1e6, static_cast<double>(totals.uploadNanoseconds) / 1e6);
         line += text;
@@ -711,7 +742,7 @@ private:
         alignment = std::max<std::uint64_t>(context.limits.minStorageBufferOffsetAlignment, 16u);
         const auto ringMemory = ResidencyService::ShaderReadMemory(context, RingBytes);
         const VkBufferUsageFlags addressable = context.bufferDeviceAddress ? VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT : 0u;
-        ring = std::make_shared<Graphics::Buffer>(context, RingBytes + RingZeroBytes, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_INDIRECT_BUFFER_BIT | VK_BUFFER_USAGE_VERTEX_BUFFER_BIT | VK_BUFFER_USAGE_INDEX_BUFFER_BIT | addressable, ringMemory);
+        ring = std::make_shared<Graphics::Buffer>(context, RingBytes + RingZeroBytes, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_INDIRECT_BUFFER_BIT | VK_BUFFER_USAGE_VERTEX_BUFFER_BIT | VK_BUFFER_USAGE_INDEX_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_SRC_BIT | addressable, ringMemory);
         std::memset(ring->Bytes().data() + RingBytes, 0, RingZeroBytes);
         ringAddress = addressable != 0u ? ring->DeviceAddress() : 0u;
         space.emplace(RingBytes, alignment);
@@ -957,15 +988,49 @@ private:
         }
     }
 
-    std::uint64_t serveKnownWrite(std::uint64_t address, std::uint64_t bytes, std::uint64_t serial, bool copiedBackWrite) {
+    bool extendWrittenImports(const Context& context, std::uint64_t address, std::uint64_t bytes) {
         auto& residency = ResidencyService::Get();
+        if (!servesKnownPrefixes() || !residency.WrittenImportAny(address, bytes) || residency.WrittenImportThroughout(address, bytes)) return false;
+        const auto* import = Graphics::HostImportFor(context, address, static_cast<std::size_t>(bytes));
+        if (import == nullptr) return false;
+        bool extended = false;
+        for (auto chunk = address & ~(ChunkBytes - 1u); chunk < address + bytes; chunk += ChunkBytes) {
+            if (chunk < import->base || chunk + ChunkBytes > import->base + import->bytes || residency.WrittenImport(chunk)) continue;
+            if (residency.UnmappedPages(chunk, ChunkBytes).size() != ChunkBytes / GpuPageBytes) continue;
+            if (residency.MapWrittenImport(chunk, import->address + (chunk - import->base))) {
+                totals.importExtensions++;
+                extended = true;
+            }
+        }
+        return extended;
+    }
+
+    std::uint64_t serveKnownWrite(const Context& context, std::uint64_t address, std::uint64_t& bytes, std::uint64_t serial, bool copiedBackWrite) {
+        auto& residency = ResidencyService::Get();
+        static_cast<void>(extendWrittenImports(context, address, bytes));
         if (residency.WrittenImportThroughout(address, bytes)) return residency.TranslateMapped(address, bytes, true);
+        if (servesKnownPrefixes() && residency.WrittenImportAny(address, bytes)) {
+            const auto [device, length] = residency.MappedPrefix(address, bytes, true);
+            if (device != 0u && length < bytes && residency.WrittenImportThroughout(address, length)) {
+                totals.knownPrefixes++;
+                bytes = length;
+                return device;
+            }
+        }
         if (bytes > (copiedBackWrite ? KnownBufferLimitBytes : KnownWriteLimitBytes)) return 0u;
         auto mapped = residency.TranslateMapped(address, bytes, true);
         if (mapped == 0u && bytes <= KnownWriteLimitBytes && servesFaultPages()) {
             if (const auto pages = residency.UnmappedPages(address, bytes); !pages.empty()) {
                 Shadow::ServeFaultPages(pages);
                 mapped = residency.TranslateMapped(address, bytes, true);
+            }
+        }
+        if (mapped == 0u && servesKnownPrefixes()) {
+            const auto [device, length] = residency.MappedPrefix(address, bytes, true);
+            if (device != 0u) {
+                totals.knownPrefixes++;
+                mapped = device;
+                bytes = length;
             }
         }
         if (mapped == 0u || copiedBackWrite) return mapped;
@@ -993,6 +1058,11 @@ private:
             const auto code = static_cast<std::uint32_t>(report.reason);
             faultReasons[code]++;
             if (report.reason == Abi::FaultReason::Unmapped) totals.unmappedFaults++;
+            if (Downgrades::Active()) {
+                char text[96];
+                std::snprintf(text, sizeof(text), "pc 0x%x stage %u at 0x%llx+%u", report.instruction, report.stage, static_cast<unsigned long long>(report.address), report.bytes);
+                Downgrades::NoteHashed(0u, Downgrades::Kind::PageFault, code, text);
+            }
             if (seenFaults.insert(code).second) std::fprintf(stderr, "[recode-record] first fault: reason %u at 0x%llx, %u bytes, stage %u, pc 0x%x\n", code, static_cast<unsigned long long>(report.address), report.bytes, report.stage, report.instruction);
             std::vector<std::uint64_t> pages;
             if (Abi::ForEachFaultPage(words, [&](std::uint64_t page) { pages.push_back(page); }) && !pages.empty()) {
@@ -1139,14 +1209,18 @@ private:
             const auto zero = ringAddress != 0u ? ringAddress + RingBytes : 0u;
             if (address == 0u || bytes == 0u) {
                 totals.knownSkipped++;
+                noteKnown(stage, Downgrades::Kind::KnownNull, index, address, bytes, 0u);
                 write(zero, 0u);
                 continue;
             }
             if (index < infos.size() && infos[index].written) {
-                const auto mapped = serveKnownWrite(address, bytes, serial, queueCopyBack(context, address, bytes));
+                auto served = bytes;
+                const auto mapped = serveKnownWrite(context, address, served, serial, queueCopyBack(context, address, bytes));
                 if (mapped != 0u) totals.knownWritten++;
                 else totals.knownWriteLookups++;
-                write(mapped, mapped != 0u ? bytes : 0u);
+                if (mapped == 0u) noteKnown(stage, Downgrades::Kind::KnownWriteRefused, index, address, bytes, 0u);
+                else if (served < bytes) noteKnown(stage, Downgrades::Kind::KnownPrefix, index, address, bytes, served);
+                write(mapped, mapped != 0u ? served : 0u);
                 continue;
             }
             if (const auto copied = copyKnownBuffer(address, bytes, serial, completed); copied != 0u) {
@@ -1161,6 +1235,7 @@ private:
                 write(span.address, bytes);
                 continue;
             }
+            static_cast<void>(extendWrittenImports(context, address, bytes));
             auto mapped = ResidencyService::Get().TranslateMapped(address, reach);
             if (mapped == 0u && reach != bytes) mapped = ResidencyService::Get().TranslateMapped(address, bytes);
             if (mapped == 0u && bytes <= KnownBufferLimitBytes && servesFaultPages()) {
@@ -1175,9 +1250,43 @@ private:
                 write(mapped, bytes);
                 continue;
             }
+            if (servesKnownPrefixes()) {
+                if (const auto [device, length] = ResidencyService::Get().MappedPrefix(address, bytes); device != 0u) {
+                    totals.knownPrefixes++;
+                    noteKnown(stage, Downgrades::Kind::KnownPrefix, index, address, bytes, length);
+                    write(device, length);
+                    continue;
+                }
+            }
             totals.knownRefused++;
+            noteKnown(stage, Downgrades::Kind::KnownRefused, index, address, bytes, 0u);
             write(zero, 0u);
         }
+    }
+
+    void readIndirectGroups(const Context& context, Graphics::Recorder& recorder, VkCommandBuffer commands, VkBuffer arguments, VkDeviceSize offset, std::uint64_t codeAddress) {
+        constexpr std::uint32_t Slots = 4096;
+        constexpr VkDeviceSize SlotBytes = 16;
+        if (!Downgrades::Active()) return;
+        if (groupReads == nullptr) groupReads = std::make_shared<Graphics::Buffer>(context, Slots * SlotBytes, VK_BUFFER_USAGE_TRANSFER_DST_BIT);
+        const auto slot = nextGroupRead++ % Slots;
+        Graphics::RecordMemoryBarrier(context, commands, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_ACCESS_SHADER_WRITE_BIT | VK_ACCESS_TRANSFER_WRITE_BIT | VK_ACCESS_HOST_WRITE_BIT, VK_ACCESS_TRANSFER_READ_BIT);
+        const VkBufferCopy region{offset, slot * SlotBytes, 3u * sizeof(std::uint32_t)};
+        context.Function<PFN_vkCmdCopyBuffer>("vkCmdCopyBuffer")(commands, arguments, groupReads->Handle(), 1, &region);
+        Graphics::RecordMemoryBarrier(context, commands, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_HOST_BIT, VK_ACCESS_TRANSFER_WRITE_BIT, VK_ACCESS_HOST_READ_BIT);
+        recorder.Keep(groupReads);
+        recorder.OnComplete([buffer = groupReads, slot, codeAddress] {
+            std::uint32_t counts[3] = {};
+            std::memcpy(counts, buffer->Bytes().data() + slot * SlotBytes, sizeof(counts));
+            Downgrades::NoteGroups(codeAddress, static_cast<std::uint64_t>(counts[0]) * counts[1] * counts[2]);
+        });
+    }
+
+    static void noteKnown(const Resolve::ResolvedStage& stage, Downgrades::Kind kind, std::uint32_t index, std::uint64_t address, std::uint64_t bytes, std::uint64_t served) {
+        if (!Downgrades::Active()) return;
+        char text[96];
+        std::snprintf(text, sizeof(text), "0x%llx+0x%llx served 0x%llx", static_cast<unsigned long long>(address), static_cast<unsigned long long>(bytes), static_cast<unsigned long long>(served));
+        Downgrades::Note(stage.program.codeAddress, kind, index, text);
     }
 
     std::optional<std::uint64_t> ringCopy(std::uint64_t address, std::uint64_t bytes, std::uint64_t serial, std::uint64_t completed) {
@@ -1479,6 +1588,7 @@ private:
                 publishRequest(context, deferred.request);
                 auto owner = Resolve::BindDeferredSampled(context, deferred.request, slot, reason);
                 if (owner == nullptr) return false;
+                Downgrades::Note(stage.program.codeAddress, Downgrades::Kind::UpstreamSampled, deferred.index, "deferred read from the existing sampled cache");
                 stage.slots[deferred.index] = slot;
                 if (context.recorder != nullptr) context.recorder->Keep(std::const_pointer_cast<void>(owner));
                 continue;
@@ -1487,6 +1597,7 @@ private:
             if (record == nullptr) {
                 if (auto adopted = adoptStorage(context, deferred.request)) record = Resolve::BindRecordSlot(deferred.request, std::move(adopted), slot);
             }
+            if (record == nullptr && Downgrades::Active() && Resolve::StorageRecordShape(deferred.request)) Downgrades::Note(stage.program.codeAddress, Downgrades::Kind::StorageRecordMissing, deferred.index, "bound from the existing cache");
             if (record != nullptr) {
                 stage.slots[deferred.index] = slot;
                 if (context.recorder != nullptr) context.recorder->Keep(record);
@@ -1496,6 +1607,7 @@ private:
             publishRequest(context, deferred.request);
             auto texture = Resolve::BindDeferredImage(context, deferred.request, slot, reason);
             if (texture == nullptr) return false;
+            Downgrades::Note(stage.program.codeAddress, Downgrades::Kind::UpstreamStorage, deferred.index, (deferred.request.flags & Heap::RequestFlag::Written) != 0u ? "written storage image from the existing cache" : "storage image from the existing cache");
             stage.slots[deferred.index] = slot;
             if (context.recorder != nullptr) context.recorder->Keep(texture);
             if ((deferred.request.flags & Heap::RequestFlag::Written) != 0u) written.push_back(std::move(texture));
@@ -1600,6 +1712,7 @@ private:
         if (indirect) {
             context.Resolved(&Graphics::DeviceFunctions::cmdDispatchIndirect, "vkCmdDispatchIndirect")(commands, argumentBuffer, argumentOffset);
             totals.indirectDispatches++;
+            readIndirectGroups(context, *recorder, commands, argumentBuffer, argumentOffset, stage.program.codeAddress);
         } else {
             context.Resolved(&Graphics::DeviceFunctions::cmdDispatch, "vkCmdDispatch")(commands, groups[0], groups[1], groups[2]);
         }
@@ -1664,6 +1777,7 @@ private:
                 publishRequest(context, deferred.request);
                 auto owner = Resolve::BindDeferredSampled(context, deferred.request, slot, reason);
                 if (owner == nullptr) return false;
+                Downgrades::Note(stage.program.codeAddress, Downgrades::Kind::UpstreamSampled, deferred.index, "deferred read from the existing sampled cache");
                 stage.slots[deferred.index] = slot;
                 if (context.recorder != nullptr) context.recorder->Keep(std::const_pointer_cast<void>(owner));
             }
@@ -1770,12 +1884,18 @@ private:
                     return false;
                 }
                 views.push_back(resident->AttachmentView(color.format, color.mip, color.depthSlice, color.layers, color.arraySlice));
+                if (Downgrades::Active()) {
+                    for (const auto& stage : draw.stages) Downgrades::Note(stage.program.codeAddress, Downgrades::Kind::UpstreamTarget, static_cast<std::uint32_t>(views.size() - 1u), "colour target from the existing surface cache");
+                }
                 Images::Targets().Note(resident);
                 owners.push_back(resident);
                 residents.push_back(std::move(resident));
             }
             if (state.depth) {
                 views.push_back(Graphics::DepthSurfaceViewWithStencilWriteIntent(context, *state.depth, state.depthWrite, state.stencilTest, writesStencil(state)));
+                if (Downgrades::Active()) {
+                    for (const auto& stage : draw.stages) Downgrades::Note(stage.program.codeAddress, Downgrades::Kind::UpstreamTarget, 8u, "depth target from the existing depth surfaces");
+                }
             }
         }
         if (!targetRecords.empty()) drainSurfaces(context, *recorder);
@@ -2193,6 +2313,8 @@ private:
     std::set<std::uint64_t> switches;
     std::unordered_map<std::uint64_t, std::uint32_t> writtenPages;
     std::vector<std::shared_ptr<Graphics::Buffer>> spareFaults;
+    std::shared_ptr<Graphics::Buffer> groupReads;
+    std::uint32_t nextGroupRead = 0;
     std::map<std::uint32_t, std::uint64_t> faultReasons;
     std::optional<RingSpace> space;
     std::map<std::vector<std::uint32_t>, VkDescriptorSetLayout> layouts;
