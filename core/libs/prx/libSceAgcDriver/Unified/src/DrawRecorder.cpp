@@ -1,6 +1,7 @@
 #include "prx/libSceAgcDriver/Unified/include/DrawRecorder.hpp"
 #include "prx/libkernel/include/Api.hpp"
 #include "prx/libSceAgcDriver/Execution/include/GuestMemory.hpp"
+#include "prx/libSceAgcDriver/Execution/include/Pm4.hpp"
 #include "prx/libSceAgcDriver/Execution/include/VulkanDevice.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/DepthSurface.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/Draw.hpp"
@@ -192,6 +193,7 @@ struct Totals {
     std::uint64_t copyBackCovered = 0;
     std::uint64_t importsReturned = 0;
     std::uint64_t indirectDispatches = 0;
+    std::uint64_t gdsBindings = 0;
     std::uint64_t knownGpuWritten = 0;
     std::uint64_t inputsResident = 0;
     std::uint64_t inputsImported = 0;
@@ -259,6 +261,16 @@ bool switchesWrittenChunks() {
 bool copiesBackDispatchWrites() {
     static const bool copies = std::getenv("APS5_RECODE_NO_COPY_BACK") == nullptr;
     return copies;
+}
+
+bool bindsGds() {
+    static const bool binds = std::getenv("APS5_RECODE_NO_GDS") == nullptr;
+    return binds;
+}
+
+bool recordsMipTailTargets() {
+    static const bool records = std::getenv("APS5_RECODE_NO_MIP_TAIL_TARGETS") == nullptr;
+    return records;
 }
 
 bool recordsIndirectDispatches() {
@@ -410,7 +422,7 @@ bool precheck(const Resolve::ResolvedDraw& draw, const Pm4::DrawParameters& para
             reason = "multisampled color target";
             return false;
         }
-        if (color.mipTail) {
+        if (color.mipTail && !recordsMipTailTargets()) {
             reason = "color target in a mip tail";
             return false;
         }
@@ -428,8 +440,8 @@ bool precheck(const Resolve::ResolvedDraw& draw, const Pm4::DrawParameters& para
             reason = "buffer array binding";
             return false;
         }
-        if (binding.source == Bindings::Source::Guest || binding.source == Bindings::Source::Gds) {
-            reason = "guest or GDS buffer binding";
+        if (binding.source == Bindings::Source::Guest || (binding.source == Bindings::Source::Gds && !bindsGds())) {
+            reason = binding.source == Bindings::Source::Gds ? "GDS buffer binding" : "guest buffer binding";
             return false;
         }
         if (binding.source == Bindings::Source::TableMap && draw.stages.at(binding.stage).tableMap == nullptr) {
@@ -526,8 +538,8 @@ bool dispatchPrecheck(const Resolve::ResolvedDraw& dispatch, std::string& reason
             reason = "buffer array binding";
             return false;
         }
-        if (binding.source == Bindings::Source::Guest || binding.source == Bindings::Source::Gds) {
-            reason = "guest or GDS buffer binding";
+        if (binding.source == Bindings::Source::Guest || (binding.source == Bindings::Source::Gds && !bindsGds())) {
+            reason = binding.source == Bindings::Source::Gds ? "GDS buffer binding" : "guest buffer binding";
             return false;
         }
         if (binding.source == Bindings::Source::TableMap && dispatch.stages.front().tableMap == nullptr) {
@@ -623,6 +635,7 @@ public:
         line += text;
         std::snprintf(text, sizeof(text), "; table maps %llu hits, %llu uploads (%.1f MiB), %llu retired, %zu held (%.1f MiB)", static_cast<unsigned long long>(totals.mapHits), static_cast<unsigned long long>(totals.mapUploads), static_cast<double>(totals.mapUploadBytes) / 1048576.0, static_cast<unsigned long long>(totals.mapRetired), maps.size(), static_cast<double>(mapBytes) / 1048576.0);
         line += text;
+        line += "; GDS bound " + std::to_string(totals.gdsBindings) + " times";
         std::snprintf(text, sizeof(text), "; fault buffers %zu in flight, %llu read: %llu faults (%llu unmapped), %llu fault pages served, %llu written ranges (%llu pieces landed late), %llu written overflows", faults.size(), static_cast<unsigned long long>(totals.faultReads), static_cast<unsigned long long>(totals.faults), static_cast<unsigned long long>(totals.unmappedFaults), static_cast<unsigned long long>(totals.faultPages), static_cast<unsigned long long>(totals.writtenRanges), static_cast<unsigned long long>(totals.writtenLate), static_cast<unsigned long long>(totals.writtenOverflows));
         line += text;
         std::snprintf(text, sizeof(text), "; GPU-written chunks %llu switched to their import from the written bitmap (%.1f MiB copied over), %llu from other GPU writes, %llu refused, %llu written pieces already on an import", static_cast<unsigned long long>(totals.importSwitches), static_cast<double>(totals.switchBytes) / 1048576.0, static_cast<unsigned long long>(totals.writtenSwitches), static_cast<unsigned long long>(totals.switchRefused), static_cast<unsigned long long>(totals.writtenOnImports));
@@ -1190,7 +1203,21 @@ private:
                     info = {mapBuffer(context, *mirror, serial, completed)->Handle(), 0, VK_WHOLE_SIZE};
                     break;
                 }
-                default: reason = "guest or GDS buffer binding"; return false;
+                case Bindings::Source::Gds: {
+                    const auto gds = Pm4::GdsAddress();
+                    const auto* import = Graphics::HostImportFor(context, gds, Pm4::GdsBytes);
+                    if (import == nullptr) {
+                        reason = "GDS not imported";
+                        return false;
+                    }
+                    info = {import->buffer, Graphics::HostImportOffset(*import, gds), Pm4::GdsBytes};
+                    const std::array written{std::pair{gds, gds + Pm4::GdsBytes}};
+                    Events::NoteRanges(written);
+                    if (context.recorder != nullptr) context.recorder->NotePendingWrite(gds, Pm4::GdsBytes);
+                    totals.gdsBindings++;
+                    break;
+                }
+                default: reason = "guest buffer binding"; return false;
             }
             infos.push_back(info);
             VkWriteDescriptorSet write{VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET};
