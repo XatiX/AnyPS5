@@ -178,6 +178,7 @@ std::uint64_t OwnProofBreaks();
 void BreakProofs();
 using StoreHook = void (*)(std::uint64_t address, std::uint64_t bytes);
 void SetStoreHook(StoreHook hook);
+void SetGpuWriteHook(StoreHook hook);
 void MarkProofThread();
 std::uint64_t CollectEpoch();
 std::uint64_t CollectEpochBumps();

@@ -59,6 +59,7 @@
 #include "prx/libc/include/general/AtomicSharedPtr.hpp"
 #if ANYPS5_UNIFIED
 #include "prx/libSceAgcDriver/Unified/include/Events.hpp"
+#include "prx/libSceAgcDriver/Unified/include/Shadow.hpp"
 #endif
 
 namespace AgcDriver::Graphics {
@@ -3985,6 +3986,10 @@ bool Recorder::noteWrite(std::uint64_t address, std::size_t bytes, bool ownLabel
     GuestMemory::ForgetKnownZero(address, bytes);
     ensureOpen();
     const auto end = address + bytes;
+#if ANYPS5_UNIFIED
+    const std::array written{std::pair{address, end}};
+    Unified::Shadow::NoteGpuWrites(written);
+#endif
     open->writes.emplace_back(address, end);
     open->writeNotes.push_back(++writeNoteCount);
     if (published != nullptr && !SnapshotCovers(published.get(), address, end)) published = nullptr;

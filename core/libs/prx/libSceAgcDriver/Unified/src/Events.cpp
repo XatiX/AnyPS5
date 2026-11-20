@@ -1,5 +1,6 @@
 #include "prx/libSceAgcDriver/Unified/include/Events.hpp"
 #include "prx/libSceAgcDriver/Execution/include/GuestMemory.hpp"
+#include "prx/libSceAgcDriver/Unified/include/Shadow.hpp"
 #include <algorithm>
 
 namespace AgcDriver::Unified::Events {
@@ -186,6 +187,7 @@ void NoteRanges(std::span<const std::pair<std::uint64_t, std::uint64_t>> ranges,
     for (const auto& [begin, end] : ranges) {
         if (end > begin) Shared().Note(begin, end - begin, owner);
     }
+    Shadow::NoteGpuWrites(ranges);
 }
 
 }

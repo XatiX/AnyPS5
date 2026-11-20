@@ -44,6 +44,7 @@ struct PageTableCounts {
     std::uint64_t rearmed = 0;
     std::uint64_t unchangedBusy = 0;
     std::uint64_t gpuOwnedPages = 0;
+    std::uint64_t gpuWrittenPages = 0;
 };
 
 class PageTable {
@@ -66,6 +67,9 @@ public:
     std::vector<ProtectionChange> MarkGpuOwned(std::uint64_t address, std::uint64_t size);
     std::vector<ProtectionChange> MarkDeviceWritten(std::uint64_t address, std::uint64_t size);
     std::vector<DirtyRange> GpuOwnedIn(std::uint64_t address, std::uint64_t size) const;
+    [[nodiscard]] bool CleanIn(std::uint64_t address, std::uint64_t size) const;
+    void NoteGpuWritten(std::uint64_t address, std::uint64_t size);
+    [[nodiscard]] bool GpuWrittenIn(std::uint64_t address, std::uint64_t size) const;
     std::vector<ProtectionChange> Reclaim(std::uint64_t address, std::uint64_t size, bool forWrite);
     [[nodiscard]] PageState StateOf(std::uint64_t address) const;
     [[nodiscard]] bool Covers(std::uint64_t address, std::uint64_t size) const;
@@ -85,6 +89,7 @@ private:
         std::array<std::uint64_t, RegionPages / 64> unreported{};
         std::array<std::uint64_t, RegionPages / 64> written{};
         std::array<std::uint64_t, RegionPages / 64> device{};
+        std::array<std::uint64_t, RegionPages / 64> gpuWritten{};
         std::uint32_t dirtyPages = 0;
         std::uint32_t trackedPages = 0;
         std::uint32_t writablePages = 0;

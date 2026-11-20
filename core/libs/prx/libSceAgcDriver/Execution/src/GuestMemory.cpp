@@ -2945,6 +2945,12 @@ void SetStoreHook(StoreHook hook) {
     storeHook.store(hook, std::memory_order_release);
 }
 
+static std::atomic<StoreHook> gpuWriteHook{nullptr};
+
+void SetGpuWriteHook(StoreHook hook) {
+    gpuWriteHook.store(hook, std::memory_order_release);
+}
+
 static std::atomic<bool> ownStoreCompare{false};
 
 void SetOwnStoreCompare(bool compare) {
@@ -3034,6 +3040,7 @@ std::uint64_t StoreOwnBytes(std::uint64_t address, std::span<const std::byte> so
 }
 
 static std::uint64_t markWritten(std::uint64_t address, std::size_t bytes, bool complete, std::uint64_t* order = nullptr) {
+    if (const auto hook = gpuWriteHook.load(std::memory_order_acquire); hook != nullptr && bytes != 0) hook(address, bytes);
     if (const auto* hooks = coreWriteHooks.load(std::memory_order_acquire); hooks != nullptr && hooks->written != nullptr && bytes != 0) {
         const auto blockFirst = address & ~(std::uint64_t{WriteBlockBytes} - 1);
         const auto blockStop = (address + bytes + WriteBlockBytes - 1) & ~(std::uint64_t{WriteBlockBytes} - 1);
