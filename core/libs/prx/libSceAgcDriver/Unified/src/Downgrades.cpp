@@ -96,6 +96,7 @@ std::string_view KindName(Kind kind) {
         case Kind::UpstreamStorage: return "upstream-storage";
         case Kind::UpstreamTarget: return "upstream-target";
         case Kind::TemplateMismatch: return "template-mismatch";
+        case Kind::KnownShort: return "known-short";
         default: return "unknown";
     }
 }
@@ -106,7 +107,8 @@ Severity SeverityOf(Kind kind) {
         case Kind::KnownRefused:
         case Kind::KnownWriteRefused:
         case Kind::PageFault:
-        case Kind::TemplateMismatch: return Severity::Severe;
+        case Kind::TemplateMismatch:
+        case Kind::KnownShort: return Severity::Severe;
         case Kind::ExistingPath:
         case Kind::StorageRecordMissing:
         case Kind::UpstreamSampled:

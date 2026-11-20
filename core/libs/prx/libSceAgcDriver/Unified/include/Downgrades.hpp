@@ -27,6 +27,7 @@ enum class Kind : std::uint32_t {
     UpstreamStorage,
     UpstreamTarget,
     TemplateMismatch,
+    KnownShort,
     Count,
 };
 
