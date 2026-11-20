@@ -192,6 +192,7 @@ struct Totals {
     std::uint64_t copyBackCovered = 0;
     std::uint64_t importsReturned = 0;
     std::uint64_t lateCopies = 0;
+    std::uint64_t knownGpuWritten = 0;
     std::uint64_t lateCopyBytes = 0;
     std::uint64_t inputsResident = 0;
     std::uint64_t inputsImported = 0;
@@ -259,6 +260,11 @@ bool switchesWrittenChunks() {
 bool copiesBackDispatchWrites() {
     static const bool copies = std::getenv("APS5_RECODE_NO_COPY_BACK") == nullptr;
     return copies;
+}
+
+bool refusesGpuWrittenCopies() {
+    static const bool refuses = std::getenv("APS5_RECODE_COPY_GPU_WRITTEN_KNOWN") == nullptr;
+    return refuses;
 }
 
 bool copiesLateWrites() {
@@ -610,7 +616,7 @@ public:
         line += "; passes " + std::to_string(totals.passesBegun) + " begun, " + std::to_string(totals.passesContinued) + " draws continued, " + std::to_string(totals.passFeedback) + " broken by a target read";
         line += "; target memo " + std::to_string(totals.targetMemoHits) + " hits, " + std::to_string(totals.targetMemoMisses) + " misses; " + std::to_string(totals.deferredReads) + " draws with reads bound at record";
         line += "; residency updates landed " + std::to_string(totals.residencyLands);
-        line += "; known buffers " + std::to_string(totals.knownServed) + " served, " + std::to_string(totals.knownMapped) + " mapped (" + std::to_string(totals.knownPaged) + " paged in), " + std::to_string(totals.knownCopied) + " copied, " + std::to_string(totals.knownRefused) + " unresolved, " + std::to_string(totals.knownSkipped) + " skipped (" + std::to_string(totals.knownPointers) + " of them pointers); known writes " + std::to_string(totals.knownWritten) + " direct (" + std::to_string(totals.knownWriteBytes >> 10u) + " KiB landed), " + std::to_string(totals.knownWriteLookups) + " through the page table, " + std::to_string(totals.copyBacks) + " copied back to their import after the dispatch (" + std::to_string(totals.copyBackBytes >> 20u) + " MiB, " + std::to_string(totals.copyBackCovered >> 10u) + " KiB of written pieces not landed, " + std::to_string(totals.importsReturned) + " chunks returned from their import)";
+        line += "; known buffers " + std::to_string(totals.knownServed) + " served, " + std::to_string(totals.knownMapped) + " mapped (" + std::to_string(totals.knownPaged) + " paged in), " + std::to_string(totals.knownCopied) + " copied (" + std::to_string(totals.knownGpuWritten) + " GPU-written ranges not copied), " + std::to_string(totals.knownRefused) + " unresolved, " + std::to_string(totals.knownSkipped) + " skipped (" + std::to_string(totals.knownPointers) + " of them pointers); known writes " + std::to_string(totals.knownWritten) + " direct (" + std::to_string(totals.knownWriteBytes >> 10u) + " KiB landed), " + std::to_string(totals.knownWriteLookups) + " through the page table, " + std::to_string(totals.copyBacks) + " copied back to their import after the dispatch (" + std::to_string(totals.copyBackBytes >> 20u) + " MiB, " + std::to_string(totals.copyBackCovered >> 10u) + " KiB of written pieces not landed, " + std::to_string(totals.importsReturned) + " chunks returned from their import)";
         line += "; draw inputs " + std::to_string(totals.inputsResident) + " resident, " + std::to_string(totals.inputsImported) + " imported, " + std::to_string(totals.inputsWritten) + " after CPU writes (" + std::to_string(totals.inputsCopied) + " copied into the ring), " + std::to_string(totals.inputsGpuWritten) + " GPU-written, " + std::to_string(totals.inputsAliased) + " aliased, " + std::to_string(totals.inputsMerged) + " served with an overlapping input";
         std::snprintf(text, sizeof(text), "; draw phases surfaces %.1f ms, targets %.1f ms, pipelines %.1f ms, owned uploads %.1f ms", static_cast<double>(totals.surfaceNanoseconds) / 1e6, static_cast<double>(totals.targetNanoseconds) / 1e6, static_cast<double>(totals.graphicsPipelineNanoseconds) / 1e6, static_cast<double>(totals.uploadNanoseconds) / 1e6);
         line += text;
@@ -1137,6 +1143,10 @@ private:
 
     std::uint64_t copyKnownBuffer(std::uint64_t address, std::uint64_t bytes, std::uint64_t serial, std::uint64_t completed) {
         if (ringAddress == 0u || bytes > KnownCopyLimitBytes) return 0u;
+        if (refusesGpuWrittenCopies() && MemoryCore::Get().Pages().GpuWrittenIn(address, bytes)) {
+            totals.knownGpuWritten++;
+            return 0u;
+        }
         const auto offset = ringCopy(address, bytes, serial, completed);
         return offset.has_value() ? ringAddress + *offset : 0u;
     }
