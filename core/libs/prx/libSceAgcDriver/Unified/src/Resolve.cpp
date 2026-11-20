@@ -30,6 +30,11 @@ namespace AgcDriver::Unified::Resolve {
 
 namespace {
 
+constexpr std::uint32_t StorageShapes = 7u;
+constexpr std::uint32_t Image2DShape = 2u;
+constexpr std::uint32_t MultisampleShape = 4u;
+constexpr std::uint32_t MultisampleArrayShape = 5u;
+
 bool dispatchesRouted() {
     static const bool enabled = [] {
         const auto* value = std::getenv("APS5_RECODE_DISPATCH");
@@ -118,6 +123,7 @@ public:
             table = std::make_unique<Heap::SlotTable>(*heap, heap->SampledSlotCount(), heap->SamplerSlotCount(), heap->StorageSlotCount());
             memo = std::make_unique<Heap::Memo>(Events::Shared(), Events::Images());
             refill = std::make_unique<Heap::Refill>(*table, *memo, [this](const Heap::SlotRequest& request) { return image(request); }, [this](const Heap::SlotRequest& request) { return sampler(request); });
+            if (dispatchesRouted() && storageDispatches()) refill->SetDeferTest([this](const Heap::SlotRequest& request) { return storageWrittenRead(request); });
             mirror = std::make_unique<Tables::TableMirror>(*refill, Events::Shared(), Events::Images());
             if (imagesRouted() && surfaces == nullptr) {
                 surfaceDevice = std::make_unique<Images::VulkanSurfaceDevice>(*context);
@@ -161,6 +167,68 @@ public:
     PacketTable<ResolvedDraw>& DispatchTable() { return dispatchHandoff; }
     const Heap::VulkanHeapDevice* Device() const { return published.load(std::memory_order_acquire); }
     Images::SurfaceTable* SurfaceTableOf() const { return publishedSurfaces.load(std::memory_order_acquire); }
+
+    std::optional<Heap::Span> storageWrittenRead(const Heap::SlotRequest& request) {
+        if ((request.flags & Heap::RequestFlag::Storage) != 0u) return std::nullopt;
+        {
+            std::lock_guard lock(storageWrittenMutex);
+            if (storageWritten.empty()) return std::nullopt;
+        }
+        try {
+            const auto resource = Graphics::DecodeTextureResource(request.words);
+            const auto bytes = Graphics::SurfaceGuestBytes(resource);
+            const auto begin = resource.baseAddress;
+            const auto end = begin + bytes;
+            std::lock_guard lock(storageWrittenMutex);
+            for (const auto& [writtenBegin, writtenEnd] : storageWritten) {
+                if (begin < writtenEnd && writtenBegin < end) return Heap::Span{begin, bytes};
+            }
+        } catch (const std::exception&) {
+        }
+        return std::nullopt;
+    }
+
+    std::shared_ptr<const void> BindDeferredSampled(const Graphics::Context& bound, const Heap::SlotRequest& request, std::uint32_t& slot, std::string& reason) {
+        if (table == nullptr) {
+            reason = "no slot table";
+            return nullptr;
+        }
+        auto texture = Graphics::CachedSampledTexture(bound, request.words);
+        if (texture == nullptr || texture->Released()) {
+            reason = "deferred sampled image not cached";
+            return nullptr;
+        }
+        slot = table->ImageSlot(request.kind, {reinterpret_cast<std::uint64_t>(texture->View()), static_cast<std::uint32_t>(texture->Layout()), texture});
+        if (slot == Heap::NoSlot) {
+            reason = "image heap full for kind " + std::to_string(request.kind);
+            return nullptr;
+        }
+        return texture;
+    }
+
+    std::shared_ptr<Graphics::StorageTexture> BindDeferred(const Graphics::Context& bound, const Heap::SlotRequest& request, std::uint32_t& slot, std::string& reason) {
+        if (table == nullptr) {
+            reason = "no slot table";
+            return nullptr;
+        }
+        try {
+            const auto resource = Graphics::DecodeTextureResource(request.words);
+            auto [texture, view] = storageView(bound, request, resource, (request.flags & Heap::RequestFlag::Written) != 0u);
+            if (texture == nullptr || view == VK_NULL_HANDLE) {
+                reason = "written storage image without a view";
+                return nullptr;
+            }
+            slot = table->ImageSlot(request.kind, {reinterpret_cast<std::uint64_t>(view), static_cast<std::uint32_t>(VK_IMAGE_LAYOUT_GENERAL), texture});
+            if (slot == Heap::NoSlot) {
+                reason = "image heap full for kind " + std::to_string(request.kind);
+                return nullptr;
+            }
+            return texture;
+        } catch (const std::exception& error) {
+            reason = std::string("written storage image: ") + error.what();
+            return nullptr;
+        }
+    }
 
 private:
     std::shared_ptr<const ResolvedDraw> resolve(const Operation& operation, const DecodeState& state) {
@@ -260,7 +328,7 @@ private:
             std::vector<Heap::SlotRequest> requests;
             if (stage.result->directHeap) {
                 Heap::SlotStatistics statistics;
-                if (!Heap::BuildSlotRequests(stage.variant->info, stage.capture->snapshot, requests, statistics, reason, false)) {
+                if (!Heap::BuildSlotRequests(stage.variant->info, stage.capture->snapshot, requests, statistics, reason, &counts == &dispatchTotals && storageDispatches())) {
                     refuse(counts, reason);
                     counts.slotNanoseconds += elapsed(slotsStarted);
                     return nullptr;
@@ -269,7 +337,7 @@ private:
             counts.requestNanoseconds += elapsed(partStarted);
             partStarted = std::chrono::steady_clock::now();
             ResolvedStage resolved{std::move(stage), {}};
-            if (!refill->Fill(requests, resolved.slots, reason, &imageUses, &resolved.owners) ||!PatchSlots(*resolved.program.result, resolved.slots, resolved.program.words, reason)) {
+            if (!refill->Fill(requests, resolved.slots, reason, &imageUses, &resolved.owners, &resolved.deferredImages) ||!PatchSlots(*resolved.program.result, resolved.slots, resolved.program.words, reason)) {
                 refuse(counts, reason);
                 counts.slotNanoseconds += elapsed(slotsStarted);
                 return nullptr;
@@ -320,6 +388,7 @@ private:
             draw.stages.push_back(std::move(resolved));
         }
         const auto layoutStarted = std::chrono::steady_clock::now();
+        draw.imageBegin = draw.uses.size();
         std::vector<std::pair<std::uint64_t, std::uint64_t>> held;
         for (auto index = beforeTargets; index < beforeBuffers; ++index) held.emplace_back(draw.uses[index].address, draw.uses[index].address + draw.uses[index].size);
         for (const auto& use : tableUses) {
@@ -476,7 +545,7 @@ private:
     }
 
     std::optional<Heap::ResolvedImage> image(const Heap::SlotRequest& request) {
-        if ((request.flags & Heap::RequestFlag::Storage) != 0u) return std::nullopt;
+        if ((request.flags & Heap::RequestFlag::Storage) != 0u) return storageImage(request);
         if (!firstImage) {
             firstImage = true;
             std::fprintf(stderr, "[recode-resolve] first image lookup\n");
@@ -516,6 +585,73 @@ private:
     void noteSurfaceReason(const std::string& why) {
         if (seenSurfaceReasons.insert(why).second) std::fprintf(stderr, "[recode-resolve] first surface refusal: %s\n", why.c_str());
         if (surfaceReasons.size() < 16u || surfaceReasons.contains(why)) surfaceReasons[why]++;
+    }
+
+    static bool storageDispatches() {
+        static const bool storage = std::getenv("APS5_RECODE_NO_STORAGE_DISPATCHES") == nullptr;
+        return storage;
+    }
+
+    static std::pair<std::shared_ptr<Graphics::StorageTexture>, VkImageView> storageView(const Graphics::Context& context, const Heap::SlotRequest& request, const Graphics::GuestTextureResource& resource, bool written) {
+        const auto shape = (request.kind - Heap::LastSampledKind - 1u) % StorageShapes;
+        const auto mip = std::min(request.flags >> Heap::RequestFlag::MipShift, resource.mipCount - 1u);
+        Graphics::CompletePendingCpuWrites(context, resource.baseAddress, static_cast<std::size_t>(Graphics::SurfaceGuestBytes(resource)));
+        auto texture = Graphics::CachedStorageImage(context, request.words, resource, mip, written);
+        if (texture == nullptr) return {nullptr, VK_NULL_HANDLE};
+        const bool firstLayer = shape == Image2DShape && resource.dimension == Graphics::TextureDimension::k2DArray;
+        VkImageView view = VK_NULL_HANDLE;
+        if ((request.flags & Heap::RequestFlag::Atomic64) != 0u) view = texture->Atomic64View(mip, firstLayer);
+        else if ((request.flags & Heap::RequestFlag::Atomic) != 0u) view = texture->AtomicView(mip, firstLayer);
+        else view = texture->StorageView(mip, firstLayer, (request.flags & Heap::RequestFlag::UintView) != 0u);
+        return {std::move(texture), view};
+    }
+
+    std::optional<Heap::ResolvedImage> storageImage(const Heap::SlotRequest& request) {
+        const auto shape = (request.kind - Heap::LastSampledKind - 1u) % StorageShapes;
+        if (shape == MultisampleShape || shape == MultisampleArrayShape) {
+            noteSurfaceReason("storage: multisampled");
+            return std::nullopt;
+        }
+        try {
+            const auto resource = Graphics::DecodeTextureResource(request.words);
+            if (resource.mipCount == 0u) return std::nullopt;
+            if (resource.dimension == Graphics::TextureDimension::k2DMsaa) {
+                noteSurfaceReason("storage: multisampled surface");
+                return std::nullopt;
+            }
+            {
+                Heap::ResolvedImage deferred;
+                deferred.memory = {resource.baseAddress, Graphics::SurfaceGuestBytes(resource)};
+                deferred.deferred = true;
+                if ((request.flags & Heap::RequestFlag::Written) != 0u) {
+                    const GuestUse use{deferred.memory.address, deferred.memory.bytes, true};
+                    noteTargetWrites(std::span<const GuestUse>(&use, 1));
+                    std::lock_guard lock(storageWrittenMutex);
+                    const std::pair range{deferred.memory.address, deferred.memory.address + deferred.memory.bytes};
+                    if (std::ranges::find(storageWritten, range) == storageWritten.end()) storageWritten.push_back(range);
+                }
+                return deferred;
+            }
+            std::shared_ptr<Graphics::StorageTexture> texture;
+            VkImageView view = VK_NULL_HANDLE;
+            {
+                GuestMemory::TagGpuLockSite(GuestMemory::GpuLockSite::Try);
+                std::unique_lock gpuLock(GuestMemory::GpuMutex(), std::try_to_lock);
+                if (!gpuLock.owns_lock()) {
+                    totals.lockBusy++;
+                    return std::nullopt;
+                }
+                std::tie(texture, view) = storageView(*context, request, resource, false);
+            }
+            if (texture == nullptr || view == VK_NULL_HANDLE) return std::nullopt;
+            Heap::ResolvedImage resolved;
+            resolved.image = {reinterpret_cast<std::uint64_t>(view), static_cast<std::uint32_t>(VK_IMAGE_LAYOUT_GENERAL), texture};
+            resolved.memory = {resource.baseAddress, Graphics::SurfaceGuestBytes(resource)};
+            return resolved;
+        } catch (const std::exception& error) {
+            noteSurfaceReason(std::string("storage: ") + error.what());
+            return std::nullopt;
+        }
     }
 
     std::optional<Heap::ResolvedImage> targetImage(const Heap::SlotRequest& request) {
@@ -611,6 +747,8 @@ private:
     std::set<std::uint64_t> missedTargets;
     std::mutex writtenTargetsMutex;
     std::set<std::pair<std::uint64_t, std::uint64_t>> writtenTargets;
+    std::mutex storageWrittenMutex;
+    std::vector<std::pair<std::uint64_t, std::uint64_t>> storageWritten;
     std::map<std::string, std::uint64_t> surfaceReasons;
     bool firstBuilt = false;
     bool firstImage = false;
@@ -661,6 +799,14 @@ const Heap::VulkanHeapDevice* HeapDevice() {
 
 Images::SurfaceTable* Surfaces() {
     return shared().SurfaceTableOf();
+}
+
+std::shared_ptr<Graphics::StorageTexture> BindDeferredImage(const Graphics::Context& context, const Heap::SlotRequest& request, std::uint32_t& slot, std::string& reason) {
+    return shared().BindDeferred(context, request, slot, reason);
+}
+
+std::shared_ptr<const void> BindDeferredSampled(const Graphics::Context& context, const Heap::SlotRequest& request, std::uint32_t& slot, std::string& reason) {
+    return shared().BindDeferredSampled(context, request, slot, reason);
 }
 
 }

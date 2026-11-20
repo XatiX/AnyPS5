@@ -13,6 +13,12 @@ namespace AgcDriver::Unified::Heap {
 struct ResolvedImage {
     ImageRef image;
     Span memory;
+    bool deferred = false;
+};
+
+struct DeferredImage {
+    std::uint32_t index = 0;
+    SlotRequest request;
 };
 
 struct ImageUse {
@@ -39,9 +45,10 @@ class Refill {
 public:
     Refill(SlotTable& table, Memo& memo, ImageLookup images, SamplerLookup samplers);
 
-    [[nodiscard]] bool Fill(std::span<const SlotRequest> requests, std::vector<std::uint32_t>& slots, std::string& reason, std::vector<ImageUse>* uses = nullptr, std::vector<std::shared_ptr<const void>>* owners = nullptr);
+    [[nodiscard]] bool Fill(std::span<const SlotRequest> requests, std::vector<std::uint32_t>& slots, std::string& reason, std::vector<ImageUse>* uses = nullptr, std::vector<std::shared_ptr<const void>>* owners = nullptr, std::vector<DeferredImage>* deferred = nullptr);
     [[nodiscard]] std::uint32_t FillOne(const SlotRequest& request, std::string& reason, Span& memory, std::shared_ptr<const void>& owner);
     [[nodiscard]] RefillCounts Counts() const { return counts; }
+    void SetDeferTest(std::function<std::optional<Span>(const SlotRequest&)> test) { deferTest = std::move(test); }
 
 private:
     [[nodiscard]] std::uint32_t image(const SlotRequest& request, std::string& reason, Span& memory, std::shared_ptr<const void>& owner);
@@ -51,6 +58,7 @@ private:
     Memo& memo;
     ImageLookup images;
     SamplerLookup samplers;
+    std::function<std::optional<Span>(const SlotRequest&)> deferTest;
     RefillCounts counts;
 };
 

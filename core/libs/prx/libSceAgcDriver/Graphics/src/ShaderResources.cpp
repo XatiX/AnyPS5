@@ -1961,6 +1961,10 @@ std::shared_ptr<StorageTexture> CachedStorageSurface(const Context& context, con
     return cachedStorageTexture(context, {}, resource, 0);
 }
 
+std::shared_ptr<StorageTexture> CachedStorageImage(const Context& context, std::span<const std::uint32_t> words, const GuestTextureResource& resource, std::uint32_t mip, bool written) {
+    return cachedStorageTexture(context, words, resource, mip, 0, written);
+}
+
 std::shared_ptr<StorageTexture> CachedStorageLayers(const Context& context, const GuestTextureResource& resource, std::uint32_t firstLayer, std::uint32_t layerCount) {
     return cachedStorageTexture(context, {}, resource, 0, 0, false, std::pair{firstLayer, layerCount});
 }

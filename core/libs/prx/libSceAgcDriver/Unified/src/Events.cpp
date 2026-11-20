@@ -27,8 +27,28 @@ std::uint64_t StripedCount::Sum() const noexcept {
     return total;
 }
 
-ChangeLog::ChangeLog() : buckets(new Bucket[BucketCount]), regions(new std::atomic<std::uint64_t>[RegionCount]) {
+ChangeLog::ChangeLog() : buckets(new Bucket[BucketCount]), blocks(new Bucket[BlockCount]), regions(new std::atomic<std::uint64_t>[RegionCount]) {
     for (std::size_t region = 0; region < RegionCount; ++region) regions[region].store(0, std::memory_order_relaxed);
+}
+
+void ChangeLog::noteBucket(Bucket& bucket, std::uint64_t epoch, std::uintptr_t owner) {
+    bucket.version.fetch_add(1, std::memory_order_acq_rel);
+    const auto previousOwner = bucket.owner.load(std::memory_order_relaxed);
+    if (previousOwner != owner) {
+        bucket.epochByOthers.store(bucket.epoch.load(std::memory_order_relaxed), std::memory_order_relaxed);
+        bucket.owner.store(owner, std::memory_order_relaxed);
+    }
+    bucket.epoch.store(epoch, std::memory_order_relaxed);
+    bucket.version.fetch_add(1, std::memory_order_release);
+}
+
+bool ChangeLog::moved(const Seen& seen, std::uint64_t stamp, std::uintptr_t owner, bool& exempted) {
+    if (seen.epoch <= stamp) return false;
+    if (owner != 0 && seen.owner == owner && seen.epochByOthers <= stamp) {
+        exempted = true;
+        return false;
+    }
+    return true;
 }
 
 std::uint64_t ChangeLog::Note(std::uint64_t address, std::uint64_t bytes, std::uintptr_t owner) {
@@ -38,19 +58,19 @@ std::uint64_t ChangeLog::Note(std::uint64_t address, std::uint64_t bytes, std::u
     ++threadNotes;
     const auto first = address / BucketBytes;
     const auto last = (address + bytes - 1) / BucketBytes;
-    const auto span = std::min<std::uint64_t>(last - first + 1, BucketCount);
-    for (std::uint64_t step = 0; step < span; ++step) {
-        const auto index = bucketOf((first + step) * BucketBytes);
-        auto& bucket = buckets[index];
-        std::lock_guard lock(stripes[index % WriterStripes]);
-        bucket.version.fetch_add(1, std::memory_order_acq_rel);
-        const auto previousOwner = bucket.owner.load(std::memory_order_relaxed);
-        if (previousOwner != owner) {
-            bucket.epochByOthers.store(bucket.epoch.load(std::memory_order_relaxed), std::memory_order_relaxed);
-            bucket.owner.store(owner, std::memory_order_relaxed);
+    const auto end = first + std::min<std::uint64_t>(last - first + 1, BucketCount);
+    for (auto index = first; index < end;) {
+        if (index % BucketsPerBlock == 0 && end - index >= BucketsPerBlock) {
+            const auto block = blockOf(index);
+            std::lock_guard lock(blockStripes[block % WriterStripes]);
+            noteBucket(blocks[block], epoch, owner);
+            index += BucketsPerBlock;
+            continue;
         }
-        bucket.epoch.store(epoch, std::memory_order_relaxed);
-        bucket.version.fetch_add(1, std::memory_order_release);
+        const auto bucket = bucketOf(index * BucketBytes);
+        std::lock_guard lock(stripes[bucket % WriterStripes]);
+        noteBucket(buckets[bucket], epoch, owner);
+        ++index;
     }
     const auto firstRegion = address / RegionBytes;
     const auto lastRegion = (address + bytes - 1) / RegionBytes;
@@ -93,12 +113,13 @@ bool ChangeLog::ChangedSince(std::uint64_t address, std::uint64_t bytes, std::ui
     }
     bool exempted = false;
     for (auto index = first; index <= last; ++index) {
-        const auto seen = read(buckets[bucketOf(index * BucketBytes)]);
-        if (seen.epoch <= stamp) continue;
-        if (owner != 0 && seen.owner == owner && seen.epochByOthers <= stamp) {
-            exempted = true;
-            continue;
+        if (index == first || index % BucketsPerBlock == 0) {
+            if (moved(read(blocks[blockOf(index)]), stamp, owner, exempted)) {
+                changed.Add();
+                return true;
+            }
         }
+        if (!moved(read(buckets[bucketOf(index * BucketBytes)]), stamp, owner, exempted)) continue;
         changed.Add();
         return true;
     }
@@ -115,7 +136,9 @@ std::uintptr_t ChangeLog::ChangedOwner(std::uint64_t address, std::uint64_t byte
     const auto last = std::min<std::uint64_t>((address + bytes - 1) / BucketBytes, first + BucketCount - 1);
     for (auto index = first; index <= last; ++index) {
         const auto seen = read(buckets[bucketOf(index * BucketBytes)]);
-        if (seen.epoch > stamp) return seen.owner;
+        const auto block = read(blocks[blockOf(index)]);
+        const auto& latest = block.epoch > seen.epoch ? block : seen;
+        if (latest.epoch > stamp) return latest.owner;
     }
     return 0;
 }
