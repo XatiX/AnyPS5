@@ -2261,9 +2261,9 @@ private:
         memory.knownBuffer = NoKnownBuffer;
         static const bool knownBuffers = std::getenv("APS5_RECODE_NO_KNOWN_BUFFERS") == nullptr;
         static const bool knownWrites = std::getenv("APS5_RECODE_NO_KNOWN_WRITES") == nullptr;
-        const bool known = access == BufferAccess::Read || (knownWrites && access == BufferAccess::Write);
+        const bool known = access == BufferAccess::Read || (knownWrites && (access == BufferAccess::Write || access == BufferAccess::Atomic));
         const bool valid = knownBuffers && m_program.Metadata().directResources && ValidateSource(descriptor, badDword);
-        if (valid && known) memory.knownBuffer = AddKnownBuffer(InternSource(descriptor), 0u, access == BufferAccess::Write);
+        if (valid && known) memory.knownBuffer = AddKnownBuffer(InternSource(descriptor), 0u, access != BufferAccess::Read);
         if (valid && access != BufferAccess::Read) m_writtenSources.insert(InternSource(descriptor));
         m_info.usesDma = true;
         m_info.bdaWrites = m_info.bdaWrites || access == BufferAccess::Write || access == BufferAccess::Atomic;

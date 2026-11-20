@@ -844,22 +844,32 @@ void EmitBdaWrite(SpirvValueEmitContext& ctx, const IrValue& inst, std::uint32_t
     });
 }
 
-void EmitKnownBdaWrite(SpirvValueEmitContext& ctx, const IrValue& inst, std::uint32_t base, std::uint32_t address, std::uint32_t value, std::uint32_t bits) {
+std::optional<KnownBdaTarget> KnownBdaTargetOf(SpirvValueEmitContext& ctx, const IrValue& inst, std::uint32_t base, std::uint32_t address, std::uint32_t bytes) {
     auto& state = ctx.state;
     const auto anchor = KnownBdaAnchor(state, ctx.Memory(inst));
-    if (!anchor || (bits != 8u && bits != 16u && bits != 32u)) {
+    if (!anchor) return std::nullopt;
+    const auto relative = Unary(state, spv::OpUConvert, TypeU32(state), Binary(state, spv::OpISub, TypeScalarU64(state), address, base));
+    KnownBdaTarget target;
+    target.inside = BdaAnchorHolds(state, *anchor, relative, 0, bytes, target.translated);
+    target.served = Binary(state, spv::OpINotEqual, TypeBool(state), anchor->device, BdaConstant(state, 0u));
+    return target;
+}
+
+void EmitKnownBdaWrite(SpirvValueEmitContext& ctx, const IrValue& inst, std::uint32_t base, std::uint32_t address, std::uint32_t value, std::uint32_t bits) {
+    auto& state = ctx.state;
+    const auto bytes = bits / 8u;
+    const auto target = bits == 8u || bits == 16u || bits == 32u ? KnownBdaTargetOf(ctx, inst, base, address, bytes) : std::nullopt;
+    if (!target) {
         EmitBdaWrite(ctx, inst, address, value, bits);
         return;
     }
     const auto u32 = TypeU32(state);
     const auto u64 = TypeScalarU64(state);
     const auto boolean = TypeBool(state);
-    const auto bytes = bits / 8u;
     const auto accessMask = BdaAccessMask(state, inst);
-    const auto relative = Unary(state, spv::OpUConvert, u32, Binary(state, spv::OpISub, u64, address, base));
-    std::uint32_t translated = 0;
-    const auto inside = BdaAnchorHolds(state, *anchor, relative, 0, bytes, translated);
-    const auto served = Binary(state, spv::OpINotEqual, boolean, anchor->device, BdaConstant(state, 0u));
+    const auto translated = target->translated;
+    const auto inside = target->inside;
+    const auto served = target->served;
     const auto storeBytes = [&] {
         const auto byteType = state.module.Type(spv::OpTypeInt, 8u, 0u);
         const auto bytePointer = TypePointer(state, spv::StorageClassPhysicalStorageBuffer, byteType);

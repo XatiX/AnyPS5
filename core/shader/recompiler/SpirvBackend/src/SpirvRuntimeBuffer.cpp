@@ -1230,7 +1230,7 @@ static std::uint32_t RuntimeBufferAtomic(SpirvValueEmitContext& context, const I
                     return result;
                 });
             }
-            const auto atomicAt = [&](std::uint32_t guest) {
+            const auto lookupAt = [&](std::uint32_t guest) {
                 const auto physical = state.module.AllocateId();
                 state.module.AddFunction(spv::OpFunctionCall, TypeScalarU64(state), physical, state.bdaAtomicPointerFunction, guest, ConstantU32(state, bits / 8u), BdaInstructionPc(state, instruction));
                 const auto mapped = Binary(state, spv::OpINotEqual, TypeBool(state), physical, BdaConstant(state, 0u));
@@ -1248,6 +1248,17 @@ static std::uint32_t RuntimeBufferAtomic(SpirvValueEmitContext& context, const I
                     state.module.AddFunction(spv::OpFunctionCall, state.module.Type(spv::OpTypeVoid), state.module.AllocateId(), state.bdaNoteWriteFunction, guest);
                     return result;
                 });
+            };
+            const auto atomicAt = [&](std::uint32_t guest) {
+                const auto target = bits == 32u && !split && !state.requirements.bufferAtomicLocks ? KnownBdaTargetOf(context, instruction, resource.base, guest, 4u) : std::nullopt;
+                if (!target) return lookupAt(guest);
+                return EmitValueIfElse(state, target->served, type, [&] {
+                    return EmitValueOrDefaultIfCondition(state, target->inside, type, zero, [&] {
+                        const auto pointer = state.module.AllocateId();
+                        state.module.AddFunction(spv::OpConvertUToPtr, TypePointer(state, spv::StorageClassPhysicalStorageBuffer, scalar), pointer, target->translated);
+                        return operation(pointer, 0u);
+                    });
+                }, [&] { return lookupAt(guest); });
             };
             if (bits == 32u) return atomicAt(Binary(state, spv::OpBitwiseAnd, TypeScalarU64(state), access.guest, BdaConstant(state, ~std::uint64_t{3u})));
             const auto unaligned = Binary(state, spv::OpINotEqual, TypeBool(state), Binary(state, spv::OpBitwiseAnd, TypeScalarU64(state), access.guest, BdaConstant(state, bits / 8u - 1u)), BdaConstant(state, 0u));
