@@ -1,4 +1,5 @@
 #include "prx/libSceAgcDriver/Unified/include/Resolve.hpp"
+#include "prx/libSceAgcDriver/Unified/include/Downgrades.hpp"
 #include "prx/libSceAgcDriver/Execution/include/GuestMemory.hpp"
 #include "prx/libSceAgcDriver/Execution/include/VulkanDevice.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/GuestTextureResource.hpp"
@@ -407,6 +408,7 @@ private:
         std::vector<Heap::ImageUse> tableUses;
         std::uint64_t tablePlaceholdersHere = 0;
         for (auto& stage : programs.stages) {
+            const Downgrades::ProgramScope programScope(stage.codeAddress);
             auto partStarted = std::chrono::steady_clock::now();
             bufferUses(*stage.variant, stage.capture->snapshot, draw.uses);
             counts.bufferNanoseconds += elapsed(partStarted);
@@ -631,6 +633,7 @@ private:
 
     void refuse(Totals& counts, const std::string& reason) {
         counts.refused++;
+        Downgrades::NoteCurrent(Downgrades::Kind::ExistingPath, 0u, "resolve: " + reason);
         auto key = reason.substr(0, 60);
         if (seenReasons.insert((&counts == &dispatchTotals ? "dispatch " : "") + key).second) std::fprintf(stderr, "[recode-resolve] first %srefusal: %s\n", &counts == &dispatchTotals ? "dispatch " : "", reason.c_str());
         if (counts.reasons.size() < 16u || counts.reasons.contains(key)) counts.reasons[key]++;
@@ -646,7 +649,10 @@ private:
             bool fallback = false;
             auto resolved = surfaceImage(request, fallback);
             if (!fallback) return resolved;
-            if (auto target = targetImage(request)) return target;
+            if (auto target = targetImage(request)) {
+                Downgrades::NoteCurrent(Downgrades::Kind::UpstreamSampled, request.kind, "render target from the existing target cache");
+                return target;
+            }
         }
         std::shared_ptr<Graphics::Texture> texture;
         {
@@ -665,6 +671,7 @@ private:
             texture = Graphics::CachedSampledTexture(*context, request.words);
         }
         if (texture == nullptr || texture->Released()) return std::nullopt;
+        Downgrades::NoteCurrent(Downgrades::Kind::UpstreamSampled, request.kind, "existing sampled texture cache");
         const auto resource = Graphics::DecodeTextureResource(request.words);
         Heap::ResolvedImage resolved;
         resolved.image = {reinterpret_cast<std::uint64_t>(texture->View()), static_cast<std::uint32_t>(texture->Layout()), texture};
