@@ -740,7 +740,7 @@ private:
             }
             const auto reach = std::max(bytes, KnownReadableBytes);
             Shadow::OwnedSpan span;
-            if (bytes <= KnownBufferLimitBytes && ((reach != bytes && Shadow::ServeOwned(context, address, reach, &span)) || Shadow::ServeOwned(context, address, bytes, &span)) && span.address != 0u) {
+            if (bytes <= KnownBufferLimitBytes && !MemoryCore::Get().Pages().GpuWrittenIn(address, reach) && ((reach != bytes && Shadow::ServeOwned(context, address, reach, &span)) || Shadow::ServeOwned(context, address, bytes, &span)) && span.address != 0u) {
                 totals.knownServed++;
                 write(span.address, bytes);
                 continue;

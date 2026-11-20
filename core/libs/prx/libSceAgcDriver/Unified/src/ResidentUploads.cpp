@@ -12,23 +12,30 @@ void ResidentUploads::snapshot(std::uint64_t address, std::uint64_t size, bool f
     for (const auto& piece : residency.ResidentPieces(address, size)) {
         const auto cursor = piece.guest;
         const auto stop = piece.guest + piece.device.bytes;
-        covered += piece.device.bytes;
-        PendingUpload upload{piece.device.handle, piece.device.offset, cursor, std::vector<std::byte>(static_cast<std::size_t>(stop - cursor))};
-        if (full && committed != nullptr) {
-            for (const auto& [from, to] : committed(cursor, upload.bytes.size(), false)) {
-                std::memcpy(upload.bytes.data() + (from - cursor), reinterpret_cast<const void*>(from), static_cast<std::size_t>(to - from));
-            }
-        } else {
-            std::memcpy(upload.bytes.data(), reinterpret_cast<const void*>(cursor), upload.bytes.size());
-        }
         if (full) {
+            covered += piece.device.bytes;
+            PendingUpload upload{piece.device.handle, piece.device.offset, cursor, std::vector<std::byte>(static_cast<std::size_t>(stop - cursor))};
+            if (committed != nullptr) {
+                for (const auto& [from, to] : committed(cursor, upload.bytes.size(), false)) {
+                    std::memcpy(upload.bytes.data() + (from - cursor), reinterpret_cast<const void*>(from), static_cast<std::size_t>(to - from));
+                }
+            } else {
+                std::memcpy(upload.bytes.data(), reinterpret_cast<const void*>(cursor), upload.bytes.size());
+            }
             ++counts.fullUploads;
             counts.fullBytes += stop - cursor;
-        } else {
-            ++counts.dirtyUploads;
-            counts.dirtyBytes += stop - cursor;
+            pending.push_back(std::move(upload));
+            continue;
         }
-        pending.push_back(std::move(upload));
+        const auto readable = committed != nullptr ? committed(cursor, static_cast<std::size_t>(stop - cursor), false) : std::vector<std::pair<std::uint64_t, std::uint64_t>>{{cursor, stop}};
+        for (const auto& [from, to] : readable) {
+            covered += to - from;
+            PendingUpload upload{piece.device.handle, piece.device.offset + (from - cursor), from, std::vector<std::byte>(static_cast<std::size_t>(to - from))};
+            std::memcpy(upload.bytes.data(), reinterpret_cast<const void*>(from), upload.bytes.size());
+            ++counts.dirtyUploads;
+            counts.dirtyBytes += to - from;
+            pending.push_back(std::move(upload));
+        }
     }
     counts.skippedBytes += size - covered;
 }

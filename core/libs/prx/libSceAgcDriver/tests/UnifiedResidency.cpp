@@ -242,6 +242,22 @@ void testFullUploadsReadCommittedPagesOnly() {
     Expect(taken.size() == 1 && taken[0].bytes[0] == std::byte{0x33} && taken[0].bytes[ChunkBytes / 2] == std::byte{0}, "uncommitted pages of a full upload read as zeros");
 }
 
+void testDirtyUploadsSkipUnreadablePages() {
+    FakeDevice device;
+    Residency residency(device, 0);
+    ResidentUploads uploads(residency, committedHalf);
+    GuestBlock guest;
+    residency.Add(guest.base, ChunkBytes);
+    uploads.Prepare(guest.base, ChunkBytes, 1);
+    static_cast<void>(uploads.Take());
+    std::memset(guest.At(0), 0x44, ChunkBytes / 2);
+    const std::vector<DirtyRange> dirty{{guest.base, ChunkBytes}};
+    uploads.NoteDirty(dirty);
+    const auto taken = uploads.Take();
+    Expect(taken.size() == 1 && taken[0].guest == guest.base && taken[0].offset == 0 && taken[0].bytes.size() == ChunkBytes / 2 && taken[0].bytes[0] == std::byte{0x44}, "a dirty range uploads only its readable pages");
+    Expect(uploads.Counts().skippedBytes == ChunkBytes / 2, "the unreadable pages of a dirty range are skipped, not zeroed");
+}
+
 }
 
 void testPageTableFollowsBoundChunks() {
@@ -271,6 +287,7 @@ int main() {
     testPageTableFollowsBoundChunks();
     testServedRangeReplacesUnboundRanges();
     testFullUploadsReadCommittedPagesOnly();
+    testDirtyUploadsSkipUnreadablePages();
     testUploadsFollowResidency();
     testDirtyRangesAcrossRangeEdgesUploadTheirResidentPart();
     testEvictionDropsPendingUploads();
