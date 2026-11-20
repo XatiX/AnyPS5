@@ -336,11 +336,21 @@ void Driver::dispatch(QueueState& queue, std::span<const std::uint32_t> packet, 
             if (!fromAhead) ++groupStats.addressMismatches;
         }
     }
+#if ANYPS5_UNIFIED
+    const bool recodeKernels = !resolving && Unified::Record::RecordsKernels(submission.queue);
+    if (recodeKernels) {
+        const auto kernelCode = std::span(snapshot.code).subspan(codeOffset);
+        if (matchesFillKernel(kernelCode, userData, compute)) Unified::Record::NoteKernel(Unified::Record::Kernel::Fill);
+        else if (matchesCopyKernel(kernelCode, userData, compute) || MatchesStreamCopyKernel(kernelCode, userData, compute) || MatchesTableCopyKernel(kernelCode, userData, compute) || MatchesIndexedCopyKernel(kernelCode, userData, compute)) Unified::Record::NoteKernel(Unified::Record::Kernel::Copy);
+    }
+#else
+    constexpr bool recodeKernels = false;
+#endif
     if (fromAhead) {
         resolved = ahead.packet;
         packet = resolved;
         indirectArguments = ahead.indirectArguments;
-    } else if (indirectArguments != 0 && !resolving && matchesFillKernel(std::span(snapshot.code).subspan(codeOffset), userData, compute)) {
+    } else if (indirectArguments != 0 && !resolving && !recodeKernels && matchesFillKernel(std::span(snapshot.code).subspan(codeOffset), userData, compute)) {
         indirectSource().path = IndirectFillKernel;
         if (submission.queue == 0 && DrawPipeline::Active() && DrawPipeline::Queue0().Busy()) DrawPipeline::Queue0().Drain(DrawPipeline::DrainReason::Packet, 0x16);
         const auto readStart = std::chrono::steady_clock::now();
@@ -353,7 +363,7 @@ void Driver::dispatch(QueueState& queue, std::span<const std::uint32_t> packet, 
     if (indirectArguments == 0 && (packet[4] & 0x2u) != 0) {
         partialGroups = Pm4::PartialGroupThreads({packet[1], packet[2], packet[3]}, {readRegister(queue.shader, 0x207), readRegister(queue.shader, 0x208), readRegister(queue.shader, 0x209)});
     }
-    const bool pipelineCandidate = !resolving && !fromAhead && DispatchItemsEnabled() && DrawPipeline::Active() && (indirectArguments == 0 || (IndirectItemsEnabled() && submission.queue == 0)) && deferredLabels().labels.empty() && !matchesCopyKernel(std::span(snapshot.code).subspan(codeOffset), userData, compute) && !MatchesStreamCopyKernel(std::span(snapshot.code).subspan(codeOffset), userData, compute) && !MatchesTableCopyKernel(std::span(snapshot.code).subspan(codeOffset), userData, compute) && !MatchesIndexedCopyKernel(std::span(snapshot.code).subspan(codeOffset), userData, compute);
+    const bool pipelineCandidate = !resolving && !fromAhead && DispatchItemsEnabled() && DrawPipeline::Active() && (indirectArguments == 0 || (IndirectItemsEnabled() && submission.queue == 0)) && deferredLabels().labels.empty() && (recodeKernels || (!matchesCopyKernel(std::span(snapshot.code).subspan(codeOffset), userData, compute) && !MatchesStreamCopyKernel(std::span(snapshot.code).subspan(codeOffset), userData, compute) && !MatchesTableCopyKernel(std::span(snapshot.code).subspan(codeOffset), userData, compute) && !MatchesIndexedCopyKernel(std::span(snapshot.code).subspan(codeOffset), userData, compute)));
     const bool partialLastGroup = partialGroups != std::array<std::uint32_t, 3>{};
     std::optional<std::pair<std::uint64_t, std::size_t>> htileClearCompletion;
     Graphics::HtileMaskClear htileMask;
@@ -371,7 +381,7 @@ void Driver::dispatch(QueueState& queue, std::span<const std::uint32_t> packet, 
         if (indirectArguments == 0 && (packet[4] & 0x20u) == 0) {
             if (const auto fill = Graphics::MatchMemoryValueFill(std::span(snapshot.code).subspan(codeOffset), userData, compute.numThreads, {packet[1], packet[2], packet[3]})) Graphics::NoteMemoryValueFill(*fill);
         }
-        if (!partialLastGroup && fillBuffer(queue, submission.queue, packet, std::span(snapshot.code).subspan(codeOffset), userData, compute, localDevice)) {
+        if (!partialLastGroup && !recodeKernels && fillBuffer(queue, submission.queue, packet, std::span(snapshot.code).subspan(codeOffset), userData, compute, localDevice)) {
             pendingDispatchPhases().outcome = DispatchOutcome::FillHle;
             if (resolvedAhead().empty()) gateOpened() = true;
             return;
@@ -387,7 +397,7 @@ void Driver::dispatch(QueueState& queue, std::span<const std::uint32_t> packet, 
             if (Graphics::NoteHtileDepthClear(buffered->address, buffered->bytes, buffered->bytes)) htileClearCompletion = std::pair{buffered->address, buffered->bytes};
             htileMask = *buffered;
         }
-        if (!partialLastGroup && indirectArguments == 0 && copyBuffer(queue, submission.queue, packet, std::span(snapshot.code).subspan(codeOffset), userData, compute, localDevice, address)) {
+        if (!partialLastGroup && !recodeKernels && indirectArguments == 0 && copyBuffer(queue, submission.queue, packet, std::span(snapshot.code).subspan(codeOffset), userData, compute, localDevice, address)) {
             pendingDispatchPhases().outcome = DispatchOutcome::CopyHle;
             if (resolvedAhead().empty()) gateOpened() = true;
             return;
@@ -396,6 +406,7 @@ void Driver::dispatch(QueueState& queue, std::span<const std::uint32_t> packet, 
         const auto recodeCandidate = [&] {
             if (submission.queue == 0) return pipelineCandidate;
             const auto kernelCode = std::span(snapshot.code).subspan(codeOffset);
+            if (recodeKernels) return true;
             return !resolving && !matchesCopyKernel(kernelCode, userData, compute) && !MatchesStreamCopyKernel(kernelCode, userData, compute) && !MatchesTableCopyKernel(kernelCode, userData, compute) && !MatchesIndexedCopyKernel(kernelCode, userData, compute);
         };
         if (Unified::Record::RecordActive() && Unified::Resolve::DispatchesRoutedOn(submission.queue) && (indirectArguments == 0 || (packet[4] & 0x20u) == 0) && recodeCandidate() && !htileClearCompletion.has_value() && htileMask.bytes == 0u) {
@@ -409,7 +420,7 @@ void Driver::dispatch(QueueState& queue, std::span<const std::uint32_t> packet, 
             }
             const auto code = std::span(snapshot.code).subspan(codeOffset);
             std::string recodeReason;
-            const bool recordable = found.value != nullptr && found.value->stages.size() == 1u && found.value->stages.front().program.codeAddress == address && (indirectArguments != 0 || (!MatchSgprPatternFill(packet, code, userData, compute) && !Graphics::MatchStorageImageClear(code, userData, compute, recodeGroups))) && Unified::Record::RecordDispatchPrecheck(localDevice->graphicsContext(), *localDevice, *found.value, recodeReason);
+            const bool recordable = found.value != nullptr && found.value->stages.size() == 1u && found.value->stages.front().program.codeAddress == address && (indirectArguments != 0 || recodeKernels || (!MatchSgprPatternFill(packet, code, userData, compute) && !Graphics::MatchStorageImageClear(code, userData, compute, recodeGroups))) && Unified::Record::RecordDispatchPrecheck(localDevice->graphicsContext(), *localDevice, *found.value, recodeReason);
             if (recordable && submission.queue != 0) {
                 if (DrawPipeline::Queue0().Busy()) DrawPipeline::Queue0().Drain(DrawPipeline::DrainReason::Packet, 0x15);
                 GuestMemory::TagGpuLockSite(GuestMemory::GpuLockSite::Dispatch);

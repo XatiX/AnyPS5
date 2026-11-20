@@ -135,6 +135,65 @@ void testImageSetNotesAreNotGpuWrites() {
     Expect(written.has_value() && written->gpuWritten && !written->ready, "a GPU write hands a detiled surface back to the existing cache");
 }
 
+void testOwnGpuWritesKeepTheSurface() {
+    FakeDevice device;
+    Events::ChangeLog shared;
+    Events::ChangeLog gpuWrites;
+    SurfaceTable table(device, shared, gpuWrites);
+    std::string reason;
+    const auto key = Key(0x900000000ull);
+    const auto created = table.Find(key, words, reason);
+    auto work = table.TakeWork();
+    table.MarkReady(*work.front(), shared.Serial(), gpuWrites.Serial());
+    const auto owner = OwnerOf(*created->surface);
+    static_cast<void>(gpuWrites.Note(key.address, key.bytes, owner));
+    static_cast<void>(shared.Note(key.address, key.bytes, owner));
+    table.MarkGpuWritten(*created->surface);
+    const auto served = table.Find(key, words, reason);
+    Expect(served.has_value() && served->ready && !served->gpuWritten && served->surface == created->surface, "a surface's own GPU write keeps it served");
+    Expect(served->surface->gpuNewer && table.TakeWork().empty(), "an own write needs no detile");
+    static_cast<void>(gpuWrites.Note(key.address, key.bytes, owner));
+    static_cast<void>(shared.Note(key.address, key.bytes, owner));
+    table.MarkGpuWritten(*created->surface);
+    Expect(table.Find(key, words, reason)->ready, "repeated own writes keep it served");
+    const auto counts = table.TakeCounts();
+    Expect(counts.ownWrites == 2u && counts.ownServed == 2u && counts.gpuWritten == 0u, "own writes and serves are counted");
+}
+
+void testForeignWritesHandTheSurfaceBack() {
+    FakeDevice device;
+    Events::ChangeLog shared;
+    Events::ChangeLog gpuWrites;
+    SurfaceTable table(device, shared, gpuWrites);
+    std::string reason;
+    const auto key = Key(0xa00000000ull);
+    const auto created = table.Find(key, words, reason);
+    auto work = table.TakeWork();
+    table.MarkReady(*work.front(), shared.Serial(), gpuWrites.Serial());
+    const auto owner = OwnerOf(*created->surface);
+    static_cast<void>(gpuWrites.Note(key.address, key.bytes, owner));
+    table.MarkGpuWritten(*created->surface);
+    static_cast<void>(shared.Note(key.address + 0x100u, 0x10));
+    const auto stored = table.Find(key, words, reason);
+    Expect(stored.has_value() && stored->gpuWritten && stored->surface == nullptr && !created->surface->gpuNewer, "a store over a GPU-newer surface hands it back");
+    static_cast<void>(gpuWrites.Note(key.address, 0x10, 8u));
+    Expect(table.Find(key, words, reason)->gpuWritten, "another GPU writer hands it back");
+}
+
+void testOverlapQuery() {
+    FakeDevice device;
+    Events::ChangeLog shared;
+    Events::ChangeLog gpuWrites;
+    SurfaceTable table(device, shared, gpuWrites);
+    std::string reason;
+    const auto first = table.Find(Key(0xb00000000ull), words, reason);
+    const auto second = table.Find(Key(0xb00010000ull), words, reason);
+    Expect(table.Overlapping(0xb00008000ull, 0x10).size() == 1u && table.Overlapping(0xb00008000ull, 0x10).front() == first->surface, "a range inside one surface finds it");
+    Expect(table.Overlapping(0xb0000ff00ull, 0x200).size() == 2u, "a range across both finds both");
+    Expect(table.Overlapping(0xb00020000ull, 0x1000).empty(), "a range past both finds none");
+    static_cast<void>(second);
+}
+
 void testBudgetDropsLeastRecentlyUsed() {
     FakeDevice device;
     Events::ChangeLog shared;
@@ -168,6 +227,9 @@ int main() {
     testSurfacesAreSharedAndQueued();
     testWritesMakeSurfacesStale();
     testRefusals();
+    testOwnGpuWritesKeepTheSurface();
+    testForeignWritesHandTheSurfaceBack();
+    testOverlapQuery();
     if (failures != 0) return 1;
     std::printf("unified images tests passed\n");
     return 0;

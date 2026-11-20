@@ -1,5 +1,6 @@
 #include "prx/libSceAgcDriver/Unified/include/Images.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/GuestTextureResource.hpp"
+#include "prx/libSceAgcDriver/Graphics/include/TextureFormat.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/TextureTiling.hpp"
 #include <algorithm>
 #include <exception>
@@ -8,12 +9,21 @@ namespace AgcDriver::Unified::Images {
 
 std::optional<ImageKey> KeyOf(std::span<const std::uint32_t, 8> words, std::string& reason) {
     Graphics::GuestTextureResource resource{};
-    std::uint64_t bytes = 0;
     try {
         resource = Graphics::DecodeTextureResource(words);
-        bytes = Graphics::SurfaceGuestBytes(resource);
     } catch (const std::exception& error) {
         reason = std::string("image decode: ") + error.what();
+        return std::nullopt;
+    }
+    return KeyOf(resource, reason);
+}
+
+std::optional<ImageKey> KeyOf(const Graphics::GuestTextureResource& resource, std::string& reason) {
+    std::uint64_t bytes = 0;
+    try {
+        bytes = Graphics::SurfaceGuestBytes(resource);
+    } catch (const std::exception& error) {
+        reason = std::string("image size: ") + error.what();
         return std::nullopt;
     }
     if (resource.baseAddress == 0u || bytes == 0u) {
@@ -31,7 +41,7 @@ std::optional<ImageKey> KeyOf(std::span<const std::uint32_t, 8> words, std::stri
     ImageKey key;
     key.surface = {resource.baseAddress, bytes, resource.format, static_cast<std::uint32_t>(resource.tileMode), static_cast<std::uint32_t>(resource.dimension), resource.width, resource.height, resource.depthOrLastArray, std::max(resource.mipCount, resource.allocatedMipCount), resource.pipeBankXor, resource.gcnPitch != 0u ? resource.gcnPitch : resource.linearPitch};
     const auto swizzle = static_cast<std::uint32_t>(resource.dstSelX) | static_cast<std::uint32_t>(resource.dstSelY) << 4u | static_cast<std::uint32_t>(resource.dstSelZ) << 8u | static_cast<std::uint32_t>(resource.dstSelW) << 12u | static_cast<std::uint32_t>(resource.bcSwizzle) << 16u;
-    key.view = {resource.baseLevel, resource.lastLevel, resource.baseArray, resource.depthOrLastArray, swizzle};
+    key.view = {resource.baseLevel, resource.lastLevel, resource.baseArray, resource.depthOrLastArray, swizzle, resource.format};
     return key;
 }
 
@@ -52,16 +62,64 @@ std::size_t SurfaceTable::KeyHash::operator()(const SurfaceKey& key) const {
     return static_cast<std::size_t>(hash);
 }
 
+bool SameBacking(const SurfaceKey& left, const SurfaceKey& right) {
+    if (left.address != right.address || left.bytes != right.bytes || left.tileMode != right.tileMode || left.width != right.width || left.height != right.height || left.mips != right.mips || left.pipeBankXor != right.pipeBankXor || left.pitch != right.pitch) return false;
+    const auto flat = [](std::uint32_t dimension) { return dimension == static_cast<std::uint32_t>(Graphics::TextureDimension::k2D) || dimension == static_cast<std::uint32_t>(Graphics::TextureDimension::k2DArray); };
+    if (left.dimension != right.dimension && !(flat(left.dimension) && flat(right.dimension) && left.depth == right.depth)) return false;
+    return Graphics::BlockWidth(left.format) == 1u && Graphics::BlockWidth(right.format) == 1u && Graphics::BytesPerElement(left.format) == Graphics::BytesPerElement(right.format);
+}
+
+std::shared_ptr<DeviceSurface> SurfaceDevice::CreateFromResource(const SurfaceKey&, const Graphics::GuestTextureResource&, std::string& reason) {
+    reason = "surface device cannot create from a resource";
+    return nullptr;
+}
+
 std::optional<Found> SurfaceTable::Find(const SurfaceKey& key, std::span<const std::uint32_t, 8> words, std::string& reason) {
+    return findWith(key, [&](std::string& why) { return device.Create(key, words, why); }, reason);
+}
+
+std::optional<Found> SurfaceTable::FindResource(const SurfaceKey& key, const Graphics::GuestTextureResource& resource, std::string& reason) {
+    return findWith(key, [&](std::string& why) { return device.CreateFromResource(key, resource, why); }, reason);
+}
+
+template<typename TCreate>
+std::optional<Found> SurfaceTable::findWith(const SurfaceKey& key, TCreate&& create, std::string& reason) {
     std::lock_guard lock(mutex);
     counts.lookups++;
-    if (gpuWrites.ChangedSince(key.address, key.bytes, 0)) {
+    const auto found = surfaces.find(key);
+    std::erase_if(newer, [](const std::shared_ptr<Surface>& surface) { return !surface->gpuNewer || surface->retired; });
+    if (!newer.empty() && (found == surfaces.end() || !found->second->gpuNewer)) {
+        for (auto& other : newer) {
+            const auto& otherKey = other->key;
+            if (otherKey == key || !SameBacking(otherKey, key)) continue;
+            const auto otherOwner = OwnerOf(*other);
+            if (gpuWrites.ChangedSince(key.address, key.bytes, other->imageStamp, otherOwner) || shared.ChangedSince(key.address, key.bytes, other->stamp, otherOwner)) break;
+            other->used = ++clock;
+            counts.aliasServed++;
+            counts.ready++;
+            return Found{other, true};
+        }
+    }
+    const auto owner = found != surfaces.end() ? OwnerOf(*found->second) : std::uintptr_t{0};
+    const auto since = found != surfaces.end() && found->second->gpuNewer ? found->second->imageStamp : std::uint64_t{0};
+    if (gpuWrites.ChangedSince(key.address, key.bytes, since, owner)) {
+        if (found != surfaces.end()) found->second->gpuNewer = false;
         counts.gpuWritten++;
         return Found{nullptr, false, true};
     }
-    if (const auto found = surfaces.find(key); found != surfaces.end()) {
+    if (found != surfaces.end()) {
         auto& surface = found->second;
         surface->used = ++clock;
+        if (surface->gpuNewer) {
+            if (!shared.ChangedSince(key.address, key.bytes, surface->stamp, owner)) {
+                counts.ownServed++;
+                counts.ready++;
+                return Found{surface, true};
+            }
+            surface->gpuNewer = false;
+            counts.gpuWritten++;
+            return Found{nullptr, false, true};
+        }
         if (surface->state == State::Ready && (shared.ChangedSince(key.address, key.bytes, surface->stamp, Events::ImageSetOwner) || gpuWrites.ChangedSince(key.address, key.bytes, surface->imageStamp))) {
             surface->state = State::Stale;
             work.push_back(surface);
@@ -71,7 +129,7 @@ std::optional<Found> SurfaceTable::Find(const SurfaceKey& key, std::span<const s
         else counts.pending++;
         return Found{surface, surface->state == State::Ready};
     }
-    auto created = device.Create(key, words, reason);
+    auto created = create(reason);
     if (created == nullptr) {
         counts.refused++;
         return std::nullopt;
@@ -109,7 +167,7 @@ std::vector<std::shared_ptr<Surface>> SurfaceTable::TakeWork() {
     std::lock_guard lock(mutex);
     std::vector<std::shared_ptr<Surface>> taken;
     taken.swap(work);
-    std::erase_if(taken, [](const std::shared_ptr<Surface>& surface) { return surface->retired; });
+    std::erase_if(taken, [](const std::shared_ptr<Surface>& surface) { return surface->retired || surface->gpuNewer; });
     return taken;
 }
 
@@ -119,6 +177,64 @@ void SurfaceTable::MarkReady(Surface& surface, std::uint64_t stamp, std::uint64_
     surface.stamp = stamp;
     surface.imageStamp = imageStamp;
     counts.detiled++;
+}
+
+std::shared_ptr<Surface> SurfaceTable::Adopt(const SurfaceKey& key, std::span<const std::uint32_t, 8> words, std::string& reason) {
+    return adoptWith(key, [&](std::string& why) { return device.Create(key, words, why); }, reason);
+}
+
+std::shared_ptr<Surface> SurfaceTable::AdoptResource(const SurfaceKey& key, const Graphics::GuestTextureResource& resource, std::string& reason) {
+    return adoptWith(key, [&](std::string& why) { return device.CreateFromResource(key, resource, why); }, reason);
+}
+
+template<typename TCreate>
+std::shared_ptr<Surface> SurfaceTable::adoptWith(const SurfaceKey& key, TCreate&& create, std::string& reason) {
+    std::lock_guard lock(mutex);
+    if (const auto found = surfaces.find(key); found != surfaces.end()) {
+        found->second->used = ++clock;
+        return found->second;
+    }
+    auto created = create(reason);
+    if (created == nullptr) {
+        counts.refused++;
+        return nullptr;
+    }
+    auto surface = std::make_shared<Surface>();
+    surface->key = key;
+    surface->device = std::move(created);
+    surface->used = ++clock;
+    surfaces.emplace(key, surface);
+    heldBytes += key.bytes;
+    counts.created++;
+    if (budget != 0u && heldBytes > budget) evict();
+    return surface;
+}
+
+void SurfaceTable::MarkGpuWritten(Surface& surface) {
+    std::lock_guard lock(mutex);
+    if (!surface.gpuNewer) {
+        if (const auto found = surfaces.find(surface.key); found != surfaces.end() && found->second.get() == &surface) newer.push_back(found->second);
+    }
+    surface.state = State::Ready;
+    surface.gpuNewer = true;
+    surface.stamp = shared.Serial();
+    surface.imageStamp = gpuWrites.Serial();
+    counts.ownWrites++;
+}
+
+void SurfaceTable::ClearGpuNewer(Surface& surface) {
+    std::lock_guard lock(mutex);
+    surface.gpuNewer = false;
+}
+
+std::vector<std::shared_ptr<Surface>> SurfaceTable::Overlapping(std::uint64_t address, std::uint64_t bytes) const {
+    std::lock_guard lock(mutex);
+    std::vector<std::shared_ptr<Surface>> overlapping;
+    const auto end = address + bytes;
+    for (const auto& [key, surface] : surfaces) {
+        if (key.address < end && address < key.address + key.bytes) overlapping.push_back(surface);
+    }
+    return overlapping;
 }
 
 void SurfaceTable::Requeue(const std::shared_ptr<Surface>& surface) {

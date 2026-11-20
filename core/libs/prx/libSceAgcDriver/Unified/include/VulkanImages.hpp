@@ -21,12 +21,16 @@ public:
     [[nodiscard]] std::uint64_t View(const ViewKey& view, std::uint32_t kind, std::string& reason) override;
     [[nodiscard]] std::uint32_t Layout() const override { return VK_IMAGE_LAYOUT_GENERAL; }
     [[nodiscard]] VkImageView StorageView(std::uint32_t level, std::uint32_t layer, std::uint32_t elementBytes);
+    [[nodiscard]] VkImageView ShapedStorageView(std::uint32_t level, bool array, bool uintView, std::string& reason);
+    [[nodiscard]] VkImageView AttachmentView(VkFormat viewFormat, std::uint32_t level, std::uint32_t layer, std::uint32_t layers, std::string& reason);
+    [[nodiscard]] bool Attachable() const { return attachable; }
     [[nodiscard]] VkImage Image() const { return image; }
     [[nodiscard]] const Graphics::GuestTextureResource& Resource() const { return resource; }
     [[nodiscard]] const Graphics::SurfaceGeometry& Geometry() const { return geometry; }
     [[nodiscard]] bool Initialized() const { return initialized; }
     [[nodiscard]] bool Compressed() const { return compressed; }
     void SetInitialized() { initialized = true; }
+    void EnsureGeneral(VkCommandBuffer commands);
 
 private:
     const Graphics::Context& context;
@@ -39,15 +43,21 @@ private:
     bool compressed = false;
     bool identity = false;
     std::mutex mutex;
-    std::map<std::tuple<std::uint32_t, std::uint32_t, std::uint32_t, std::uint32_t, std::uint32_t, std::uint32_t>, VkImageView> views;
+    std::map<std::tuple<std::uint32_t, std::uint32_t, std::uint32_t, std::uint32_t, std::uint32_t, std::uint32_t, std::uint32_t>, VkImageView> views;
     std::map<std::tuple<std::uint32_t, std::uint32_t, std::uint32_t>, VkImageView> storageViews;
+    std::map<std::tuple<std::uint32_t, bool, bool>, VkImageView> shapedStorageViews;
+    std::map<std::tuple<std::uint32_t, std::uint32_t, std::uint32_t, std::uint32_t>, VkImageView> attachmentViews;
+    bool attachable = false;
 };
+
+void CopyImageContent(const Graphics::Context& context, VkCommandBuffer commands, VkImage source, VkImage destination, std::uint32_t width, std::uint32_t height, std::uint32_t levels, std::uint32_t layers);
 
 class VulkanSurfaceDevice final : public SurfaceDevice {
 public:
     explicit VulkanSurfaceDevice(const Graphics::Context& context) : context(context) {}
 
     [[nodiscard]] std::shared_ptr<DeviceSurface> Create(const SurfaceKey& key, std::span<const std::uint32_t, 8> words, std::string& reason) override;
+    [[nodiscard]] std::shared_ptr<DeviceSurface> CreateFromResource(const SurfaceKey& key, const Graphics::GuestTextureResource& resource, std::string& reason) override;
 
 private:
     const Graphics::Context& context;

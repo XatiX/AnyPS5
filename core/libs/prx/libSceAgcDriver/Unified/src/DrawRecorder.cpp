@@ -13,6 +13,7 @@
 #include "prx/libSceAgcDriver/Graphics/include/ShaderResources.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/Shaders.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/Texture.hpp"
+#include "prx/libSceAgcDriver/Graphics/include/TextureFormat.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/VertexInput.hpp"
 #include "prx/libSceAgcDriver/Unified/include/DataRing.hpp"
 #include "prx/libSceAgcDriver/Unified/include/Events.hpp"
@@ -24,6 +25,7 @@
 #include "prx/libSceAgcDriver/Unified/include/TableMirror.hpp"
 #include "prx/libSceAgcDriver/Unified/include/Targets.hpp"
 #include "prx/libSceAgcDriver/Unified/include/VulkanHeap.hpp"
+#include "prx/libSceAgcDriver/Unified/include/VulkanImages.hpp"
 #include "prx/libc/include/GuestArena.hpp"
 #include "Optimization/ShaderStageInputInfo.hpp"
 #include "BdaAbi.hpp"
@@ -192,6 +194,12 @@ struct Totals {
     std::uint64_t copyBackBytes = 0;
     std::uint64_t copyBackCovered = 0;
     std::uint64_t importsReturned = 0;
+    std::uint64_t residencyRefreshes = 0;
+    std::uint64_t recordWrites = 0;
+    std::uint64_t recordTargetDraws = 0;
+    std::uint64_t recordAdoptions = 0;
+    std::uint64_t recordAdoptionRefusals = 0;
+    std::uint64_t recordTargetRefusals = 0;
     std::uint64_t indirectDispatches = 0;
     std::uint64_t gdsBindings = 0;
     std::uint64_t knownGpuWritten = 0;
@@ -263,6 +271,26 @@ bool copiesBackDispatchWrites() {
     return copies;
 }
 
+std::atomic<std::uint64_t> recordedFills{0};
+std::atomic<std::uint64_t> recordedCopies{0};
+
+bool adoptsUpstream() {
+    static const bool adopts = std::getenv("APS5_RECODE_ADOPT_UPSTREAM") != nullptr;
+    return adopts;
+}
+
+std::atomic<std::uint64_t> publishedRecords{0};
+
+bool recordsTargets() {
+    static const bool records = std::getenv("APS5_RECODE_TARGET_RECORDS") != nullptr;
+    return records;
+}
+
+bool refreshesBeforeCopyBack() {
+    static const bool refreshes = std::getenv("APS5_RECODE_NO_COPY_BACK_REFRESH") == nullptr;
+    return refreshes;
+}
+
 bool bindsGds() {
     static const bool binds = std::getenv("APS5_RECODE_NO_GDS") == nullptr;
     return binds;
@@ -271,6 +299,11 @@ bool bindsGds() {
 bool recordsMipTailTargets() {
     static const bool records = std::getenv("APS5_RECODE_NO_MIP_TAIL_TARGETS") == nullptr;
     return records;
+}
+
+bool marksDispatchWrites() {
+    static const bool marks = std::getenv("APS5_RECODE_NO_DISPATCH_WRITTEN_PAGES") == nullptr;
+    return marks;
 }
 
 bool buildsPipelinesAhead() {
@@ -636,7 +669,7 @@ public:
         line += "; passes " + std::to_string(totals.passesBegun) + " begun, " + std::to_string(totals.passesContinued) + " draws continued, " + std::to_string(totals.passFeedback) + " broken by a target read";
         line += "; target memo " + std::to_string(totals.targetMemoHits) + " hits, " + std::to_string(totals.targetMemoMisses) + " misses; " + std::to_string(totals.deferredReads) + " draws with reads bound at record";
         line += "; residency updates landed " + std::to_string(totals.residencyLands);
-        line += "; known buffers " + std::to_string(totals.knownServed) + " served, " + std::to_string(totals.knownMapped) + " mapped (" + std::to_string(totals.knownPaged) + " paged in), " + std::to_string(totals.knownCopied) + " copied (" + std::to_string(totals.knownGpuWritten) + " GPU-written ranges not copied), " + std::to_string(totals.knownRefused) + " unresolved, " + std::to_string(totals.knownSkipped) + " skipped (" + std::to_string(totals.knownPointers) + " of them pointers); known writes " + std::to_string(totals.knownWritten) + " direct (" + std::to_string(totals.knownWriteBytes >> 10u) + " KiB landed), " + std::to_string(totals.knownWriteLookups) + " through the page table, " + std::to_string(totals.copyBacks) + " copied back to their import after the dispatch (" + std::to_string(totals.copyBackBytes >> 20u) + " MiB, " + std::to_string(totals.copyBackCovered >> 10u) + " KiB of written pieces not landed, " + std::to_string(totals.importsReturned) + " chunks returned from their import)";
+        line += "; known buffers " + std::to_string(totals.knownServed) + " served, " + std::to_string(totals.knownMapped) + " mapped (" + std::to_string(totals.knownPaged) + " paged in), " + std::to_string(totals.knownCopied) + " copied (" + std::to_string(totals.knownGpuWritten) + " GPU-written ranges not copied), " + std::to_string(totals.knownRefused) + " unresolved, " + std::to_string(totals.knownSkipped) + " skipped (" + std::to_string(totals.knownPointers) + " of them pointers); known writes " + std::to_string(totals.knownWritten) + " direct (" + std::to_string(totals.knownWriteBytes >> 10u) + " KiB landed), " + std::to_string(totals.knownWriteLookups) + " through the page table, " + std::to_string(totals.copyBacks) + " copied back to their import after the dispatch (" + std::to_string(totals.copyBackBytes >> 20u) + " MiB, " + std::to_string(totals.copyBackCovered >> 10u) + " KiB of written pieces not landed, " + std::to_string(totals.importsReturned) + " chunks returned from their import, " + std::to_string(totals.residencyRefreshes) + " residency refreshes before the dispatch)";
         line += "; draw inputs " + std::to_string(totals.inputsResident) + " resident, " + std::to_string(totals.inputsImported) + " imported, " + std::to_string(totals.inputsWritten) + " after CPU writes (" + std::to_string(totals.inputsCopied) + " copied into the ring), " + std::to_string(totals.inputsGpuWritten) + " GPU-written, " + std::to_string(totals.inputsAliased) + " aliased, " + std::to_string(totals.inputsMerged) + " served with an overlapping input";
         std::snprintf(text, sizeof(text), "; draw phases surfaces %.1f ms, targets %.1f ms, pipelines %.1f ms, owned uploads %.1f ms", static_cast<double>(totals.surfaceNanoseconds) / 1e6, static_cast<double>(totals.targetNanoseconds) / 1e6, static_cast<double>(totals.graphicsPipelineNanoseconds) / 1e6, static_cast<double>(totals.uploadNanoseconds) / 1e6);
         line += text;
@@ -644,7 +677,12 @@ public:
         line += text;
         std::snprintf(text, sizeof(text), "; table maps %llu hits, %llu uploads (%.1f MiB), %llu retired, %zu held (%.1f MiB)", static_cast<unsigned long long>(totals.mapHits), static_cast<unsigned long long>(totals.mapUploads), static_cast<double>(totals.mapUploadBytes) / 1048576.0, static_cast<unsigned long long>(totals.mapRetired), maps.size(), static_cast<double>(mapBytes) / 1048576.0);
         line += text;
-        line += "; GDS bound " + std::to_string(totals.gdsBindings) + " times; dispatches waited for their pipeline " + std::to_string(totals.pipelineWaits) + " times (" + std::to_string(totals.pipelineWaitNanoseconds / 1000000u) + " ms)";
+        line += "; images adopted from the existing cache " + std::to_string(totals.recordAdoptions) + " (" + std::to_string(totals.recordAdoptionRefusals) + " refused), published back " + std::to_string(publishedRecords.load(std::memory_order_relaxed));
+        line += "; storage writes to recode surfaces " + std::to_string(totals.recordWrites) + "; draws into recode surface targets " + std::to_string(totals.recordTargetDraws) + " (" + std::to_string(totals.recordTargetRefusals) + " targets refused";
+        for (const auto& [why, count] : recordTargetReasons) line += " [" + why + " " + std::to_string(count) + "]";
+        line += ")";
+        line += "; fill and copy kernels recorded " + std::to_string(recordedFills.load(std::memory_order_relaxed)) + " and " + std::to_string(recordedCopies.load(std::memory_order_relaxed));
+        line += "; GDS bound " + std::to_string(totals.gdsBindings) + " times;dispatches waited for their pipeline " + std::to_string(totals.pipelineWaits) + " times (" + std::to_string(totals.pipelineWaitNanoseconds / 1000000u) + " ms)";
         std::snprintf(text, sizeof(text), "; fault buffers %zu in flight, %llu read: %llu faults (%llu unmapped), %llu fault pages served, %llu written ranges (%llu pieces landed late), %llu written overflows", faults.size(), static_cast<unsigned long long>(totals.faultReads), static_cast<unsigned long long>(totals.faults), static_cast<unsigned long long>(totals.unmappedFaults), static_cast<unsigned long long>(totals.faultPages), static_cast<unsigned long long>(totals.writtenRanges), static_cast<unsigned long long>(totals.writtenLate), static_cast<unsigned long long>(totals.writtenOverflows));
         line += text;
         std::snprintf(text, sizeof(text), "; GPU-written chunks %llu switched to their import from the written bitmap (%.1f MiB copied over), %llu from other GPU writes, %llu refused, %llu written pieces already on an import", static_cast<unsigned long long>(totals.importSwitches), static_cast<double>(totals.switchBytes) / 1048576.0, static_cast<unsigned long long>(totals.writtenSwitches), static_cast<unsigned long long>(totals.switchRefused), static_cast<unsigned long long>(totals.writtenOnImports));
@@ -794,8 +832,33 @@ private:
         const auto* import = Graphics::HostImportFor(context, address, static_cast<std::size_t>(bytes));
         if (import == nullptr || address < import->base || address + bytes > import->base + import->bytes) return false;
         returnImports(context, address, bytes, *import);
+        if (refreshesBeforeCopyBack()) refreshResidency(context, address, bytes, *import);
         copyBacks.push_back({address, bytes, import});
         return true;
+    }
+
+    void refreshResidency(const Context& context, std::uint64_t address, std::uint64_t bytes, const Graphics::HostImport& import) {
+        auto& residency = ResidencyService::Get();
+        std::vector<std::pair<std::uint64_t, VkBufferCopy>> regions;
+        const auto end = address + bytes;
+        for (auto at = address; at < end;) {
+            const auto next = std::min(end, (at & ~(ChunkBytes - 1u)) + ChunkBytes);
+            if (!residency.WrittenImport(at & ~(ChunkBytes - 1u))) {
+                if (const auto span = residency.Translate(at, next - at)) {
+                    const auto source = Graphics::HostImportOffset(import, at);
+                    if (!regions.empty() && regions.back().first == span->handle && regions.back().second.srcOffset + regions.back().second.size == source && regions.back().second.dstOffset + regions.back().second.size == span->offset) regions.back().second.size += next - at;
+                    else regions.push_back({span->handle, VkBufferCopy{source, span->offset, next - at}});
+                }
+            }
+            at = next;
+        }
+        if (regions.empty()) return;
+        const auto commands = context.recorder->Commands();
+        Graphics::RecordMemoryBarrier(context, commands, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_ACCESS_SHADER_WRITE_BIT | VK_ACCESS_TRANSFER_WRITE_BIT | VK_ACCESS_SHADER_READ_BIT, VK_ACCESS_TRANSFER_READ_BIT | VK_ACCESS_TRANSFER_WRITE_BIT);
+        const auto copy = context.Function<PFN_vkCmdCopyBuffer>("vkCmdCopyBuffer");
+        for (const auto& [handle, region] : regions) copy(commands, import.buffer, reinterpret_cast<VkBuffer>(static_cast<std::uintptr_t>(handle)), 1, &region);
+        Graphics::RecordMemoryBarrier(context, commands, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_ACCESS_TRANSFER_WRITE_BIT, VK_ACCESS_MEMORY_READ_BIT | VK_ACCESS_MEMORY_WRITE_BIT);
+        totals.residencyRefreshes += regions.size();
     }
 
     void returnImports(const Context& context, std::uint64_t address, std::uint64_t bytes, const Graphics::HostImport& import) {
@@ -1404,6 +1467,7 @@ private:
     }
 
     bool recordDispatch(const Context& context, const Resolve::ResolvedDraw& dispatch, const std::array<std::uint32_t, 3>& groups, std::string& reason) {
+        writtenRecords.clear();
         if (dispatch.stages.size() != 1u || dispatch.stages.front().deferredImages.empty()) return recordBound(context, dispatch, groups, {}, reason);
         auto bound = dispatch;
         auto& stage = bound.stages.front();
@@ -1412,12 +1476,24 @@ private:
         for (const auto& deferred : stage.deferredImages) {
             std::uint32_t slot = 0;
             if ((deferred.request.flags & Heap::RequestFlag::Storage) == 0u) {
+                publishRequest(context, deferred.request);
                 auto owner = Resolve::BindDeferredSampled(context, deferred.request, slot, reason);
                 if (owner == nullptr) return false;
                 stage.slots[deferred.index] = slot;
                 if (context.recorder != nullptr) context.recorder->Keep(std::const_pointer_cast<void>(owner));
                 continue;
             }
+            auto record = Resolve::BindDeferredRecord(deferred.request, slot);
+            if (record == nullptr) {
+                if (auto adopted = adoptStorage(context, deferred.request)) record = Resolve::BindRecordSlot(deferred.request, std::move(adopted), slot);
+            }
+            if (record != nullptr) {
+                stage.slots[deferred.index] = slot;
+                if (context.recorder != nullptr) context.recorder->Keep(record);
+                if ((deferred.request.flags & Heap::RequestFlag::Written) != 0u) writtenRecords.push_back(std::move(record));
+                continue;
+            }
+            publishRequest(context, deferred.request);
             auto texture = Resolve::BindDeferredImage(context, deferred.request, slot, reason);
             if (texture == nullptr) return false;
             stage.slots[deferred.index] = slot;
@@ -1541,13 +1617,27 @@ private:
             static_cast<void>(Graphics::DepthSurfaceStoreBack(context, *texture));
             totals.storageWrites++;
         }
-        if (!written.empty()) GuestMemory::BreakProofs();
+        if (!written.empty() || !writtenRecords.empty()) GuestMemory::BreakProofs();
+        auto* surfaceTable = Resolve::Surfaces();
+        for (const auto& record : writtenRecords) {
+            const auto owner = Images::OwnerOf(*record);
+            static_cast<void>(Events::GpuWrites().Note(record->key.address, record->key.bytes, owner));
+            static_cast<void>(Events::Shared().Note(record->key.address, record->key.bytes, owner));
+            if (surfaceTable != nullptr) surfaceTable->MarkGpuWritten(*record);
+            totals.recordWrites++;
+        }
         std::vector<std::pair<std::uint64_t, std::uint64_t>> writtenRanges;
         for (std::size_t index = 0; index < dispatch.uses.size(); ++index) {
             const auto& use = dispatch.uses[index];
-            if (use.write) writtenRanges.emplace_back(use.address, use.address + use.size);
+            if (!use.write) continue;
+            if (std::ranges::any_of(writtenRecords, [&](const std::shared_ptr<Images::Surface>& record) { return record->key.address <= use.address && use.address + use.size <= record->key.address + record->key.bytes; })) continue;
+            writtenRanges.emplace_back(use.address, use.address + use.size);
         }
+        writtenRecords.clear();
         if (!writtenRanges.empty()) Events::NoteRanges(writtenRanges);
+        if (marksDispatchWrites()) {
+            for (const auto& [begin, end] : writtenRanges) MemoryCore::Get().Pages().NoteGpuWritten(begin, end - begin);
+        }
         return true;
     }
 
@@ -1571,6 +1661,7 @@ private:
             if (stage.deferredImages.empty()) continue;
             for (const auto& deferred : stage.deferredImages) {
                 std::uint32_t slot = 0;
+                publishRequest(context, deferred.request);
                 auto owner = Resolve::BindDeferredSampled(context, deferred.request, slot, reason);
                 if (owner == nullptr) return false;
                 stage.slots[deferred.index] = slot;
@@ -1640,7 +1731,8 @@ private:
         std::vector<std::shared_ptr<void>> owners;
         std::vector<std::shared_ptr<Graphics::StorageTexture>> residents;
         phase = std::chrono::steady_clock::now();
-        const bool memoUsable = std::exchange(targetMemo.valid, false);
+        const bool memoUsable = std::exchange(targetMemo.valid, false) && !recordsTargets();
+        std::vector<std::shared_ptr<Images::Surface>> targetRecords;
         if (memoUsable && targetsFromMemo(context, *recorder, state, views, owners, residents)) {
             totals.targetMemoHits++;
         } else {
@@ -1648,11 +1740,30 @@ private:
             views.clear();
             owners.clear();
             residents.clear();
+            if (recordsTargets() && !state.colors.empty()) {
+                std::vector<VkImageView> recordViews;
+                for (const auto& color : state.colors) {
+                    VkImageView view = VK_NULL_HANDLE;
+                    auto record = targetRecord(context, color, view);
+                    if (record == nullptr) break;
+                    recordViews.push_back(view);
+                    targetRecords.push_back(std::move(record));
+                }
+                if (targetRecords.size() == state.colors.size()) {
+                    views = std::move(recordViews);
+                    for (const auto& record : targetRecords) owners.push_back(record);
+                    totals.recordTargetDraws++;
+                } else {
+                    targetRecords.clear();
+                }
+            }
             for (const auto& color : state.colors) {
+                if (!targetRecords.empty()) break;
                 if (Graphics::AttachmentProxyFormat(context, color.format) != VK_FORMAT_UNDEFINED) {
                     reason = "proxied color format";
                     return false;
                 }
+                publishTarget(context, color);
                 auto resident = Graphics::CachedStorageSurface(context, Graphics::SurfaceForTarget(color));
                 if (resident == nullptr || !resident->Attachable()) {
                     reason = "color target not resident";
@@ -1667,6 +1778,7 @@ private:
                 views.push_back(Graphics::DepthSurfaceViewWithStencilWriteIntent(context, *state.depth, state.depthWrite, state.stencilTest, writesStencil(state)));
             }
         }
+        if (!targetRecords.empty()) drainSurfaces(context, *recorder);
         Graphics::PipelineSetLayouts sets;
         sets.main = setLayout(context, draw, 0);
         sets.split = draw.layout.split;
@@ -1895,6 +2007,16 @@ private:
             if (stage.tableMap != nullptr) recorder->Keep(std::const_pointer_cast<Tables::Mirror>(stage.tableMap));
         }
         if (pageTable != nullptr) recorder->Keep(pageTable);
+        if (!targetRecords.empty()) {
+            auto* surfaceTable = Resolve::Surfaces();
+            for (const auto& record : targetRecords) {
+                const auto owner = Images::OwnerOf(*record);
+                static_cast<void>(Events::GpuWrites().Note(record->key.address, record->key.bytes, owner));
+                static_cast<void>(Events::Shared().Note(record->key.address, record->key.bytes, owner));
+                if (surfaceTable != nullptr) surfaceTable->MarkGpuWritten(*record);
+                recorder->Keep(record);
+            }
+        }
         std::vector<bool> storeNow(residents.size(), false);
         for (std::size_t index = 0; index < residents.size(); ++index) {
             auto& resident = residents[index];
@@ -1909,6 +2031,106 @@ private:
         totals.linearStores += static_cast<std::uint64_t>(std::ranges::count(storeNow, true));
         if (memoizesTargets()) rememberTargets(*recorder, state, views, residents);
         return true;
+    }
+
+    static void publishRequest(const Context& context, const Heap::SlotRequest& request) {
+        if (!adoptsUpstream() && !recordsTargets()) return;
+        try {
+            const auto resource = Graphics::DecodeTextureResource(request.words);
+            PublishRecords(context, resource.baseAddress, Graphics::SurfaceGuestBytes(resource));
+        } catch (const std::exception&) {
+        }
+    }
+
+    static void publishTarget(const Context& context, const Graphics::ColorTarget& color) {
+        if (!adoptsUpstream() && !recordsTargets()) return;
+        try {
+            const auto resource = Graphics::SurfaceForTarget(color);
+            PublishRecords(context, resource.baseAddress, Graphics::SurfaceGuestBytes(resource));
+        } catch (const std::exception&) {
+        }
+    }
+
+    bool adoptFromUpstream(const Context& context, Images::Surface& record, const std::shared_ptr<Graphics::StorageTexture>& upstream, std::string& why) {
+        auto* vulkan = dynamic_cast<Images::VulkanSurface*>(record.device.get());
+        if (vulkan == nullptr || upstream == nullptr || context.recorder == nullptr) {
+            why = "nothing to adopt from";
+            return false;
+        }
+        const auto& resource = vulkan->Resource();
+        const auto& descriptor = upstream->Descriptor();
+        if (vulkan->Compressed() || resource.width != descriptor.width || resource.height != descriptor.height || Graphics::BytesPerElement(resource.format) != Graphics::BytesPerElement(descriptor.format)) {
+            why = "upstream image has another shape";
+            return false;
+        }
+        const auto commands = context.recorder->Commands();
+        vulkan->EnsureGeneral(commands);
+        const auto levels = std::min(static_cast<std::uint32_t>(std::max<std::size_t>(vulkan->Geometry().mips.size(), 1u)), std::max(descriptor.mipCount, 1u));
+        const auto layers = std::min(std::max(vulkan->Geometry().imageLayers, 1u), std::max(upstream->ImageLayers(), 1u));
+        Images::CopyImageContent(context, commands, upstream->Image(), vulkan->Image(), resource.width, resource.height, levels, layers);
+        context.recorder->Keep(upstream);
+        const auto owner = Images::OwnerOf(record);
+        static_cast<void>(Events::GpuWrites().Note(record.key.address, record.key.bytes, owner));
+        static_cast<void>(Events::Shared().Note(record.key.address, record.key.bytes, owner));
+        if (auto* table = Resolve::Surfaces()) table->MarkGpuWritten(record);
+        totals.recordAdoptions++;
+        return true;
+    }
+
+    std::shared_ptr<Images::Surface> adoptStorage(const Context& context, const Heap::SlotRequest& request) {
+        auto* table = Resolve::Surfaces();
+        if (!adoptsUpstream() || table == nullptr || !Resolve::StorageRecordShape(request)) return nullptr;
+        std::string why;
+        const auto key = Images::KeyOf(request.words, why);
+        if (!key.has_value()) return nullptr;
+        try {
+            const auto resource = Graphics::DecodeTextureResource(request.words);
+            const auto mip = std::min(request.flags >> Heap::RequestFlag::MipShift, std::max(resource.mipCount, 1u) - 1u);
+            auto upstream = Graphics::CachedStorageImage(context, request.words, resource, mip, false);
+            auto record = table->Adopt(key->surface, request.words, why);
+            if (record == nullptr || !adoptFromUpstream(context, *record, upstream, why)) {
+                totals.recordAdoptionRefusals++;
+                return nullptr;
+            }
+            return record;
+        } catch (const std::exception&) {
+            totals.recordAdoptionRefusals++;
+            return nullptr;
+        }
+    }
+
+    std::shared_ptr<Images::Surface> targetRecord(const Context& context, const Graphics::ColorTarget& color, VkImageView& view) {
+        const auto refuse = [&](const std::string& why) {
+            totals.recordTargetRefusals++;
+            if (recordTargetReasons.size() < 24u || recordTargetReasons.contains(why)) {
+                if (recordTargetReasons[why]++ == 0u) std::fprintf(stderr, "[recode-record] first target record refusal: %s\n", why.c_str());
+            }
+            return std::shared_ptr<Images::Surface>{};
+        };
+        auto* table = Resolve::Surfaces();
+        if (table == nullptr) return refuse("no surface table");
+        if (color.samples != 1u || color.mipTail || color.dccAddress != 0u || color.cmaskAddress != 0u || color.staged || color.depthSlice != 0u) return refuse("target needs metadata, samples, a mip tail or a slice");
+        std::string why;
+        const auto resource = Graphics::SurfaceForTarget(color);
+        const auto key = Images::KeyOf(resource, why);
+        if (!key.has_value()) return refuse("target key: " + why);
+        const auto found = table->FindResource(key->surface, resource, why);
+        if (!found.has_value()) return refuse("target surface: " + why);
+        auto record = found->surface;
+        if (record == nullptr) {
+            if (!adoptsUpstream()) return refuse("target written by another owner");
+            auto upstream = Graphics::CachedStorageSurface(context, resource);
+            record = table->AdoptResource(key->surface, resource, why);
+            if (record == nullptr || !adoptFromUpstream(context, *record, upstream, why)) {
+                totals.recordAdoptionRefusals++;
+                return refuse("target adoption: " + why);
+            }
+        }
+        auto* vulkan = dynamic_cast<Images::VulkanSurface*>(record->device.get());
+        if (vulkan == nullptr) return refuse("target surface without a Vulkan image");
+        view = vulkan->AttachmentView(color.format, color.mip, resource.baseArray + color.arraySlice, std::max(color.layers, 1u), why);
+        if (view == VK_NULL_HANDLE) return refuse(why);
+        return record;
     }
 
     bool targetsFromMemo(const Context& context, const Graphics::Recorder& recorder, const Graphics::State& state, std::vector<VkImageView>& views, std::vector<std::shared_ptr<void>>& owners, std::vector<std::shared_ptr<Graphics::StorageTexture>>& residents) {
@@ -1964,6 +2186,8 @@ private:
     std::deque<FaultBuffer> faults;
     std::deque<KnownWrite> knownWrites;
     std::vector<CopyBack> copyBacks;
+    std::vector<std::shared_ptr<Images::Surface>> writtenRecords;
+    std::map<std::string, std::uint64_t> recordTargetReasons;
     std::map<std::uint64_t, std::vector<std::pair<std::uint64_t, std::uint64_t>>> copiedBack;
     bool copyingBack = false;
     std::set<std::uint64_t> switches;
@@ -2010,6 +2234,44 @@ bool RecordActive() {
         return value != nullptr && std::string_view(value) == "record";
     }();
     return enabled;
+}
+
+bool RecordsKernels(std::uint32_t queue) {
+    static const bool records = std::getenv("APS5_RECODE_NO_KERNEL_RECORD") == nullptr;
+    return records && RecordActive() && Resolve::DispatchesRoutedOn(queue);
+}
+
+void PublishRecords(const Graphics::Context& context, std::uint64_t address, std::uint64_t bytes) {
+    auto* table = Resolve::Surfaces();
+    if (table == nullptr || context.recorder == nullptr || !RecordActive()) return;
+    for (const auto& record : table->Overlapping(address, bytes)) {
+        if (!record->gpuNewer) continue;
+        auto* vulkan = dynamic_cast<Images::VulkanSurface*>(record->device.get());
+        if (vulkan == nullptr || vulkan->Compressed()) continue;
+        std::shared_ptr<Graphics::StorageTexture> upstream;
+        try {
+            upstream = Graphics::CachedStorageSurface(context, vulkan->Resource());
+        } catch (const std::exception&) {
+            continue;
+        }
+        if (upstream == nullptr) continue;
+        const auto& resource = vulkan->Resource();
+        const auto& descriptor = upstream->Descriptor();
+        if (resource.width != descriptor.width || resource.height != descriptor.height || Graphics::BytesPerElement(resource.format) != Graphics::BytesPerElement(descriptor.format)) continue;
+        const auto commands = context.recorder->Commands();
+        const auto levels = std::min(static_cast<std::uint32_t>(std::max<std::size_t>(vulkan->Geometry().mips.size(), 1u)), std::max(descriptor.mipCount, 1u));
+        const auto layers = std::min(std::max(vulkan->Geometry().imageLayers, 1u), std::max(upstream->ImageLayers(), 1u));
+        Images::CopyImageContent(context, commands, vulkan->Image(), upstream->Image(), resource.width, resource.height, levels, layers);
+        context.recorder->Keep(record);
+        context.recorder->Keep(upstream);
+        upstream->MarkDirty();
+        table->ClearGpuNewer(*record);
+        publishedRecords.fetch_add(1, std::memory_order_relaxed);
+    }
+}
+
+void NoteKernel(Kernel kernel) {
+    (kernel == Kernel::Fill ? recordedFills : recordedCopies).fetch_add(1, std::memory_order_relaxed);
 }
 
 bool IdleStores() {
