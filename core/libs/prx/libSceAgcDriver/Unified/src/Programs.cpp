@@ -1,4 +1,5 @@
 #include "prx/libSceAgcDriver/Unified/include/Programs.hpp"
+#include "prx/libSceAgcDriver/Unified/include/Downgrades.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/Diagnostics.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/Driver.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/Shaders/ShaderRegistry.hpp"
@@ -70,8 +71,35 @@ bool usesImageTables(const ShaderRecompiler::ShaderInfo& info) {
     return std::ranges::any_of(info.images, [](const auto& image) { return image.table != ShaderRecompiler::NoTable; });
 }
 
+class ProbeScope {
+public:
+    explicit ProbeScope(std::uint64_t codeAddress) : active(probed(codeAddress)) {
+        if (active) ShaderRecompiler::SetDebugProbeActive(true);
+    }
+    ~ProbeScope() {
+        if (active) ShaderRecompiler::SetDebugProbeActive(false);
+    }
+    ProbeScope(const ProbeScope&) = delete;
+    ProbeScope& operator=(const ProbeScope&) = delete;
+    [[nodiscard]] bool Active() const { return active; }
+
+private:
+    static bool probed(std::uint64_t codeAddress) {
+        static const char* list = std::getenv("APS5_RECODE_PROBE");
+        if (list == nullptr || *list == '\0') return false;
+        const auto hash = Downgrades::ProgramHash(codeAddress);
+        if (!Downgrades::ListedHash(list, hash)) return false;
+        static std::atomic<std::uint32_t> compiles{0};
+        if (compiles.fetch_add(1) < 16u) std::fprintf(stderr, "[recode-probe] compiling program %016llx at 0x%llx with APS5_PROBE=%s\n", static_cast<unsigned long long>(hash), static_cast<unsigned long long>(codeAddress), std::getenv("APS5_PROBE") != nullptr ? std::getenv("APS5_PROBE") : "(unset)");
+        return true;
+    }
+
+    bool active = false;
+};
+
 template <typename Lap>
 bool materializeStage(const ProgramInputs& inputs, ShaderRecompiler::RecompileRequest& request, const DriverDetail::ShaderSnapshot& snapshot, std::size_t codeOffset, std::uint32_t budget, ShaderMemory& shaderMemory, ProgramSet& out, const Lap& lap, StageProgram& stage, std::string& reason) {
+    const ProbeScope probe(snapshot.codeAddress + codeOffset * sizeof(std::uint32_t));
     const auto source = ShaderRecompiler::PrepareShader(request);
     lap(PhaseVariant);
     if (source == nullptr || source->artifact == nullptr) {
@@ -95,7 +123,7 @@ bool materializeStage(const ProgramInputs& inputs, ShaderRecompiler::RecompileRe
     std::shared_ptr<const ShaderRecompiler::RecompileResult> result;
     std::shared_ptr<const ShaderRecompiler::ResultTemplate> shape;
     ShaderRecompiler::TemplateWords words;
-    if (inputs.templates != nullptr) {
+    if (inputs.templates != nullptr && !probe.Active()) {
         const auto key = invocation.TemplateKey(*capture);
         shape = inputs.templates->Find(key);
         const bool stale = shape != nullptr && !shape->refillable && shape->snapshotKey != invocation.SnapshotKey(*capture);

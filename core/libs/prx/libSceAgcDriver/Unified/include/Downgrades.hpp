@@ -43,6 +43,11 @@ struct Row {
     std::uint64_t indirect = 0;
     std::uint64_t groups = 0;
     std::uint64_t groupsRead = 0;
+    std::uint64_t compileNanoseconds = 0;
+    std::uint64_t compiles = 0;
+    std::uint64_t buildNanoseconds = 0;
+    std::uint64_t builds = 0;
+    std::uint64_t spirvBytes = 0;
     std::map<std::pair<Kind, std::uint32_t>, std::uint64_t> counts;
     std::map<std::pair<Kind, std::uint32_t>, std::string> details;
     [[nodiscard]] std::uint64_t Total() const;
@@ -53,6 +58,9 @@ class Ledger {
 public:
     void NoteWork(std::uint64_t hash, Work work, std::uint64_t groups);
     void NoteGroups(std::uint64_t hash, std::uint64_t groups);
+    void NoteCompile(std::uint64_t hash, std::uint64_t nanoseconds);
+    void NoteBuild(std::uint64_t hash, std::uint64_t nanoseconds, std::uint64_t spirvBytes);
+    [[nodiscard]] std::vector<Row> CompileRows(std::size_t limit) const;
     bool Note(std::uint64_t hash, Kind kind, std::uint32_t binding, std::string_view detail);
     [[nodiscard]] std::vector<Row> Rows() const;
     [[nodiscard]] std::vector<std::string> Table(std::size_t limit) const;
@@ -69,6 +77,8 @@ private:
 [[nodiscard]] bool Excluded(std::uint64_t codeAddress);
 void NoteWork(std::uint64_t codeAddress, Work work, std::uint64_t groups = 0);
 void NoteGroups(std::uint64_t codeAddress, std::uint64_t groups);
+void NoteCompile(std::uint64_t codeAddress, std::uint64_t nanoseconds);
+void NoteBuild(std::uint64_t codeAddress, std::uint64_t nanoseconds, std::uint64_t spirvBytes);
 void Note(std::uint64_t codeAddress, Kind kind, std::uint32_t binding = 0, std::string_view detail = {});
 void NoteHashed(std::uint64_t hash, Kind kind, std::uint32_t binding = 0, std::string_view detail = {});
 void NoteCurrent(Kind kind, std::uint32_t binding = 0, std::string_view detail = {});

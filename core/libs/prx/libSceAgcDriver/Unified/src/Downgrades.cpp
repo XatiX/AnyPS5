@@ -159,6 +159,36 @@ void Ledger::NoteGroups(std::uint64_t hash, std::uint64_t groups) {
     row.groupsRead++;
 }
 
+void Ledger::NoteCompile(std::uint64_t hash, std::uint64_t nanoseconds) {
+    std::lock_guard lock(mutex);
+    auto& row = rows[hash];
+    row.hash = hash;
+    row.compileNanoseconds += nanoseconds;
+    row.compiles++;
+}
+
+void Ledger::NoteBuild(std::uint64_t hash, std::uint64_t nanoseconds, std::uint64_t spirvBytes) {
+    std::lock_guard lock(mutex);
+    auto& row = rows[hash];
+    row.hash = hash;
+    row.buildNanoseconds += nanoseconds;
+    row.builds++;
+    row.spirvBytes = std::max(row.spirvBytes, spirvBytes);
+}
+
+std::vector<Row> Ledger::CompileRows(std::size_t limit) const {
+    std::vector<Row> result;
+    {
+        std::lock_guard lock(mutex);
+        for (const auto& [hash, row] : rows) {
+            if (row.compiles != 0u || row.builds != 0u) result.push_back(row);
+        }
+    }
+    std::ranges::sort(result, [](const Row& left, const Row& right) { return std::max(left.compileNanoseconds, left.buildNanoseconds) > std::max(right.compileNanoseconds, right.buildNanoseconds); });
+    if (result.size() > limit) result.resize(limit);
+    return result;
+}
+
 bool Ledger::Note(std::uint64_t hash, Kind kind, std::uint32_t binding, std::string_view detail) {
     std::lock_guard lock(mutex);
     auto& row = rows[hash];
@@ -189,6 +219,11 @@ std::string Ledger::Format(const Row& row) {
     char text[160];
     std::snprintf(text, sizeof(text), "%016llx %s draws %llu dispatches %llu indirect %llu groups %llu/%llu |", static_cast<unsigned long long>(row.hash), std::string(severityName(row.Worst())).c_str(), static_cast<unsigned long long>(row.draws), static_cast<unsigned long long>(row.dispatches), static_cast<unsigned long long>(row.indirect), static_cast<unsigned long long>(row.groups), static_cast<unsigned long long>(row.groupsRead));
     std::string line = text;
+    if (row.compiles != 0u) {
+        line.pop_back();
+        std::snprintf(text, sizeof(text), "compile %llu ms/%llu |", static_cast<unsigned long long>(row.compileNanoseconds / 1000000u), static_cast<unsigned long long>(row.compiles));
+        line += text;
+    }
     for (const auto& [key, count] : row.counts) {
         std::snprintf(text, sizeof(text), " %s[%u] %llu", std::string(KindName(key.first)).c_str(), key.second, static_cast<unsigned long long>(count));
         line += text;
@@ -281,6 +316,16 @@ void NoteWork(std::uint64_t codeAddress, Work work, std::uint64_t groups) {
     reportWhenDue();
 }
 
+void NoteCompile(std::uint64_t codeAddress, std::uint64_t nanoseconds) {
+    if (!Active()) return;
+    ledger().NoteCompile(ProgramHash(codeAddress), nanoseconds);
+}
+
+void NoteBuild(std::uint64_t codeAddress, std::uint64_t nanoseconds, std::uint64_t spirvBytes) {
+    if (!Active()) return;
+    ledger().NoteBuild(ProgramHash(codeAddress), nanoseconds, spirvBytes);
+}
+
 void NoteGroups(std::uint64_t codeAddress, std::uint64_t groups) {
     if (!Active()) return;
     ledger().NoteGroups(ProgramHash(codeAddress), groups);
@@ -343,6 +388,19 @@ void Report() {
     const auto seconds = std::chrono::duration_cast<std::chrono::seconds>(std::chrono::steady_clock::now() - started()).count();
     std::fprintf(stderr, "[recode-downgrades] table at %lld s: %zu programs with downgrades\n", static_cast<long long>(seconds), lines.size());
     for (const auto& line : lines) std::fprintf(stderr, "[recode-downgrades] %s\n", line.c_str());
+    const auto compiled = ledger().CompileRows(SIZE_MAX);
+    std::uint64_t compileTotal = 0;
+    std::uint64_t compileCount = 0;
+    std::uint64_t buildTotal = 0;
+    std::uint64_t buildCount = 0;
+    for (const auto& row : compiled) {
+        compileTotal += row.compileNanoseconds;
+        compileCount += row.compiles;
+        buildTotal += row.buildNanoseconds;
+        buildCount += row.builds;
+    }
+    std::fprintf(stderr, "[recode-compile] at %lld s: %llu ms waiting on %llu pipeline builds, %llu ms building %llu compute pipelines (one builder thread), %zu programs\n", static_cast<long long>(seconds), static_cast<unsigned long long>(compileTotal / 1000000u), static_cast<unsigned long long>(compileCount), static_cast<unsigned long long>(buildTotal / 1000000u), static_cast<unsigned long long>(buildCount), compiled.size());
+    for (std::size_t index = 0; index < compiled.size() && index < 12u; ++index) std::fprintf(stderr, "[recode-compile] %016llx waited %llu ms/%llu built %llu ms/%llu spirv %llu KiB draws %llu dispatches %llu\n", static_cast<unsigned long long>(compiled[index].hash), static_cast<unsigned long long>(compiled[index].compileNanoseconds / 1000000u), static_cast<unsigned long long>(compiled[index].compiles), static_cast<unsigned long long>(compiled[index].buildNanoseconds / 1000000u), static_cast<unsigned long long>(compiled[index].builds), static_cast<unsigned long long>(compiled[index].spirvBytes >> 10u), static_cast<unsigned long long>(compiled[index].draws), static_cast<unsigned long long>(compiled[index].dispatches));
     if (!settings().strict) return;
     std::array<std::size_t, static_cast<std::size_t>(Severity::Count)> worst{};
     for (const auto& row : ledger().Rows()) worst[static_cast<std::size_t>(row.Worst())]++;

@@ -552,6 +552,7 @@ struct PipelineJob {
     VkPipelineShaderStageCreateFlags stageFlags = 0;
     std::uint32_t subgroupSize = 0;
     VulkanDevice* owner = nullptr;
+    std::uint64_t codeAddress = 0;
 };
 
 constexpr std::uint64_t UnsavedBuildNanoseconds = 5'000'000'000u;
@@ -1479,7 +1480,9 @@ private:
         lock.lock();
         pipelineLock.lock();
         totals.pipelineWaits++;
-        totals.pipelineWaitNanoseconds += elapsed(started);
+        const auto waited = elapsed(started);
+        totals.pipelineWaitNanoseconds += waited;
+        if (Downgrades::Active() && !dispatch.stages.empty()) Downgrades::NoteCompile(dispatch.stages.front().program.codeAddress, waited);
         if (computePipelines.contains(key)) return true;
         if (const auto failed = failedPipelines.find(key); failed != failedPipelines.end()) reason = "compute pipeline failed: " + failed->second;
         return false;
@@ -1520,7 +1523,7 @@ private:
             return false;
         }
         const auto& result = dispatch.stages.front().program.result;
-        PipelineJob job{key, context, result, setLayout(context, dispatch, 0), heap->Layout(), emptySetLayout(context), owner.computePipelineFlags(), 0u, owner.computeSubgroupSize(*result), &owner};
+        PipelineJob job{key, context, result, setLayout(context, dispatch, 0), heap->Layout(), emptySetLayout(context), owner.computePipelineFlags(), 0u, owner.computeSubgroupSize(*result), &owner, dispatch.stages.front().program.codeAddress};
         try {
             job.stageFlags = owner.computeStageFlags(*result);
         } catch (const std::exception& error) {
@@ -1554,6 +1557,7 @@ private:
                 failure = error.what();
             }
             const auto built = elapsed(started);
+            Downgrades::NoteBuild(job->codeAddress, built, job->result != nullptr ? job->result->spirv.size() * sizeof(std::uint32_t) : 0u);
             {
                 std::lock_guard lock(pipelineMutex);
                 buildingPipelines.erase(job->key);
@@ -1910,7 +1914,11 @@ private:
         totals.targetNanoseconds += elapsed(phase);
         phase = std::chrono::steady_clock::now();
         auto pipeline = Graphics::CachedPipeline(context, state, vertexInput, sets, shaders, VK_IMAGE_LAYOUT_GENERAL);
-        totals.graphicsPipelineNanoseconds += elapsed(phase);
+        const auto pipelineSpent = elapsed(phase);
+        totals.graphicsPipelineNanoseconds += pipelineSpent;
+        if (pipelineSpent >= 1000000u && Downgrades::Active()) {
+            for (const auto& stage : draw.stages) Downgrades::NoteCompile(stage.program.codeAddress, pipelineSpent);
+        }
         if (pipeline == nullptr) {
             reason = "no pipeline";
             return false;
