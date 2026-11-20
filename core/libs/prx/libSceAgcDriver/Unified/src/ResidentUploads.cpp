@@ -8,23 +8,12 @@ namespace AgcDriver::Unified {
 ResidentUploads::ResidentUploads(Residency& residency, Committed committed) : residency(residency), committed(committed) {}
 
 void ResidentUploads::snapshot(std::uint64_t address, std::uint64_t size, bool full) {
-    const auto end = address + size;
-    auto cursor = address;
-    while (cursor < end) {
-        auto stop = std::min(end, (cursor & ~(ChunkBytes - 1)) + ChunkBytes);
-        const auto first = residency.Translate(cursor, stop - cursor);
-        if (!first) {
-            counts.skippedBytes += stop - cursor;
-            cursor = stop;
-            continue;
-        }
-        while (stop < end) {
-            const auto next = std::min(end, stop + ChunkBytes);
-            const auto more = residency.Translate(stop, next - stop);
-            if (!more || more->handle != first->handle || more->offset != first->offset + (stop - cursor)) break;
-            stop = next;
-        }
-        PendingUpload upload{first->handle, first->offset, cursor, std::vector<std::byte>(static_cast<std::size_t>(stop - cursor))};
+    std::uint64_t covered = 0;
+    for (const auto& piece : residency.ResidentPieces(address, size)) {
+        const auto cursor = piece.guest;
+        const auto stop = piece.guest + piece.device.bytes;
+        covered += piece.device.bytes;
+        PendingUpload upload{piece.device.handle, piece.device.offset, cursor, std::vector<std::byte>(static_cast<std::size_t>(stop - cursor))};
         if (full && committed != nullptr) {
             for (const auto& [from, to] : committed(cursor, upload.bytes.size(), false)) {
                 std::memcpy(upload.bytes.data() + (from - cursor), reinterpret_cast<const void*>(from), static_cast<std::size_t>(to - from));
@@ -40,8 +29,8 @@ void ResidentUploads::snapshot(std::uint64_t address, std::uint64_t size, bool f
             counts.dirtyBytes += stop - cursor;
         }
         pending.push_back(std::move(upload));
-        cursor = stop;
     }
+    counts.skippedBytes += size - covered;
 }
 
 void ResidentUploads::NoteDirty(std::span<const DirtyRange> ranges) {

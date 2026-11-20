@@ -20,6 +20,7 @@ struct MemoryCoreCounts {
     std::uint64_t staleFaults = 0;
     std::uint64_t landedBytes = 0;
     std::uint64_t driverPagesSettled = 0;
+    std::uint64_t rearmedChanged = 0;
 };
 
 class MemoryCore {
@@ -63,6 +64,7 @@ private:
     std::atomic<std::uint64_t> staleFaults{0};
     std::atomic<std::uint64_t> landedBytes{0};
     std::atomic<std::uint64_t> driverPagesSettled{0};
+    std::atomic<std::uint64_t> rearmedChanged{0};
 };
 
 }

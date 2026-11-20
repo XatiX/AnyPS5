@@ -97,14 +97,21 @@ std::vector<DirtyRange> MemoryCore::ConsumeDirty() {
     }
     std::lock_guard lock(mutex);
     std::vector<ProtectionChange> changes;
-    const PageTable::WriteCheck written = [this, &hashed](std::uint64_t page, bool proven) {
-        if (!proven) {
-            if (const auto found = hashed.find(page); found != hashed.end()) return found->second;
-        }
-        return rehash(page, proven);
+    std::vector<std::uint64_t> unchanged;
+    const PageTable::WriteCheck written = [this, &hashed, &unchanged](std::uint64_t page, bool proven) {
+        bool changed = false;
+        if (const auto found = hashed.find(page); !proven && found != hashed.end()) changed = found->second;
+        else changed = rehash(page, proven);
+        if (!changed) unchanged.push_back(page);
+        return changed;
     };
     auto ranges = hashBusy ? pages.ConsumeDirty(changes, written) : pages.ConsumeDirty(changes);
     protector.Apply(changes);
+    for (const auto page : unchanged) {
+        if (pages.StateOf(page * PageBytes) != PageState::CpuClean || !rehash(page, false)) continue;
+        ranges.push_back({page * PageBytes, PageBytes});
+        rearmedChanged.fetch_add(1, std::memory_order_relaxed);
+    }
     for (const auto& range : ranges) Events::Shared().Note(range.address, range.size);
     return ranges;
 }
@@ -203,7 +210,7 @@ void MemoryCore::NoteDriverWrite(std::uint64_t address, std::uint64_t size) {
 }
 
 MemoryCoreCounts MemoryCore::Counts() const {
-    return {writesOpened.load(std::memory_order_relaxed), hostWritesOpened.load(std::memory_order_relaxed), gpuOwnedFaults.load(std::memory_order_relaxed), foreignFaults.load(std::memory_order_relaxed), staleFaults.load(std::memory_order_relaxed), landedBytes.load(std::memory_order_relaxed), driverPagesSettled.load(std::memory_order_relaxed)};
+    return {writesOpened.load(std::memory_order_relaxed), hostWritesOpened.load(std::memory_order_relaxed), gpuOwnedFaults.load(std::memory_order_relaxed), foreignFaults.load(std::memory_order_relaxed), staleFaults.load(std::memory_order_relaxed), landedBytes.load(std::memory_order_relaxed), driverPagesSettled.load(std::memory_order_relaxed), rearmedChanged.load(std::memory_order_relaxed)};
 }
 
 }
