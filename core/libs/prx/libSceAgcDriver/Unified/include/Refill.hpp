@@ -39,7 +39,10 @@ struct RefillCounts {
     std::uint64_t lookups = 0;
     std::uint64_t placeholders = 0;
     std::uint64_t failures = 0;
+    std::uint64_t deferred = 0;
 };
+
+inline constexpr std::uint32_t DeferSlot = NoSlot - 1u;
 
 class Refill {
 public:

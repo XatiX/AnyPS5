@@ -42,6 +42,17 @@ bool Refill::Fill(std::span<const SlotRequest> requests, std::vector<std::uint32
             counts.failures++;
             return false;
         }
+        if (slot == DeferSlot) {
+            if (deferred != nullptr) {
+                counts.deferred++;
+                deferred->push_back({static_cast<std::uint32_t>(slots.size()), request});
+                if (uses != nullptr && memory.bytes != 0u) uses->push_back({memory, (request.flags & RequestFlag::Written) != 0u});
+            } else {
+                counts.placeholders++;
+            }
+            slots.push_back(0u);
+            continue;
+        }
         slots.push_back(slot);
         if (owners != nullptr && owner != nullptr) owners->push_back(std::move(owner));
         if (uses != nullptr && memory.bytes != 0u) uses->push_back({memory, (request.flags & RequestFlag::Written) != 0u});
@@ -52,6 +63,10 @@ bool Refill::Fill(std::span<const SlotRequest> requests, std::vector<std::uint32
 std::uint32_t Refill::FillOne(const SlotRequest& request, std::string& reason, Span& memory, std::shared_ptr<const void>& owner) {
     const auto slot = (request.flags & RequestFlag::Sampler) != 0u ? sampler(request, reason) : image(request, reason, memory, owner);
     if (slot == NoSlot) counts.failures++;
+    if (slot == DeferSlot) {
+        counts.placeholders++;
+        return 0u;
+    }
     return slot;
 }
 
@@ -68,6 +83,10 @@ std::uint32_t Refill::image(const SlotRequest& request, std::string& reason, Spa
     if (!resolved.has_value()) {
         counts.placeholders++;
         return 0u;
+    }
+    if (resolved->deferred) {
+        memory = resolved->memory;
+        return DeferSlot;
     }
     const auto slot = table.ImageSlot(request.kind, resolved->image);
     if (slot == NoSlot) {
