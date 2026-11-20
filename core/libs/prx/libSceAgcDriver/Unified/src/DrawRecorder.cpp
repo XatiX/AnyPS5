@@ -120,6 +120,18 @@ struct FaultBuffer {
     std::uint64_t serial = 0;
 };
 
+struct KnownWrite {
+    std::uint64_t serial = 0;
+    std::uint64_t address = 0;
+    std::uint64_t bytes = 0;
+};
+
+struct CopyBack {
+    std::uint64_t address = 0;
+    std::uint64_t bytes = 0;
+    const Graphics::HostImport* import = nullptr;
+};
+
 struct Totals {
     std::uint64_t recorded = 0;
     std::uint64_t refused = 0;
@@ -172,6 +184,13 @@ struct Totals {
     std::uint64_t knownPointers = 0;
     std::uint64_t knownRefused = 0;
     std::uint64_t knownSkipped = 0;
+    std::uint64_t knownWritten = 0;
+    std::uint64_t knownWriteLookups = 0;
+    std::uint64_t knownWriteBytes = 0;
+    std::uint64_t copyBacks = 0;
+    std::uint64_t copyBackBytes = 0;
+    std::uint64_t copyBackCovered = 0;
+    std::uint64_t importsReturned = 0;
     std::uint64_t inputsResident = 0;
     std::uint64_t inputsImported = 0;
     std::uint64_t inputsWritten = 0;
@@ -233,6 +252,11 @@ bool servesFaultPages() {
 bool switchesWrittenChunks() {
     static const bool switches = std::getenv("APS5_RECODE_NO_WRITTEN_IMPORTS") == nullptr;
     return switches;
+}
+
+bool copiesBackDispatchWrites() {
+    static const bool copies = std::getenv("APS5_RECODE_NO_COPY_BACK") == nullptr;
+    return copies;
 }
 
 struct DrawInput {
@@ -313,6 +337,7 @@ void countInput(Totals& totals, InputSource source) {
 
 constexpr std::uint64_t KnownBufferLimitBytes = 256ull << 20u;
 constexpr std::uint64_t KnownCopyLimitBytes = 64ull << 10u;
+constexpr std::uint64_t KnownWriteLimitBytes = 1ull << 20u;
 constexpr std::uint64_t InputCopyLimitBytes = 64ull << 10u;
 constexpr std::uint32_t PagesPerChunk = static_cast<std::uint32_t>(ChunkBytes / PageBytes);
 
@@ -578,7 +603,7 @@ public:
         line += "; passes " + std::to_string(totals.passesBegun) + " begun, " + std::to_string(totals.passesContinued) + " draws continued, " + std::to_string(totals.passFeedback) + " broken by a target read";
         line += "; target memo " + std::to_string(totals.targetMemoHits) + " hits, " + std::to_string(totals.targetMemoMisses) + " misses; " + std::to_string(totals.deferredReads) + " draws with reads bound at record";
         line += "; residency updates landed " + std::to_string(totals.residencyLands);
-        line += "; known buffers " + std::to_string(totals.knownServed) + " served, " + std::to_string(totals.knownMapped) + " mapped (" + std::to_string(totals.knownPaged) + " paged in), " + std::to_string(totals.knownCopied) + " copied, " + std::to_string(totals.knownRefused) + " unresolved, " + std::to_string(totals.knownSkipped) + " skipped (" + std::to_string(totals.knownPointers) + " of them pointers)";
+        line += "; known buffers " + std::to_string(totals.knownServed) + " served, " + std::to_string(totals.knownMapped) + " mapped (" + std::to_string(totals.knownPaged) + " paged in), " + std::to_string(totals.knownCopied) + " copied, " + std::to_string(totals.knownRefused) + " unresolved, " + std::to_string(totals.knownSkipped) + " skipped (" + std::to_string(totals.knownPointers) + " of them pointers); known writes " + std::to_string(totals.knownWritten) + " direct (" + std::to_string(totals.knownWriteBytes >> 10u) + " KiB landed), " + std::to_string(totals.knownWriteLookups) + " through the page table, " + std::to_string(totals.copyBacks) + " copied back to their import after the dispatch (" + std::to_string(totals.copyBackBytes >> 20u) + " MiB, " + std::to_string(totals.copyBackCovered >> 10u) + " KiB of written pieces not landed, " + std::to_string(totals.importsReturned) + " chunks returned from their import)";
         line += "; draw inputs " + std::to_string(totals.inputsResident) + " resident, " + std::to_string(totals.inputsImported) + " imported, " + std::to_string(totals.inputsWritten) + " after CPU writes (" + std::to_string(totals.inputsCopied) + " copied into the ring), " + std::to_string(totals.inputsGpuWritten) + " GPU-written, " + std::to_string(totals.inputsAliased) + " aliased, " + std::to_string(totals.inputsMerged) + " served with an overlapping input";
         std::snprintf(text, sizeof(text), "; draw phases surfaces %.1f ms, targets %.1f ms, pipelines %.1f ms, owned uploads %.1f ms", static_cast<double>(totals.surfaceNanoseconds) / 1e6, static_cast<double>(totals.targetNanoseconds) / 1e6, static_cast<double>(totals.graphicsPipelineNanoseconds) / 1e6, static_cast<double>(totals.uploadNanoseconds) / 1e6);
         line += text;
@@ -702,7 +727,156 @@ private:
         if (copied) Graphics::RecordMemoryBarrier(context, commands, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT | VK_PIPELINE_STAGE_HOST_BIT, VK_ACCESS_TRANSFER_WRITE_BIT, VK_ACCESS_MEMORY_READ_BIT | VK_ACCESS_MEMORY_WRITE_BIT | VK_ACCESS_HOST_READ_BIT);
     }
 
-    void readFaults(Graphics::Buffer& buffer) {
+    void landWritten(std::uint64_t begin, std::uint64_t size) {
+        auto& residency = ResidencyService::Get();
+        for (auto at = begin; at < begin + size;) {
+            const auto chunk = at & ~(ChunkBytes - 1u);
+            const auto next = std::min(begin + size, chunk + ChunkBytes);
+            if (residency.WrittenImport(chunk)) {
+                totals.writtenOnImports++;
+            } else {
+                landing.emplace_back(at, next - at);
+                totals.writtenLate++;
+                for (auto page = (at - chunk) / PageBytes; page <= (next - 1u - chunk) / PageBytes; ++page) writtenPages[chunk] |= 1u << page;
+                if (switchesWrittenChunks()) switches.insert(chunk);
+            }
+            at = next;
+        }
+    }
+
+    void landKnownWrites(std::uint64_t completed) {
+        while (!knownWrites.empty() && knownWrites.front().serial <= completed) {
+            const auto& written = knownWrites.front();
+            if (!ResidencyService::Get().WrittenImportThroughout(written.address, written.bytes)) {
+                landWritten(written.address, written.bytes);
+                totals.knownWriteBytes += written.bytes;
+            }
+            knownWrites.pop_front();
+        }
+    }
+
+    bool queueCopyBack(const Context& context, std::uint64_t address, std::uint64_t bytes) {
+        if (!copyingBack || bytes > KnownBufferLimitBytes || ResidencyService::Get().WrittenImportThroughout(address, bytes)) return false;
+        const auto* import = Graphics::HostImportFor(context, address, static_cast<std::size_t>(bytes));
+        if (import == nullptr || address < import->base || address + bytes > import->base + import->bytes) return false;
+        returnImports(context, address, bytes, *import);
+        copyBacks.push_back({address, bytes, import});
+        return true;
+    }
+
+    void returnImports(const Context& context, std::uint64_t address, std::uint64_t bytes, const Graphics::HostImport& import) {
+        auto& residency = ResidencyService::Get();
+        if (!residency.WrittenImportAny(address, bytes)) return;
+        std::vector<std::pair<std::uint64_t, VkBufferCopy>> regions;
+        for (auto chunk = address & ~(ChunkBytes - 1u); chunk < address + bytes; chunk += ChunkBytes) {
+            if (chunk < import.base || chunk + ChunkBytes > import.base + import.bytes || !residency.WrittenImport(chunk)) continue;
+            const auto span = residency.ReturnWrittenImport(chunk);
+            if (!span) continue;
+            regions.push_back({span->handle, VkBufferCopy{Graphics::HostImportOffset(import, chunk), span->offset, ChunkBytes}});
+        }
+        if (regions.empty()) return;
+        const auto commands = context.recorder->Commands();
+        Graphics::RecordMemoryBarrier(context, commands, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_ACCESS_SHADER_WRITE_BIT | VK_ACCESS_TRANSFER_WRITE_BIT, VK_ACCESS_TRANSFER_READ_BIT | VK_ACCESS_TRANSFER_WRITE_BIT);
+        const auto copy = context.Function<PFN_vkCmdCopyBuffer>("vkCmdCopyBuffer");
+        for (const auto& [handle, region] : regions) copy(commands, import.buffer, reinterpret_cast<VkBuffer>(static_cast<std::uintptr_t>(handle)), 1, &region);
+        totals.importsReturned += regions.size();
+    }
+
+    void recordCopyBacks(const Context& context, VkCommandBuffer commands, std::uint64_t serial) {
+        if (copyBacks.empty()) return;
+        auto& residency = ResidencyService::Get();
+        const auto copy = context.Function<PFN_vkCmdCopyBuffer>("vkCmdCopyBuffer");
+        auto& covered = copiedBack[serial];
+        std::vector<std::pair<std::uint64_t, std::uint64_t>> ends;
+        std::vector<VkBufferCopy> regions;
+        std::uint64_t handle = 0;
+        VkBuffer target = VK_NULL_HANDLE;
+        const auto flush = [&] {
+            if (!regions.empty()) copy(commands, reinterpret_cast<VkBuffer>(static_cast<std::uintptr_t>(handle)), target, static_cast<std::uint32_t>(regions.size()), regions.data());
+            regions.clear();
+        };
+        for (const auto& back : copyBacks) {
+            const auto end = back.address + back.bytes;
+            const auto whole = residency.WrittenImportAny(back.address, back.bytes) ? std::nullopt : residency.Translate(back.address, back.bytes);
+            if (whole) {
+                if (whole->handle != handle || back.import->buffer != target) {
+                    flush();
+                    handle = whole->handle;
+                    target = back.import->buffer;
+                }
+                regions.push_back({whole->offset, Graphics::HostImportOffset(*back.import, back.address), back.bytes});
+                totals.copyBackBytes += back.bytes;
+            }
+            for (auto at = whole ? end : back.address; at < end;) {
+                const auto chunk = at & ~(ChunkBytes - 1u);
+                const auto next = std::min(end, chunk + ChunkBytes);
+                const auto span = residency.WrittenImport(chunk) ? std::nullopt : residency.Translate(at, next - at);
+                if (span) {
+                    if (span->handle != handle || back.import->buffer != target) {
+                        flush();
+                        handle = span->handle;
+                        target = back.import->buffer;
+                    }
+                    const auto destination = Graphics::HostImportOffset(*back.import, at);
+                    if (!regions.empty() && regions.back().srcOffset + regions.back().size == span->offset && regions.back().dstOffset + regions.back().size == destination) regions.back().size += next - at;
+                    else regions.push_back({span->offset, destination, next - at});
+                    totals.copyBackBytes += next - at;
+                }
+                at = next;
+            }
+            covered.emplace_back(back.address, end);
+            ends.emplace_back(back.address, end);
+            totals.copyBacks++;
+        }
+        flush();
+        copyBacks.clear();
+        Graphics::RecordMemoryBarrier(context, commands, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT | VK_PIPELINE_STAGE_HOST_BIT, VK_ACCESS_TRANSFER_WRITE_BIT, VK_ACCESS_MEMORY_READ_BIT | VK_ACCESS_MEMORY_WRITE_BIT | VK_ACCESS_HOST_READ_BIT);
+        for (const auto& [begin, end] : ends) {
+            Events::Shared().Note(begin, end - begin);
+            MemoryCore::Get().Pages().NoteGpuWritten(begin, end - begin);
+        }
+    }
+
+    void landUncovered(std::uint64_t begin, std::uint64_t size, const std::vector<std::pair<std::uint64_t, std::uint64_t>>* covered) {
+        const auto end = begin + size;
+        if (covered == nullptr) {
+            landWritten(begin, size);
+            return;
+        }
+        for (auto at = begin; at < end;) {
+            const auto hit = std::ranges::find_if(*covered, [&](const auto& range) { return range.first <= at && at < range.second; });
+            if (hit != covered->end()) {
+                const auto stop = std::min(end, hit->second);
+                totals.copyBackCovered += stop - at;
+                at = stop;
+                continue;
+            }
+            auto stop = end;
+            for (const auto& range : *covered) {
+                if (range.first > at && range.first < stop) stop = range.first;
+            }
+            landWritten(at, stop - at);
+            at = stop;
+        }
+    }
+
+    std::uint64_t serveKnownWrite(std::uint64_t address, std::uint64_t bytes, std::uint64_t serial, bool copiedBackWrite) {
+        auto& residency = ResidencyService::Get();
+        if (residency.WrittenImportThroughout(address, bytes)) return residency.TranslateMapped(address, bytes, true);
+        if (bytes > (copiedBackWrite ? KnownBufferLimitBytes : KnownWriteLimitBytes)) return 0u;
+        auto mapped = residency.TranslateMapped(address, bytes, true);
+        if (mapped == 0u && bytes <= KnownWriteLimitBytes && servesFaultPages()) {
+            std::vector<std::uint64_t> pages;
+            for (auto page = address & ~(GpuPageBytes - 1u); page < address + bytes; page += GpuPageBytes) pages.push_back(page);
+            Shadow::ServeFaultPages(pages);
+            mapped = residency.TranslateMapped(address, bytes, true);
+        }
+        if (mapped == 0u || copiedBackWrite) return mapped;
+        if (knownWrites.empty() || knownWrites.back().serial != serial || knownWrites.back().address != address || knownWrites.back().bytes != bytes) knownWrites.push_back({serial, address, bytes});
+        return mapped;
+    }
+
+    void readFaults(Graphics::Buffer& buffer, std::uint64_t serial) {
         namespace Abi = ShaderRecompiler::BdaAbi;
         auto bytes = buffer.Bytes();
         auto* words = reinterpret_cast<std::uint32_t*>(bytes.data());
@@ -711,23 +885,10 @@ private:
         std::vector<std::pair<std::uint64_t, std::uint64_t>> written;
         if (Abi::ForEachWrittenRange(words, [&](std::uint64_t begin, std::size_t size) { written.emplace_back(begin, size); })) {
             totals.writtenRanges += written.size();
-            auto& residency = ResidencyService::Get();
-            for (const auto& [begin, size] : written) {
-                for (auto at = begin; at < begin + size;) {
-                    const auto chunk = at & ~(ChunkBytes - 1u);
-                    const auto next = std::min(begin + size, chunk + ChunkBytes);
-                    if (residency.WrittenImport(chunk)) {
-                        totals.writtenOnImports++;
-                    } else {
-                        landing.emplace_back(at, next - at);
-                        totals.writtenLate++;
-                        for (auto page = (at - chunk) / PageBytes; page <= (next - 1u - chunk) / PageBytes; ++page) writtenPages[chunk] |= 1u << page;
-                        if (switchesWrittenChunks()) switches.insert(chunk);
-                    }
-                    at = next;
-                }
-            }
+            const auto found = copiedBack.find(serial);
+            for (const auto& [begin, size] : written) landUncovered(begin, size, found == copiedBack.end() ? nullptr : &found->second);
         }
+        copiedBack.erase(copiedBack.begin(), copiedBack.upper_bound(serial));
         Abi::Fault report{};
         std::memcpy(&report, bytes.data(), sizeof(report));
         if (report.state == Abi::FaultState::Ready) {
@@ -747,7 +908,7 @@ private:
 
     std::shared_ptr<Graphics::Buffer> faultFor(const Context& context, std::uint64_t serial, std::uint64_t completed) {
         while (!faults.empty() && faults.front().serial <= completed && faults.front().serial != serial) {
-            readFaults(*faults.front().buffer);
+            readFaults(*faults.front().buffer, faults.front().serial);
             spareFaults.push_back(std::move(faults.front().buffer));
             faults.pop_front();
         }
@@ -868,6 +1029,7 @@ private:
         const auto& layout = stage.program.variant->info.bindings;
         const auto& known = stage.program.capture != nullptr ? stage.program.capture->snapshot.knownBuffers : none;
         const auto& infos = stage.program.variant->info.info.knownBuffers;
+        landKnownWrites(completed);
         for (std::uint32_t index = 0; index < layout.knownBufferCount; ++index) {
             const auto dword = layout.KnownBufferDword() + index * ShaderRecompiler::KnownBufferDwords;
             const auto write = [&](std::uint64_t device, std::uint64_t bytes) {
@@ -881,6 +1043,13 @@ private:
             if (address == 0u || bytes == 0u) {
                 totals.knownSkipped++;
                 write(zero, 0u);
+                continue;
+            }
+            if (index < infos.size() && infos[index].written) {
+                const auto mapped = serveKnownWrite(address, bytes, serial, queueCopyBack(context, address, bytes));
+                if (mapped != 0u) totals.knownWritten++;
+                else totals.knownWriteLookups++;
+                write(mapped, mapped != 0u ? bytes : 0u);
                 continue;
             }
             if (const auto copied = copyKnownBuffer(address, bytes, serial, completed); copied != 0u) {
@@ -1187,14 +1356,23 @@ private:
         const auto serial = recorder->OpenBatchSerial();
         const auto completed = recorder->CompletedThrough();
         std::shared_ptr<Graphics::Buffer> pageTable;
+        applySwitches(context, *recorder);
         const auto set = allocateSet(context, main, serial, completed);
-        if (!writeSet(context, dispatch, 0, set, serial, completed, pageTable, reason)) return false;
+        copyBacks.clear();
+        copyingBack = copiesBackDispatchWrites();
         std::array<std::byte, Graphics::ComputePushConstantBytes> block{};
         const auto& push = stage.program.words.pushConstants;
-        if (!push.empty()) std::memcpy(block.data(), push.data(), push.size());
-        servePushKnownBuffers(context, stage, block, serial, completed);
+        const bool setWritten = writeSet(context, dispatch, 0, set, serial, completed, pageTable, reason);
+        if (setWritten) {
+            if (!push.empty()) std::memcpy(block.data(), push.data(), push.size());
+            servePushKnownBuffers(context, stage, block, serial, completed);
+        }
+        copyingBack = false;
+        if (!setWritten) {
+            copyBacks.clear();
+            return false;
+        }
 
-        applySwitches(context, *recorder);
         if (Shadow::OwnedUploadsPending()) {
             std::vector<std::shared_ptr<void>> kept;
             if (Shadow::RecordOwnedUploads(recorder->Commands(), kept) != 0u) totals.residencyLands++;
@@ -1215,6 +1393,7 @@ private:
         context.Resolved(&Graphics::DeviceFunctions::cmdDispatch, "vkCmdDispatch")(commands, groups[0], groups[1], groups[2]);
         recorder->EndGpuTiming(dispatchTiming);
         Graphics::RecordMemoryBarrier(context, commands, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT | VK_PIPELINE_STAGE_HOST_BIT, VK_ACCESS_SHADER_WRITE_BIT, VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT | VK_ACCESS_UNIFORM_READ_BIT | VK_ACCESS_TRANSFER_READ_BIT | VK_ACCESS_TRANSFER_WRITE_BIT | VK_ACCESS_INDIRECT_COMMAND_READ_BIT | VK_ACCESS_INDEX_READ_BIT | VK_ACCESS_VERTEX_ATTRIBUTE_READ_BIT | VK_ACCESS_COLOR_ATTACHMENT_READ_BIT | VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_READ_BIT | VK_ACCESS_HOST_READ_BIT);
+        recordCopyBacks(context, commands, serial);
 
         recorder->Keep(pipeline);
         for (const auto& owned : stage.owners) recorder->Keep(std::const_pointer_cast<void>(owned));
@@ -1647,6 +1826,10 @@ private:
     std::vector<std::pair<std::uint64_t, std::uint64_t>> passTargets;
     TargetMemo targetMemo;
     std::deque<FaultBuffer> faults;
+    std::deque<KnownWrite> knownWrites;
+    std::vector<CopyBack> copyBacks;
+    std::map<std::uint64_t, std::vector<std::pair<std::uint64_t, std::uint64_t>>> copiedBack;
+    bool copyingBack = false;
     std::set<std::uint64_t> switches;
     std::unordered_map<std::uint64_t, std::uint32_t> writtenPages;
     std::vector<std::shared_ptr<Graphics::Buffer>> spareFaults;

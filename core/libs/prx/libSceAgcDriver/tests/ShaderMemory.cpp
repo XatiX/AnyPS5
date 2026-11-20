@@ -3865,9 +3865,16 @@ void verifyImageTableKeys() {
     require(heapTables != 0u, "image table heap mode: no table image array sits in the heap set");
     const auto materialV = TableV(guest.materials.data(), 16u, 3u);
     const auto& known = heap.capture->snapshot.knownBuffers;
-    const auto descriptors = std::ranges::count_if(known, [](const DescriptorValue& value) { return value.dwordCount == 4u; });
-    const auto material = std::ranges::find_if(known, [](const DescriptorValue& value) { return value.dwordCount == 4u; });
-    require(descriptors == 1 && std::equal(materialV.begin(), materialV.end(), material->dwords.begin()), "known buffers: the material V# read through s_buffer_load is not the heap-mode snapshot's one known buffer");
+    const auto& knownInfo = GetResourcePlan(heapRequest)->info.knownBuffers;
+    require(knownInfo.size() == known.size(), "known buffers: the plan and the snapshot list different known buffers");
+    std::vector<DescriptorValue> readDescriptors;
+    std::vector<DescriptorValue> writtenDescriptors;
+    for (std::size_t index = 0; index < known.size(); ++index) {
+        if (known[index].dwordCount != 4u) continue;
+        (knownInfo[index].written ? writtenDescriptors : readDescriptors).push_back(known[index]);
+    }
+    require(readDescriptors.size() == 1u && std::equal(materialV.begin(), materialV.end(), readDescriptors[0].dwords.begin()), "known buffers: the material V# read through s_buffer_load is not the heap-mode snapshot's one read known buffer");
+    require(writtenDescriptors.size() == 1u && std::ranges::none_of(knownInfo, [](const KnownBuffer& info) { return info.written && info.Pointer(); }), "known buffers: the buffer_store_dword V# is not the heap-mode snapshot's one written known buffer");
     require(std::ranges::all_of(known, [](const DescriptorValue& value) { return value.dwordCount == 4u || value.dwordCount == 2u; }), "known buffers: an entry is neither a V# nor a two-dword pointer");
     const auto plain = CompileTable(TableRequest(TableMaterialCode, userData));
     require(plain.capture->snapshot.knownBuffers.empty(), "known buffers: the default compile lists known buffers");

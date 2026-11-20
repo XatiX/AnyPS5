@@ -195,6 +195,7 @@ public:
             }
         }
         m_currentBlock = std::numeric_limits<std::uint32_t>::max();
+        DropKnownReadsOfWrittenSources();
         PlanResourceControlFlow();
         if (m_bdaTraces > bdaTraceLimit) std::fprintf(stderr, "[bda] %u more address accesses in this program not shown\n", m_bdaTraces - bdaTraceLimit);
         CheckTableStores();
@@ -2259,20 +2260,33 @@ private:
         memory.gpuDescriptor = true;
         memory.knownBuffer = NoKnownBuffer;
         static const bool knownBuffers = std::getenv("APS5_RECODE_NO_KNOWN_BUFFERS") == nullptr;
-        if (knownBuffers && m_program.Metadata().directResources && access == BufferAccess::Read && ValidateSource(descriptor, badDword)) memory.knownBuffer = AddKnownBuffer(InternSource(descriptor));
+        static const bool knownWrites = std::getenv("APS5_RECODE_NO_KNOWN_WRITES") == nullptr;
+        const bool known = access == BufferAccess::Read || (knownWrites && (access == BufferAccess::Write || access == BufferAccess::Atomic));
+        const bool valid = knownBuffers && m_program.Metadata().directResources && ValidateSource(descriptor, badDword);
+        if (valid && known) memory.knownBuffer = AddKnownBuffer(InternSource(descriptor), 0u, access != BufferAccess::Read);
+        if (valid && access != BufferAccess::Read) m_writtenSources.insert(InternSource(descriptor));
         m_info.usesDma = true;
         m_info.bdaWrites = m_info.bdaWrites || access == BufferAccess::Write || access == BufferAccess::Atomic;
         return true;
     }
 
-    std::uint32_t AddKnownBuffer(std::uint32_t source, std::uint32_t pointerBytes = 0u) {
-        const auto found = std::ranges::find_if(m_info.knownBuffers, [&](const KnownBuffer& known) { return known.source == source && known.Pointer() == (pointerBytes != 0u); });
+    void DropKnownReadsOfWrittenSources() {
+        if (m_writtenSources.empty()) return;
+        for (auto& memory : m_program.Resources().memoryInfo) {
+            if (memory.knownBuffer >= m_info.knownBuffers.size()) continue;
+            const auto& known = m_info.knownBuffers[memory.knownBuffer];
+            if (!known.written && !known.Pointer() && m_writtenSources.contains(known.source)) memory.knownBuffer = NoKnownBuffer;
+        }
+    }
+
+    std::uint32_t AddKnownBuffer(std::uint32_t source, std::uint32_t pointerBytes = 0u, bool written = false) {
+        const auto found = std::ranges::find_if(m_info.knownBuffers, [&](const KnownBuffer& known) { return known.source == source && known.Pointer() == (pointerBytes != 0u) && known.written == written; });
         if (found != m_info.knownBuffers.end()) {
             found->pointerBytes = std::max(found->pointerBytes, pointerBytes);
             return static_cast<std::uint32_t>(found - m_info.knownBuffers.begin());
         }
         if (m_info.knownBuffers.size() >= RuntimeAbi::BufferCapacity) return NoKnownBuffer;
-        m_info.knownBuffers.push_back({source, pointerBytes});
+        m_info.knownBuffers.push_back({source, pointerBytes, written});
         return static_cast<std::uint32_t>(m_info.knownBuffers.size() - 1u);
     }
 
@@ -2630,6 +2644,7 @@ private:
     ShaderInfo m_info;
     IrBuilder m_builder;
     std::vector<DescriptorSource> m_sources;
+    std::unordered_set<std::uint32_t> m_writtenSources;
     std::unordered_map<const IrValue*, const IrBlock*> m_readOrigins;
     std::vector<std::vector<std::uint32_t>> m_blockSources;
     std::vector<std::vector<std::uint32_t>> m_blockImages;

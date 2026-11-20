@@ -262,10 +262,45 @@ bool ResidencyService::MapWrittenImport(std::uint64_t chunk, std::uint64_t targe
     return true;
 }
 
+bool ResidencyService::WrittenImportAny(std::uint64_t address, std::uint64_t size) const {
+    if (!Attached() || size == 0) return false;
+    std::lock_guard lock(mutex);
+    const auto found = writtenImports.lower_bound(address & ~(ChunkBytes - 1));
+    return found != writtenImports.end() && found->first < address + size;
+}
+
+std::optional<DeviceSpan> ResidencyService::ReturnWrittenImport(std::uint64_t chunk) {
+    if (!Attached()) return std::nullopt;
+    std::lock_guard lock(mutex);
+    if (!pages) return std::nullopt;
+    const auto found = writtenImports.find(chunk);
+    if (found == writtenImports.end()) return std::nullopt;
+    const auto bound = ledger->Translate(chunk, GpuPageBytes);
+    if (!bound) return std::nullopt;
+    if (pages->Lookup(chunk) == found->second) {
+        pages->Unmap(chunk, GpuPageBytes);
+        pages->Map(chunk, GpuPageBytes, bound->address, GpuPagePermissions);
+    }
+    writtenImports.erase(found);
+    ++writtenImportsReturned;
+    return bound;
+}
+
 bool ResidencyService::WrittenImport(std::uint64_t chunk) const {
     if (!Attached()) return false;
     std::lock_guard lock(mutex);
     return writtenImports.contains(chunk);
+}
+
+bool ResidencyService::WrittenImportThroughout(std::uint64_t address, std::uint64_t size) const {
+    if (!Attached() || size == 0) return false;
+    std::lock_guard lock(mutex);
+    const auto first = address & ~(ChunkBytes - 1);
+    auto found = writtenImports.lower_bound(first);
+    for (auto chunk = first; chunk < address + size; chunk += ChunkBytes, ++found) {
+        if (found == writtenImports.end() || found->first != chunk) return false;
+    }
+    return true;
 }
 
 std::shared_ptr<Graphics::Buffer> ResidencyService::PageTableBuffer() const {
@@ -335,17 +370,17 @@ std::optional<DeviceSpan> ResidencyService::Translate(std::uint64_t address, std
     return ledger->Translate(address, size);
 }
 
-std::uint64_t ResidencyService::TranslateMapped(std::uint64_t address, std::uint64_t size) const {
+std::uint64_t ResidencyService::TranslateMapped(std::uint64_t address, std::uint64_t size, bool write) const {
     if (!Attached() || size == 0) return 0;
     std::lock_guard lock(mutex);
     if (!pages) return 0;
-    const auto device = pages->Lookup(address);
+    const auto device = pages->Lookup(address, write);
     if (device == 0) return 0;
     const auto firstPage = address >> GpuPageBits;
     const auto lastPage = (address + size - 1) >> GpuPageBits;
     for (auto page = firstPage + 1; page <= lastPage; ++page) {
         const auto guest = page << GpuPageBits;
-        if (pages->Lookup(guest) != device + (guest - address)) return 0;
+        if (pages->Lookup(guest, write) != device + (guest - address)) return 0;
     }
     return device;
 }
@@ -466,10 +501,10 @@ std::string ResidencyService::Line() const {
         static_cast<unsigned long long>(uploadCounts.dirtyUploads), static_cast<unsigned long long>(uploadCounts.dirtyBytes >> 20), static_cast<unsigned long long>(uploadCounts.fullUploads), static_cast<unsigned long long>(uploadCounts.fullBytes >> 20), static_cast<unsigned long long>(uploadCounts.skippedBytes >> 20),
         static_cast<unsigned long long>(recordedUploads), static_cast<unsigned long long>(recordedBytes >> 20), static_cast<unsigned long long>(stagingCreated), static_cast<unsigned long long>(stagingReused), static_cast<unsigned long long>(stagingPool.size()), static_cast<unsigned long long>(stagingHeld >> 20), static_cast<unsigned long long>(served.size()), static_cast<unsigned long long>(serveRefusals), static_cast<unsigned long long>(ownerRanges));
     if (!pages) return line;
-    char table[640];
-    std::snprintf(table, sizeof(table), "[recode-page-table] leaves %u of %u, updates %llu (%llu MiB), leaves dropped %llu, shared pages %llu; imports mapped %llu pages, %llu spaces, %llu pages of retired imports dropped; fault pages served %llu, already mapped %llu, refused %llu; read backs %llu (%llu KiB), not resident %llu KiB; GPU-written chunks on their import %llu (%llu forgotten)\n", pages->Leaves(), PageTableLeafCapacity,
+    char table[768];
+    std::snprintf(table, sizeof(table), "[recode-page-table] leaves %u of %u, updates %llu (%llu MiB), leaves dropped %llu, shared pages %llu; imports mapped %llu pages, %llu spaces, %llu pages of retired imports dropped; fault pages served %llu, already mapped %llu, refused %llu; read backs %llu (%llu KiB), not resident %llu KiB; GPU-written chunks on their import %llu (%llu forgotten, %llu returned)\n", pages->Leaves(), PageTableLeafCapacity,
         static_cast<unsigned long long>(pageUpdates), static_cast<unsigned long long>(pageUpdateBytes >> 20), static_cast<unsigned long long>(pageLeavesDropped), static_cast<unsigned long long>(ledgerCounts.sharedPages),
-        static_cast<unsigned long long>(importPages.size()), static_cast<unsigned long long>(importMaps), static_cast<unsigned long long>(importPagesForgotten), static_cast<unsigned long long>(faultPagesServed), static_cast<unsigned long long>(faultPagesMapped), static_cast<unsigned long long>(faultPagesRefused), static_cast<unsigned long long>(readBacks), static_cast<unsigned long long>(readBackBytes >> 10), static_cast<unsigned long long>(readBackMissedBytes >> 10), static_cast<unsigned long long>(writtenImports.size()), static_cast<unsigned long long>(writtenImportsForgotten));
+        static_cast<unsigned long long>(importPages.size()), static_cast<unsigned long long>(importMaps), static_cast<unsigned long long>(importPagesForgotten), static_cast<unsigned long long>(faultPagesServed), static_cast<unsigned long long>(faultPagesMapped), static_cast<unsigned long long>(faultPagesRefused), static_cast<unsigned long long>(readBacks), static_cast<unsigned long long>(readBackBytes >> 10), static_cast<unsigned long long>(readBackMissedBytes >> 10), static_cast<unsigned long long>(writtenImports.size()), static_cast<unsigned long long>(writtenImportsForgotten), static_cast<unsigned long long>(writtenImportsReturned));
     return std::string(line) + table;
 }
 

@@ -507,9 +507,10 @@ private:
         }
         const auto& known = variant.info.info.knownBuffers;
         for (std::size_t index = 0; index < snapshot.knownBuffers.size(); ++index) {
-            const auto [address, bytes] = KnownBufferSpan(index < known.size() ? known[index] : ShaderRecompiler::KnownBuffer{}, snapshot.knownBuffers[index]);
+            const auto& info = index < known.size() ? known[index] : ShaderRecompiler::KnownBuffer{};
+            const auto [address, bytes] = KnownBufferSpan(info, snapshot.knownBuffers[index]);
             if (address == 0u || bytes == 0u) continue;
-            uses.push_back({address, bytes, false});
+            uses.push_back({address, bytes, info.written});
         }
     }
 
