@@ -55,13 +55,26 @@ std::size_t SurfaceTable::KeyHash::operator()(const SurfaceKey& key) const {
 std::optional<Found> SurfaceTable::Find(const SurfaceKey& key, std::span<const std::uint32_t, 8> words, std::string& reason) {
     std::lock_guard lock(mutex);
     counts.lookups++;
-    if (gpuWrites.ChangedSince(key.address, key.bytes, 0)) {
+    const auto found = surfaces.find(key);
+    const auto owner = found != surfaces.end() ? OwnerOf(*found->second) : std::uintptr_t{0};
+    if (gpuWrites.ChangedSince(key.address, key.bytes, 0, owner)) {
+        if (found != surfaces.end()) found->second->gpuNewer = false;
         counts.gpuWritten++;
         return Found{nullptr, false, true};
     }
-    if (const auto found = surfaces.find(key); found != surfaces.end()) {
+    if (found != surfaces.end()) {
         auto& surface = found->second;
         surface->used = ++clock;
+        if (surface->gpuNewer) {
+            if (!shared.ChangedSince(key.address, key.bytes, surface->stamp, owner)) {
+                counts.ownServed++;
+                counts.ready++;
+                return Found{surface, true};
+            }
+            surface->gpuNewer = false;
+            counts.gpuWritten++;
+            return Found{nullptr, false, true};
+        }
         if (surface->state == State::Ready && (shared.ChangedSince(key.address, key.bytes, surface->stamp, Events::ImageSetOwner) || gpuWrites.ChangedSince(key.address, key.bytes, surface->imageStamp))) {
             surface->state = State::Stale;
             work.push_back(surface);
@@ -119,6 +132,30 @@ void SurfaceTable::MarkReady(Surface& surface, std::uint64_t stamp, std::uint64_
     surface.stamp = stamp;
     surface.imageStamp = imageStamp;
     counts.detiled++;
+}
+
+void SurfaceTable::MarkGpuWritten(Surface& surface) {
+    std::lock_guard lock(mutex);
+    surface.state = State::Ready;
+    surface.gpuNewer = true;
+    surface.stamp = shared.Serial();
+    surface.imageStamp = gpuWrites.Serial();
+    counts.ownWrites++;
+}
+
+void SurfaceTable::ClearGpuNewer(Surface& surface) {
+    std::lock_guard lock(mutex);
+    surface.gpuNewer = false;
+}
+
+std::vector<std::shared_ptr<Surface>> SurfaceTable::Overlapping(std::uint64_t address, std::uint64_t bytes) const {
+    std::lock_guard lock(mutex);
+    std::vector<std::shared_ptr<Surface>> overlapping;
+    const auto end = address + bytes;
+    for (const auto& [key, surface] : surfaces) {
+        if (key.address < end && address < key.address + key.bytes) overlapping.push_back(surface);
+    }
+    return overlapping;
 }
 
 void SurfaceTable::Requeue(const std::shared_ptr<Surface>& surface) {

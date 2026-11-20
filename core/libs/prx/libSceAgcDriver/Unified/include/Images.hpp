@@ -68,7 +68,12 @@ struct Surface {
     std::uint64_t imageStamp = 0;
     std::uint64_t used = 0;
     bool retired = false;
+    bool gpuNewer = false;
 };
+
+[[nodiscard]] inline std::uintptr_t OwnerOf(const Surface& surface) {
+    return Events::ResourceOwner(&surface);
+}
 
 struct Found {
     std::shared_ptr<Surface> surface;
@@ -86,6 +91,8 @@ struct TableCounts {
     std::uint64_t detiled = 0;
     std::uint64_t gpuWritten = 0;
     std::uint64_t evicted = 0;
+    std::uint64_t ownWrites = 0;
+    std::uint64_t ownServed = 0;
 };
 
 class SurfaceTable {
@@ -95,6 +102,9 @@ public:
     [[nodiscard]] std::optional<Found> Find(const SurfaceKey& key, std::span<const std::uint32_t, 8> words, std::string& reason);
     [[nodiscard]] std::vector<std::shared_ptr<Surface>> TakeWork();
     void MarkReady(Surface& surface, std::uint64_t stamp, std::uint64_t imageStamp);
+    void MarkGpuWritten(Surface& surface);
+    void ClearGpuNewer(Surface& surface);
+    [[nodiscard]] std::vector<std::shared_ptr<Surface>> Overlapping(std::uint64_t address, std::uint64_t bytes) const;
     void Requeue(const std::shared_ptr<Surface>& surface);
     [[nodiscard]] TableCounts TakeCounts();
     [[nodiscard]] std::size_t Size() const;
