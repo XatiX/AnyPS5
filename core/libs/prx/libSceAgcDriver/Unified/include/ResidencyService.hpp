@@ -42,7 +42,9 @@ public:
     std::optional<DeviceSpan> Serve(std::uint64_t address, std::uint64_t size, std::span<const std::pair<std::uint64_t, std::uint64_t>> committed, std::uint64_t owner = 0, std::uint64_t ownerSize = 0);
     bool ServeFaultPage(std::uint64_t page, std::uint64_t allocation, std::uint64_t allocationBytes, std::span<const std::pair<std::uint64_t, std::uint64_t>> committed);
     void MapImports(std::uint64_t serial, std::shared_ptr<const std::vector<ShaderRecompiler::BdaAbi::Range>> ranges);
-    void ForgetImport(std::uint64_t base, std::uint64_t bytes, std::uint64_t deviceBegin, std::uint64_t deviceEnd);
+    std::vector<std::uint64_t> ForgetImport(std::uint64_t base, std::uint64_t bytes, std::uint64_t deviceBegin, std::uint64_t deviceEnd);
+    bool MapWrittenImport(std::uint64_t chunk, std::uint64_t target);
+    [[nodiscard]] bool WrittenImport(std::uint64_t chunk) const;
     [[nodiscard]] std::shared_ptr<Graphics::Buffer> PageTableBuffer() const;
     std::vector<PendingUpload> ReadBack(std::span<const std::pair<std::uint64_t, std::uint64_t>> ranges);
     [[nodiscard]] bool Pending() const;
@@ -75,6 +77,8 @@ private:
     std::vector<std::pair<std::uint64_t, std::uint64_t>> queued;
     std::map<std::uint64_t, std::uint64_t> served;
     std::map<std::uint64_t, std::uint64_t> importPages;
+    std::map<std::uint64_t, std::uint64_t> writtenImports;
+    std::uint64_t writtenImportsForgotten = 0;
     std::deque<std::shared_ptr<const std::vector<ShaderRecompiler::BdaAbi::Range>>> importSpaces;
     std::uint64_t importSerial = 0;
     std::uint64_t importMaps = 0;

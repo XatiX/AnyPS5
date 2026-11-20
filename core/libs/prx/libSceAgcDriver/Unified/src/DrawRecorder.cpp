@@ -39,6 +39,7 @@
 #include <mutex>
 #include <optional>
 #include <set>
+#include <unordered_map>
 #include <thread>
 
 namespace AgcDriver::Graphics {
@@ -140,7 +141,13 @@ struct Totals {
     std::uint64_t unmappedFaults = 0;
     std::uint64_t faultPages = 0;
     std::uint64_t writtenRanges = 0;
+    std::uint64_t writtenLate = 0;
     std::uint64_t writtenOverflows = 0;
+    std::uint64_t writtenOnImports = 0;
+    std::uint64_t importSwitches = 0;
+    std::uint64_t writtenSwitches = 0;
+    std::uint64_t switchBytes = 0;
+    std::uint64_t switchRefused = 0;
     std::uint64_t nanoseconds = 0;
     std::uint64_t dispatches = 0;
     std::uint64_t dispatchExisting = 0;
@@ -191,6 +198,11 @@ bool servesFaultPages() {
     return serves;
 }
 
+bool switchesWrittenChunks() {
+    static const bool switches = std::getenv("APS5_RECODE_NO_WRITTEN_IMPORTS") == nullptr;
+    return switches;
+}
+
 struct DrawInput {
     VkBuffer buffer = VK_NULL_HANDLE;
     VkDeviceSize offset = 0;
@@ -238,6 +250,7 @@ void countInput(Totals& totals, InputSource source) {
 constexpr std::uint64_t KnownBufferLimitBytes = 256ull << 20u;
 constexpr std::uint64_t KnownCopyLimitBytes = 64ull << 10u;
 constexpr std::uint64_t InputCopyLimitBytes = 64ull << 10u;
+constexpr std::uint32_t PagesPerChunk = static_cast<std::uint32_t>(ChunkBytes / PageBytes);
 
 bool copiesInputs() {
     static const bool copies = std::getenv("APS5_RECODE_NO_INPUT_COPIES") == nullptr;
@@ -508,7 +521,9 @@ public:
         line += text;
         std::snprintf(text, sizeof(text), "; table maps %llu hits, %llu uploads (%.1f MiB), %llu retired, %zu held (%.1f MiB)", static_cast<unsigned long long>(totals.mapHits), static_cast<unsigned long long>(totals.mapUploads), static_cast<double>(totals.mapUploadBytes) / 1048576.0, static_cast<unsigned long long>(totals.mapRetired), maps.size(), static_cast<double>(mapBytes) / 1048576.0);
         line += text;
-        std::snprintf(text, sizeof(text), "; fault buffers %zu in flight, %llu read: %llu faults (%llu unmapped), %llu fault pages served, %llu written ranges landed, %llu written overflows", faults.size(), static_cast<unsigned long long>(totals.faultReads), static_cast<unsigned long long>(totals.faults), static_cast<unsigned long long>(totals.unmappedFaults), static_cast<unsigned long long>(totals.faultPages), static_cast<unsigned long long>(totals.writtenRanges), static_cast<unsigned long long>(totals.writtenOverflows));
+        std::snprintf(text, sizeof(text), "; fault buffers %zu in flight, %llu read: %llu faults (%llu unmapped), %llu fault pages served, %llu written ranges (%llu pieces landed late), %llu written overflows", faults.size(), static_cast<unsigned long long>(totals.faultReads), static_cast<unsigned long long>(totals.faults), static_cast<unsigned long long>(totals.unmappedFaults), static_cast<unsigned long long>(totals.faultPages), static_cast<unsigned long long>(totals.writtenRanges), static_cast<unsigned long long>(totals.writtenLate), static_cast<unsigned long long>(totals.writtenOverflows));
+        line += text;
+        std::snprintf(text, sizeof(text), "; GPU-written chunks %llu switched to their import from the written bitmap (%.1f MiB copied over), %llu from other GPU writes, %llu refused, %llu written pieces already on an import", static_cast<unsigned long long>(totals.importSwitches), static_cast<double>(totals.switchBytes) / 1048576.0, static_cast<unsigned long long>(totals.writtenSwitches), static_cast<unsigned long long>(totals.switchRefused), static_cast<unsigned long long>(totals.writtenOnImports));
         line += text;
         for (const auto& [reasonCode, count] : faultReasons) line += "; fault reason " + std::to_string(reasonCode) + " " + std::to_string(count);
         faultReasons.clear();
@@ -574,6 +589,54 @@ private:
         Events::NoteRanges(ends);
     }
 
+    bool switchChunk(const Context& context, VkCommandBuffer commands, std::uint64_t chunk, bool copyWritten, bool& copied) {
+        auto& residency = ResidencyService::Get();
+        if (residency.WrittenImport(chunk)) return false;
+        const auto* import = Graphics::HostImportFor(context, chunk, static_cast<std::size_t>(ChunkBytes));
+        if (import == nullptr || chunk < import->base || chunk + ChunkBytes > import->base + import->bytes) {
+            totals.switchRefused++;
+            return false;
+        }
+        const auto found = writtenPages.find(chunk);
+        const std::uint32_t mask = copyWritten && found != writtenPages.end() ? found->second : 0u;
+        const auto copy = context.Function<PFN_vkCmdCopyBuffer>("vkCmdCopyBuffer");
+        for (std::uint32_t page = 0; page < PagesPerChunk;) {
+            if ((mask & (1u << page)) == 0u) {
+                ++page;
+                continue;
+            }
+            auto last = page;
+            while (last + 1u < PagesPerChunk && (mask & (1u << (last + 1u))) != 0u) ++last;
+            const auto begin = chunk + page * PageBytes;
+            const auto bytes = (last - page + 1u) * PageBytes;
+            page = last + 1u;
+            const auto span = residency.Translate(begin, bytes);
+            if (!span) continue;
+            if (!copied) Graphics::RecordMemoryBarrier(context, commands, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_ACCESS_SHADER_WRITE_BIT | VK_ACCESS_TRANSFER_WRITE_BIT, VK_ACCESS_TRANSFER_READ_BIT | VK_ACCESS_TRANSFER_WRITE_BIT);
+            copied = true;
+            const VkBufferCopy region{span->offset, Graphics::HostImportOffset(*import, begin), bytes};
+            copy(commands, reinterpret_cast<VkBuffer>(static_cast<std::uintptr_t>(span->handle)), import->buffer, 1, &region);
+            totals.switchBytes += bytes;
+        }
+        return residency.MapWrittenImport(chunk, import->address + (chunk - import->base));
+    }
+
+    void applySwitches(const Context& context, Graphics::Recorder& recorder) {
+        if (!switchesWrittenChunks()) return;
+        auto others = Shadow::TakeGpuWrittenChunks();
+        if (others.empty() && switches.empty()) return;
+        const auto commands = recorder.Commands();
+        bool copied = false;
+        for (const auto chunk : switches) {
+            if (switchChunk(context, commands, chunk, true, copied)) totals.importSwitches++;
+        }
+        for (const auto chunk : others) {
+            if (switchChunk(context, commands, chunk, false, copied)) totals.writtenSwitches++;
+        }
+        switches.clear();
+        if (copied) Graphics::RecordMemoryBarrier(context, commands, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT | VK_PIPELINE_STAGE_HOST_BIT, VK_ACCESS_TRANSFER_WRITE_BIT, VK_ACCESS_MEMORY_READ_BIT | VK_ACCESS_MEMORY_WRITE_BIT | VK_ACCESS_HOST_READ_BIT);
+    }
+
     void readFaults(Graphics::Buffer& buffer) {
         namespace Abi = ShaderRecompiler::BdaAbi;
         auto bytes = buffer.Bytes();
@@ -583,7 +646,22 @@ private:
         std::vector<std::pair<std::uint64_t, std::uint64_t>> written;
         if (Abi::ForEachWrittenRange(words, [&](std::uint64_t begin, std::size_t size) { written.emplace_back(begin, size); })) {
             totals.writtenRanges += written.size();
-            landing.insert(landing.end(), written.begin(), written.end());
+            auto& residency = ResidencyService::Get();
+            for (const auto& [begin, size] : written) {
+                for (auto at = begin; at < begin + size;) {
+                    const auto chunk = at & ~(ChunkBytes - 1u);
+                    const auto next = std::min(begin + size, chunk + ChunkBytes);
+                    if (residency.WrittenImport(chunk)) {
+                        totals.writtenOnImports++;
+                    } else {
+                        landing.emplace_back(at, next - at);
+                        totals.writtenLate++;
+                        for (auto page = (at - chunk) / PageBytes; page <= (next - 1u - chunk) / PageBytes; ++page) writtenPages[chunk] |= 1u << page;
+                        if (switchesWrittenChunks()) switches.insert(chunk);
+                    }
+                    at = next;
+                }
+            }
         }
         Abi::Fault report{};
         std::memcpy(&report, bytes.data(), sizeof(report));
@@ -1019,6 +1097,7 @@ private:
         if (!push.empty()) std::memcpy(block.data(), push.data(), push.size());
         servePushKnownBuffers(context, stage, block, serial, completed);
 
+        applySwitches(context, *recorder);
         if (Shadow::OwnedUploadsPending()) {
             std::vector<std::shared_ptr<void>> kept;
             if (Shadow::RecordOwnedUploads(recorder->Commands(), kept) != 0u) totals.residencyLands++;
@@ -1249,6 +1328,7 @@ private:
             recorder->NotePendingRead(parameters.indexAddress, bytes, Graphics::Recorder::ReadKind::DrawInput);
         }
 
+        applySwitches(context, *recorder);
         if (Shadow::OwnedUploadsPending()) {
             phase = std::chrono::steady_clock::now();
             std::vector<std::shared_ptr<void>> kept;
@@ -1376,6 +1456,8 @@ private:
     std::uint64_t ringAddress = 0;
     std::vector<std::pair<std::uint64_t, std::uint64_t>> passTargets;
     std::deque<FaultBuffer> faults;
+    std::set<std::uint64_t> switches;
+    std::unordered_map<std::uint64_t, std::uint32_t> writtenPages;
     std::vector<std::shared_ptr<Graphics::Buffer>> spareFaults;
     std::map<std::uint32_t, std::uint64_t> faultReasons;
     std::optional<RingSpace> space;

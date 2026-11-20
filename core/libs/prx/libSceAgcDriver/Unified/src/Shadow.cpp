@@ -18,6 +18,7 @@
 #include <cstring>
 #include <mutex>
 #include <map>
+#include <set>
 #include <algorithm>
 #include <unordered_map>
 #include <vector>
@@ -499,9 +500,6 @@ void ServeFaultPages(std::span<const std::uint64_t> pages) {
     }
 }
 
-void ForgetImport(std::uint64_t base, std::uint64_t bytes, std::uint64_t deviceBegin, std::uint64_t deviceEnd) {
-    ResidencyService::Get().ForgetImport(base, bytes, deviceBegin, deviceEnd);
-}
 
 void LandGpuWrites(GuestRanges ranges) {
     static const bool ahead = std::getenv("APS5_RECODE_NO_READBACK_AHEAD") == nullptr;
@@ -525,6 +523,49 @@ bool ResidentDrawInputs() {
     return resident;
 }
 
+namespace {
+
+constexpr std::size_t WrittenChunksPendingBound = std::size_t{1} << 16u;
+
+struct WrittenChunks {
+    std::mutex mutex;
+    std::set<std::uint64_t> queued;
+    std::vector<std::uint64_t> pending;
+};
+
+WrittenChunks& writtenChunks() {
+    static auto& chunks = *new WrittenChunks();
+    return chunks;
+}
+
+void queueWrittenChunks(std::uint64_t begin, std::uint64_t end) {
+    auto& chunks = writtenChunks();
+    std::lock_guard lock(chunks.mutex);
+    for (auto chunk = begin & ~(ChunkBytes - 1); chunk < end; chunk += ChunkBytes) {
+        if (chunks.pending.size() < WrittenChunksPendingBound && chunks.queued.insert(chunk).second) chunks.pending.push_back(chunk);
+    }
+}
+
+}
+
+std::vector<std::uint64_t> TakeGpuWrittenChunks() {
+    auto& chunks = writtenChunks();
+    std::lock_guard lock(chunks.mutex);
+    std::vector<std::uint64_t> taken;
+    taken.swap(chunks.pending);
+    return taken;
+}
+
+void ForgetImport(std::uint64_t base, std::uint64_t bytes, std::uint64_t deviceBegin, std::uint64_t deviceEnd) {
+    const auto forgotten = ResidencyService::Get().ForgetImport(base, bytes, deviceBegin, deviceEnd);
+    if (forgotten.empty()) return;
+    auto& chunks = writtenChunks();
+    std::lock_guard lock(chunks.mutex);
+    for (const auto chunk : forgotten) {
+        if (chunks.pending.size() < WrittenChunksPendingBound) chunks.pending.push_back(chunk);
+    }
+}
+
 void NoteGpuWrites(GuestRanges ranges) {
     if (ranges.empty() || !ResidentDrawInputs() || !memoryInstalled()) return;
     static std::mutex markedMutex;
@@ -534,6 +575,7 @@ void NoteGpuWrites(GuestRanges ranges) {
         if (end <= begin) continue;
         begin &= ~(PageBytes - 1);
         end = (end + PageBytes - 1) & ~(PageBytes - 1);
+        queueWrittenChunks(begin, end);
         auto next = marked.upper_bound(begin);
         if (next != marked.begin()) {
             const auto previous = std::prev(next);
