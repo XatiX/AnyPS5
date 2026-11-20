@@ -24,6 +24,7 @@
 #include <string>
 #include <utility>
 #if ANYPS5_UNIFIED
+#include "prx/libSceAgcDriver/Unified/include/Resolve.hpp"
 #include "prx/libSceAgcDriver/Unified/include/Shadow.hpp"
 #endif
 
@@ -502,7 +503,12 @@ void Driver::execute(Submission& submission) {
             currentPacketOffset() = cursor;
             if (gateOpened()) {
                 gateOpened() = false;
-                if (!pipelineDispatch() || submission.queue != 0) timed(&WorkerProfile::dispatchMs, [&] { resolveGroupAhead(submission, queue, cursor); });
+#if ANYPS5_UNIFIED
+                const bool routed = submission.queue != 0 && Unified::Resolve::DispatchesRoutedOn(submission.queue);
+#else
+                const bool routed = false;
+#endif
+                if ((!pipelineDispatch() || submission.queue != 0) && !routed) timed(&WorkerProfile::dispatchMs, [&] { resolveGroupAhead(submission, queue, cursor); });
             }
             const bool ringOverlap = submission.queue != 0 && Graphics::Recorder::DispatchOverlapEnabled();
             if (ringOverlap) Graphics::Recorder::SetDispatchOrder(submission.queue + 1u, ringOrder.afterDispatch);

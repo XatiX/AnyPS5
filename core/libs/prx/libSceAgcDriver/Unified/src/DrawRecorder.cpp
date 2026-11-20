@@ -191,6 +191,7 @@ struct Totals {
     std::uint64_t copyBackBytes = 0;
     std::uint64_t copyBackCovered = 0;
     std::uint64_t importsReturned = 0;
+    std::uint64_t indirectDispatches = 0;
     std::uint64_t knownGpuWritten = 0;
     std::uint64_t inputsResident = 0;
     std::uint64_t inputsImported = 0;
@@ -258,6 +259,11 @@ bool switchesWrittenChunks() {
 bool copiesBackDispatchWrites() {
     static const bool copies = std::getenv("APS5_RECODE_NO_COPY_BACK") == nullptr;
     return copies;
+}
+
+bool recordsIndirectDispatches() {
+    static const bool records = std::getenv("APS5_RECODE_NO_INDIRECT_DISPATCHES") == nullptr;
+    return records;
 }
 
 bool refusesGpuWrittenCopies() {
@@ -498,7 +504,7 @@ bool dispatchPrecheck(const Resolve::ResolvedDraw& dispatch, std::string& reason
         reason = "placeholder images";
         return false;
     }
-    if (dispatch.operation.dispatch.indirect) {
+    if (dispatch.operation.dispatch.indirect && (dispatch.operation.dispatch.indirectAddress == 0u || !recordsIndirectDispatches())) {
         reason = "indirect dispatch";
         return false;
     }
@@ -613,7 +619,7 @@ public:
         line += "; draw inputs " + std::to_string(totals.inputsResident) + " resident, " + std::to_string(totals.inputsImported) + " imported, " + std::to_string(totals.inputsWritten) + " after CPU writes (" + std::to_string(totals.inputsCopied) + " copied into the ring), " + std::to_string(totals.inputsGpuWritten) + " GPU-written, " + std::to_string(totals.inputsAliased) + " aliased, " + std::to_string(totals.inputsMerged) + " served with an overlapping input";
         std::snprintf(text, sizeof(text), "; draw phases surfaces %.1f ms, targets %.1f ms, pipelines %.1f ms, owned uploads %.1f ms", static_cast<double>(totals.surfaceNanoseconds) / 1e6, static_cast<double>(totals.targetNanoseconds) / 1e6, static_cast<double>(totals.graphicsPipelineNanoseconds) / 1e6, static_cast<double>(totals.uploadNanoseconds) / 1e6);
         line += text;
-        std::snprintf(text, sizeof(text), "; dispatches %llu recorded (%llu storage images written), %llu to the existing path, %.1f us per dispatch; compute pipelines %zu held, %llu queued, %llu built in %.1f ms, %zu building, %zu failed", static_cast<unsigned long long>(totals.dispatches), static_cast<unsigned long long>(totals.storageWrites), static_cast<unsigned long long>(totals.dispatchExisting), totals.dispatches == 0 ? 0.0 : static_cast<double>(totals.dispatchNanoseconds) / 1000.0 / static_cast<double>(totals.dispatches), computePipelines.size(), static_cast<unsigned long long>(totals.pipelinesQueued), static_cast<unsigned long long>(totals.pipelinesBuilt), static_cast<double>(totals.pipelineNanoseconds) / 1e6, buildingPipelines.size(), failedPipelines.size());
+        std::snprintf(text, sizeof(text), "; dispatches %llu recorded (%llu indirect, %llu storage images written), %llu to the existing path, %.1f us per dispatch; compute pipelines %zu held, %llu queued, %llu built in %.1f ms, %zu building, %zu failed", static_cast<unsigned long long>(totals.dispatches), static_cast<unsigned long long>(totals.indirectDispatches), static_cast<unsigned long long>(totals.storageWrites), static_cast<unsigned long long>(totals.dispatchExisting), totals.dispatches == 0 ? 0.0 : static_cast<double>(totals.dispatchNanoseconds) / 1000.0 / static_cast<double>(totals.dispatches), computePipelines.size(), static_cast<unsigned long long>(totals.pipelinesQueued), static_cast<unsigned long long>(totals.pipelinesBuilt), static_cast<double>(totals.pipelineNanoseconds) / 1e6, buildingPipelines.size(), failedPipelines.size());
         line += text;
         std::snprintf(text, sizeof(text), "; table maps %llu hits, %llu uploads (%.1f MiB), %llu retired, %zu held (%.1f MiB)", static_cast<unsigned long long>(totals.mapHits), static_cast<unsigned long long>(totals.mapUploads), static_cast<double>(totals.mapUploadBytes) / 1048576.0, static_cast<unsigned long long>(totals.mapRetired), maps.size(), static_cast<double>(mapBytes) / 1048576.0);
         line += text;
@@ -1338,6 +1344,31 @@ private:
         return recordBound(context, bound, groups, written, reason);
     }
 
+    bool placeDispatchArguments(const Context& context, Graphics::Recorder& recorder, std::uint64_t address, std::uint64_t serial, std::uint64_t completed, VkBuffer& buffer, VkDeviceSize& offset, std::string& reason) {
+        constexpr std::size_t bytes = 3u * sizeof(std::uint32_t);
+        const auto* source = reinterpret_cast<const std::byte*>(address);
+        if (!Graphics::Recorder::SnapshotWriteOverlaps(address, bytes) && recorder.PendingLeaseSerial(address, bytes) == 0u && !MemoryCore::Get().Pages().GpuWrittenIn(address, bytes) && GuestMemory::Accessible(source, bytes, false)) {
+            const auto placed = ringWrite(std::span(source, bytes), serial, completed);
+            if (!placed.has_value()) {
+                reason = "ring full";
+                return false;
+            }
+            buffer = ring->Handle();
+            offset = *placed;
+            totals.snapshotArguments++;
+            return true;
+        }
+        const auto* import = Graphics::HostImportFor(context, address, bytes);
+        if (import == nullptr) {
+            reason = "indirect arguments not imported";
+            return false;
+        }
+        recorder.NotePendingRead(address, bytes, Graphics::Recorder::ReadKind::Indirect);
+        buffer = import->buffer;
+        offset = Graphics::HostImportOffset(*import, address);
+        return true;
+    }
+
     bool recordBound(const Context& context, const Resolve::ResolvedDraw& dispatch, const std::array<std::uint32_t, 3>& groups, std::span<const std::shared_ptr<Graphics::StorageTexture>> written, std::string& reason) {
         auto* recorder = context.recorder;
         const auto* heap = Resolve::HeapDevice();
@@ -1346,7 +1377,8 @@ private:
             return false;
         }
         if (!attach(context, reason) || !dispatchPrecheck(dispatch, reason)) return false;
-        for (std::uint32_t axis = 0; axis < 3; ++axis) {
+        const bool indirect = dispatch.operation.dispatch.indirect;
+        for (std::uint32_t axis = 0; axis < 3 && !indirect; ++axis) {
             if (groups[axis] > context.limits.maxComputeWorkGroupCount[axis]) {
                 reason = "group count past the device limit";
                 return false;
@@ -1382,6 +1414,12 @@ private:
             copyBacks.clear();
             return false;
         }
+        VkBuffer argumentBuffer = VK_NULL_HANDLE;
+        VkDeviceSize argumentOffset = 0;
+        if (indirect && !placeDispatchArguments(context, *recorder, dispatch.operation.dispatch.indirectAddress, serial, completed, argumentBuffer, argumentOffset, reason)) {
+            copyBacks.clear();
+            return false;
+        }
 
         if (Shadow::OwnedUploadsPending()) {
             std::vector<std::shared_ptr<void>> kept;
@@ -1391,16 +1429,21 @@ private:
         if (recorder->HasQueuedKeyStores()) recorder->FlushKeyStores();
         if (recorder->HasQueuedStores()) recorder->FlushStores();
         const auto commands = recorder->Commands();
-        Graphics::RecordMemoryBarrier(context, commands, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT | VK_PIPELINE_STAGE_HOST_BIT, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_ACCESS_SHADER_WRITE_BIT | VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT | VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT | VK_ACCESS_TRANSFER_WRITE_BIT | VK_ACCESS_HOST_WRITE_BIT, VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT);
+        Graphics::RecordMemoryBarrier(context, commands, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT | VK_PIPELINE_STAGE_HOST_BIT, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT | (indirect ? VK_PIPELINE_STAGE_DRAW_INDIRECT_BIT : 0u), VK_ACCESS_SHADER_WRITE_BIT | VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT | VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT | VK_ACCESS_TRANSFER_WRITE_BIT | VK_ACCESS_HOST_WRITE_BIT, VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT | (indirect ? VK_ACCESS_INDIRECT_COMMAND_READ_BIT : 0u));
         context.BindComputePipeline(commands, pipeline->pipeline);
         const auto bind = context.Resolved(&Graphics::DeviceFunctions::cmdBindDescriptorSets, "vkCmdBindDescriptorSets");
         bind(commands, VK_PIPELINE_BIND_POINT_COMPUTE, pipeline->layout, ShaderRecompiler::RuntimeAbi::DescriptorSet, 1, &set, 0, nullptr);
         const VkDescriptorSet heapSet = heap->Set();
         bind(commands, VK_PIPELINE_BIND_POINT_COMPUTE, pipeline->layout, ShaderRecompiler::RuntimeAbi::DirectHeapSet, 1, &heapSet, 0, nullptr);
         if (!push.empty()) context.Function<PFN_vkCmdPushConstants>("vkCmdPushConstants")(commands, pipeline->layout, VK_SHADER_STAGE_COMPUTE_BIT, 0, Graphics::ComputePushConstantBytes, block.data());
-        noteFaultToken(context, *recorder, commands, dispatch.stages, FaultStage::compute, "dispatch", groups[0], groups[1] * groups[2]);
+        noteFaultToken(context, *recorder, commands, dispatch.stages, FaultStage::compute, indirect ? "dispatch indirect" : "dispatch", groups[0], groups[1] * groups[2]);
         const auto dispatchTiming = recorder->BeginGpuTiming(DispatchTimingKey);
-        context.Resolved(&Graphics::DeviceFunctions::cmdDispatch, "vkCmdDispatch")(commands, groups[0], groups[1], groups[2]);
+        if (indirect) {
+            context.Resolved(&Graphics::DeviceFunctions::cmdDispatchIndirect, "vkCmdDispatchIndirect")(commands, argumentBuffer, argumentOffset);
+            totals.indirectDispatches++;
+        } else {
+            context.Resolved(&Graphics::DeviceFunctions::cmdDispatch, "vkCmdDispatch")(commands, groups[0], groups[1], groups[2]);
+        }
         recorder->EndGpuTiming(dispatchTiming);
         Graphics::RecordMemoryBarrier(context, commands, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT | VK_PIPELINE_STAGE_HOST_BIT, VK_ACCESS_SHADER_WRITE_BIT, VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT | VK_ACCESS_UNIFORM_READ_BIT | VK_ACCESS_TRANSFER_READ_BIT | VK_ACCESS_TRANSFER_WRITE_BIT | VK_ACCESS_INDIRECT_COMMAND_READ_BIT | VK_ACCESS_INDEX_READ_BIT | VK_ACCESS_VERTEX_ATTRIBUTE_READ_BIT | VK_ACCESS_COLOR_ATTACHMENT_READ_BIT | VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_READ_BIT | VK_ACCESS_HOST_READ_BIT);
         recordCopyBacks(context, commands, serial);

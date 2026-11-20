@@ -214,7 +214,12 @@ void Driver::dispatch(QueueState& queue, std::span<const std::uint32_t> packet, 
             return;
         }
 #if ANYPS5_UNIFIED
-        if (Unified::Record::RecordActive() && Unified::Resolve::DispatchesActive() && pipelineCandidate && submission.queue == 0 && indirectArguments == 0 && !htileClearCompletion.has_value() && htileMask.bytes == 0u) {
+        const auto recodeCandidate = [&] {
+            if (submission.queue == 0) return pipelineCandidate;
+            const auto kernelCode = std::span(snapshot.code).subspan(codeOffset);
+            return !resolving && !matchesCopyKernel(kernelCode, userData, compute) && !MatchesStreamCopyKernel(kernelCode, userData, compute) && !MatchesTableCopyKernel(kernelCode, userData, compute) && !MatchesIndexedCopyKernel(kernelCode, userData, compute);
+        };
+        if (Unified::Record::RecordActive() && Unified::Resolve::DispatchesRoutedOn(submission.queue) && (indirectArguments == 0 || (packet[4] & 0x20u) == 0) && recodeCandidate() && !htileClearCompletion.has_value() && htileMask.bytes == 0u) {
             auto& resolvedDispatches = Unified::Resolve::ResolvedDispatches();
             const auto packetOffset = currentPacketOffset();
             const auto found = resolvedDispatches.Find(submission.queue, submission.serial, packetOffset, std::chrono::milliseconds(50));
@@ -225,7 +230,15 @@ void Driver::dispatch(QueueState& queue, std::span<const std::uint32_t> packet, 
             }
             const auto code = std::span(snapshot.code).subspan(codeOffset);
             std::string recodeReason;
-            if (found.value != nullptr && found.value->stages.size() == 1u && found.value->stages.front().program.codeAddress == address && !MatchSgprPatternFill(packet, code, userData, compute) && !Graphics::MatchStorageImageClear(code, userData, compute, recodeGroups) && Unified::Record::RecordDispatchPrecheck(localDevice->graphicsContext(), *localDevice, *found.value, recodeReason)) {
+            const bool recordable = found.value != nullptr && found.value->stages.size() == 1u && found.value->stages.front().program.codeAddress == address && (indirectArguments != 0 || (!MatchSgprPatternFill(packet, code, userData, compute) && !Graphics::MatchStorageImageClear(code, userData, compute, recodeGroups))) && Unified::Record::RecordDispatchPrecheck(localDevice->graphicsContext(), *localDevice, *found.value, recodeReason);
+            if (recordable && submission.queue != 0) {
+                if (DrawPipeline::Queue0().Busy()) DrawPipeline::Queue0().Drain(DrawPipeline::DrainReason::Packet, 0x15);
+                GuestMemory::TagGpuLockSite(GuestMemory::GpuLockSite::Dispatch);
+                std::lock_guard commitLock(GuestMemory::GpuMutex());
+                recordLabelsForPacket(localDevice.get(), submission.queue);
+                std::string reason;
+                if (Unified::Record::RecordDispatch(localDevice->graphicsContext(), *found.value, recodeGroups, reason)) return;
+            } else if (recordable && submission.queue == 0) {
                 std::vector<DrawPipeline::Range> reads;
                 std::vector<DrawPipeline::Range> writes;
                 for (const auto& use : found.value->uses) (use.write ? writes : reads).emplace_back(use.address, use.address + use.size);
