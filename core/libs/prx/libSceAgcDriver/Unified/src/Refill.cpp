@@ -9,11 +9,32 @@ DescriptorKey KeyOf(const SlotRequest& request) {
 
 Refill::Refill(SlotTable& table, Memo& memo, ImageLookup images, SamplerLookup samplers) : table(table), memo(memo), images(std::move(images)), samplers(std::move(samplers)) {}
 
-bool Refill::Fill(std::span<const SlotRequest> requests, std::vector<std::uint32_t>& slots, std::string& reason, std::vector<ImageUse>* uses, std::vector<std::shared_ptr<const void>>* owners) {
+bool Refill::Fill(std::span<const SlotRequest> requests, std::vector<std::uint32_t>& slots, std::string& reason, std::vector<ImageUse>* uses, std::vector<std::shared_ptr<const void>>* owners, std::vector<DeferredImage>* deferred) {
     slots.clear();
     slots.reserve(requests.size());
+    constexpr auto storageWrite = RequestFlag::Storage | RequestFlag::Written;
     for (const auto& request : requests) {
+        if (deferred != nullptr && (request.flags & RequestFlag::Storage) != 0u && (request.flags & RequestFlag::Inactive) == 0u) {
+            counts.lookups++;
+            const auto found = images(request);
+            if (found.has_value() && found->deferred) {
+                deferred->push_back({static_cast<std::uint32_t>(slots.size()), request});
+                if (uses != nullptr && found->memory.bytes != 0u) uses->push_back({found->memory, (request.flags & storageWrite) == storageWrite});
+            } else {
+                counts.placeholders++;
+            }
+            slots.push_back(0u);
+            continue;
+        }
         const bool isSampler = (request.flags & RequestFlag::Sampler) != 0u;
+        if (deferred != nullptr && !isSampler && deferTest && (request.flags & RequestFlag::Inactive) == 0u) {
+            if (const auto span = deferTest(request)) {
+                deferred->push_back({static_cast<std::uint32_t>(slots.size()), request});
+                if (uses != nullptr && span->bytes != 0u) uses->push_back({*span, false});
+                slots.push_back(0u);
+                continue;
+            }
+        }
         Span memory;
         std::shared_ptr<const void> owner;
         const auto slot = isSampler ? sampler(request, reason) : image(request, reason, memory, owner);

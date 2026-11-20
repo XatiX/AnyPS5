@@ -7,6 +7,7 @@
 #include "prx/libSceAgcDriver/Unified/include/PacketTable.hpp"
 #include "prx/libSceAgcDriver/Unified/include/Programs.hpp"
 #include "prx/libSceAgcDriver/Unified/include/Ranges.hpp"
+#include "prx/libSceAgcDriver/Unified/include/Refill.hpp"
 #include <cstdint>
 #include <memory>
 #include <string>
@@ -14,6 +15,10 @@
 
 namespace AgcDriver {
 class VulkanDevice;
+}
+
+namespace AgcDriver::Graphics {
+class StorageTexture;
 }
 
 namespace AgcDriver::Unified::Heap {
@@ -35,6 +40,7 @@ struct ResolvedStage {
     std::vector<std::uint32_t> slots;
     std::shared_ptr<const Tables::Mirror> tableMap;
     std::vector<std::shared_ptr<const void>> owners;
+    std::vector<Heap::DeferredImage> deferredImages;
 };
 
 struct ResolvedDraw {
@@ -44,6 +50,7 @@ struct ResolvedDraw {
     bool complete = true;
     std::size_t targetBegin = 0;
     std::size_t targetEnd = 0;
+    std::size_t imageBegin = 0;
     Bindings::Layout layout;
     std::shared_ptr<const Graphics::State> state;
 };
@@ -57,6 +64,8 @@ void Consume(const Operation& operation, const DecodeState& state);
 [[nodiscard]] PacketTable<ResolvedDraw>& ResolvedDispatches();
 [[nodiscard]] const Heap::VulkanHeapDevice* HeapDevice();
 [[nodiscard]] Images::SurfaceTable* Surfaces();
+[[nodiscard]] std::shared_ptr<Graphics::StorageTexture> BindDeferredImage(const Graphics::Context& context, const Heap::SlotRequest& request, std::uint32_t& slot, std::string& reason);
+[[nodiscard]] std::shared_ptr<const void> BindDeferredSampled(const Graphics::Context& context, const Heap::SlotRequest& request, std::uint32_t& slot, std::string& reason);
 
 }
 
