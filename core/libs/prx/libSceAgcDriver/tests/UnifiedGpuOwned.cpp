@@ -153,6 +153,21 @@ void testOwnedPagesLandOnFault() {
     Expect(fake.shadow[10 * PageBytes + 8] == std::byte{0x99} && fake.shadow[10 * PageBytes + 16] == std::byte{0x42}, "only the bytes the GPU changed are landed over a page that was opened early");
     Expect(!core.Written().Any(base + 10 * PageBytes, PageBytes) && fake.uploads.load() >= 1, "the opened page's pieces are taken and the page is uploaded again");
 
+    static_cast<void>(core.NoteGpuWrite(base + 11 * PageBytes, PageBytes, 10));
+    std::memset(fake.shadow.data() + 11 * PageBytes, 0x21, PageBytes);
+    std::memset(fake.mirror.data() + 11 * PageBytes, 0x65, PageBytes);
+    fake.bypass.store(true);
+    const auto early = *reinterpret_cast<volatile std::uint8_t*>(base + 11 * PageBytes);
+    static_cast<void>(early);
+    fake.bypass.store(false);
+    fake.completed.store(10);
+    core.FlushGpuWrites(base + 11 * PageBytes + 0x200, 8);
+    Expect(fake.shadow[11 * PageBytes + 0x200] == std::byte{0x65} && fake.shadow[11 * PageBytes + 0x207] == std::byte{0x65} && fake.shadow[11 * PageBytes + 0x208] == std::byte{0x21}, "a small read lands only the bytes it asked for");
+    Expect(!core.Written().Any(base + 11 * PageBytes + 0x200, 8) && core.Written().Any(base + 11 * PageBytes + 0x208, 8), "a small read takes only its own bytes from the written set");
+    Expect(core.Counts().smallReads == 1 && core.Counts().smallReadBytes == 8, "the small read is counted");
+    core.FlushGpuWrites(base + 11 * PageBytes, PageBytes);
+    Expect(fake.shadow[11 * PageBytes + 0x208] == std::byte{0x65} && !core.Written().Any(base + 11 * PageBytes, PageBytes), "a page-sized read lands the rest of the page");
+
     const std::vector<std::byte> pre(0x40, std::byte{0x01});
     std::vector<std::byte> post(0x40, std::byte{0x01});
     post[4] = std::byte{0xaa};

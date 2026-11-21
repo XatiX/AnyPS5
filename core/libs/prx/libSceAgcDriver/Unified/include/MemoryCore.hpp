@@ -44,6 +44,8 @@ struct MemoryCoreCounts {
     std::uint64_t unreadableHashes = 0;
     std::uint64_t gpuOnlyBytes = 0;
     std::uint64_t bypassLanded = 0;
+    std::uint64_t smallReads = 0;
+    std::uint64_t smallReadBytes = 0;
 };
 
 struct GpuWriteMark {
@@ -68,6 +70,7 @@ public:
     static constexpr std::uint64_t ReadAheadPages = 16;
     static constexpr std::size_t HotPages = 32;
     static constexpr std::uint32_t HotLifetime = 4096;
+    static constexpr std::uint64_t SmallReadBytes = 256;
     static constexpr int ResolveAttempts = 3;
     static constexpr std::uint64_t UnviewedReports = 8;
 
@@ -123,7 +126,7 @@ private:
     bool resolveOwnedFault(std::uint64_t address, bool write);
     bool resolvePage(std::uint64_t page, bool write);
     void openWithPreImage(std::uint64_t page);
-    std::uint64_t landOpenPieces(std::uint64_t page, std::uint64_t completed);
+    std::uint64_t landOpenPieces(std::uint64_t page, std::uint64_t completed, std::uint64_t begin, std::uint64_t end);
     void noteHot(std::uint64_t page);
     void resolverLoop();
 
@@ -172,6 +175,8 @@ private:
     std::atomic<std::uint64_t> gpuOnlyBytes{0};
     std::atomic<std::uint64_t> unviewedReports{0};
     std::atomic<std::uint64_t> bypassLanded{0};
+    std::atomic<std::uint64_t> smallReads{0};
+    std::atomic<std::uint64_t> smallReadBytes{0};
 };
 
 }

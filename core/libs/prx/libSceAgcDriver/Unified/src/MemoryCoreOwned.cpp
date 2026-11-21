@@ -126,43 +126,52 @@ void MemoryCore::openWithPreImage(std::uint64_t page) {
     Events::Shared().Note(page, PageBytes);
 }
 
-std::uint64_t MemoryCore::landOpenPieces(std::uint64_t page, std::uint64_t completed) {
+std::uint64_t MemoryCore::landOpenPieces(std::uint64_t page, std::uint64_t completed, std::uint64_t begin, std::uint64_t end) {
     auto* current = host.load(std::memory_order_acquire);
     if (current == nullptr) return 0;
+    begin = std::max(begin, page);
+    end = std::min(end, page + PageBytes);
+    if (begin >= end) return 0;
+    const auto span = end - begin;
     {
         std::lock_guard lock(mutex);
         const auto found = preImages.find(page);
         if (found == preImages.end()) return 0;
-        const auto pieces = written.In(page, PageBytes);
-        if (pieces.empty()) {
+        if (!written.Any(page, PageBytes)) {
             preImages.erase(found);
             return 0;
         }
+        const auto pieces = written.In(begin, span);
         if (std::ranges::none_of(pieces, [&](const WrittenRange& piece) { return piece.serial <= completed; })) return 0;
     }
-    std::vector<std::byte> mirror(PageBytes);
-    if (!current->ReadMirror(page, mirror)) return 0;
+    std::vector<std::byte> mirror(static_cast<std::size_t>(span));
+    if (!current->ReadMirror(begin, mirror)) return 0;
     std::unique_lock lock(mutex);
     const auto found = preImages.find(page);
-    auto* view = current->View(page, PageBytes);
+    auto* view = current->View(begin, static_cast<std::size_t>(span));
     if (found == preImages.end() || view == nullptr) return 0;
-    const auto pieces = written.In(page, PageBytes);
+    const auto pieces = written.In(begin, span);
     const auto& before = found->second;
     std::uint64_t changed = 0;
     for (const auto& piece : pieces) {
         if (piece.serial > completed) continue;
-        for (auto at = piece.begin - page; at < piece.end - page; ++at) {
-            if (mirror[at] == before[at]) continue;
-            view[at] = mirror[at];
+        for (auto at = piece.begin; at < piece.end; ++at) {
+            const auto byte = mirror[at - begin];
+            if (byte == before[at - page]) continue;
+            view[at - begin] = byte;
             ++changed;
         }
     }
-    written.Take(page, PageBytes, completed);
+    written.Take(begin, span, completed);
     if (!written.Any(page, PageBytes)) preImages.erase(found);
     diffLandedBytes.fetch_add(changed, std::memory_order_relaxed);
-    if (changed != 0) Events::Shared().Note(page, PageBytes);
+    if (span < PageBytes) {
+        smallReads.fetch_add(1, std::memory_order_relaxed);
+        smallReadBytes.fetch_add(span, std::memory_order_relaxed);
+    }
+    if (changed != 0) Events::Shared().Note(begin, span);
     lock.unlock();
-    current->Upload(page, PageBytes);
+    current->Upload(begin, span);
     return changed;
 }
 
@@ -290,7 +299,10 @@ void MemoryCore::FlushGpuWrites(std::uint64_t address, std::uint64_t size) {
             }
         }
         if (!owned) {
-            if (landOpenPieces(page, completed) == 0 && written.Pending(page, PageBytes) > completed) flushPendingBytes.fetch_add(PageBytes, std::memory_order_relaxed);
+            const bool small = size <= SmallReadBytes;
+            const auto begin = small ? std::max(address, page) : page;
+            const auto stop = small ? std::min(end, page + PageBytes) : page + PageBytes;
+            if (landOpenPieces(page, completed, begin, stop) == 0 && written.Pending(begin, stop - begin) > completed) flushPendingBytes.fetch_add(stop - begin, std::memory_order_relaxed);
             continue;
         }
         std::vector<std::byte> mirror(PageBytes);
@@ -333,7 +345,7 @@ void MemoryCore::LandOpened() {
         for (const auto& [page, image] : preImages) opened.push_back(page);
     }
     const auto completed = current->Completed();
-    for (const auto page : opened) landOpenPieces(page, completed);
+    for (const auto page : opened) landOpenPieces(page, completed, page, page + PageBytes);
 }
 
 std::vector<DirtyRange> MemoryCore::WithoutGpuWritten(std::span<const DirtyRange> ranges) const {
