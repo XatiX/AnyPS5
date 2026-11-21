@@ -358,6 +358,55 @@ bool adoptsUpstream() {
 std::atomic<std::uint64_t> publishedRecords{0};
 std::atomic<std::uint64_t> staleRecordsKept{0};
 
+struct BatchLandings {
+    std::atomic<std::uint64_t> pending{0};
+    std::atomic<std::uint64_t> scheduled{0};
+    std::atomic<std::uint64_t> ran{0};
+    std::atomic<std::uint64_t> landedBytes{0};
+    std::atomic<std::uint64_t> retried{0};
+    std::mutex retryMutex;
+    std::vector<KnownWrite> retry;
+};
+
+BatchLandings& batchLandings() {
+    static auto& landings = *new BatchLandings();
+    return landings;
+}
+
+bool landsInCompletions() {
+    static const bool lands = std::getenv("APS5_RECODE_BATCH_LANDINGS") != nullptr;
+    return lands && Mirror::WritesEnabled() && ResidencyService::Get().ReadsOffGpuMutex();
+}
+
+void landInCompletion(const std::vector<KnownWrite>& writes) {
+    auto& landings = batchLandings();
+    std::vector<std::pair<std::uint64_t, std::uint64_t>> ranges;
+    ranges.reserve(writes.size());
+    for (const auto& written : writes) ranges.emplace_back(written.address, written.bytes);
+    const auto pieces = ResidencyService::Get().ReadBack(ranges);
+    auto& core = MemoryCore::Get();
+    for (const auto& written : writes) {
+        std::vector<std::byte> after(static_cast<std::size_t>(written.bytes));
+        std::uint64_t covered = 0;
+        for (const auto& piece : pieces) {
+            const auto begin = std::max(piece.guest, written.address);
+            const auto end = std::min(piece.guest + piece.bytes.size(), written.address + written.bytes);
+            if (begin >= end) continue;
+            std::memcpy(after.data() + (begin - written.address), piece.bytes.data() + (begin - piece.guest), static_cast<std::size_t>(end - begin));
+            covered += end - begin;
+        }
+        if (covered < written.bytes) {
+            std::lock_guard lock(landings.retryMutex);
+            landings.retry.push_back(written);
+            landings.retried.fetch_add(1, std::memory_order_relaxed);
+            continue;
+        }
+        core.LandDiff(written.address, *written.before, after, written.serial);
+        landings.landedBytes.fetch_add(written.bytes, std::memory_order_relaxed);
+    }
+    landings.ran.fetch_add(1, std::memory_order_relaxed);
+}
+
 bool ownsImages() {
     return Images::OwnersEnabled();
 }
@@ -767,6 +816,7 @@ public:
         try {
             recorded = record(context, draw, parameters, reason);
             landWrites();
+            scheduleLandings(context);
         } catch (const std::exception& error) {
             reason = std::string("record failed: ") + error.what();
         }
@@ -814,6 +864,7 @@ public:
         try {
             recorded = recordDispatch(context, dispatch, groups, reason);
             landWrites();
+            scheduleLandings(context);
         } catch (const std::exception& error) {
             reason = std::string("record failed: ") + error.what();
         }
@@ -927,6 +978,10 @@ public:
         std::snprintf(text, sizeof(text), "; table maps %llu hits, %llu uploads (%.1f MiB), %llu retired, %zu held (%.1f MiB)", static_cast<unsigned long long>(totals.mapHits), static_cast<unsigned long long>(totals.mapUploads), static_cast<double>(totals.mapUploadBytes) / 1048576.0, static_cast<unsigned long long>(totals.mapRetired), maps.size(), static_cast<double>(mapBytes) / 1048576.0);
         line += text;
         line += "; images adopted from the existing cache " + std::to_string(totals.recordAdoptions) + " (" + std::to_string(totals.recordAdoptionRefusals) + " refused), published back " + std::to_string(publishedRecords.load(std::memory_order_relaxed)) + " (" + std::to_string(staleRecordsKept.load(std::memory_order_relaxed)) + " not published: guest memory changed since their GPU write)";
+        {
+            auto& landings = batchLandings();
+            line += "; landings after their batch " + std::to_string(landings.scheduled.load(std::memory_order_relaxed)) + " scheduled, " + std::to_string(landings.ran.load(std::memory_order_relaxed)) + " ran (" + std::to_string(landings.landedBytes.load(std::memory_order_relaxed) >> 10u) + " KiB), " + std::to_string(landings.pending.load(std::memory_order_relaxed)) + " pending, " + std::to_string(landings.retried.load(std::memory_order_relaxed)) + " retried later";
+        }
         line += "; storage writes to recode surfaces " + std::to_string(totals.recordWrites) + "; draws into recode surface targets " + std::to_string(totals.recordTargetDraws) + " (" + std::to_string(totals.recordTargetRefusals) + " targets refused";
         for (const auto& [why, count] : recordTargetReasons) line += " [" + why + " " + std::to_string(count) + "]";
         line += ")";
@@ -1031,6 +1086,36 @@ private:
             auto key = "surface: " + why.substr(0, 50);
             if (seen.insert(key).second) std::fprintf(stderr, "[recode-record] first surface failure: %s\n", why.c_str());
             if (totals.reasons.size() < 24u || totals.reasons.contains(key)) totals.reasons[key]++;
+        });
+    }
+
+    void scheduleLandings(const Context& context) {
+        if (!landsInCompletions() || context.recorder == nullptr) return;
+        auto& landings = batchLandings();
+        {
+            std::lock_guard lock(landings.retryMutex);
+            for (auto& written : landings.retry) pendingDiffs.push_back(std::move(written));
+            landings.retry.clear();
+        }
+        std::vector<KnownWrite> due;
+        for (auto it = knownWrites.begin(); it != knownWrites.end();) {
+            if (it->before == nullptr) {
+                ++it;
+                continue;
+            }
+            due.push_back(std::move(*it));
+            it = knownWrites.erase(it);
+        }
+        if (due.empty()) return;
+        landings.pending.fetch_add(1, std::memory_order_acq_rel);
+        landings.scheduled.fetch_add(1, std::memory_order_relaxed);
+        context.recorder->OnComplete([due = std::move(due)] {
+            try {
+                landInCompletion(due);
+            } catch (const std::exception& error) {
+                std::fprintf(stderr, "[recode-landings] a landing after its batch failed: %s\n", error.what());
+            }
+            batchLandings().pending.fetch_sub(1, std::memory_order_acq_rel);
         });
     }
 
@@ -3065,6 +3150,10 @@ bool RecordActive() {
 bool RecordsKernels(std::uint32_t queue) {
     static const bool records = std::getenv("APS5_RECODE_NO_KERNEL_RECORD") == nullptr;
     return records && RecordActive() && Resolve::DispatchesRoutedOn(queue);
+}
+
+bool LandingsPending() {
+    return batchLandings().pending.load(std::memory_order_acquire) != 0u;
 }
 
 void PublishRecords(const Graphics::Context& context, std::uint64_t address, std::uint64_t bytes) {
