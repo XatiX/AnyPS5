@@ -1,6 +1,7 @@
 #include "prx/libSceAgcDriver/Unified/include/Shadow.hpp"
 #include "prx/libSceAgcDriver/Unified/include/Front.hpp"
 #include "prx/libSceAgcDriver/Unified/include/MemoryCore.hpp"
+#include "prx/libSceAgcDriver/Unified/include/MirrorHost.hpp"
 #include "prx/libSceAgcDriver/Unified/include/ResidencyService.hpp"
 #include "prx/libSceAgcDriver/Unified/include/Events.hpp"
 #include "prx/libSceAgcDriver/Unified/include/ProofVerdict.hpp"
@@ -135,7 +136,12 @@ void consumeMemory() {
     if (!memoryInstalled()) return;
     const auto start = std::chrono::steady_clock::now();
     const auto ranges = MemoryCore::Get().ConsumeDirty();
-    ResidencyService::Get().NoteDirty(ranges);
+    if (Mirror::WritesEnabled()) {
+        ResidencyService::Get().NoteDirty(MemoryCore::Get().WithoutGpuWritten(ranges));
+        MemoryCore::Get().LandAhead();
+    } else {
+        ResidencyService::Get().NoteDirty(ranges);
+    }
     const auto nanoseconds = static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - start).count());
     auto& totals = memoryTotals();
     std::uint64_t bytes = 0;
@@ -249,6 +255,7 @@ std::shared_ptr<QueueState> RecordedState(const DriverDetail::Submission& submis
 
 void NoteDevice(const std::shared_ptr<VulkanDevice>& device) {
     Resolve::Attach(device);
+    Mirror::Attach(device);
 }
 
 void NoteDriverDraw(const QueueState& queue, const DriverDetail::Submission& submission, std::size_t packetOffset) {

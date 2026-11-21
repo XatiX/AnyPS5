@@ -47,6 +47,13 @@ struct PageTableCounts {
     std::uint64_t gpuWrittenPages = 0;
 };
 
+struct GpuTake {
+    std::vector<ProtectionChange> changes;
+    std::vector<DirtyRange> owned;
+    std::vector<DirtyRange> dirty;
+    std::vector<DirtyRange> open;
+};
+
 class PageTable {
 public:
     static constexpr std::uint32_t MaxGapPages = 3;
@@ -65,6 +72,7 @@ public:
     std::vector<DirtyRange> ConsumeDirty(std::vector<ProtectionChange>& changes, const WriteCheck& written = {});
     void AdvanceFrame();
     std::vector<ProtectionChange> MarkGpuOwned(std::uint64_t address, std::uint64_t size);
+    GpuTake TakeForGpu(std::uint64_t address, std::uint64_t size);
     std::vector<ProtectionChange> MarkDeviceWritten(std::uint64_t address, std::uint64_t size);
     std::vector<DirtyRange> GpuOwnedIn(std::uint64_t address, std::uint64_t size) const;
     [[nodiscard]] bool CleanIn(std::uint64_t address, std::uint64_t size) const;

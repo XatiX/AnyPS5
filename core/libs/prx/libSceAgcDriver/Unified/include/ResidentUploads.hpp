@@ -32,8 +32,11 @@ class ResidentUploads {
 public:
     using Committed = std::vector<std::pair<std::uint64_t, std::uint64_t>> (*)(std::uint64_t address, std::size_t bytes, bool writable);
 
+    using View = const std::byte* (*)(std::uint64_t address, std::size_t bytes);
+
     explicit ResidentUploads(Residency& residency, Committed committed = nullptr);
 
+    void SetView(View next);
     void NoteDirty(std::span<const DirtyRange> ranges);
     bool Prepare(std::uint64_t address, std::uint64_t size, std::uint64_t frame);
     bool PrepareFilled(std::uint64_t address, std::uint64_t size, std::uint64_t frame);
@@ -44,9 +47,11 @@ public:
 
 private:
     void snapshot(std::uint64_t address, std::uint64_t size, bool full);
+    const std::byte* source(std::uint64_t address, std::size_t bytes) const;
 
     Residency& residency;
     Committed committed;
+    View view = nullptr;
     mutable std::mutex mutex;
     std::vector<PendingUpload> pending;
     UploadCounts counts;

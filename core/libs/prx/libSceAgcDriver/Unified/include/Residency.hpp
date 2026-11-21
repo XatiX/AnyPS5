@@ -79,6 +79,8 @@ class GpuPageTable;
 
 class Residency {
 public:
+    using Keep = bool (*)(std::uint64_t address, std::uint64_t size);
+
     Residency(ResidencyDevice& device, std::uint64_t budget);
     ~Residency();
     Residency(const Residency&) = delete;
@@ -97,6 +99,7 @@ public:
     std::vector<GuestSpan> Evict(std::uint64_t frame);
     [[nodiscard]] std::uint64_t Removals() const;
     void SetBudget(std::uint64_t bytes);
+    void SetKeep(Keep next);
     void SetPageTable(GpuPageTable* table);
     [[nodiscard]] ResidencyCounts Counts() const;
 
@@ -126,6 +129,7 @@ private:
 
     ResidencyDevice& device;
     GpuPageTable* pageTable = nullptr;
+    Keep keep = nullptr;
     std::uint64_t sharedPages = 0;
     mutable std::mutex mutex;
     Ranges ranges;

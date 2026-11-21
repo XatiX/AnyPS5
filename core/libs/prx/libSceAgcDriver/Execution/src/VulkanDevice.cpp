@@ -3165,6 +3165,10 @@ std::uint64_t VulkanDevice::SubmittedEpoch() const {
     return state->recorder ? state->recorder->NewestSubmitted() : 0;
 }
 
+std::uint64_t VulkanDevice::CompletedEpoch() const {
+    return state->recorder ? state->recorder->TimelineValue() : 0;
+}
+
 bool VulkanDevice::WaitRecordedFor(std::uint64_t serial, std::uint64_t timeoutNanos) {
     return state->recorder && state->recorder->WaitSerialFor(serial, timeoutNanos);
 }

@@ -73,7 +73,9 @@ bool ResidencyService::Attach(const Graphics::Context& graphics) {
     context.emplace(graphics);
     device = std::make_unique<VulkanResidency>(*context);
     ledger = std::make_unique<Residency>(*device, 0);
+    ledger->SetKeep(keep);
     uploads = std::make_unique<ResidentUploads>(*ledger, GuestMemory::CommittedRanges);
+    uploads->SetView([](std::uint64_t address, std::size_t bytes) { return static_cast<const std::byte*>(GuestMemory::OwnStoreTarget(address, bytes)); });
     if (PageTableEnabled()) {
         pages = std::make_unique<GpuPageTable>();
         pageBuffer = std::make_shared<Graphics::Buffer>(*context, Abi::PageTableBytes(PageTableLeafCapacity), VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT, ShaderReadMemory(*context, Abi::PageTableBytes(PageTableLeafCapacity)));
@@ -513,6 +515,12 @@ void ResidencyService::AdvanceFrame() {
     std::lock_guard lock(mutex);
     ledger->SetBudget(device->BudgetBytes());
     uploads->Evict(now);
+}
+
+void ResidencyService::SetKeep(Residency::Keep next) {
+    std::lock_guard lock(mutex);
+    keep = next;
+    if (ledger) ledger->SetKeep(next);
 }
 
 std::uint64_t ResidencyService::Removals() const {

@@ -1,12 +1,17 @@
 #ifndef CORE_LIBS_PRX_LIBSCEAGCDRIVER_UNIFIED_INCLUDE_MEMORYCORE_HPP
 #define CORE_LIBS_PRX_LIBSCEAGCDRIVER_UNIFIED_INCLUDE_MEMORYCORE_HPP
 
+#include "prx/libSceAgcDriver/Unified/include/GpuWritten.hpp"
 #include "prx/libSceAgcDriver/Unified/include/PageTable.hpp"
 #include "prx/libSceAgcDriver/Unified/include/Protector.hpp"
 #include <atomic>
+#include <condition_variable>
+#include <cstddef>
 #include <cstdint>
+#include <deque>
 #include <mutex>
 #include <span>
+#include <thread>
 #include <unordered_map>
 #include <vector>
 
@@ -21,11 +26,52 @@ struct MemoryCoreCounts {
     std::uint64_t landedBytes = 0;
     std::uint64_t driverPagesSettled = 0;
     std::uint64_t rearmedChanged = 0;
+    std::uint64_t ownedPages = 0;
+    std::uint64_t openBytes = 0;
+    std::uint64_t faultsParked = 0;
+    std::uint64_t faultsBypassed = 0;
+    std::uint64_t faultsResolved = 0;
+    std::uint64_t faultsOpenedStale = 0;
+    std::uint64_t readAheadPages = 0;
+    std::uint64_t ownedLandedBytes = 0;
+    std::uint64_t diffLandedBytes = 0;
+    std::uint64_t diffUnchangedBytes = 0;
+    std::uint64_t flushes = 0;
+    std::uint64_t flushPendingBytes = 0;
+    std::uint64_t hotLandedPages = 0;
+    std::uint64_t preImages = 0;
+};
+
+struct GpuWriteMark {
+    std::vector<DirtyRange> owned;
+    std::vector<DirtyRange> open;
+    std::vector<DirtyRange> upload;
+};
+
+class MemoryHost {
+public:
+    virtual ~MemoryHost() = default;
+    virtual std::uint64_t Completed() = 0;
+    virtual bool WaitFor(std::uint64_t serial) = 0;
+    virtual bool ReadMirror(std::uint64_t address, std::span<std::byte> out) = 0;
+    virtual std::byte* View(std::uint64_t address, std::size_t bytes) = 0;
+    virtual void Upload(std::uint64_t address, std::uint64_t size) = 0;
+    virtual bool Bypass() = 0;
 };
 
 class MemoryCore {
 public:
+    static constexpr std::uint64_t ReadAheadPages = 16;
+    static constexpr std::size_t HotPages = 32;
+    static constexpr std::uint32_t HotLifetime = 4096;
+    static constexpr int ResolveAttempts = 3;
+
     static MemoryCore& Get();
+
+    MemoryCore() = default;
+    ~MemoryCore();
+    MemoryCore(const MemoryCore&) = delete;
+    MemoryCore& operator=(const MemoryCore&) = delete;
 
     bool Install();
     void Uninstall();
@@ -42,13 +88,37 @@ public:
     void LandGpuWrite(std::uint64_t address, std::span<const std::byte> bytes, void* view = nullptr);
     void CollectWrites(std::uint64_t address, std::uint64_t size, PageTable::WrittenRun written, void* context);
     void NoteDriverWrite(std::uint64_t address, std::uint64_t size);
+    void SetHost(MemoryHost* next);
+    GpuWriteMark NoteGpuWrite(std::uint64_t address, std::uint64_t size, std::uint64_t serial);
+    void LandDiff(std::uint64_t address, std::span<const std::byte> before, std::span<const std::byte> after, std::uint64_t serial);
+    void FlushGpuWrites(std::uint64_t address, std::uint64_t size);
+    void LandAhead();
+    [[nodiscard]] std::vector<DirtyRange> WithoutGpuWritten(std::span<const DirtyRange> ranges) const;
+    [[nodiscard]] GpuWritten& Written() { return written; }
     [[nodiscard]] PageTable& Pages() { return pages; }
     [[nodiscard]] Protector& Protection() { return protector; }
     [[nodiscard]] MemoryCoreCounts Counts() const;
 
 private:
+    struct Parked {
+        std::uint64_t page = 0;
+        bool write = false;
+        bool done = false;
+        bool opened = false;
+    };
+    struct Hot {
+        std::uint64_t page = 0;
+        std::uint32_t life = 0;
+    };
+
     static std::uint64_t PageHash(std::uint64_t page);
     bool rehash(std::uint64_t page, bool proven);
+    bool resolveOwnedFault(std::uint64_t address, bool write);
+    bool resolvePage(std::uint64_t page, bool write);
+    void openWithPreImage(std::uint64_t page);
+    std::uint64_t landOpenPieces(std::uint64_t page, std::uint64_t completed);
+    void noteHot(std::uint64_t page);
+    void resolverLoop();
 
     std::mutex hashMutex;
     std::mutex collectMutex;
@@ -57,6 +127,17 @@ private:
     std::unordered_map<std::uint64_t, std::uint64_t> busyHashes;
     std::unordered_map<std::uint64_t, std::uint64_t> collectHashes;
     Protector protector;
+    GpuWritten written;
+    std::atomic<MemoryHost*> host{nullptr};
+    std::unordered_map<std::uint64_t, std::vector<std::byte>> preImages;
+    std::vector<Hot> hot;
+    std::mutex parkMutex;
+    std::condition_variable parkSignal;
+    std::deque<Parked*> parked;
+    std::thread resolver;
+    bool resolverStarted = false;
+    bool resolverStop = false;
+    std::thread::id resolverThread;
     std::atomic<std::uint64_t> writesOpened{0};
     std::atomic<std::uint64_t> hostWritesOpened{0};
     std::atomic<std::uint64_t> gpuOwnedFaults{0};
@@ -65,6 +146,20 @@ private:
     std::atomic<std::uint64_t> landedBytes{0};
     std::atomic<std::uint64_t> driverPagesSettled{0};
     std::atomic<std::uint64_t> rearmedChanged{0};
+    std::atomic<std::uint64_t> ownedPages{0};
+    std::atomic<std::uint64_t> openBytes{0};
+    std::atomic<std::uint64_t> faultsParked{0};
+    std::atomic<std::uint64_t> faultsBypassed{0};
+    std::atomic<std::uint64_t> faultsResolved{0};
+    std::atomic<std::uint64_t> faultsOpenedStale{0};
+    std::atomic<std::uint64_t> readAheadPages{0};
+    std::atomic<std::uint64_t> ownedLandedBytes{0};
+    std::atomic<std::uint64_t> diffLandedBytes{0};
+    std::atomic<std::uint64_t> diffUnchangedBytes{0};
+    std::atomic<std::uint64_t> flushes{0};
+    std::atomic<std::uint64_t> flushPendingBytes{0};
+    std::atomic<std::uint64_t> hotLandedPages{0};
+    std::atomic<std::uint64_t> preImageCount{0};
 };
 
 }

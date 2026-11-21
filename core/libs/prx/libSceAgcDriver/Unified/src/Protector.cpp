@@ -68,6 +68,18 @@ bool Protector::NeverArmed(std::uint64_t address) const {
     return address < it->second;
 }
 
+bool Protector::Readable(std::uint64_t address) {
+#ifdef _WIN32
+    MEMORY_BASIC_INFORMATION memory{};
+    if (VirtualQuery(reinterpret_cast<const void*>(address), &memory, sizeof(memory)) != sizeof(memory) || memory.State != MEM_COMMIT) return false;
+    const auto access = memory.Protect & 0xffu;
+    return (memory.Protect & PAGE_GUARD) == 0 && access != PAGE_NOACCESS && access != 0;
+#else
+    static_cast<void>(address);
+    return false;
+#endif
+}
+
 void Protector::Track(Tracker next) {
     std::lock_guard lock(mutex);
     tracker = next;

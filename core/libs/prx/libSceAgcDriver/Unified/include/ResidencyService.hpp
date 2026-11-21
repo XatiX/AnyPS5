@@ -55,6 +55,7 @@ public:
     [[nodiscard]] bool Pending() const;
     std::size_t Record(VkCommandBuffer commands, std::vector<std::shared_ptr<void>>& kept);
     void AdvanceFrame();
+    void SetKeep(Residency::Keep next);
     [[nodiscard]] std::uint64_t Frame() const { return frame.load(std::memory_order_relaxed); }
     [[nodiscard]] std::uint64_t Removals() const;
     [[nodiscard]] std::string Line() const;
@@ -67,6 +68,7 @@ private:
     std::optional<Graphics::Context> context;
     std::unique_ptr<VulkanResidency> device;
     std::unique_ptr<Residency> ledger;
+    Residency::Keep keep = nullptr;
     std::unique_ptr<ResidentUploads> uploads;
     std::unique_ptr<GpuPageTable> pages;
     std::shared_ptr<Graphics::Buffer> pageBuffer;

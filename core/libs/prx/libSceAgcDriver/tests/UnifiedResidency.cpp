@@ -97,6 +97,22 @@ void testEvictionTakesTheOldestRange() {
     Expect(residency.Counts().evicted == 2, "evictions are counted");
 }
 
+void testEvictionKeepsVetoedRanges() {
+    FakeDevice device;
+    Residency residency(device, ChunkBytes);
+    residency.Add(0x20000000, ChunkBytes);
+    residency.Add(0x30000000, ChunkBytes);
+    residency.MakeResident(0x20000000, ChunkBytes, 1);
+    residency.MakeResident(0x30000000, ChunkBytes, 2);
+    residency.SetKeep([](std::uint64_t address, std::uint64_t) { return address == 0x20000000; });
+    const auto evicted = residency.Evict(3);
+    Expect(evicted.size() == 1 && evicted[0].address == 0x30000000, "a range the veto keeps is passed over for a newer one");
+    Expect(residency.Translate(0x20000000, 4).has_value(), "the vetoed range stays bound");
+    residency.SetKeep([](std::uint64_t, std::uint64_t) { return true; });
+    residency.MakeResident(0x30000000, ChunkBytes, 3);
+    Expect(residency.Evict(4).empty() && residency.Counts().boundBytes == 2 * ChunkBytes, "nothing is evicted when every range is vetoed");
+}
+
 void testRemoveReturnsChunks() {
     FakeDevice device;
     device.poolLimit = 1;
@@ -325,6 +341,7 @@ int main() {
     testAddBindsNothing();
     testMakeResidentBindsCoveringChunks();
     testEvictionTakesTheOldestRange();
+    testEvictionKeepsVetoedRanges();
     testRemoveReturnsChunks();
     testFailedBindKeepsChunksFree();
     testRemovedRangesKeepTheMirror();

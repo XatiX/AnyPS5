@@ -30,6 +30,7 @@ public:
     void NeverArm(std::uint64_t address, std::uint64_t size);
     void AllowArm(std::uint64_t address, std::uint64_t size);
     [[nodiscard]] bool NeverArmed(std::uint64_t address) const;
+    [[nodiscard]] static bool Readable(std::uint64_t address);
     std::size_t Apply(std::span<const ProtectionChange> changes, bool* held = nullptr);
     void Defer(std::span<const ProtectionChange> changes);
     std::size_t Flush();

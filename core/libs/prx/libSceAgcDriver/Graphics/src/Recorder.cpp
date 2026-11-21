@@ -4906,6 +4906,13 @@ void Recorder::WaitSerial(std::uint64_t serial) {
     Check(result, "vkWaitSemaphoresKHR recorder");
 }
 
+std::uint64_t Recorder::TimelineValue() const {
+    if (timeline == VK_NULL_HANDLE) return 0;
+    std::uint64_t value = 0;
+    if (context.Function<PFN_vkGetSemaphoreCounterValueKHR>("vkGetSemaphoreCounterValueKHR")(context.device, timeline, &value) != VK_SUCCESS) return 0;
+    return value;
+}
+
 bool Recorder::WaitSerialFor(std::uint64_t serial, std::uint64_t timeoutNanos) {
     PerformanceTimer frameTiming("Recorder.WaitSerialFor");
     if (timeline == VK_NULL_HANDLE || serial == 0) return false;

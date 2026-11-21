@@ -307,6 +307,7 @@ std::vector<GuestSpan> Residency::Evict(std::uint64_t frame) {
         auto oldest = ranges.end();
         for (auto it = ranges.begin(); it != ranges.end(); ++it) {
             if (it->second.heldChunks == 0 || it->second.lastUse >= frame) continue;
+            if (keep != nullptr && keep(it->first, it->second.end - it->first)) continue;
             if (oldest == ranges.end() || it->second.lastUse < oldest->second.lastUse) oldest = it;
         }
         if (oldest == ranges.end()) break;
@@ -320,6 +321,11 @@ std::vector<GuestSpan> Residency::Evict(std::uint64_t frame) {
 void Residency::SetBudget(std::uint64_t bytes) {
     std::lock_guard lock(mutex);
     budget = bytes;
+}
+
+void Residency::SetKeep(Keep next) {
+    std::lock_guard lock(mutex);
+    keep = next;
 }
 
 void Residency::mapChunk(std::uint64_t chunk, std::uint64_t deviceAddress) {

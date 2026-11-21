@@ -122,7 +122,7 @@ void MemoryCore::MarkGpuOwned(std::uint64_t address, std::uint64_t size) {
 }
 
 bool MemoryCore::HandleFault(std::uint64_t address, bool write) {
-    std::lock_guard lock(mutex);
+    std::unique_lock lock(mutex);
     const auto state = pages.StateOf(address);
     if (state == PageState::Untracked || state == PageState::Reserved) {
         foreignFaults.fetch_add(1, std::memory_order_relaxed);
@@ -130,9 +130,14 @@ bool MemoryCore::HandleFault(std::uint64_t address, bool write) {
     }
     if (state == PageState::GpuOwned) {
         gpuOwnedFaults.fetch_add(1, std::memory_order_relaxed);
-        return false;
+        lock.unlock();
+        return resolveOwnedFault(address, write);
     }
-    if (!write) return false;
+    if (!write) {
+        if (host.load(std::memory_order_acquire) == nullptr || !Protector::Readable(address)) return false;
+        staleFaults.fetch_add(1, std::memory_order_relaxed);
+        return true;
+    }
     if (state != PageState::CpuClean) {
         staleFaults.fetch_add(1, std::memory_order_relaxed);
         Events::Shared().Note(address & ~(PageBytes - 1), PageBytes);
@@ -156,7 +161,13 @@ void MemoryCore::PrepareHostWrite(std::uint64_t address, std::uint64_t size) {
     std::vector<ProtectionChange> changes;
     const auto end = address + size;
     for (auto page = address & ~(PageBytes - 1); page < end; page += PageBytes) {
-        if (pages.StateOf(page) != PageState::CpuClean) continue;
+        const auto state = pages.StateOf(page);
+        if (state == PageState::GpuOwned) {
+            openWithPreImage(page);
+            hostWritesOpened.fetch_add(1, std::memory_order_relaxed);
+            continue;
+        }
+        if (state != PageState::CpuClean) continue;
         if (pages.HandleWrite(page, changes)) hostWritesOpened.fetch_add(1, std::memory_order_relaxed);
     }
     protector.Apply(changes);
@@ -205,12 +216,41 @@ void MemoryCore::CollectWrites(std::uint64_t address, std::uint64_t size, PageTa
 void MemoryCore::NoteDriverWrite(std::uint64_t address, std::uint64_t size) {
     if (size == 0) return;
     std::lock_guard lock(mutex);
+    if (written.Any(address, size)) {
+        written.Discard(address, size);
+        for (auto page = address & ~(PageBytes - 1); page < address + size; page += PageBytes) {
+            if (pages.StateOf(page) == PageState::GpuOwned) openWithPreImage(page);
+        }
+    }
     protector.Apply(pages.MarkDeviceWritten(address, size));
     driverPagesSettled.fetch_add((size + PageBytes - 1) / PageBytes, std::memory_order_relaxed);
 }
 
 MemoryCoreCounts MemoryCore::Counts() const {
-    return {writesOpened.load(std::memory_order_relaxed), hostWritesOpened.load(std::memory_order_relaxed), gpuOwnedFaults.load(std::memory_order_relaxed), foreignFaults.load(std::memory_order_relaxed), staleFaults.load(std::memory_order_relaxed), landedBytes.load(std::memory_order_relaxed), driverPagesSettled.load(std::memory_order_relaxed), rearmedChanged.load(std::memory_order_relaxed)};
+    MemoryCoreCounts counts;
+    counts.writesOpened = writesOpened.load(std::memory_order_relaxed);
+    counts.hostWritesOpened = hostWritesOpened.load(std::memory_order_relaxed);
+    counts.gpuOwnedFaults = gpuOwnedFaults.load(std::memory_order_relaxed);
+    counts.foreignFaults = foreignFaults.load(std::memory_order_relaxed);
+    counts.staleFaults = staleFaults.load(std::memory_order_relaxed);
+    counts.landedBytes = landedBytes.load(std::memory_order_relaxed);
+    counts.driverPagesSettled = driverPagesSettled.load(std::memory_order_relaxed);
+    counts.rearmedChanged = rearmedChanged.load(std::memory_order_relaxed);
+    counts.ownedPages = ownedPages.load(std::memory_order_relaxed);
+    counts.openBytes = openBytes.load(std::memory_order_relaxed);
+    counts.faultsParked = faultsParked.load(std::memory_order_relaxed);
+    counts.faultsBypassed = faultsBypassed.load(std::memory_order_relaxed);
+    counts.faultsResolved = faultsResolved.load(std::memory_order_relaxed);
+    counts.faultsOpenedStale = faultsOpenedStale.load(std::memory_order_relaxed);
+    counts.readAheadPages = readAheadPages.load(std::memory_order_relaxed);
+    counts.ownedLandedBytes = ownedLandedBytes.load(std::memory_order_relaxed);
+    counts.diffLandedBytes = diffLandedBytes.load(std::memory_order_relaxed);
+    counts.diffUnchangedBytes = diffUnchangedBytes.load(std::memory_order_relaxed);
+    counts.flushes = flushes.load(std::memory_order_relaxed);
+    counts.flushPendingBytes = flushPendingBytes.load(std::memory_order_relaxed);
+    counts.hotLandedPages = hotLandedPages.load(std::memory_order_relaxed);
+    counts.preImages = preImageCount.load(std::memory_order_relaxed);
+    return counts;
 }
 
 }

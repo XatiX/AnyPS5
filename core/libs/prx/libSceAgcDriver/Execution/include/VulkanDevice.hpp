@@ -131,6 +131,7 @@ public:
     std::uint64_t SubmitAndEpoch();
     void WaitRecorded(std::uint64_t serial);
     std::uint64_t SubmittedEpoch() const;
+    std::uint64_t CompletedEpoch() const;
     bool WaitRecordedFor(std::uint64_t serial, std::uint64_t timeoutNanos);
     void ReapRecorded(std::uint64_t serial);
     // Completes the batches that already finished (non-blocking); under the mutex.

@@ -7,6 +7,18 @@ namespace AgcDriver::Unified {
 
 ResidentUploads::ResidentUploads(Residency& residency, Committed committed) : residency(residency), committed(committed) {}
 
+void ResidentUploads::SetView(View next) {
+    std::lock_guard lock(mutex);
+    view = next;
+}
+
+const std::byte* ResidentUploads::source(std::uint64_t address, std::size_t bytes) const {
+    if (view != nullptr) {
+        if (const auto* alias = view(address, bytes); alias != nullptr) return alias;
+    }
+    return reinterpret_cast<const std::byte*>(address);
+}
+
 void ResidentUploads::snapshot(std::uint64_t address, std::uint64_t size, bool full) {
     std::uint64_t covered = 0;
     for (const auto& piece : residency.ResidentPieces(address, size)) {
@@ -17,10 +29,10 @@ void ResidentUploads::snapshot(std::uint64_t address, std::uint64_t size, bool f
             PendingUpload upload{piece.device.handle, piece.device.offset, cursor, std::vector<std::byte>(static_cast<std::size_t>(stop - cursor))};
             if (committed != nullptr) {
                 for (const auto& [from, to] : committed(cursor, upload.bytes.size(), false)) {
-                    std::memcpy(upload.bytes.data() + (from - cursor), reinterpret_cast<const void*>(from), static_cast<std::size_t>(to - from));
+                    std::memcpy(upload.bytes.data() + (from - cursor), source(from, static_cast<std::size_t>(to - from)), static_cast<std::size_t>(to - from));
                 }
             } else {
-                std::memcpy(upload.bytes.data(), reinterpret_cast<const void*>(cursor), upload.bytes.size());
+                std::memcpy(upload.bytes.data(), source(cursor, upload.bytes.size()), upload.bytes.size());
             }
             ++counts.fullUploads;
             counts.fullBytes += stop - cursor;
@@ -31,7 +43,7 @@ void ResidentUploads::snapshot(std::uint64_t address, std::uint64_t size, bool f
         for (const auto& [from, to] : readable) {
             covered += to - from;
             PendingUpload upload{piece.device.handle, piece.device.offset + (from - cursor), from, std::vector<std::byte>(static_cast<std::size_t>(to - from))};
-            std::memcpy(upload.bytes.data(), reinterpret_cast<const void*>(from), upload.bytes.size());
+            std::memcpy(upload.bytes.data(), source(from, upload.bytes.size()), upload.bytes.size());
             ++counts.dirtyUploads;
             counts.dirtyBytes += to - from;
             pending.push_back(std::move(upload));

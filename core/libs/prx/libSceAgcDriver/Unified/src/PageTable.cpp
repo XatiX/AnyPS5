@@ -277,6 +277,48 @@ std::vector<ProtectionChange> PageTable::MarkGpuOwned(std::uint64_t address, std
     return changes;
 }
 
+GpuTake PageTable::TakeForGpu(std::uint64_t address, std::uint64_t size) {
+    GpuTake take;
+    if (size == 0) return take;
+    const auto append = [](std::vector<DirtyRange>& list, std::uint64_t begin, std::uint64_t end) {
+        if (end <= begin) return;
+        if (!list.empty() && list.back().address + list.back().size == begin) list.back().size += end - begin;
+        else list.push_back({begin, end - begin});
+    };
+    const auto end = address + size;
+    const auto firstWhole = (address + PageBytes - 1) & ~(PageBytes - 1);
+    const auto lastWhole = end & ~(PageBytes - 1);
+    if (firstWhole >= lastWhole) {
+        append(take.open, address, end);
+        return take;
+    }
+    std::lock_guard lock(mutex);
+    append(take.open, address, firstWhole);
+    for (auto page = firstWhole / PageBytes; page < lastWhole / PageBytes; ++page) {
+        const auto at = page * PageBytes;
+        auto* region = regionOf(page, false);
+        const auto slot = slotOf(page);
+        const auto state = region == nullptr ? PageState::Untracked : region->states[slot];
+        if (state == PageState::GpuOwned) {
+            append(take.owned, at, at + PageBytes);
+            continue;
+        }
+        const bool tracked = state == PageState::CpuClean || state == PageState::CpuDirty;
+        if (!tracked || region->busyUntil[slot] != 0) {
+            append(take.open, at, at + PageBytes);
+            continue;
+        }
+        if (state == PageState::CpuDirty) append(take.dirty, at, at + PageBytes);
+        unlist(page);
+        region->streak[slot] = 0;
+        setState(page, PageState::GpuOwned);
+        appendChange(take.changes, page, Protection::NoAccess);
+        append(take.owned, at, at + PageBytes);
+    }
+    append(take.open, lastWhole, end);
+    return take;
+}
+
 std::vector<ProtectionChange> PageTable::MarkDeviceWritten(std::uint64_t address, std::uint64_t size) {
     std::lock_guard lock(mutex);
     std::vector<ProtectionChange> changes;
