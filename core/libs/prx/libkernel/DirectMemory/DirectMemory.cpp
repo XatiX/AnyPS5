@@ -1549,7 +1549,16 @@ int DoMapZero(void** addr, size_t len, int prot, int flags) {
 std::uint8_t* GuestViewAddress_nid_no_patch(std::uintptr_t address, std::size_t bytes) {
 #ifdef _WIN32
     auto* view = SharedView();
-    return view != nullptr && view->Mapped(address, bytes) ? view->Address(address) : nullptr;
+    if (view == nullptr) return nullptr;
+    if (view->Mapped(address, bytes)) return view->Address(address);
+    std::unique_lock lock(g_directLock, std::try_to_lock);
+    if (!lock.owns_lock()) return nullptr;
+    const auto next = g_directMappings.upper_bound(address);
+    if (next == g_directMappings.begin()) return nullptr;
+    const auto mapping = std::prev(next);
+    if (address + bytes > mapping->second.end) return nullptr;
+    const auto physical = mapping->second.phys + (address - mapping->first);
+    return view->DirectMapped(physical, bytes) ? view->DirectAddress(physical) : nullptr;
 #else
     static_cast<void>(address);
     static_cast<void>(bytes);

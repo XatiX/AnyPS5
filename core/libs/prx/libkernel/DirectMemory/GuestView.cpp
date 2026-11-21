@@ -125,6 +125,20 @@ bool GuestView::Mapped(std::uintptr_t guest, std::size_t bytes) const {
     return true;
 }
 
+bool GuestView::DirectMapped(std::uint64_t physical, std::size_t bytes) const {
+    if (view == nullptr || bytes == 0 || physical + bytes > viewBytes - guestBytes) return false;
+    std::lock_guard guard(lock);
+    auto cursor = reinterpret_cast<std::uintptr_t>(DirectAddress(physical));
+    const auto end = cursor + bytes;
+    auto piece = directPieces.upper_bound(cursor);
+    if (piece == directPieces.begin()) return false;
+    for (--piece; cursor < end; ++piece) {
+        if (piece == directPieces.end() || piece->first > cursor || piece->second.end <= cursor) return false;
+        cursor = piece->second.end;
+    }
+    return true;
+}
+
 void GuestView::Discard(std::uintptr_t guest, std::size_t bytes) {
     if (bytes == 0 || !Covers(guest, bytes)) return;
     std::lock_guard guard(lock);
