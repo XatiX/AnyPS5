@@ -78,6 +78,10 @@ std::uint64_t MemoryCore::PageHash(std::uint64_t page) {
 }
 
 bool MemoryCore::rehash(std::uint64_t page, bool proven) {
+    if (!Protector::Readable(page * PageBytes)) {
+        unreadableHashes.fetch_add(1, std::memory_order_relaxed);
+        return proven;
+    }
     const auto hash = PageHash(page);
     auto [entry, inserted] = busyHashes.try_emplace(page, hash);
     if (inserted || proven || entry->second != hash) {
@@ -203,6 +207,10 @@ void MemoryCore::LandGpuWrite(std::uint64_t address, std::span<const std::byte> 
 void MemoryCore::CollectWrites(std::uint64_t address, std::uint64_t size, PageTable::WrittenRun written, void* context) {
     std::lock_guard lock(collectMutex);
     pages.Collect(address, size, written, context, [this](std::uint64_t page, bool proven) {
+        if (!Protector::Readable(page * PageBytes)) {
+            unreadableHashes.fetch_add(1, std::memory_order_relaxed);
+            return proven;
+        }
         const auto hash = PageHash(page);
         auto [entry, inserted] = collectHashes.try_emplace(page, hash);
         if (proven || (!inserted && entry->second != hash)) {
@@ -250,6 +258,10 @@ MemoryCoreCounts MemoryCore::Counts() const {
     counts.flushPendingBytes = flushPendingBytes.load(std::memory_order_relaxed);
     counts.hotLandedPages = hotLandedPages.load(std::memory_order_relaxed);
     counts.preImages = preImageCount.load(std::memory_order_relaxed);
+    counts.unviewedBytes = unviewedBytes.load(std::memory_order_relaxed);
+    counts.unreadableHashes = unreadableHashes.load(std::memory_order_relaxed);
+    counts.gpuOnlyBytes = gpuOnlyBytes.load(std::memory_order_relaxed);
+    counts.bypassLanded = bypassLanded.load(std::memory_order_relaxed);
     return counts;
 }
 

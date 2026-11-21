@@ -1,6 +1,7 @@
 #include "prx/libSceAgcDriver/Unified/include/MemoryCore.hpp"
 #include "prx/libSceAgcDriver/Unified/include/Events.hpp"
 #include <algorithm>
+#include <cstdio>
 #include <cstring>
 
 namespace AgcDriver::Unified {
@@ -36,9 +37,34 @@ GpuWriteMark MemoryCore::NoteGpuWrite(std::uint64_t address, std::uint64_t size,
     GpuWriteMark mark;
     if (size == 0) return mark;
     written.Note(address, size, serial);
+    auto* current = host.load(std::memory_order_acquire);
+    if (current == nullptr || current->View(address, static_cast<std::size_t>(size)) == nullptr) {
+        if (current != nullptr && unviewedReports.fetch_add(1, std::memory_order_relaxed) < UnviewedReports) {
+            const auto firstPage = pageOf(address);
+            const auto lastPage = pageOf(address + size - 1);
+            std::fprintf(stderr, "[recode-gpu-owned] write outside the second view: 0x%llx+0x%llx, %s memory; first page %s, last page %s\n", static_cast<unsigned long long>(address), static_cast<unsigned long long>(size), Protector::RegionKind(address), current->View(firstPage, PageBytes) != nullptr ? "viewed" : "not viewed", current->View(lastPage, PageBytes) != nullptr ? "viewed" : "not viewed");
+        }
+        std::uint64_t readableBytes = 0;
+        for (const auto& range : Protector::ReadableRanges(address, size)) {
+            mark.open.push_back(range);
+            readableBytes += range.size;
+        }
+        unviewedBytes.fetch_add(readableBytes, std::memory_order_relaxed);
+        gpuOnlyBytes.fetch_add(size - readableBytes, std::memory_order_relaxed);
+        if (readableBytes != size) {
+            std::uint64_t cursor = address;
+            for (const auto& range : mark.open) {
+                if (range.address > cursor) written.Discard(cursor, range.address - cursor);
+                cursor = range.address + range.size;
+            }
+            if (cursor < address + size) written.Discard(cursor, address + size - cursor);
+        }
+        return mark;
+    }
     std::lock_guard lock(mutex);
     auto take = pages.TakeForGpu(address, size, takeDirty);
     protector.Apply(take.changes);
+    protector.Apply(pages.Register(address, size));
     std::uint64_t owned = 0;
     for (const auto& range : take.owned) owned += range.size / PageBytes;
     std::uint64_t open = 0;
@@ -61,7 +87,7 @@ void MemoryCore::LandDiff(std::uint64_t address, std::span<const std::byte> befo
     if (bytes == 0) return;
     auto* current = host.load(std::memory_order_acquire);
     if (current == nullptr) return;
-    std::lock_guard lock(mutex);
+    std::unique_lock lock(mutex);
     auto* view = current->View(address, bytes);
     if (view == nullptr) return;
     std::uint64_t changed = 0;
@@ -80,7 +106,9 @@ void MemoryCore::LandDiff(std::uint64_t address, std::span<const std::byte> befo
     diffLandedBytes.fetch_add(changed, std::memory_order_relaxed);
     diffUnchangedBytes.fetch_add(bytes - changed, std::memory_order_relaxed);
     if (changed != 0) Events::Shared().Note(address, bytes);
-    if (std::memcmp(view, after.data(), bytes) != 0) current->Upload(address, bytes);
+    const bool stale = std::memcmp(view, after.data(), bytes) != 0;
+    lock.unlock();
+    if (stale) current->Upload(address, bytes);
 }
 
 void MemoryCore::openWithPreImage(std::uint64_t page) {
@@ -99,19 +127,26 @@ void MemoryCore::openWithPreImage(std::uint64_t page) {
 }
 
 std::uint64_t MemoryCore::landOpenPieces(std::uint64_t page, std::uint64_t completed) {
-    const auto found = preImages.find(page);
-    if (found == preImages.end()) return 0;
     auto* current = host.load(std::memory_order_acquire);
     if (current == nullptr) return 0;
-    const auto pieces = written.In(page, PageBytes);
-    if (pieces.empty()) {
-        preImages.erase(found);
-        return 0;
+    {
+        std::lock_guard lock(mutex);
+        const auto found = preImages.find(page);
+        if (found == preImages.end()) return 0;
+        const auto pieces = written.In(page, PageBytes);
+        if (pieces.empty()) {
+            preImages.erase(found);
+            return 0;
+        }
+        if (std::ranges::none_of(pieces, [&](const WrittenRange& piece) { return piece.serial <= completed; })) return 0;
     }
-    if (std::ranges::none_of(pieces, [&](const WrittenRange& piece) { return piece.serial <= completed; })) return 0;
     std::vector<std::byte> mirror(PageBytes);
+    if (!current->ReadMirror(page, mirror)) return 0;
+    std::unique_lock lock(mutex);
+    const auto found = preImages.find(page);
     auto* view = current->View(page, PageBytes);
-    if (view == nullptr || !current->ReadMirror(page, mirror)) return 0;
+    if (found == preImages.end() || view == nullptr) return 0;
+    const auto pieces = written.In(page, PageBytes);
     const auto& before = found->second;
     std::uint64_t changed = 0;
     for (const auto& piece : pieces) {
@@ -126,6 +161,7 @@ std::uint64_t MemoryCore::landOpenPieces(std::uint64_t page, std::uint64_t compl
     if (!written.Any(page, PageBytes)) preImages.erase(found);
     diffLandedBytes.fetch_add(changed, std::memory_order_relaxed);
     if (changed != 0) Events::Shared().Note(page, PageBytes);
+    lock.unlock();
     current->Upload(page, PageBytes);
     return changed;
 }
@@ -192,6 +228,10 @@ bool MemoryCore::resolveOwnedFault(std::uint64_t address, bool write) {
     auto* current = host.load(std::memory_order_acquire);
     if (current == nullptr) return false;
     if (current->Bypass() || std::this_thread::get_id() == resolverThread) {
+        if (std::this_thread::get_id() != resolverThread && written.Pending(page, PageBytes) <= current->Completed()) {
+            bypassLanded.fetch_add(1, std::memory_order_relaxed);
+            return resolvePage(page, write);
+        }
         std::lock_guard lock(mutex);
         if (pages.StateOf(page) == PageState::GpuOwned) openWithPreImage(page);
         faultsBypassed.fetch_add(1, std::memory_order_relaxed);
@@ -244,14 +284,14 @@ void MemoryCore::FlushGpuWrites(std::uint64_t address, std::uint64_t size) {
         {
             std::lock_guard lock(mutex);
             owned = pages.StateOf(page) == PageState::GpuOwned;
-            if (!owned) {
-                if (landOpenPieces(page, completed) == 0 && written.Pending(page, PageBytes) > completed) flushPendingBytes.fetch_add(PageBytes, std::memory_order_relaxed);
-                continue;
-            }
-            if (written.Pending(page, PageBytes) > completed) {
+            if (owned && written.Pending(page, PageBytes) > completed) {
                 flushPendingBytes.fetch_add(PageBytes, std::memory_order_relaxed);
                 continue;
             }
+        }
+        if (!owned) {
+            if (landOpenPieces(page, completed) == 0 && written.Pending(page, PageBytes) > completed) flushPendingBytes.fetch_add(PageBytes, std::memory_order_relaxed);
+            continue;
         }
         std::vector<std::byte> mirror(PageBytes);
         if (!current->ReadMirror(page, mirror)) continue;
@@ -281,6 +321,19 @@ void MemoryCore::LandAhead() {
         FlushGpuWrites(page, PageBytes);
         if (ownedLandedBytes.load(std::memory_order_relaxed) != before) hotLandedPages.fetch_add(1, std::memory_order_relaxed);
     }
+}
+
+void MemoryCore::LandOpened() {
+    auto* current = host.load(std::memory_order_acquire);
+    if (current == nullptr) return;
+    std::vector<std::uint64_t> opened;
+    {
+        std::lock_guard lock(mutex);
+        opened.reserve(preImages.size());
+        for (const auto& [page, image] : preImages) opened.push_back(page);
+    }
+    const auto completed = current->Completed();
+    for (const auto page : opened) landOpenPieces(page, completed);
 }
 
 std::vector<DirtyRange> MemoryCore::WithoutGpuWritten(std::span<const DirtyRange> ranges) const {

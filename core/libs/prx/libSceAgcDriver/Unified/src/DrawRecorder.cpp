@@ -130,6 +130,7 @@ struct KnownWrite {
     std::uint64_t serial = 0;
     std::uint64_t address = 0;
     std::uint64_t bytes = 0;
+    std::shared_ptr<const std::vector<std::byte>> before;
 };
 
 struct CopyBack {
@@ -167,6 +168,10 @@ struct Totals {
     std::uint64_t writtenLate = 0;
     std::uint64_t ownedBytes = 0;
     std::uint64_t openLandedBytes = 0;
+    std::uint64_t mirrorWriteBytes = 0;
+    std::uint64_t mirrorArguments = 0;
+    std::uint64_t edgeSnapshotBytes = 0;
+    std::uint64_t edgeDiffBytes = 0;
     std::uint64_t writtenOverflows = 0;
     std::uint64_t writtenOnImports = 0;
     std::uint64_t importSwitches = 0;
@@ -424,11 +429,25 @@ std::optional<DrawInput> importedInput(const Context& context, std::uint64_t add
     return DrawInput{import->buffer, Graphics::HostImportOffset(*import, address)};
 }
 
+bool mirrorMode() {
+    return Mirror::WritesEnabled();
+}
+
+bool gpuPending(std::uint64_t address, std::uint64_t bytes) {
+    return mirrorMode() && MemoryCore::Get().Written().Any(address, bytes);
+}
+
+std::optional<DrawInput> mirrorInput(std::uint64_t address, std::uint64_t bytes) {
+    const auto span = ResidencyService::Get().MirrorSpan(address, bytes);
+    if (!span) return std::nullopt;
+    return DrawInput{reinterpret_cast<VkBuffer>(static_cast<std::uintptr_t>(span->handle)), static_cast<VkDeviceSize>(span->offset)};
+}
+
 std::optional<DrawInput> drawInput(const Context& context, std::uint64_t address, std::uint64_t bytes, InputSource& source) {
     source = InputSource::Imported;
     auto& pages = MemoryCore::Get().Pages();
     if (!Shadow::ResidentDrawInputs()) return importedInput(context, address, bytes);
-    if (pages.GpuWrittenIn(address, bytes) || !pages.GpuOwnedIn(address, bytes).empty()) {
+    if (pages.GpuWrittenIn(address, bytes) || !pages.GpuOwnedIn(address, bytes).empty() || gpuPending(address, bytes)) {
         source = InputSource::GpuWritten;
     } else if (DirectMemoryAliased_nid_postfix(static_cast<std::uintptr_t>(address), static_cast<std::size_t>(bytes))) {
         source = InputSource::Aliased;
@@ -441,6 +460,11 @@ std::optional<DrawInput> drawInput(const Context& context, std::uint64_t address
             }
             source = InputSource::Written;
         }
+    }
+    if (mirrorMode() && source != InputSource::Aliased) {
+        if (auto input = mirrorInput(address, bytes)) return input;
+        if (gpuPending(address, bytes)) return std::nullopt;
+        source = InputSource::Imported;
     }
     return importedInput(context, address, bytes);
 }
@@ -490,6 +514,7 @@ void countInput(Totals& totals, InputSource source) {
 constexpr std::uint64_t KnownBufferLimitBytes = 256ull << 20u;
 constexpr std::uint64_t KnownCopyLimitBytes = 64ull << 10u;
 constexpr std::uint64_t KnownWriteLimitBytes = 1ull << 20u;
+constexpr std::size_t ExtentsShown = 3;
 std::uint32_t coldSmallWrites() {
     static const std::uint32_t limit = [] {
         const char* value = std::getenv("APS5_RECODE_DIRECT_SMALL_WRITES");
@@ -507,7 +532,6 @@ bool copiesInputs() {
     return copies;
 }
 
-constexpr std::size_t ExtentsShown = 3;
 bool shaderDataBinding(const Resolve::ResolvedStage& stage, std::uint32_t index) {
     const auto& bindings = stage.program.result->bindings;
     return index < bindings.size() && bindings[index].role == ShaderRecompiler::DescriptorRole::ShaderData;
@@ -742,6 +766,7 @@ public:
         totals.nanoseconds += elapsed(started);
         if (recorded) {
             totals.recorded++;
+            noteExtent(draw);
             noteStagesWork(draw, Downgrades::Work::Draw, 0);
             noteUses(draw, "draw");
             return true;
@@ -759,7 +784,6 @@ public:
         if (excluded && !dispatch.stages.empty() && context.recorder != nullptr && probesOutput(dispatch.stages.front().program.codeAddress) && outputProbeDue(dispatch.stages.front().program.codeAddress)) {
             const auto codeAddress = dispatch.stages.front().program.codeAddress;
             for (std::size_t index = 0; index < dispatch.uses.size() && index < dispatch.imageBegin; ++index) {
-            noteExtent(draw);
                 const auto& use = dispatch.uses[index];
                 if (!use.write || use.size == 0u || use.size > OutputProbeLimitBytes) continue;
                 context.recorder->OnComplete([codeAddress, address = use.address, size = use.size] {
@@ -907,7 +931,7 @@ public:
         std::snprintf(text, sizeof(text), "; fault buffers %zu in flight, %llu read: %llu faults (%llu unmapped), %llu fault pages served, %llu written ranges (%llu pieces landed late), %llu written overflows", faults.size(), static_cast<unsigned long long>(totals.faultReads), static_cast<unsigned long long>(totals.faults), static_cast<unsigned long long>(totals.unmappedFaults), static_cast<unsigned long long>(totals.faultPages), static_cast<unsigned long long>(totals.writtenRanges), static_cast<unsigned long long>(totals.writtenLate), static_cast<unsigned long long>(totals.writtenOverflows));
         line += text;
         if (Mirror::WritesEnabled()) {
-            std::snprintf(text, sizeof(text), "; late writes left GPU-owned %.1f MiB, landed at once %.1f MiB", static_cast<double>(totals.ownedBytes) / 1048576.0, static_cast<double>(totals.openLandedBytes) / 1048576.0);
+            std::snprintf(text, sizeof(text), "; mirror writes %.1f MiB, pages left GPU-owned %.1f MiB, edges landed whole %.1f MiB, edges snapshot %.1f MiB and landed by diff %.1f MiB, indirect arguments from the mirror %llu", static_cast<double>(totals.mirrorWriteBytes) / 1048576.0, static_cast<double>(totals.ownedBytes) / 1048576.0, static_cast<double>(totals.openLandedBytes) / 1048576.0, static_cast<double>(totals.edgeSnapshotBytes) / 1048576.0, static_cast<double>(totals.edgeDiffBytes) / 1048576.0, static_cast<unsigned long long>(totals.mirrorArguments));
             line += text;
         }
         std::snprintf(text, sizeof(text), "; GPU-written chunks %llu switched to their import from the written bitmap (%.1f MiB copied over), %llu from other GPU writes, %llu refused, %llu written pieces already on an import", static_cast<unsigned long long>(totals.importSwitches), static_cast<double>(totals.switchBytes) / 1048576.0, static_cast<unsigned long long>(totals.writtenSwitches), static_cast<unsigned long long>(totals.switchRefused), static_cast<unsigned long long>(totals.writtenOnImports));
@@ -915,6 +939,7 @@ public:
         for (const auto& [reasonCode, count] : faultReasons) line += "; fault reason " + std::to_string(reasonCode) + " " + std::to_string(count);
         faultReasons.clear();
         for (const auto& [why, count] : totals.reasons) line += "; " + why + " " + std::to_string(count);
+        line += "\n" + extentLine();
         const auto pools = totals.pools;
         totals = {};
         totals.pools = pools;
@@ -922,24 +947,6 @@ public:
     }
 
 private:
-    bool attach(const Context& context, std::string& reason) {
-        if (device == context.device && ring != nullptr) return true;
-        if (device != VK_NULL_HANDLE) {
-            reason = "a second device";
-            return false;
-        }
-        if (ResidencyService::PageTableEnabled() && !ResidencyService::Get().Attach(context)) {
-            reason = "residency service did not attach";
-            return false;
-        }
-        line += "\n" + extentLine();
-        device = context.device;
-        alignment = std::max<std::uint64_t>(context.limits.minStorageBufferOffsetAlignment, 16u);
-        const auto ringMemory = ResidencyService::ShaderReadMemory(context, RingBytes);
-        const VkBufferUsageFlags addressable = context.bufferDeviceAddress ? VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT : 0u;
-        ring = std::make_shared<Graphics::Buffer>(context, RingBytes + RingZeroBytes, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_INDIRECT_BUFFER_BIT | VK_BUFFER_USAGE_VERTEX_BUFFER_BIT | VK_BUFFER_USAGE_INDEX_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_SRC_BIT | addressable, ringMemory);
-        std::memset(ring->Bytes().data() + RingBytes, 0, RingZeroBytes);
-        ringAddress = addressable != 0u ? ring->DeviceAddress() : 0u;
     void noteExtent(const Resolve::ResolvedDraw& draw) {
         if (draw.state == nullptr) return;
         const auto width = static_cast<std::uint32_t>(std::lround(std::fabs(draw.state->viewport.width)));
@@ -977,6 +984,23 @@ private:
         return line + part;
     }
 
+    bool attach(const Context& context, std::string& reason) {
+        if (device == context.device && ring != nullptr) return true;
+        if (device != VK_NULL_HANDLE) {
+            reason = "a second device";
+            return false;
+        }
+        if (ResidencyService::PageTableEnabled() && !ResidencyService::Get().Attach(context)) {
+            reason = "residency service did not attach";
+            return false;
+        }
+        device = context.device;
+        alignment = std::max<std::uint64_t>(context.limits.minStorageBufferOffsetAlignment, 16u);
+        const auto ringMemory = ResidencyService::ShaderReadMemory(context, RingBytes);
+        const VkBufferUsageFlags addressable = context.bufferDeviceAddress ? VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT : 0u;
+        ring = std::make_shared<Graphics::Buffer>(context, RingBytes + RingZeroBytes, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_INDIRECT_BUFFER_BIT | VK_BUFFER_USAGE_VERTEX_BUFFER_BIT | VK_BUFFER_USAGE_INDEX_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_SRC_BIT | addressable, ringMemory);
+        std::memset(ring->Bytes().data() + RingBytes, 0, RingZeroBytes);
+        ringAddress = addressable != 0u ? ring->DeviceAddress() : 0u;
         space.emplace(RingBytes, alignment);
         std::fprintf(stderr, "[recode-record] ring %llu MiB, alignment %llu, %s memory\n", static_cast<unsigned long long>(RingBytes >> 20u), static_cast<unsigned long long>(alignment), (ringMemory & VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT) != 0 ? "device" : "host");
         return true;
@@ -1004,6 +1028,11 @@ private:
     }
 
     void landWrites() {
+        if (!pendingDiffs.empty()) {
+            const auto diffs = std::move(pendingDiffs);
+            pendingDiffs.clear();
+            landDiffs(diffs);
+        }
         if (landing.empty()) return;
         const auto written = std::move(landing);
         const auto serials = std::move(landingSerials);
@@ -1078,7 +1107,7 @@ private:
     }
 
     void applySwitches(const Context& context, Graphics::Recorder& recorder) {
-        if (!switchesWrittenChunks()) return;
+        if (!switchesWrittenChunks() || mirrorMode()) return;
         auto others = Shadow::TakeGpuWrittenChunks();
         if (others.empty() && switches.empty()) return;
         const auto commands = recorder.Commands();
@@ -1144,12 +1173,47 @@ private:
 
     void landKnownWrites(std::uint64_t completed) {
         while (!knownWrites.empty() && knownWrites.front().serial <= completed) {
-            const auto& written = knownWrites.front();
+            auto written = std::move(knownWrites.front());
+            knownWrites.pop_front();
+            if (written.before != nullptr) {
+                pendingDiffs.push_back(std::move(written));
+                continue;
+            }
             if (!ResidencyService::Get().WrittenImportThroughout(written.address, written.bytes)) {
                 landWritten(written.address, written.bytes, written.serial);
                 totals.knownWriteBytes += written.bytes;
             }
-            knownWrites.pop_front();
+        }
+    }
+
+    void landDiffs(const std::vector<KnownWrite>& diffs) {
+        std::vector<std::pair<std::uint64_t, std::uint64_t>> ranges;
+        ranges.reserve(diffs.size());
+        for (const auto& written : diffs) ranges.emplace_back(written.address, written.bytes);
+        std::vector<PendingUpload> pieces;
+        {
+            std::unique_lock<GuestMemory::GpuMutexType> gpu(GuestMemory::GpuMutex(), std::defer_lock);
+            if (!GuestMemory::GpuMutex().HeldByThisThread()) gpu.lock();
+            pieces = ResidencyService::Get().ReadBack(ranges);
+        }
+        auto& core = MemoryCore::Get();
+        for (const auto& written : diffs) {
+            std::vector<std::byte> after(static_cast<std::size_t>(written.bytes));
+            std::uint64_t covered = 0;
+            for (const auto& piece : pieces) {
+                const auto begin = std::max(piece.guest, written.address);
+                const auto end = std::min(piece.guest + piece.bytes.size(), written.address + written.bytes);
+                if (begin >= end) continue;
+                std::memcpy(after.data() + (begin - written.address), piece.bytes.data() + (begin - piece.guest), static_cast<std::size_t>(end - begin));
+                covered += end - begin;
+            }
+            if (covered < written.bytes) {
+                landWritten(written.address, written.bytes, written.serial);
+                totals.knownWriteBytes += written.bytes;
+                continue;
+            }
+            core.LandDiff(written.address, *written.before, after, written.serial);
+            totals.edgeDiffBytes += written.bytes;
         }
     }
 
@@ -1303,7 +1367,7 @@ private:
 
     bool extendWrittenImports(const Context& context, std::uint64_t address, std::uint64_t bytes) {
         auto& residency = ResidencyService::Get();
-        if (!servesKnownPrefixes() || residency.WrittenImportThroughout(address, bytes) || residency.TranslateMapped(address, bytes) != 0u) return false;
+        if (mirrorMode() || !servesKnownPrefixes() || residency.WrittenImportThroughout(address, bytes) || residency.TranslateMapped(address, bytes) != 0u) return false;
         const auto* import = Graphics::HostImportFor(context, address, 1u);
         if (import == nullptr || context.recorder == nullptr) return false;
         bool extended = false;
@@ -1331,6 +1395,28 @@ private:
         }
         if (copied) Graphics::RecordMemoryBarrier(context, commands, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT | VK_PIPELINE_STAGE_HOST_BIT, VK_ACCESS_TRANSFER_WRITE_BIT, VK_ACCESS_MEMORY_READ_BIT | VK_ACCESS_MEMORY_WRITE_BIT | VK_ACCESS_HOST_READ_BIT);
         return extended;
+    }
+
+    std::uint64_t mirrorKnownWrite(std::uint64_t address, std::uint64_t bytes, std::uint64_t serial) {
+        if (bytes > KnownBufferLimitBytes) return 0u;
+        auto& residency = ResidencyService::Get();
+        const auto span = residency.MirrorSpan(address, bytes);
+        if (!span) return 0u;
+        const auto mark = MemoryCore::Get().NoteGpuWrite(address, bytes, serial);
+        if (!mark.upload.empty()) residency.NoteDirty(mark.upload);
+        for (const auto& range : mark.owned) totals.ownedBytes += range.size;
+        for (const auto& range : mark.open) {
+            if (!knownWrites.empty() && knownWrites.back().serial == serial && knownWrites.back().address == range.address && knownWrites.back().bytes == range.size) continue;
+            std::shared_ptr<const std::vector<std::byte>> before;
+            const auto* view = static_cast<const std::byte*>(GuestMemory::OwnStoreTarget(range.address, static_cast<std::size_t>(range.size)));
+            if (view != reinterpret_cast<const std::byte*>(range.address) && range.size <= KnownBufferLimitBytes) {
+                before = std::make_shared<const std::vector<std::byte>>(view, view + range.size);
+                totals.edgeSnapshotBytes += range.size;
+            }
+            knownWrites.push_back({serial, range.address, range.size, std::move(before)});
+        }
+        totals.mirrorWriteBytes += bytes;
+        return span->address;
     }
 
     std::uint64_t serveKnownWrite(const Context& context, std::uint64_t address, std::uint64_t& bytes, std::uint64_t serial, bool copiedBackWrite) {
@@ -1541,6 +1627,17 @@ private:
                 write(zero, 0u);
                 continue;
             }
+            if (index < infos.size() && infos[index].written && mirrorMode()) {
+                const auto mapped = mirrorKnownWrite(address, bytes, serial);
+                if (mapped != 0u) {
+                    totals.knownWritten++;
+                } else {
+                    totals.knownWriteLookups++;
+                    noteKnown(stage, Downgrades::Kind::KnownWriteRefused, index, address, bytes, 0u);
+                }
+                write(mapped, mapped != 0u ? bytes : 0u);
+                continue;
+            }
             if (index < infos.size() && infos[index].written) {
                 auto served = bytes;
                 if (const auto direct = directSmallWrite(context, address, bytes); direct != 0u) {
@@ -1639,13 +1736,13 @@ private:
         if (!GuestArena::GuestArenaContains_nid_postfix(reinterpret_cast<const void*>(address), static_cast<std::size_t>(bytes))) return std::nullopt;
         const auto committed = GuestMemory::CommittedRanges(address, static_cast<std::size_t>(bytes));
         if (committed.size() != 1u || committed.front().first > address || committed.front().second < address + bytes) return std::nullopt;
-        if (!MemoryCore::Get().Pages().GpuOwnedIn(address, bytes).empty()) return std::nullopt;
+        if (!MemoryCore::Get().Pages().GpuOwnedIn(address, bytes).empty() || gpuPending(address, bytes)) return std::nullopt;
         return ringWrite(std::span(reinterpret_cast<const std::byte*>(address), static_cast<std::size_t>(bytes)), serial, completed);
     }
 
     std::uint64_t copyKnownBuffer(std::uint64_t address, std::uint64_t bytes, std::uint64_t serial, std::uint64_t completed) {
         if (ringAddress == 0u || bytes > KnownCopyLimitBytes) return 0u;
-        if (refusesGpuWrittenCopies() && MemoryCore::Get().Pages().GpuWrittenIn(address, bytes)) {
+        if ((refusesGpuWrittenCopies() && MemoryCore::Get().Pages().GpuWrittenIn(address, bytes)) || gpuPending(address, bytes)) {
             totals.knownGpuWritten++;
             return 0u;
         }
@@ -2026,7 +2123,7 @@ private:
     bool placeDispatchArguments(const Context& context, Graphics::Recorder& recorder, std::uint64_t address, std::uint64_t serial, std::uint64_t completed, VkBuffer& buffer, VkDeviceSize& offset, std::string& reason) {
         constexpr std::size_t bytes = 3u * sizeof(std::uint32_t);
         const auto* source = reinterpret_cast<const std::byte*>(address);
-        if (!Graphics::Recorder::SnapshotWriteOverlaps(address, bytes) && recorder.PendingLeaseSerial(address, bytes) == 0u && !MemoryCore::Get().Pages().GpuWrittenIn(address, bytes) && GuestMemory::Accessible(source, bytes, false)) {
+        if (!Graphics::Recorder::SnapshotWriteOverlaps(address, bytes) && recorder.PendingLeaseSerial(address, bytes) == 0u && !MemoryCore::Get().Pages().GpuWrittenIn(address, bytes) && !gpuPending(address, bytes) && MemoryCore::Get().Pages().GpuOwnedIn(address, bytes).empty() && GuestMemory::Accessible(source, bytes, false)) {
             const auto placed = ringWrite(std::span(source, bytes), serial, completed);
             if (!placed.has_value()) {
                 reason = "ring full";
@@ -2036,6 +2133,18 @@ private:
             offset = *placed;
             totals.snapshotArguments++;
             return true;
+        }
+        if (mirrorMode()) {
+            if (const auto input = mirrorInput(address, bytes)) {
+                buffer = input->buffer;
+                offset = input->offset;
+                totals.mirrorArguments++;
+                return true;
+            }
+            if (gpuPending(address, bytes)) {
+                reason = "indirect arguments with pending GPU bytes not in the mirror";
+                return false;
+            }
         }
         const auto* import = Graphics::HostImportFor(context, address, bytes);
         if (import == nullptr) {
@@ -2403,14 +2512,14 @@ private:
 
         VkBuffer argumentBuffer = VK_NULL_HANDLE;
         VkDeviceSize argumentOffset = 0;
-        const Graphics::HostImport* countImport = nullptr;
+        std::optional<DrawInput> indirectCount;
         if (parameters.indirect) {
             using Rule = Pm4::DrawParameters::IndirectDraw::Rule;
             const auto& args = *parameters.indirect;
             const auto bytes = static_cast<std::size_t>(args.RangeBytes());
             const bool rewritten = args.vertexRule == Rule::Constant || args.instanceRule == Rule::Constant;
             const auto* source = reinterpret_cast<const std::byte*>(args.arguments);
-            if (!args.countIndirect && !Graphics::Recorder::SnapshotWriteOverlaps(args.arguments, bytes) && recorder->PendingLeaseSerial(args.arguments, bytes) == 0u && GuestMemory::Accessible(source, bytes, false)) {
+            if (!args.countIndirect && !Graphics::Recorder::SnapshotWriteOverlaps(args.arguments, bytes) && recorder->PendingLeaseSerial(args.arguments, bytes) == 0u && !gpuPending(args.arguments, bytes) && MemoryCore::Get().Pages().GpuOwnedIn(args.arguments, bytes).empty() && GuestMemory::Accessible(source, bytes, false)) {
                 std::vector<std::byte> copy(source, source + bytes);
                 for (std::uint32_t record = 0; record < args.count; ++record) {
                     const auto base = static_cast<std::size_t>(record) * args.stride;
@@ -2430,9 +2539,21 @@ private:
                     reason = "constant rule on GPU-written arguments";
                     return false;
                 }
-                const auto* import = Graphics::HostImportFor(context, args.arguments, bytes);
-                if (import == nullptr) {
-                    reason = "indirect arguments not imported";
+                const auto readInput = [&](std::uint64_t address, std::uint64_t size, bool& mirrored) -> std::optional<DrawInput> {
+                    mirrored = false;
+                    if (mirrorMode()) {
+                        if (auto input = mirrorInput(address, size)) {
+                            mirrored = true;
+                            return input;
+                        }
+                        if (gpuPending(address, size)) return std::nullopt;
+                    }
+                    return importedInput(context, address, size);
+                };
+                bool argumentsMirrored = false;
+                const auto argumentInput = readInput(args.arguments, bytes, argumentsMirrored);
+                if (!argumentInput) {
+                    reason = "indirect arguments neither in the mirror nor imported";
                     return false;
                 }
                 if (args.countIndirect) {
@@ -2440,16 +2561,18 @@ private:
                         reason = "no indirect count";
                         return false;
                     }
-                    countImport = Graphics::HostImportFor(context, args.countAddress, sizeof(std::uint32_t));
-                    if (countImport == nullptr) {
-                        reason = "indirect count not imported";
+                    bool countMirrored = false;
+                    indirectCount = readInput(args.countAddress, sizeof(std::uint32_t), countMirrored);
+                    if (!indirectCount) {
+                        reason = "indirect count neither in the mirror nor imported";
                         return false;
                     }
-                    recorder->NotePendingRead(args.countAddress, sizeof(std::uint32_t), Graphics::Recorder::ReadKind::Indirect);
+                    if (!countMirrored) recorder->NotePendingRead(args.countAddress, sizeof(std::uint32_t), Graphics::Recorder::ReadKind::Indirect);
                 }
-                recorder->NotePendingRead(args.arguments, bytes, Graphics::Recorder::ReadKind::Indirect);
-                argumentBuffer = import->buffer;
-                argumentOffset = Graphics::HostImportOffset(*import, args.arguments);
+                if (argumentsMirrored) totals.mirrorArguments++;
+                else recorder->NotePendingRead(args.arguments, bytes, Graphics::Recorder::ReadKind::Indirect);
+                argumentBuffer = argumentInput->buffer;
+                argumentOffset = argumentInput->offset;
             }
             totals.indirect++;
         }
@@ -2507,7 +2630,7 @@ private:
         const bool feedback = recorder->RenderPassOpen() && overlaps(passReads, passTargets);
         if (feedback) totals.passFeedback++;
         const bool snapshotArguments = parameters.indirect && ring != nullptr && argumentBuffer == ring->Handle();
-        const bool forced = !mergesPasses() || !draw.complete || feedback || storesImages || (parameters.indirect && !snapshotArguments) || countImport != nullptr;
+        const bool forced = !mergesPasses() || !draw.complete || feedback || storesImages || (parameters.indirect && !snapshotArguments) || indirectCount.has_value();
         const bool fenced = state.depth.has_value();
         const auto start = recorder->StartDrawPass(key, forced, fenced, access);
         if (recorder->OpenBatchSerial() != serial) totals.batchMoves++;
@@ -2551,9 +2674,9 @@ private:
         const auto drawTiming = recorder->BeginInPassGpuTiming(DrawTimingKey | (std::uint64_t{0x7ec} << 48u) | (timedProgram & 0xffffffffffffull));
         if (parameters.indirect) {
             const auto& args = *parameters.indirect;
-            if (countImport != nullptr) {
-                if (parameters.indexed) context.Function<PFN_vkCmdDrawIndexedIndirectCountKHR>("vkCmdDrawIndexedIndirectCountKHR")(commands, argumentBuffer, argumentOffset, countImport->buffer, Graphics::HostImportOffset(*countImport, args.countAddress), args.count, args.stride);
-                else context.Function<PFN_vkCmdDrawIndirectCountKHR>("vkCmdDrawIndirectCountKHR")(commands, argumentBuffer, argumentOffset, countImport->buffer, Graphics::HostImportOffset(*countImport, args.countAddress), args.count, args.stride);
+            if (indirectCount) {
+                if (parameters.indexed) context.Function<PFN_vkCmdDrawIndexedIndirectCountKHR>("vkCmdDrawIndexedIndirectCountKHR")(commands, argumentBuffer, argumentOffset, indirectCount->buffer, indirectCount->offset, args.count, args.stride);
+                else context.Function<PFN_vkCmdDrawIndirectCountKHR>("vkCmdDrawIndirectCountKHR")(commands, argumentBuffer, argumentOffset, indirectCount->buffer, indirectCount->offset, args.count, args.stride);
             } else if (args.count <= 1u || context.multiDrawIndirect) {
                 if (parameters.indexed) context.Resolved(&Graphics::DeviceFunctions::cmdDrawIndexedIndirect, "vkCmdDrawIndexedIndirect")(commands, argumentBuffer, argumentOffset, args.count, args.stride);
                 else context.Resolved(&Graphics::DeviceFunctions::cmdDrawIndirect, "vkCmdDrawIndirect")(commands, argumentBuffer, argumentOffset, args.count, args.stride);
@@ -2898,6 +3021,8 @@ private:
     std::map<std::vector<std::uint64_t>, std::shared_ptr<ComputePipeline>> computePipelines;
     std::vector<std::pair<std::uint64_t, std::uint64_t>> landing;
     std::vector<std::uint64_t> landingSerials;
+    std::vector<KnownWrite> pendingDiffs;
+    std::map<std::pair<std::uint32_t, std::uint32_t>, std::uint64_t> extents;
     std::set<std::vector<std::uint64_t>> buildingPipelines;
     std::map<std::vector<std::uint64_t>, std::string> failedPipelines;
     std::deque<PipelineJob> pipelineJobs;
@@ -2953,7 +3078,6 @@ void PublishRecords(const Graphics::Context& context, std::uint64_t address, std
         const auto commands = context.recorder->Commands();
         const auto levels = std::min(static_cast<std::uint32_t>(std::max<std::size_t>(vulkan->Geometry().mips.size(), 1u)), std::max(descriptor.mipCount, 1u));
         const auto layers = std::min(std::max(vulkan->Geometry().imageLayers, 1u), std::max(upstream->ImageLayers(), 1u));
-    std::map<std::pair<std::uint32_t, std::uint32_t>, std::uint64_t> extents;
         Images::CopyImageContent(context, commands, vulkan->Image(), upstream->Image(), resource.width, resource.height, levels, layers);
         context.recorder->Keep(record);
         context.recorder->Keep(upstream);

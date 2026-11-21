@@ -80,6 +80,40 @@ bool Protector::Readable(std::uint64_t address) {
 #endif
 }
 
+const char* Protector::RegionKind(std::uint64_t address) {
+#ifdef _WIN32
+    MEMORY_BASIC_INFORMATION memory{};
+    if (VirtualQuery(reinterpret_cast<const void*>(address), &memory, sizeof(memory)) != sizeof(memory)) return "unknown";
+    if (memory.State != MEM_COMMIT) return memory.State == MEM_RESERVE ? "reserved" : "free";
+    return memory.Type == MEM_MAPPED ? "mapped" : memory.Type == MEM_PRIVATE ? "private" : memory.Type == MEM_IMAGE ? "image" : "other";
+#else
+    static_cast<void>(address);
+    return "unknown";
+#endif
+}
+
+std::vector<DirtyRange> Protector::ReadableRanges(std::uint64_t address, std::uint64_t size) {
+    std::vector<DirtyRange> readable;
+#ifdef _WIN32
+    const auto end = address + size;
+    for (auto cursor = address; cursor < end;) {
+        MEMORY_BASIC_INFORMATION memory{};
+        if (VirtualQuery(reinterpret_cast<const void*>(cursor), &memory, sizeof(memory)) != sizeof(memory)) break;
+        const auto stop = std::min<std::uint64_t>(end, reinterpret_cast<std::uint64_t>(memory.BaseAddress) + memory.RegionSize);
+        const auto access = memory.Protect & 0xffu;
+        const bool open = memory.State == MEM_COMMIT && (memory.Protect & PAGE_GUARD) == 0 && access != PAGE_NOACCESS && access != 0;
+        if (open) {
+            if (!readable.empty() && readable.back().address + readable.back().size == cursor) readable.back().size += stop - cursor;
+            else readable.push_back({cursor, stop - cursor});
+        }
+        cursor = stop;
+    }
+#else
+    readable.push_back({address, size});
+#endif
+    return readable;
+}
+
 void Protector::Track(Tracker next) {
     std::lock_guard lock(mutex);
     tracker = next;

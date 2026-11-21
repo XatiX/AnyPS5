@@ -4,7 +4,9 @@
 #include "prx/libSceAgcDriver/Unified/include/MemoryCore.hpp"
 #include "prx/libSceAgcDriver/Unified/include/ResidencyService.hpp"
 #include <array>
+#include <atomic>
 #include <chrono>
+#include <cstdio>
 #include <cstdlib>
 #include <cstring>
 #include <mutex>
@@ -47,7 +49,17 @@ public:
 
     bool ReadMirror(std::uint64_t address, std::span<std::byte> out) override {
         std::unique_lock<GuestMemory::GpuMutexType> gpu(GuestMemory::GpuMutex(), std::defer_lock);
-        if (!GuestMemory::GpuMutex().HeldByThisThread()) gpu.lock();
+        if (!GuestMemory::GpuMutex().HeldByThisThread()) {
+            bool locked = false;
+            for (int tries = 0; tries < LockTries && !locked; ++tries) {
+                locked = gpu.try_lock();
+                if (!locked) std::this_thread::sleep_for(std::chrono::microseconds(500));
+            }
+            if (!locked) {
+                if (!lockTimeoutSeen.exchange(true)) std::fprintf(stderr, "[recode-gpu-owned] a mirror read gave up waiting %d ms for the GPU mutex at 0x%llx; the page opens with its old bytes\n", LockTries / 2, static_cast<unsigned long long>(address));
+                return false;
+            }
+        }
         const std::array ranges{std::pair{address, static_cast<std::uint64_t>(out.size())}};
         const auto pieces = ResidencyService::Get().ReadBack(ranges);
         std::uint64_t covered = 0;
@@ -60,7 +72,8 @@ public:
     }
 
     std::byte* View(std::uint64_t address, std::size_t bytes) override {
-        return static_cast<std::byte*>(GuestMemory::OwnStoreTarget(address, bytes));
+        auto* view = GuestMemory::OwnStoreTarget(address, bytes);
+        return view == reinterpret_cast<void*>(address) ? nullptr : static_cast<std::byte*>(view);
     }
 
     void Upload(std::uint64_t address, std::uint64_t size) override {
@@ -80,6 +93,7 @@ private:
 
     std::mutex mutex;
     std::weak_ptr<VulkanDevice> device;
+    std::atomic<bool> lockTimeoutSeen{false};
 };
 
 Host& host() {
@@ -96,8 +110,11 @@ bool WritesEnabled() {
 
 void Attach(const std::shared_ptr<VulkanDevice>& device) {
     if (!WritesEnabled()) return;
+    static std::atomic<VulkanDevice*> attached{nullptr};
+    if (attached.exchange(device.get(), std::memory_order_acq_rel) == device.get()) return;
     host().Attach(device);
     MemoryCore::Get().SetHost(&host());
+    ResidencyService::Get().SetMirrorSpaces(true);
     ResidencyService::Get().SetKeep([](std::uint64_t address, std::uint64_t size) { return MemoryCore::Get().Written().Any(address, size); });
     GuestMemory::SetMirrorFlushHook([](std::uint64_t address, std::size_t bytes) { MemoryCore::Get().FlushGpuWrites(address, bytes); });
 }

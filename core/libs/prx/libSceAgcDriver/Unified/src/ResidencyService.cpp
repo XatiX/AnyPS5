@@ -195,8 +195,23 @@ bool ResidencyService::ServeFaultPage(std::uint64_t page, std::uint64_t allocati
 
 void ResidencyService::MapImports(std::uint64_t serial, std::shared_ptr<const std::vector<Abi::Range>> ranges) {
     if (!Attached() || ranges == nullptr) return;
+    std::vector<SpaceCommit> commits;
+    if (mirrorSpaces.load(std::memory_order_acquire)) {
+        commits.reserve(ranges->size());
+        for (const auto& range : *ranges) {
+            if (range.end > range.begin) commits.push_back({range.begin, range.end - range.begin, GuestMemory::CommittedRanges(range.begin, static_cast<std::size_t>(range.end - range.begin))});
+        }
+    }
     std::lock_guard lock(mutex);
     if (!pages || serial == importSerial) return;
+    if (mirrorSpaces.load(std::memory_order_relaxed)) {
+        serveSpaces(commits);
+        importSerial = serial;
+        importSpaces.push_back(std::move(ranges));
+        while (importSpaces.size() > ImportSpacesKept) importSpaces.pop_front();
+        ++importMaps;
+        return;
+    }
     std::vector<LinearSpan> spans;
     spans.reserve(ranges->size());
     for (const auto& range : *ranges) spans.push_back({range.begin, range.end, range.deviceAddress});
@@ -258,7 +273,7 @@ std::vector<std::uint64_t> ResidencyService::ForgetImport(std::uint64_t base, st
 bool ResidencyService::MapWrittenImport(std::uint64_t chunk, std::uint64_t target) {
     if (!Attached() || target == 0u) return false;
     std::lock_guard lock(mutex);
-    if (!pages || writtenImports.contains(chunk)) return false;
+    if (!pages || mirrorSpaces || writtenImports.contains(chunk)) return false;
     pages->Map(chunk, GpuPageBytes, target, GpuPagePermissions);
     writtenImports.emplace(chunk, target);
     return true;
@@ -517,6 +532,51 @@ void ResidencyService::AdvanceFrame() {
     uploads->Evict(now);
 }
 
+void ResidencyService::SetMirrorSpaces(bool enabled) {
+    std::lock_guard lock(mutex);
+    mirrorSpaces.store(enabled, std::memory_order_release);
+    if (!enabled || !pages) return;
+    for (const auto& [page, target] : importPages) {
+        if (pages->Lookup(page) != target) continue;
+        pages->Unmap(page, GpuPageBytes);
+        if (const auto bound = ledger->Translate(page, GpuPageBytes)) pages->Map(page, GpuPageBytes, bound->address, GpuPagePermissions);
+    }
+    importPages.clear();
+    importSerial = 0;
+}
+
+std::optional<DeviceSpan> ResidencyService::MirrorSpan(std::uint64_t address, std::uint64_t size) {
+    if (!Attached() || size == 0) return std::nullopt;
+    if (auto span = Translate(address, size)) return span;
+    const auto committed = GuestMemory::CommittedRanges(address, static_cast<std::size_t>(size));
+    if (!Serve(address, size, committed)) return std::nullopt;
+    return Translate(address, size);
+}
+
+void ResidencyService::serveSpaces(std::span<const SpaceCommit> commits) {
+    const auto now = frame.load(std::memory_order_relaxed);
+    for (const auto& commit : commits) {
+        const auto size = commit.size;
+        if (!ledger->Owns(commit.address, size)) {
+            ledger->RemoveUnboundInside(commit.address, size);
+            if (!ledger->Add(commit.address, size)) {
+                ++spacesRefused;
+                continue;
+            }
+        }
+        bool served = true;
+        for (const auto& [from, to] : commit.committed) {
+            if (to > from && !uploads->Prepare(from, to - from, now)) served = false;
+        }
+        if (served) {
+            ++spacesServed;
+            spaceBytes += size;
+        } else {
+            ++spacesRefused;
+        }
+    }
+}
+
 void ResidencyService::SetKeep(Residency::Keep next) {
     std::lock_guard lock(mutex);
     keep = next;
@@ -547,7 +607,13 @@ std::string ResidencyService::Line() const {
     std::snprintf(table, sizeof(table), "[recode-page-table] leaves %u of %u, updates %llu (%llu MiB), leaves dropped %llu, shared pages %llu; imports mapped %llu pages, %llu spaces, %llu pages of retired imports dropped; fault pages served %llu, already mapped %llu, refused %llu; read backs %llu (%llu KiB), not resident %llu KiB; GPU-written chunks on their import %llu (%llu forgotten, %llu returned, %llu of them bound on return)\n", pages->Leaves(), PageTableLeafCapacity,
         static_cast<unsigned long long>(pageUpdates), static_cast<unsigned long long>(pageUpdateBytes >> 20), static_cast<unsigned long long>(pageLeavesDropped), static_cast<unsigned long long>(ledgerCounts.sharedPages),
         static_cast<unsigned long long>(importPages.size()), static_cast<unsigned long long>(importMaps), static_cast<unsigned long long>(importPagesForgotten), static_cast<unsigned long long>(faultPagesServed), static_cast<unsigned long long>(faultPagesMapped), static_cast<unsigned long long>(faultPagesRefused), static_cast<unsigned long long>(readBacks), static_cast<unsigned long long>(readBackBytes >> 10), static_cast<unsigned long long>(readBackMissedBytes >> 10), static_cast<unsigned long long>(writtenImports.size()), static_cast<unsigned long long>(writtenImportsForgotten), static_cast<unsigned long long>(writtenImportsReturned), static_cast<unsigned long long>(writtenImportsBound));
-    return std::string(line) + table;
+    std::string spaces;
+    if (mirrorSpaces) {
+        char text[192];
+        std::snprintf(text, sizeof(text), "[recode-mirror-spaces] served %llu, refused %llu, %llu MiB\n", static_cast<unsigned long long>(spacesServed), static_cast<unsigned long long>(spacesRefused), static_cast<unsigned long long>(spaceBytes >> 20));
+        spaces = text;
+    }
+    return std::string(line) + table + spaces;
 }
 
 }

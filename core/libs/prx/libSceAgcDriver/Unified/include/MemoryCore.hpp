@@ -40,6 +40,10 @@ struct MemoryCoreCounts {
     std::uint64_t flushPendingBytes = 0;
     std::uint64_t hotLandedPages = 0;
     std::uint64_t preImages = 0;
+    std::uint64_t unviewedBytes = 0;
+    std::uint64_t unreadableHashes = 0;
+    std::uint64_t gpuOnlyBytes = 0;
+    std::uint64_t bypassLanded = 0;
 };
 
 struct GpuWriteMark {
@@ -65,6 +69,7 @@ public:
     static constexpr std::size_t HotPages = 32;
     static constexpr std::uint32_t HotLifetime = 4096;
     static constexpr int ResolveAttempts = 3;
+    static constexpr std::uint64_t UnviewedReports = 8;
 
     static MemoryCore& Get();
 
@@ -94,6 +99,7 @@ public:
     void LandDiff(std::uint64_t address, std::span<const std::byte> before, std::span<const std::byte> after, std::uint64_t serial);
     void FlushGpuWrites(std::uint64_t address, std::uint64_t size);
     void LandAhead();
+    void LandOpened();
     [[nodiscard]] std::vector<DirtyRange> WithoutGpuWritten(std::span<const DirtyRange> ranges) const;
     [[nodiscard]] GpuWritten& Written() { return written; }
     [[nodiscard]] PageTable& Pages() { return pages; }
@@ -161,6 +167,11 @@ private:
     std::atomic<std::uint64_t> flushPendingBytes{0};
     std::atomic<std::uint64_t> hotLandedPages{0};
     std::atomic<std::uint64_t> preImageCount{0};
+    std::atomic<std::uint64_t> unviewedBytes{0};
+    std::atomic<std::uint64_t> unreadableHashes{0};
+    std::atomic<std::uint64_t> gpuOnlyBytes{0};
+    std::atomic<std::uint64_t> unviewedReports{0};
+    std::atomic<std::uint64_t> bypassLanded{0};
 };
 
 }
