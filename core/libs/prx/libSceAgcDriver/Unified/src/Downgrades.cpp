@@ -98,6 +98,7 @@ std::string_view KindName(Kind kind) {
         case Kind::TemplateMismatch: return "template-mismatch";
         case Kind::KnownShort: return "known-short";
         case Kind::SampledAhead: return "sampled-ahead";
+        case Kind::ViewMismatch: return "view-mismatch";
         default: return "unknown";
     }
 }
@@ -110,7 +111,8 @@ Severity SeverityOf(Kind kind) {
         case Kind::PageFault:
         case Kind::TemplateMismatch:
         case Kind::KnownShort:
-        case Kind::SampledAhead: return Severity::Severe;
+        case Kind::SampledAhead:
+        case Kind::ViewMismatch: return Severity::Severe;
         case Kind::ExistingPath:
         case Kind::StorageRecordMissing:
         case Kind::UpstreamSampled:

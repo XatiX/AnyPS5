@@ -1737,6 +1737,7 @@ private:
             stageStorageImages.emplace_back(texture->Image(), storageWritten);
             if (storageWritten) written.push_back(std::move(texture));
         }
+        const Downgrades::ProgramScope programScope(stage.program.codeAddress);
         for (const auto* deferred : sampled) {
             std::uint32_t slot = 0;
             publishRequest(context, deferred->request);

@@ -92,6 +92,41 @@ SampledClass sampledClass(const Graphics::Texture& texture) {
     return texture.ViewsStorageImage() ? SampledView : SampledSnapshot;
 }
 
+VkImageViewType wantedViewType(std::uint32_t kind) {
+    constexpr std::array<VkImageViewType, 7> types{VK_IMAGE_VIEW_TYPE_1D, VK_IMAGE_VIEW_TYPE_1D_ARRAY, VK_IMAGE_VIEW_TYPE_2D, VK_IMAGE_VIEW_TYPE_2D_ARRAY, VK_IMAGE_VIEW_TYPE_2D, VK_IMAGE_VIEW_TYPE_2D_ARRAY, VK_IMAGE_VIEW_TYPE_3D};
+    return types[(kind - ShaderRecompiler::RuntimeAbi::FirstImageBinding) % types.size()];
+}
+
+enum SampledChoice : std::size_t { ChoicePlain, ChoiceFirstLayer, ChoiceArray, ChoiceMismatch, ChoiceCount };
+
+bool choosesViews() {
+    static const bool chooses = std::getenv("APS5_RECODE_PLAIN_VIEWS") == nullptr;
+    return chooses;
+}
+
+VkImageView sampledView(const Graphics::Texture& texture, std::uint32_t kind, SampledChoice& choice) {
+    const auto wanted = wantedViewType(kind);
+    choice = ChoicePlain;
+    if (texture.SampledViewRange(false).type == wanted) return texture.View();
+    choice = ChoiceMismatch;
+    if (!choosesViews()) return texture.View();
+    if (wanted == VK_IMAGE_VIEW_TYPE_2D && texture.FirstLayerView() != VK_NULL_HANDLE && texture.SampledViewRange(true).type == wanted) {
+        choice = ChoiceFirstLayer;
+        return texture.FirstLayerView();
+    }
+    if (wanted == VK_IMAGE_VIEW_TYPE_2D_ARRAY && texture.HasArrayView()) {
+        choice = ChoiceArray;
+        return texture.ArrayView();
+    }
+    return texture.View();
+}
+
+void noteViewMismatch(const Graphics::Texture& texture, const Heap::SlotRequest& request) {
+    char text[96];
+    std::snprintf(text, sizeof(text), "slot wants view type %d, the cache texture has %d", static_cast<int>(wantedViewType(request.kind)), static_cast<int>(texture.SampledViewRange(false).type));
+    Downgrades::NoteCurrent(Downgrades::Kind::ViewMismatch, request.kind, text);
+}
+
 bool memoizesTables() {
     static const bool enabled = std::getenv("APS5_RECODE_NO_TABLE_MEMO") == nullptr;
     return enabled;
@@ -245,7 +280,11 @@ public:
             return nullptr;
         }
         sampledAtRecord[sampledClass(*texture)].fetch_add(1, std::memory_order_relaxed);
-        slot = table->ImageSlot(request.kind, {reinterpret_cast<std::uint64_t>(texture->View()), static_cast<std::uint32_t>(texture->Layout()), texture});
+        SampledChoice choice = ChoicePlain;
+        const auto view = sampledView(*texture, request.kind, choice);
+        viewChoices[choice].fetch_add(1, std::memory_order_relaxed);
+        if (choice == ChoiceMismatch) noteViewMismatch(*texture, request);
+        slot = table->ImageSlot(request.kind, {reinterpret_cast<std::uint64_t>(view), static_cast<std::uint32_t>(texture->Layout()), texture});
         if (slot == Heap::NoSlot) {
             reason = "image heap full for kind " + std::to_string(request.kind);
             return nullptr;
@@ -343,6 +382,7 @@ private:
 
     std::array<std::atomic<std::uint64_t>, SampledClassCount> sampledAhead{};
     std::array<std::atomic<std::uint64_t>, SampledClassCount> sampledAtRecord{};
+    std::array<std::atomic<std::uint64_t>, ChoiceCount> viewChoices{};
     std::mutex refusalMutex;
     std::string lastRefusal;
     std::mutex recordMutex;
@@ -588,6 +628,7 @@ public:
         line += "; gpu lock busy " + std::to_string(totals.lockBusy);
         const auto taken = [](std::array<std::atomic<std::uint64_t>, SampledClassCount>& counts) { return std::to_string(counts[SampledView].exchange(0, std::memory_order_relaxed)) + " views, " + std::to_string(counts[SampledCopy].exchange(0, std::memory_order_relaxed)) + " per-use copies, " + std::to_string(counts[SampledSnapshot].exchange(0, std::memory_order_relaxed)) + " snapshots"; };
         line += "; existing-cache sampled textures bound when resolved " + taken(sampledAhead) + "; bound when recorded " + taken(sampledAtRecord);
+        line += "; their views " + std::to_string(viewChoices[ChoicePlain].exchange(0, std::memory_order_relaxed)) + " plain, " + std::to_string(viewChoices[ChoiceFirstLayer].exchange(0, std::memory_order_relaxed)) + " first layer, " + std::to_string(viewChoices[ChoiceArray].exchange(0, std::memory_order_relaxed)) + " array, " + std::to_string(viewChoices[ChoiceMismatch].exchange(0, std::memory_order_relaxed)) + " of another type than the slot";
         {
             std::lock_guard recordLock(recordMutex);
             line += "; storage images on recode surfaces " + std::to_string(storageRecords) + ", " + std::to_string(storageRecordRefusals) + " refused";
@@ -739,8 +780,12 @@ private:
         } else {
             Downgrades::NoteCurrent(Downgrades::Kind::UpstreamSampled, request.kind, "existing sampled texture cache");
         }
+        SampledChoice choice = ChoicePlain;
+        const auto view = sampledView(*texture, request.kind, choice);
+        viewChoices[choice].fetch_add(1, std::memory_order_relaxed);
+        if (choice == ChoiceMismatch) noteViewMismatch(*texture, request);
         Heap::ResolvedImage resolved;
-        resolved.image = {reinterpret_cast<std::uint64_t>(texture->View()), static_cast<std::uint32_t>(texture->Layout()), texture};
+        resolved.image = {reinterpret_cast<std::uint64_t>(view), static_cast<std::uint32_t>(texture->Layout()), texture};
         resolved.memory = {resource.baseAddress, Graphics::SurfaceGuestBytes(resource)};
         return resolved;
     }

@@ -29,6 +29,7 @@ enum class Kind : std::uint32_t {
     TemplateMismatch,
     KnownShort,
     SampledAhead,
+    ViewMismatch,
     Count,
 };
 
