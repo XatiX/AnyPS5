@@ -27,6 +27,7 @@ bool RecordDispatchPrecheck(const Graphics::Context& context, VulkanDevice& owne
 bool RecordDispatch(const Graphics::Context& context, const Resolve::ResolvedDraw& dispatch, const std::array<std::uint32_t, 3>& groups, std::string& reason);
 void PrebuildDispatch(const Graphics::Context& context, VulkanDevice& owner, const Resolve::ResolvedDraw& dispatch);
 void RefuseUnrecorded(std::string_view work, std::uint64_t codeAddress, std::string_view reason);
+void NoteExistingDispatch(std::uint64_t codeAddress, std::uint64_t arguments, std::uint64_t groups);
 [[nodiscard]] std::string RecordLine();
 
 }

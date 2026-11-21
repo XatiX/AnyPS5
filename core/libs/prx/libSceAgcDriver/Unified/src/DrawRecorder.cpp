@@ -2817,6 +2817,20 @@ void RefuseUnrecorded(std::string_view work, std::uint64_t codeAddress, std::str
     Downgrades::RefuseExistingPath(codeAddress, work, refusal.empty() ? std::string("not resolved in time") : "resolve refused it: " + refusal);
 }
 
+void NoteExistingDispatch(std::uint64_t codeAddress, std::uint64_t arguments, std::uint64_t groups) {
+    if (!Downgrades::Active()) return;
+    Downgrades::Note(codeAddress, Downgrades::Kind::ExistingPath, 0, "dispatch on the existing path");
+    if (arguments == 0u) {
+        Downgrades::NoteWork(codeAddress, Downgrades::Work::Dispatch, groups);
+        return;
+    }
+    if (!GuestMemory::Accessible(reinterpret_cast<const std::byte*>(arguments), 3u * sizeof(std::uint32_t), false)) return;
+    std::uint32_t counts[3] = {};
+    std::memcpy(counts, reinterpret_cast<const void*>(arguments), sizeof(counts));
+    Downgrades::NoteWork(codeAddress, Downgrades::Work::IndirectDispatch, 0);
+    Downgrades::NoteGroups(codeAddress, static_cast<std::uint64_t>(counts[0]) * counts[1] * counts[2]);
+}
+
 std::string RecordLine() {
     return shared().Line();
 }

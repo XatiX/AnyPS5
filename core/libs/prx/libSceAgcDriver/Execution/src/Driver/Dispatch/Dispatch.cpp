@@ -451,6 +451,7 @@ void Driver::dispatch(QueueState& queue, std::span<const std::uint32_t> packet, 
         } else if (Unified::Record::RecordActive() && Unified::Resolve::DispatchesRoutedOn(submission.queue)) {
             Unified::Record::RefuseUnrecorded("dispatch", address, htileClearCompletion.has_value() || htileMask.bytes != 0u ? "HTILE clear handled by the existing path" : indirectArguments != 0 && (packet[4] & 0x20u) != 0 ? "indirect dispatch in thread dimensions" : "not a pipeline candidate (resolved ahead, labels pending or dispatch items off)");
         }
+        Unified::Record::NoteExistingDispatch(address, indirectArguments, static_cast<std::uint64_t>(packet[1]) * packet[2] * packet[3]);
 #endif
     }
     if (indirectArguments == 0 && (packet[4] & 0x20u) != 0) {
