@@ -7,6 +7,7 @@
 #include <mutex>
 #include <optional>
 #include <span>
+#include <unordered_map>
 #include <vector>
 
 namespace AgcDriver::Unified {
@@ -14,7 +15,8 @@ namespace AgcDriver::Unified {
 inline constexpr std::uint64_t ChunkBytes = 0x10000;
 inline constexpr std::uint64_t PoolBytes = 0x10000000;
 inline constexpr std::uint32_t PoolChunks = static_cast<std::uint32_t>(PoolBytes / ChunkBytes);
-inline constexpr std::uint64_t RetireFrames = 4;
+inline constexpr unsigned MirrorSegmentBits = 36;
+inline constexpr std::uint64_t MirrorSegmentBytes = std::uint64_t{1} << MirrorSegmentBits;
 
 struct Chunk {
     std::uint32_t pool = 0;
@@ -68,8 +70,9 @@ struct ResidencyCounts {
     std::uint64_t evicted = 0;
     std::uint64_t refused = 0;
     std::uint64_t sharedPages = 0;
-    std::uint64_t retired = 0;
+    std::uint64_t segments = 0;
     std::uint64_t removals = 0;
+    std::uint64_t sharedChunks = 0;
 };
 
 class GpuPageTable;
@@ -88,10 +91,10 @@ public:
     [[nodiscard]] std::optional<DeviceSpan> Translate(std::uint64_t address, std::uint64_t size) const;
     [[nodiscard]] std::vector<ResidentPiece> ResidentPieces(std::uint64_t address, std::uint64_t size) const;
     [[nodiscard]] std::optional<DeviceSpan> Base(std::uint64_t address) const;
+    [[nodiscard]] std::uint64_t MirrorAddress(std::uint64_t address) const;
     void Touch(std::uint64_t address, std::uint64_t frame);
     std::size_t RemoveUnboundInside(std::uint64_t address, std::uint64_t size);
     std::vector<GuestSpan> Evict(std::uint64_t frame);
-    void Retire(std::uint64_t frame);
     [[nodiscard]] std::uint64_t Removals() const;
     void SetBudget(std::uint64_t bytes);
     void SetPageTable(GpuPageTable* table);
@@ -100,32 +103,34 @@ public:
 private:
     struct Range {
         std::uint64_t end = 0;
-        DeviceBuffer buffer;
         std::uint64_t origin = 0;
         std::uint64_t lastUse = 0;
-        std::uint64_t boundChunks = 0;
-        std::vector<std::optional<Chunk>> chunks;
+        std::uint64_t heldChunks = 0;
+        std::vector<bool> held;
     };
     using Ranges = std::map<std::uint64_t, Range>;
-    struct Retired {
-        std::uint64_t handle = 0;
-        std::uint64_t frame = 0;
+    struct Held {
+        Chunk chunk;
+        std::uint32_t holders = 0;
     };
 
     Ranges::iterator rangeOf(std::uint64_t address);
     Ranges::const_iterator rangeOf(std::uint64_t address) const;
+    const DeviceBuffer* segmentOf(std::uint64_t address) const;
+    const DeviceBuffer* segmentFor(std::uint64_t address);
     std::optional<Chunk> take();
     void put(Chunk chunk);
-    std::uint64_t unbind(Range& range);
-    void mapChunk(const Range& range, std::size_t index);
-    void unmapChunk(const Range& range, std::size_t index);
-    void retire(const Range& range);
+    std::uint64_t release(Range& range);
+    void mapChunk(std::uint64_t chunk, std::uint64_t deviceAddress);
+    void unmapChunk(std::uint64_t chunk, std::uint64_t deviceAddress);
 
     ResidencyDevice& device;
     GpuPageTable* pageTable = nullptr;
     std::uint64_t sharedPages = 0;
     mutable std::mutex mutex;
     Ranges ranges;
+    std::map<std::uint64_t, DeviceBuffer> segments;
+    std::unordered_map<std::uint64_t, Held> bound;
     std::vector<Chunk> free;
     std::uint32_t pools = 0;
     std::uint64_t budget = 0;
@@ -133,9 +138,8 @@ private:
     std::uint64_t boundCount = 0;
     std::uint64_t evictedCount = 0;
     std::uint64_t refusedCount = 0;
-    std::vector<Retired> retired;
-    std::uint64_t retireFrame = 0;
     std::uint64_t removals = 0;
+    std::uint64_t sharedChunks = 0;
 };
 
 }

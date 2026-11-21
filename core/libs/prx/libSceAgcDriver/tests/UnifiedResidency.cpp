@@ -58,7 +58,7 @@ void testAddBindsNothing() {
     Residency residency(device, 0);
     Expect(residency.Add(0x10008000, 0x30000), "a range is added");
     Expect(!residency.Add(0x10010000, 0x1000), "an overlapping range is refused");
-    Expect(device.buffers.size() == 1 && device.buffers.begin()->second == 0x40000, "the device buffer covers the range in whole chunks");
+    Expect(device.buffers.size() == 1 && device.buffers.begin()->second == MirrorSegmentBytes, "the range lies in the mirror segment of its address");
     Expect(device.bound.empty() && device.pools.empty(), "adding a range binds no memory");
     Expect(residency.Owns(0x10008000, 0x30000) && !residency.Owns(0x10008000, 0x30001) && !residency.Owns(0x10000000, 1), "ownership follows the added bytes");
     Expect(!residency.Translate(0x10008000, 4).has_value(), "an unbound page has no device address");
@@ -74,7 +74,7 @@ void testMakeResidentBindsCoveringChunks() {
     const auto again = residency.MakeResident(0x10010000, 0x100, 2);
     Expect(again.empty(), "a bound chunk is not bound again");
     const auto span = residency.Translate(0x10009000, 0x10);
-    Expect(span && span->offset == 0x9000 && span->address == (std::uint64_t{1} << 40u) + 0x9000, "a resident page translates to its device address");
+    Expect(span && span->offset == 0x10009000 && span->address == (std::uint64_t{1} << 40u) + 0x10009000, "a resident page translates to the mirror base plus its guest address");
     Expect(!residency.Translate(0x1001f000, 0x2000).has_value(), "a span reaching an unbound chunk does not translate");
     const auto tail = residency.MakeResident(0x10030000, 0x10000, 3);
     Expect(tail.size() == 1 && tail[0].address == 0x10030000 && tail[0].size == 0x8000, "the last span ends at the range");
@@ -121,9 +121,14 @@ void testFailedBindKeepsChunksFree() {
 }
 
 struct GuestBlock {
-    std::vector<std::byte> storage = std::vector<std::byte>(5 * ChunkBytes);
-    std::uint64_t base = (reinterpret_cast<std::uint64_t>(storage.data()) + ChunkBytes - 1) & ~(ChunkBytes - 1);
+    std::vector<std::byte> storage = std::vector<std::byte>(9 * ChunkBytes);
+    std::uint64_t base = Aligned();
     std::byte* At(std::uint64_t offset) { return reinterpret_cast<std::byte*>(base + offset); }
+    std::uint64_t Mirror(std::uint64_t offset) const { return (base + offset) & (MirrorSegmentBytes - 1); }
+    std::uint64_t Aligned() const {
+        const auto first = (reinterpret_cast<std::uint64_t>(storage.data()) + ChunkBytes - 1) & ~(ChunkBytes - 1);
+        return (first >> MirrorSegmentBits) == ((first + 4 * ChunkBytes - 1) >> MirrorSegmentBits) ? first : first + 4 * ChunkBytes;
+    }
 };
 
 void testUploadsFollowResidency() {
@@ -138,15 +143,15 @@ void testUploadsFollowResidency() {
     Expect(uploads.Take().empty() && uploads.Counts().skippedBytes == 0x1000, "a dirty page that is not resident is not uploaded");
     Expect(uploads.Prepare(guest.base + 0x1000, 0x100, 1), "preparing a span makes it resident");
     auto taken = uploads.Take();
-    Expect(taken.size() == 1 && taken[0].offset == 0 && taken[0].bytes.size() == ChunkBytes && std::memcmp(taken[0].bytes.data(), guest.At(0), ChunkBytes) == 0, "a newly resident chunk is uploaded in full");
+    Expect(taken.size() == 1 && taken[0].offset == guest.Mirror(0) && taken[0].bytes.size() == ChunkBytes && std::memcmp(taken[0].bytes.data(), guest.At(0), ChunkBytes) == 0, "a newly resident chunk is uploaded in full");
     std::memset(guest.At(0x2000), 0x5a, 0x1000);
     const std::vector<DirtyRange> dirty{{guest.base + 0x2000, 0x1000}, {guest.base + ChunkBytes, 0x1000}};
     uploads.NoteDirty(dirty);
     taken = uploads.Take();
-    Expect(taken.size() == 1 && taken[0].offset == 0x2000 && taken[0].bytes.size() == 0x1000 && taken[0].bytes[0] == std::byte{0x5a}, "a dirty resident page is uploaded alone");
+    Expect(taken.size() == 1 && taken[0].offset == guest.Mirror(0x2000) && taken[0].bytes.size() == 0x1000 && taken[0].bytes[0] == std::byte{0x5a}, "a dirty resident page is uploaded alone");
     Expect(uploads.Prepare(guest.base, 3 * ChunkBytes, 2), "the rest of the range is made resident");
     taken = uploads.Take();
-    Expect(taken.size() == 1 && taken[0].offset == ChunkBytes && taken[0].bytes.size() == 2 * ChunkBytes, "only the newly bound chunks are uploaded, as one span");
+    Expect(taken.size() == 1 && taken[0].offset == guest.Mirror(ChunkBytes) && taken[0].bytes.size() == 2 * ChunkBytes, "only the newly bound chunks are uploaded, as one span");
     Expect(!uploads.Prepare(guest.base + 2 * ChunkBytes, 2 * ChunkBytes, 2), "a span past the range is refused");
 }
 
@@ -162,7 +167,7 @@ void testDirtyRangesAcrossRangeEdgesUploadTheirResidentPart() {
     const std::vector<DirtyRange> dirty{{guest.base + 0x1000, 0x4000}};
     uploads.NoteDirty(dirty);
     const auto taken = uploads.Take();
-    Expect(taken.size() == 1 && taken[0].guest == guest.base + 0x2000 && taken[0].offset == 0x2000 && taken[0].bytes.size() == 0x2000 && taken[0].bytes[0] == std::byte{0x11}, "a dirty range wider than the served range uploads the served part");
+    Expect(taken.size() == 1 && taken[0].guest == guest.base + 0x2000 && taken[0].offset == guest.Mirror(0x2000) && taken[0].bytes.size() == 0x2000 && taken[0].bytes[0] == std::byte{0x11}, "a dirty range wider than the served range uploads the served part");
     Expect(uploads.Counts().skippedBytes == 0x2000, "only the pages outside the served range are skipped");
 }
 
@@ -200,7 +205,7 @@ void testServedRangeReplacesUnboundRanges() {
     residency.MakeResident(0x80000000, ChunkBytes, 1);
     Expect(residency.RemoveUnboundInside(0x70000000, 0x20000000) == 0, "bound ranges are kept");
     const auto base = residency.Base(0x70008000);
-    Expect(base && base->offset == 0x8000 && base->bytes == 0xf8000 && base->address == (std::uint64_t{4} << 40u) + 0x8000, "the base of an address does not need its chunk bound");
+    Expect(base && base->offset == 0x70008000 && base->bytes == 0xf8000 && base->address == (std::uint64_t{1} << 40u) + 0x70008000, "the base of an address does not need its chunk bound");
     Expect(residency.Base(0x70020000).has_value() && !residency.Translate(0x70020000, 4).has_value(), "an unbound page has a base but no translation");
     residency.SetBudget(ChunkBytes);
     residency.Touch(0x70000000, 5);
@@ -208,22 +213,49 @@ void testServedRangeReplacesUnboundRanges() {
     Expect(evicted.size() == 1 && evicted[0].address == 0x80000000, "a touched range is kept over an older one");
 }
 
-void testRemovedBuffersOutliveInFlightFrames() {
+void testRemovedRangesKeepTheMirror() {
     FakeDevice device;
     Residency residency(device, 0);
-    residency.Retire(10);
     residency.Add(0x70010000, 0x1000);
     residency.Add(0x90000000, ChunkBytes);
+    residency.MakeResident(0x90000000, ChunkBytes, 1);
+    const auto before = residency.Translate(0x90000000, 4);
     Expect(residency.RemoveUnboundInside(0x70000000, 0x100000) == 1, "an unbound range inside is removed");
     residency.Remove(0x90000000);
-    Expect(device.buffers.size() == 2 && residency.Counts().retired == 2 && residency.Removals() == 2, "removed buffers stay alive for work already recorded");
-    residency.Retire(10 + RetireFrames - 1);
-    Expect(device.buffers.size() == 2, "they outlive the frames still in flight");
-    residency.Retire(10 + RetireFrames);
-    Expect(device.buffers.empty() && residency.Counts().retired == 0, "they are destroyed once those frames are done");
-    residency.Add(0x70010000, 0x1000);
-    residency.Remove(0x70010000);
-    Expect(device.buffers.size() == 1, "a buffer retired at the newest frame waits again");
+    Expect(device.buffers.size() == 1 && device.bound.empty() && residency.Removals() == 2 && residency.Counts().segments == 1, "removed ranges unbind their memory and keep the mirror buffer");
+    Expect(!residency.Translate(0x90000000, 4).has_value() && residency.MirrorAddress(0x90000000) == (std::uint64_t{1} << 40u) + 0x90000000, "a removed range has no translation, its mirror address stays");
+    residency.Add(0x90000000, ChunkBytes);
+    residency.MakeResident(0x90000000, ChunkBytes, 2);
+    const auto after = residency.Translate(0x90000000, 4);
+    Expect(before && after && before->address == after->address && before->handle == after->handle, "a range added again at an address has the device address it had");
+    Expect(residency.Add(std::uint64_t{3} << MirrorSegmentBits, ChunkBytes) && device.buffers.size() == 2, "a range in another 64 GiB segment gets that segment's buffer");
+    Expect(!residency.Add((std::uint64_t{2} << MirrorSegmentBits) - ChunkBytes, 2 * ChunkBytes) && residency.Counts().refused == 1, "a range across two segments is refused");
+}
+
+void testSpansAcrossAdjacentRangesTranslate() {
+    FakeDevice device;
+    Residency residency(device, 0);
+    ResidentUploads uploads(residency);
+    GuestBlock guest;
+    residency.Add(guest.base, ChunkBytes + 0x8000);
+    residency.Add(guest.base + ChunkBytes + 0x8000, 0x8000);
+    residency.Add(guest.base + 3 * ChunkBytes, ChunkBytes);
+    Expect(uploads.Prepare(guest.base, ChunkBytes + 0x8000, 1), "the first range is made resident");
+    static_cast<void>(uploads.Take());
+    Expect(!residency.Translate(guest.base + ChunkBytes, ChunkBytes).has_value(), "a span reaching a range that is not resident does not translate");
+    std::memset(guest.At(ChunkBytes + 0x8000), 0x77, 0x8000);
+    Expect(uploads.Prepare(guest.base + ChunkBytes + 0x8000, 0x8000, 1), "the second range joins the chunk the first one bound");
+    const auto taken = uploads.Take();
+    Expect(device.bound.size() == 2 && residency.Counts().sharedChunks == 1 && residency.Counts().boundBytes == 2 * ChunkBytes, "a chunk two ranges share is bound once");
+    Expect(taken.size() == 1 && taken[0].guest == guest.base + ChunkBytes + 0x8000 && taken[0].offset == guest.Mirror(ChunkBytes + 0x8000) && taken[0].bytes.size() == 0x8000 && taken[0].bytes[0] == std::byte{0x77}, "the joining range uploads its own part of the shared chunk");
+    const auto span = residency.Translate(guest.base + 0x4000, 2 * ChunkBytes - 0x4000);
+    Expect(span && span->offset == guest.Mirror(0x4000) && span->bytes == 2 * ChunkBytes - 0x4000, "a span over two adjacent resident ranges is one device range");
+    uploads.Prepare(guest.base + 3 * ChunkBytes, ChunkBytes, 1);
+    Expect(!residency.Translate(guest.base + ChunkBytes, 3 * ChunkBytes).has_value(), "a span over a gap between ranges does not translate");
+    residency.Remove(guest.base);
+    Expect(device.bound.size() == 2 && residency.Translate(guest.base + ChunkBytes + 0x8000, 0x8000).has_value(), "removing one holder keeps the shared chunk bound for the other");
+    residency.Remove(guest.base + ChunkBytes + 0x8000);
+    Expect(device.bound.size() == 1, "the shared chunk is unbound with its last holder");
 }
 
 std::vector<std::pair<std::uint64_t, std::uint64_t>> committedHalf(std::uint64_t address, std::size_t bytes, bool) {
@@ -254,7 +286,7 @@ void testDirtyUploadsSkipUnreadablePages() {
     const std::vector<DirtyRange> dirty{{guest.base, ChunkBytes}};
     uploads.NoteDirty(dirty);
     const auto taken = uploads.Take();
-    Expect(taken.size() == 1 && taken[0].guest == guest.base && taken[0].offset == 0 && taken[0].bytes.size() == ChunkBytes / 2 && taken[0].bytes[0] == std::byte{0x44}, "a dirty range uploads only its readable pages");
+    Expect(taken.size() == 1 && taken[0].guest == guest.base && taken[0].offset == guest.Mirror(0) && taken[0].bytes.size() == ChunkBytes / 2 && taken[0].bytes[0] == std::byte{0x44}, "a dirty range uploads only its readable pages");
     Expect(uploads.Counts().skippedBytes == ChunkBytes / 2, "the unreadable pages of a dirty range are skipped, not zeroed");
 }
 
@@ -267,18 +299,17 @@ void testPageTableFollowsBoundChunks() {
     residency.Add(0x50000000, 0x18000);
     residency.MakeResident(0x50000000, ChunkBytes, 1);
     residency.SetPageTable(&pages);
-    const auto first = std::uint64_t{1} << 40u;
-    Expect(pages.Lookup(0x50000010) == first + 0x10, "a chunk bound before the table is attached is mapped");
+    const auto mirror = std::uint64_t{1} << 40u;
+    Expect(pages.Lookup(0x50000010) == mirror + 0x50000010, "a chunk bound before the table is attached is mapped");
     Expect(pages.Lookup(0x50010000) == 0, "an unbound chunk is not mapped");
     residency.MakeResident(0x50010000, 0x8000, 2);
-    Expect(pages.Lookup(0x50017ff0, true) == first + 0x17ff0, "a newly bound chunk is mapped for reads and writes");
+    Expect(pages.Lookup(0x50017ff0, true) == mirror + 0x50017ff0, "a newly bound chunk is mapped for reads and writes");
     residency.Add(0x50018000, 0x10000);
     residency.MakeResident(0x50018000, 0x10000, 3);
-    Expect(residency.Counts().sharedPages == 1 && pages.Lookup(0x50018000) == first + 0x18000, "a chunk two ranges share stays mapped to the first");
-    const auto second = std::uint64_t{2} << 40u;
-    Expect(pages.Lookup(0x50020000) == second + 0x10000, "the second range maps its own chunk");
+    Expect(residency.Counts().sharedPages == 0 && residency.Counts().sharedChunks == 1 && pages.Lookup(0x50018000) == mirror + 0x50018000, "a chunk two ranges share has one mapping");
+    Expect(pages.Lookup(0x50020000) == mirror + 0x50020000, "the second range's own chunk is mapped at its mirror address");
     residency.Remove(0x50018000);
-    Expect(pages.Lookup(0x50018000) == first + 0x18000 && pages.Lookup(0x50020000) == 0, "removing a range unmaps only its own chunks");
+    Expect(pages.Lookup(0x50018000) == mirror + 0x50018000 && pages.Lookup(0x50020000) == 0, "removing a range unmaps only the chunks no other range holds");
     residency.Remove(0x50000000);
     Expect(pages.Lookup(0x50000000) == 0 && pages.Lookup(0x50010000) == 0, "unbinding a range unmaps it");
 }
@@ -296,7 +327,8 @@ int main() {
     testEvictionTakesTheOldestRange();
     testRemoveReturnsChunks();
     testFailedBindKeepsChunksFree();
-    testRemovedBuffersOutliveInFlightFrames();
+    testRemovedRangesKeepTheMirror();
+    testSpansAcrossAdjacentRangesTranslate();
     if (failures != 0) {
         std::fprintf(stderr, "%d failure(s)\n", failures);
         return 1;
