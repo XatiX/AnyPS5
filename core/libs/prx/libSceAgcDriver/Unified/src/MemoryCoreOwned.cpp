@@ -1,4 +1,5 @@
 #include "prx/libSceAgcDriver/Unified/include/MemoryCore.hpp"
+#include "prx/libSceAgcDriver/Unified/include/Downgrades.hpp"
 #include "prx/libSceAgcDriver/Unified/include/Events.hpp"
 #include <algorithm>
 #include <cstdio>
@@ -90,6 +91,7 @@ void MemoryCore::LandDiff(std::uint64_t address, std::span<const std::byte> befo
     std::unique_lock lock(mutex);
     auto* view = current->View(address, bytes);
     if (view == nullptr) return;
+    Downgrades::WatchTouch("a diff landing", address, bytes);
     std::uint64_t changed = 0;
     for (std::size_t at = 0; at < bytes;) {
         if (before[at] == after[at]) {
@@ -162,6 +164,7 @@ std::uint64_t MemoryCore::landOpenPieces(std::uint64_t page, std::uint64_t compl
             ++changed;
         }
     }
+    if (changed != 0) Downgrades::WatchTouch("an opened page landing", begin, span);
     written.Take(begin, span, completed);
     if (!written.Any(page, PageBytes)) preImages.erase(found);
     diffLandedBytes.fetch_add(changed, std::memory_order_relaxed);
@@ -211,6 +214,7 @@ bool MemoryCore::resolvePage(std::uint64_t page, bool write) {
             if (pages.StateOf(at) != PageState::GpuOwned || written.Pending(at, PageBytes) > completed) continue;
             auto* view = current->View(at, PageBytes);
             if (view == nullptr) continue;
+            Downgrades::WatchTouch("a GPU-owned page landing on a fault", at, PageBytes);
             std::memcpy(view, mirror.data() + index * PageBytes, PageBytes);
             written.Take(at, PageBytes, completed);
             const auto reclaimed = pages.Reclaim(at, PageBytes, index == 0 && write);
@@ -311,6 +315,7 @@ void MemoryCore::FlushGpuWrites(std::uint64_t address, std::uint64_t size) {
         if (pages.StateOf(page) != PageState::GpuOwned || written.Pending(page, PageBytes) > current->Completed()) continue;
         auto* view = current->View(page, PageBytes);
         if (view == nullptr) continue;
+        Downgrades::WatchTouch("a GPU-owned page landing on a flush", page, PageBytes);
         std::memcpy(view, mirror.data(), PageBytes);
         written.Take(page, PageBytes, current->Completed());
         protector.Apply(pages.Reclaim(page, PageBytes, false));

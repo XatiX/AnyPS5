@@ -1,5 +1,6 @@
 #include "prx/libSceAgcDriver/Unified/include/Downgrades.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/Shaders/ShaderRegistry.hpp"
+#include "prx/libSceAgcDriver/Execution/include/GuestMemory.hpp"
 #include "RdnaDecoder/RdnaInstructionDecoder.hpp"
 #include <algorithm>
 #include <array>
@@ -390,7 +391,115 @@ GuestWriteJournal& journal() {
 
 }
 
+namespace {
+
+constexpr std::size_t WatchedRanges = 8;
+constexpr std::uint64_t WatchLines = 400;
+constexpr std::size_t WatchSampleBytes = 16;
+
+struct Watched {
+    std::uint64_t begin = 0;
+    std::uint64_t end = 0;
+    std::uint64_t hash = 0;
+    std::array<std::byte, WatchSampleBytes> sample{};
+    bool sampled = false;
+};
+
+struct WatchState {
+    std::mutex mutex;
+    std::vector<Watched> ranges;
+    std::uint64_t offset = 0;
+    std::uint64_t lines = 0;
+    std::chrono::steady_clock::time_point start = std::chrono::steady_clock::now();
+};
+
+const std::string& watchList() {
+    static const std::string list = [] {
+        const char* value = std::getenv("APS5_RECODE_WATCH");
+        return std::string(value == nullptr ? "" : value);
+    }();
+    return list;
+}
+
+WatchState& watchState() {
+    static auto* state = [] {
+        auto* created = new WatchState;
+        const char* offset = std::getenv("APS5_RECODE_WATCH_OFFSET");
+        created->offset = offset != nullptr ? std::strtoull(offset, nullptr, 16) : 0xfff8u;
+        return created;
+    }();
+    return *state;
+}
+
+long long watchMs(const WatchState& state) {
+    return static_cast<long long>(std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - state.start).count());
+}
+
+std::string hexOf(std::span<const std::byte> bytes) {
+    std::string text;
+    char digits[4];
+    for (std::size_t index = 0; index < bytes.size(); ++index) {
+        std::snprintf(digits, sizeof(digits), "%02x", static_cast<unsigned>(bytes[bytes.size() - 1 - index]));
+        text += digits;
+        if (index == 7) text += ' ';
+    }
+    return text;
+}
+
+}
+
+bool Watching() {
+    return !watchList().empty();
+}
+
+void WatchProgramWrite(std::uint64_t codeAddress, std::uint64_t address, std::uint64_t bytes) {
+    if (!Watching() || bytes == 0u) return;
+    const auto hash = ProgramHash(codeAddress);
+    if (!ListedHash(watchList(), hash)) return;
+    auto& state = watchState();
+    std::lock_guard lock(state.mutex);
+    for (const auto& range : state.ranges) {
+        if (range.begin == address && range.end == address + bytes) return;
+    }
+    if (state.ranges.size() >= WatchedRanges) state.ranges.erase(state.ranges.begin());
+    state.ranges.push_back({address, address + bytes, hash});
+    std::fprintf(stderr, "[recode-watch] %lld ms: %016llx writes 0x%llx+0x%llx (sampling +0x%llx)\n", watchMs(state), static_cast<unsigned long long>(hash), static_cast<unsigned long long>(address), static_cast<unsigned long long>(bytes), static_cast<unsigned long long>(state.offset));
+}
+
+void WatchTouch(const char* what, std::uint64_t address, std::uint64_t bytes) {
+    if (!Watching() || bytes == 0u) return;
+    auto& state = watchState();
+    std::lock_guard lock(state.mutex);
+    for (const auto& range : state.ranges) {
+        if (address >= range.end || range.begin >= address + bytes) continue;
+        if (state.lines++ >= WatchLines) return;
+        const auto sampled = range.begin + state.offset;
+        const bool covers = address <= sampled && sampled < address + bytes;
+        std::fprintf(stderr, "[recode-watch] %lld ms: %s 0x%llx+0x%llx inside 0x%llx+0x%llx%s\n", watchMs(state), what, static_cast<unsigned long long>(address), static_cast<unsigned long long>(bytes), static_cast<unsigned long long>(range.begin), static_cast<unsigned long long>(range.end - range.begin), covers ? " (covers the sampled bytes)" : "");
+        return;
+    }
+}
+
+void WatchPoll() {
+    if (!Watching()) return;
+    auto& state = watchState();
+    std::lock_guard lock(state.mutex);
+    for (auto& range : state.ranges) {
+        const auto sampled = range.begin + state.offset;
+        if (sampled + WatchSampleBytes > range.end) continue;
+        const auto* view = static_cast<const std::byte*>(GuestMemory::OwnStoreTarget(sampled, WatchSampleBytes));
+        if (view == nullptr || view == reinterpret_cast<const std::byte*>(sampled)) continue;
+        std::array<std::byte, WatchSampleBytes> now{};
+        std::memcpy(now.data(), view, WatchSampleBytes);
+        if (range.sampled && now == range.sample) continue;
+        if (state.lines++ < WatchLines) std::fprintf(stderr, "[recode-watch] %lld ms: bytes at 0x%llx %s -> %s\n", watchMs(state), static_cast<unsigned long long>(sampled), range.sampled ? hexOf(range.sample).c_str() : "(first)", hexOf(now).c_str());
+        range.sample = now;
+        range.sampled = true;
+    }
+}
+
 void NoteGuestWrite(const char* what, std::uint64_t address, std::uint64_t bytes) {
+    WatchTouch(what, address, bytes);
     if (!Active() || bytes == 0u) return;
     auto& log = journal();
     std::lock_guard lock(log.mutex);

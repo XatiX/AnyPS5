@@ -1,4 +1,5 @@
 #include "prx/libSceAgcDriver/Unified/include/MemoryCore.hpp"
+#include "prx/libSceAgcDriver/Unified/include/Downgrades.hpp"
 #include "prx/libSceAgcDriver/Unified/include/Events.hpp"
 #include <array>
 #include <atomic>
@@ -179,6 +180,7 @@ void MemoryCore::PrepareHostWrite(std::uint64_t address, std::uint64_t size) {
 
 void MemoryCore::LandGpuWrite(std::uint64_t address, std::span<const std::byte> bytes, void* view) {
     if (bytes.empty()) return;
+    Downgrades::WatchTouch("a GPU write landed from residency", address, bytes.size());
     if (view != nullptr && view != reinterpret_cast<void*>(address)) {
         std::memcpy(view, bytes.data(), bytes.size());
         landedBytes.fetch_add(bytes.size(), std::memory_order_relaxed);

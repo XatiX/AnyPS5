@@ -356,6 +356,7 @@ bool adoptsUpstream() {
 }
 
 std::atomic<std::uint64_t> publishedRecords{0};
+std::atomic<std::uint64_t> staleRecordsKept{0};
 
 bool ownsImages() {
     return Images::OwnersEnabled();
@@ -925,7 +926,7 @@ public:
         line += text;
         std::snprintf(text, sizeof(text), "; table maps %llu hits, %llu uploads (%.1f MiB), %llu retired, %zu held (%.1f MiB)", static_cast<unsigned long long>(totals.mapHits), static_cast<unsigned long long>(totals.mapUploads), static_cast<double>(totals.mapUploadBytes) / 1048576.0, static_cast<unsigned long long>(totals.mapRetired), maps.size(), static_cast<double>(mapBytes) / 1048576.0);
         line += text;
-        line += "; images adopted from the existing cache " + std::to_string(totals.recordAdoptions) + " (" + std::to_string(totals.recordAdoptionRefusals) + " refused), published back " + std::to_string(publishedRecords.load(std::memory_order_relaxed));
+        line += "; images adopted from the existing cache " + std::to_string(totals.recordAdoptions) + " (" + std::to_string(totals.recordAdoptionRefusals) + " refused), published back " + std::to_string(publishedRecords.load(std::memory_order_relaxed)) + " (" + std::to_string(staleRecordsKept.load(std::memory_order_relaxed)) + " not published: guest memory changed since their GPU write)";
         line += "; storage writes to recode surfaces " + std::to_string(totals.recordWrites) + "; draws into recode surface targets " + std::to_string(totals.recordTargetDraws) + " (" + std::to_string(totals.recordTargetRefusals) + " targets refused";
         for (const auto& [why, count] : recordTargetReasons) line += " [" + why + " " + std::to_string(count) + "]";
         line += ")";
@@ -2256,6 +2257,7 @@ private:
         for (std::size_t index = 0; index < dispatch.uses.size(); ++index) {
             const auto& use = dispatch.uses[index];
             if (!use.write) continue;
+            if (Downgrades::Watching()) Downgrades::WatchProgramWrite(stage.program.codeAddress, use.address, use.size);
             if (std::ranges::any_of(writtenRecords, [&](const std::shared_ptr<Images::Surface>& record) { return record->key.address <= use.address && use.address + use.size <= record->key.address + record->key.bytes; })) continue;
             writtenRanges.emplace_back(use.address, use.address + use.size);
         }
@@ -2622,6 +2624,7 @@ private:
             const auto& use = draw.uses[index];
             if (use.size == 0u) continue;
             const std::pair range{use.address, use.address + use.size};
+            if (use.write && Downgrades::Watching() && !draw.stages.empty()) Downgrades::WatchProgramWrite(draw.stages.back().program.codeAddress, use.address, use.size);
             if (index >= draw.targetBegin && index < draw.targetEnd) drawTargets.push_back(range);
             else if (use.write) passWrites.push_back(range);
             else passReads.push_back(range);
@@ -3069,6 +3072,12 @@ void PublishRecords(const Graphics::Context& context, std::uint64_t address, std
     if (table == nullptr || context.recorder == nullptr || !RecordActive()) return;
     for (const auto& record : table->Overlapping(address, bytes)) {
         if (!record->gpuNewer) continue;
+        if (table->ChangedSinceWrite(*record)) {
+            Downgrades::WatchTouch("a record changed since its GPU write, not published", record->key.address, record->key.bytes);
+            table->ClearGpuNewer(*record);
+            staleRecordsKept.fetch_add(1, std::memory_order_relaxed);
+            continue;
+        }
         auto* vulkan = dynamic_cast<Images::VulkanSurface*>(record->device.get());
         if (vulkan == nullptr || vulkan->Compressed()) continue;
         std::shared_ptr<Graphics::StorageTexture> upstream;
@@ -3084,6 +3093,7 @@ void PublishRecords(const Graphics::Context& context, std::uint64_t address, std
         const auto commands = context.recorder->Commands();
         const auto levels = std::min(static_cast<std::uint32_t>(std::max<std::size_t>(vulkan->Geometry().mips.size(), 1u)), std::max(descriptor.mipCount, 1u));
         const auto layers = std::min(std::max(vulkan->Geometry().imageLayers, 1u), std::max(upstream->ImageLayers(), 1u));
+        Downgrades::WatchTouch("a record published to the existing cache", record->key.address, record->key.bytes);
         Images::CopyImageContent(context, commands, vulkan->Image(), upstream->Image(), resource.width, resource.height, levels, layers);
         context.recorder->Keep(record);
         context.recorder->Keep(upstream);

@@ -1,4 +1,5 @@
 #include "prx/libSceAgcDriver/Unified/include/Shadow.hpp"
+#include "prx/libSceAgcDriver/Unified/include/Downgrades.hpp"
 #include "prx/libSceAgcDriver/Unified/include/Front.hpp"
 #include "prx/libSceAgcDriver/Unified/include/MemoryCore.hpp"
 #include "prx/libSceAgcDriver/Unified/include/MirrorHost.hpp"
@@ -136,6 +137,10 @@ void consumeMemory() {
     if (!memoryInstalled()) return;
     const auto start = std::chrono::steady_clock::now();
     const auto ranges = MemoryCore::Get().ConsumeDirty();
+    if (Downgrades::Watching()) {
+        for (const auto& range : ranges) Downgrades::WatchTouch("a CPU-dirty range", range.address, range.size);
+        Downgrades::WatchPoll();
+    }
     if (Mirror::WritesEnabled()) {
         ResidencyService::Get().NoteDirty(MemoryCore::Get().WithoutGpuWritten(ranges));
         MemoryCore::Get().LandAhead();
@@ -584,6 +589,11 @@ void ForgetImport(std::uint64_t base, std::uint64_t bytes, std::uint64_t deviceB
 }
 
 void NoteGpuWrites(GuestRanges ranges) {
+    if (Downgrades::Watching()) {
+        for (const auto& [begin, end] : ranges) {
+            if (end > begin) Downgrades::WatchTouch("a GPU write note", begin, end - begin);
+        }
+    }
     if (ranges.empty() || !ResidentDrawInputs() || !memoryInstalled()) return;
     static std::mutex markedMutex;
     static auto& marked = *new std::map<std::uint64_t, std::uint64_t>();

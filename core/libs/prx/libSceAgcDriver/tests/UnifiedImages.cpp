@@ -180,6 +180,25 @@ void testForeignWritesHandTheSurfaceBack() {
     Expect(table.Find(key, words, reason)->gpuWritten, "another GPU writer hands it back");
 }
 
+void testCpuReuseMakesARecordStale() {
+    FakeDevice device;
+    Events::ChangeLog shared;
+    Events::ChangeLog gpuWrites;
+    SurfaceTable table(device, shared, gpuWrites);
+    std::string reason;
+    const auto key = Key(0xb00000000ull);
+    const auto created = table.Find(key, words, reason);
+    auto work = table.TakeWork();
+    table.MarkReady(*work.front(), shared.Serial(), gpuWrites.Serial());
+    const auto owner = OwnerOf(*created->surface);
+    static_cast<void>(gpuWrites.Note(key.address, key.bytes, owner));
+    static_cast<void>(shared.Note(key.address, key.bytes, owner));
+    table.MarkGpuWritten(*created->surface);
+    Expect(!table.ChangedSinceWrite(*created->surface), "a record's own write leaves it current");
+    static_cast<void>(shared.Note(key.address + 0x8000u, 0x40));
+    Expect(table.ChangedSinceWrite(*created->surface), "a CPU store into the record's memory after its GPU write makes it stale");
+}
+
 void testOverlapQuery() {
     FakeDevice device;
     Events::ChangeLog shared;
@@ -252,6 +271,7 @@ int main() {
     testRefusals();
     testOwnGpuWritesKeepTheSurface();
     testForeignWritesHandTheSurfaceBack();
+    testCpuReuseMakesARecordStale();
     testOverlapQuery();
     testRangesKeepTheirFirstOwner();
     if (failures != 0) return 1;

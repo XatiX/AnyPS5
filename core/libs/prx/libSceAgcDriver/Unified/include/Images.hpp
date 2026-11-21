@@ -130,6 +130,7 @@ public:
     [[nodiscard]] std::shared_ptr<Surface> AdoptResource(const SurfaceKey& key, const Graphics::GuestTextureResource& resource, std::string& reason);
     void MarkGpuWritten(Surface& surface);
     void ClearGpuNewer(Surface& surface);
+    [[nodiscard]] bool ChangedSinceWrite(const Surface& surface) const;
     [[nodiscard]] std::vector<std::shared_ptr<Surface>> Overlapping(std::uint64_t address, std::uint64_t bytes) const;
     void Requeue(const std::shared_ptr<Surface>& surface);
     [[nodiscard]] Side OwnerOfRange(std::uint64_t address, std::uint64_t bytes) const;

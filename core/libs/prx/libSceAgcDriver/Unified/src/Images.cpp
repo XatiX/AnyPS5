@@ -244,6 +244,12 @@ void SurfaceTable::ClearGpuNewer(Surface& surface) {
     surface.gpuNewer = false;
 }
 
+bool SurfaceTable::ChangedSinceWrite(const Surface& surface) const {
+    std::lock_guard lock(mutex);
+    const auto owner = OwnerOf(surface);
+    return shared.ChangedSince(surface.key.address, surface.key.bytes, surface.stamp, owner) || gpuWrites.ChangedSince(surface.key.address, surface.key.bytes, surface.imageStamp, owner);
+}
+
 std::vector<std::shared_ptr<Surface>> SurfaceTable::Overlapping(std::uint64_t address, std::uint64_t bytes) const {
     std::lock_guard lock(mutex);
     std::vector<std::shared_ptr<Surface>> overlapping;
