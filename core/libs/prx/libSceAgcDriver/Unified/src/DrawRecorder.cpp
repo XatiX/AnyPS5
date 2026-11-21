@@ -822,6 +822,25 @@ public:
         }
     }
 
+    void probeArguments(const Context& context, Graphics::Recorder& recorder, VkCommandBuffer commands, std::uint64_t address, VkBuffer used, VkDeviceSize usedOffset, std::uint64_t codeAddress) {
+        constexpr VkDeviceSize bytes = 3u * sizeof(std::uint32_t);
+        auto& residency = ResidencyService::Get();
+        const auto copy = context.Function<PFN_vkCmdCopyBuffer>("vkCmdCopyBuffer");
+        const auto read = [&](VkBuffer source, VkDeviceSize offset, const char* where) {
+            auto buffer = std::make_shared<Graphics::Buffer>(context, static_cast<std::size_t>(bytes), VK_BUFFER_USAGE_TRANSFER_DST_BIT);
+            Graphics::RecordMemoryBarrier(context, commands, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_ACCESS_SHADER_WRITE_BIT | VK_ACCESS_TRANSFER_WRITE_BIT, VK_ACCESS_TRANSFER_READ_BIT);
+            const VkBufferCopy region{offset, 0, bytes};
+            copy(commands, source, buffer->Handle(), 1, &region);
+            Graphics::RecordMemoryBarrier(context, commands, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT | VK_PIPELINE_STAGE_HOST_BIT, VK_ACCESS_TRANSFER_WRITE_BIT, VK_ACCESS_HOST_READ_BIT | VK_ACCESS_MEMORY_READ_BIT);
+            recorder.Keep(buffer);
+            recorder.OnComplete([buffer, codeAddress, address, where] { printOutput(codeAddress, where, address, buffer->Bytes()); });
+        };
+        const auto* import = Graphics::HostImportFor(context, address, static_cast<std::size_t>(bytes));
+        read(used, usedOffset, ring != nullptr && used == ring->Handle() ? "arguments-used-snapshot" : import != nullptr && used == import->buffer ? "arguments-used-import" : "arguments-used-residency");
+        if (const auto span = residency.Translate(address, bytes)) read(reinterpret_cast<VkBuffer>(static_cast<std::uintptr_t>(span->handle)), span->offset, residency.WrittenImportAny(address, bytes) ? "arguments-in-residency-behind-import" : "arguments-in-residency");
+        if (import != nullptr) read(import->buffer, Graphics::HostImportOffset(*import, address), "arguments-in-import");
+    }
+
     void noteUses(const Resolve::ResolvedDraw& work, const char* what) {
         if (!Downgrades::Active() || work.stages.empty()) return;
         const auto code = work.stages.back().program.codeAddress;
@@ -2020,6 +2039,8 @@ private:
         bind(commands, VK_PIPELINE_BIND_POINT_COMPUTE, pipeline->layout, ShaderRecompiler::RuntimeAbi::DirectHeapSet, 1, &heapSet, 0, nullptr);
         if (!push.empty()) context.Function<PFN_vkCmdPushConstants>("vkCmdPushConstants")(commands, pipeline->layout, VK_SHADER_STAGE_COMPUTE_BIT, 0, Graphics::ComputePushConstantBytes, block.data());
         noteFaultToken(context, *recorder, commands, dispatch.stages, FaultStage::compute, indirect ? "dispatch indirect" : "dispatch", groups[0], groups[1] * groups[2]);
+        const bool probed = probesOutput(stage.program.codeAddress) && outputProbeDue(stage.program.codeAddress);
+        if (probed && indirect) probeArguments(context, *recorder, commands, dispatch.operation.dispatch.indirectAddress, argumentBuffer, argumentOffset, stage.program.codeAddress);
         const auto dispatchTiming = recorder->BeginGpuTiming(DispatchTimingKey);
         if (indirect) {
             context.Resolved(&Graphics::DeviceFunctions::cmdDispatchIndirect, "vkCmdDispatchIndirect")(commands, argumentBuffer, argumentOffset);
@@ -2031,7 +2052,7 @@ private:
         recorder->EndGpuTiming(dispatchTiming);
         Graphics::RecordMemoryBarrier(context, commands, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT | VK_PIPELINE_STAGE_HOST_BIT, VK_ACCESS_SHADER_WRITE_BIT, VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT | VK_ACCESS_UNIFORM_READ_BIT | VK_ACCESS_TRANSFER_READ_BIT | VK_ACCESS_TRANSFER_WRITE_BIT | VK_ACCESS_INDIRECT_COMMAND_READ_BIT | VK_ACCESS_INDEX_READ_BIT | VK_ACCESS_VERTEX_ATTRIBUTE_READ_BIT | VK_ACCESS_COLOR_ATTACHMENT_READ_BIT | VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_READ_BIT | VK_ACCESS_HOST_READ_BIT);
         recordCopyBacks(context, commands, serial);
-        if (probesOutput(stage.program.codeAddress) && outputProbeDue(stage.program.codeAddress)) probeOutputs(context, *recorder, commands, dispatch, stage.program.codeAddress);
+        if (probed) probeOutputs(context, *recorder, commands, dispatch, stage.program.codeAddress);
 
         recorder->Keep(pipeline);
         for (const auto& owned : stage.owners) recorder->Keep(std::const_pointer_cast<void>(owned));
@@ -2902,6 +2923,17 @@ void RefuseUnrecorded(std::string_view work, std::uint64_t codeAddress, std::str
     const auto refusal = Resolve::TakeRefusal();
     if (refusal == "no device") return;
     Downgrades::RefuseExistingPath(codeAddress, work, refusal.empty() ? std::string("not resolved in time") : "resolve refused it: " + refusal);
+}
+
+void ProbeExistingWrites(Graphics::Recorder& recorder, std::uint64_t codeAddress, std::span<const std::pair<std::uint64_t, std::uint64_t>> writes) {
+    if (RecordActive() || writes.empty() || !probesOutput(codeAddress) || !outputProbeDue(codeAddress)) return;
+    for (const auto& [begin, end] : writes) {
+        if (end <= begin || end - begin > OutputProbeLimitBytes) continue;
+        recorder.OnComplete([codeAddress, address = begin, size = end - begin] {
+            if (!GuestMemory::Accessible(reinterpret_cast<const std::byte*>(address), static_cast<std::size_t>(size), false)) return;
+            printOutput(codeAddress, "old-path", address, std::span(reinterpret_cast<const std::byte*>(address), static_cast<std::size_t>(size)));
+        });
+    }
 }
 
 void NoteExistingDispatch(std::uint64_t codeAddress, std::uint64_t arguments, std::uint64_t groups) {

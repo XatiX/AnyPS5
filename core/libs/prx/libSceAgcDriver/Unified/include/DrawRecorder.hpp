@@ -6,8 +6,10 @@
 #include "prx/libSceAgcDriver/Unified/include/Resolve.hpp"
 #include <array>
 #include <cstdint>
+#include <span>
 #include <string>
 #include <string_view>
+#include <utility>
 
 namespace AgcDriver {
 class VulkanDevice;
@@ -28,6 +30,7 @@ bool RecordDispatch(const Graphics::Context& context, const Resolve::ResolvedDra
 void PrebuildDispatch(const Graphics::Context& context, VulkanDevice& owner, const Resolve::ResolvedDraw& dispatch);
 void RefuseUnrecorded(std::string_view work, std::uint64_t codeAddress, std::string_view reason);
 void NoteExistingDispatch(std::uint64_t codeAddress, std::uint64_t arguments, std::uint64_t groups);
+void ProbeExistingWrites(Graphics::Recorder& recorder, std::uint64_t codeAddress, std::span<const std::pair<std::uint64_t, std::uint64_t>> writes);
 [[nodiscard]] std::string RecordLine();
 
 }

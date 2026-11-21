@@ -244,6 +244,17 @@ public:
         handoff.Offer(operation.queue, operation.submission, operation.packetOffset, std::move(draw));
     }
 
+    void ConsumeFailed(const Operation& operation, const char* what) {
+        const std::string reason = std::string("resolve threw: ") + what;
+        {
+            std::lock_guard lock(refusalMutex);
+            lastRefusal = reason;
+            if (thrown.insert(reason.substr(0, 80)).second) std::fprintf(stderr, "[recode-resolve] first exception while resolving: %s\n", what);
+        }
+        if (IsDispatch(operation.kind)) dispatchHandoff.Offer(operation.queue, operation.submission, operation.packetOffset, nullptr);
+        else if (IsDraw(operation.kind)) handoff.Offer(operation.queue, operation.submission, operation.packetOffset, nullptr);
+    }
+
     PacketTable<ResolvedDraw>& Table() { return handoff; }
     PacketTable<ResolvedDraw>& DispatchTable() { return dispatchHandoff; }
     const Heap::VulkanHeapDevice* Device() const { return published.load(std::memory_order_acquire); }
@@ -393,6 +404,7 @@ private:
     std::array<std::atomic<std::uint64_t>, ChoiceCount> viewChoices{};
     std::mutex refusalMutex;
     std::string lastRefusal;
+    std::set<std::string> thrown;
     std::mutex recordMutex;
     std::uint64_t storageRecords = 0;
     std::uint64_t storageRecordRefusals = 0;
@@ -765,13 +777,7 @@ private:
             firstImage = true;
             std::fprintf(stderr, "[recode-resolve] first image lookup\n");
         }
-        if (surfaces != nullptr && ownedByRecord(request)) {
-            const auto resource = Graphics::DecodeTextureResource(request.words);
-            Heap::ResolvedImage deferred;
-            deferred.memory = {resource.baseAddress, Graphics::SurfaceGuestBytes(resource)};
-            deferred.deferred = true;
-            return deferred;
-        }
+        if (surfaces != nullptr && ownedByRecord(request)) return deferredImage(request);
         if (surfaces != nullptr) {
             bool fallback = false;
             auto resolved = surfaceImage(request, fallback);
@@ -783,13 +789,7 @@ private:
                 }
             }
         }
-        if (sampledBind() != SampledBind::Ahead) {
-            const auto resource = Graphics::DecodeTextureResource(request.words);
-            Heap::ResolvedImage deferred;
-            deferred.memory = {resource.baseAddress, Graphics::SurfaceGuestBytes(resource)};
-            deferred.deferred = true;
-            return deferred;
-        }
+        if (sampledBind() != SampledBind::Ahead) return deferredImage(request);
         std::shared_ptr<Graphics::Texture> texture;
         {
             GuestMemory::TagGpuLockSite(GuestMemory::GpuLockSite::Try);
@@ -825,6 +825,19 @@ private:
         resolved.image = {reinterpret_cast<std::uint64_t>(view), static_cast<std::uint32_t>(texture->Layout()), texture};
         resolved.memory = {resource.baseAddress, Graphics::SurfaceGuestBytes(resource)};
         return resolved;
+    }
+
+    std::optional<Heap::ResolvedImage> deferredImage(const Heap::SlotRequest& request) {
+        try {
+            const auto resource = Graphics::DecodeTextureResource(request.words);
+            Heap::ResolvedImage deferred;
+            deferred.memory = {resource.baseAddress, Graphics::SurfaceGuestBytes(resource)};
+            deferred.deferred = true;
+            return deferred;
+        } catch (const std::exception& error) {
+            noteSurfaceReason(std::string("deferred image: ") + error.what());
+            return std::nullopt;
+        }
     }
 
     bool ownedByRecord(const Heap::SlotRequest& request) const {
@@ -973,9 +986,14 @@ private:
 
     std::optional<Heap::ResolvedSampler> sampler(const Heap::SlotRequest& request) {
         if (context->samplerCache == nullptr) return std::nullopt;
-        const auto found = context->samplerCache->Get(*context, std::span<const std::uint32_t>(request.words).first(4), (request.flags & Heap::RequestFlag::Compare) != 0u, false, true, false);
-        if (found == nullptr) return std::nullopt;
-        return Heap::ResolvedSampler{reinterpret_cast<std::uint64_t>(found->Handle()), found};
+        try {
+            const auto found = context->samplerCache->Get(*context, std::span<const std::uint32_t>(request.words).first(4), (request.flags & Heap::RequestFlag::Compare) != 0u, false, true, false);
+            if (found == nullptr) return std::nullopt;
+            return Heap::ResolvedSampler{reinterpret_cast<std::uint64_t>(found->Handle()), found};
+        } catch (const std::exception& error) {
+            noteSurfaceReason(std::string("sampler: ") + error.what());
+            return std::nullopt;
+        }
     }
 
     std::mutex mutex;
@@ -1034,7 +1052,11 @@ void Attach(const std::shared_ptr<VulkanDevice>& device) {
 }
 
 void Consume(const Operation& operation, const DecodeState& state) {
-    shared().Consume(operation, state);
+    try {
+        shared().Consume(operation, state);
+    } catch (const std::exception& error) {
+        shared().ConsumeFailed(operation, error.what());
+    }
 }
 
 std::string Line() {
