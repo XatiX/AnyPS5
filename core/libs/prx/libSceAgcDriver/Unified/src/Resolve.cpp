@@ -324,7 +324,7 @@ public:
     }
 
     static bool StorageRecordShape(const Heap::SlotRequest& request) {
-        if (!storageRecordsOn() || (request.flags & (Heap::RequestFlag::Atomic | Heap::RequestFlag::Atomic64)) != 0u || (request.flags & Heap::RequestFlag::UintView) == 0u) return false;
+        if (!storageRecordsOn() || (request.flags & (Heap::RequestFlag::Atomic | Heap::RequestFlag::Atomic64)) != 0u) return false;
         const auto shape = (request.kind - Heap::LastSampledKind - 1u) % StorageShapes;
         return shape == Image2DShape || shape == Image2DArrayShape;
     }
@@ -352,14 +352,22 @@ public:
 
 private:
     static bool storageRecordsOn() {
-        static const bool records = std::getenv("APS5_RECODE_STORAGE_RECORDS") != nullptr;
+        static const bool records = std::getenv("APS5_RECODE_STORAGE_RECORDS") != nullptr || std::getenv("APS5_RECODE_IMAGE_OWNERS") != nullptr;
         return records;
     }
+
+public:
+    bool BindViewSlot(const Heap::SlotRequest& request, std::uint64_t view, std::uint32_t layout, std::shared_ptr<const void> owner, std::uint32_t& slot) {
+        if (table == nullptr || view == 0u || owner == nullptr) return false;
+        slot = table->ImageSlot(request.kind, {view, layout, std::move(owner)});
+        return slot != Heap::NoSlot;
+    }
+
+private:
 
     std::shared_ptr<Images::Surface> storageRecordFor(const Heap::SlotRequest& request) {
         if (!storageRecordsOn() || surfaces == nullptr) return nullptr;
         if ((request.flags & (Heap::RequestFlag::Atomic | Heap::RequestFlag::Atomic64)) != 0u) return noteRecordRefusal("atomic storage");
-        if ((request.flags & Heap::RequestFlag::UintView) == 0u) return noteRecordRefusal("typed storage view");
         const auto shape = (request.kind - Heap::LastSampledKind - 1u) % StorageShapes;
         if (shape != Image2DShape && shape != Image2DArrayShape) return noteRecordRefusal("storage shape");
         std::string why;
@@ -735,6 +743,13 @@ private:
             firstImage = true;
             std::fprintf(stderr, "[recode-resolve] first image lookup\n");
         }
+        if (surfaces != nullptr && ownedByRecord(request)) {
+            const auto resource = Graphics::DecodeTextureResource(request.words);
+            Heap::ResolvedImage deferred;
+            deferred.memory = {resource.baseAddress, Graphics::SurfaceGuestBytes(resource)};
+            deferred.deferred = true;
+            return deferred;
+        }
         if (surfaces != nullptr) {
             bool fallback = false;
             auto resolved = surfaceImage(request, fallback);
@@ -788,6 +803,17 @@ private:
         resolved.image = {reinterpret_cast<std::uint64_t>(view), static_cast<std::uint32_t>(texture->Layout()), texture};
         resolved.memory = {resource.baseAddress, Graphics::SurfaceGuestBytes(resource)};
         return resolved;
+    }
+
+    bool ownedByRecord(const Heap::SlotRequest& request) const {
+        static const bool owners = std::getenv("APS5_RECODE_IMAGE_OWNERS") != nullptr;
+        if (!owners) return false;
+        try {
+            const auto resource = Graphics::DecodeTextureResource(request.words);
+            return surfaces->OwnerOfRange(resource.baseAddress, Graphics::SurfaceGuestBytes(resource)) == Images::Side::Record;
+        } catch (const std::exception&) {
+            return false;
+        }
     }
 
     void noteTargetWrites(std::span<const GuestUse> uses) {
@@ -1040,6 +1066,10 @@ std::shared_ptr<Images::Surface> BindRecordSlot(const Heap::SlotRequest& request
 
 bool StorageRecordShape(const Heap::SlotRequest& request) {
     return Resolver::StorageRecordShape(request);
+}
+
+bool BindViewSlot(const Heap::SlotRequest& request, std::uint64_t view, std::uint32_t layout, std::shared_ptr<const void> owner, std::uint32_t& slot) {
+    return shared().BindViewSlot(request, view, layout, std::move(owner), slot);
 }
 
 std::shared_ptr<const void> BindDeferredSampled(const Graphics::Context& context, const Heap::SlotRequest& request, std::uint32_t& slot, std::string& reason) {

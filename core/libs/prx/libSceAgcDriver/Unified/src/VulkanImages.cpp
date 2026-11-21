@@ -13,6 +13,44 @@ namespace {
 
 constexpr std::uint32_t DimensionsPerClass = 7;
 
+VkFormat linearStorageFormat(VkFormat format) {
+    switch (format) {
+        case VK_FORMAT_R8G8B8A8_SRGB: return VK_FORMAT_R8G8B8A8_UNORM;
+        case VK_FORMAT_B8G8R8A8_SRGB: return VK_FORMAT_B8G8R8A8_UNORM;
+        case VK_FORMAT_A8B8G8R8_SRGB_PACK32: return VK_FORMAT_A8B8G8R8_UNORM_PACK32;
+        case VK_FORMAT_R8_SRGB: return VK_FORMAT_R8_UNORM;
+        case VK_FORMAT_R8G8_SRGB: return VK_FORMAT_R8G8_UNORM;
+        default: return format;
+    }
+}
+
+VkFormat packedStorageView(VkFormat format) {
+    switch (format) {
+        case VK_FORMAT_R5G6B5_UNORM_PACK16:
+        case VK_FORMAT_A1R5G5B5_UNORM_PACK16:
+        case VK_FORMAT_R5G5B5A1_UNORM_PACK16:
+        case VK_FORMAT_B4G4R4A4_UNORM_PACK16: return VK_FORMAT_R16_UINT;
+        default: return VK_FORMAT_UNDEFINED;
+    }
+}
+
+VkFormat uintStorageView(VkFormat format) {
+    switch (format) {
+        case VK_FORMAT_R8G8_SINT: return VK_FORMAT_R8G8_UINT;
+        case VK_FORMAT_R8G8B8A8_SINT: return VK_FORMAT_R8G8B8A8_UINT;
+        case VK_FORMAT_R16_SINT: return VK_FORMAT_R16_UINT;
+        case VK_FORMAT_R16G16_SINT: return VK_FORMAT_R16G16_UINT;
+        case VK_FORMAT_R16G16B16A16_SINT: return VK_FORMAT_R16G16B16A16_UINT;
+        case VK_FORMAT_R32_SINT: return VK_FORMAT_R32_UINT;
+        case VK_FORMAT_R32G32_SINT: return VK_FORMAT_R32G32_UINT;
+        case VK_FORMAT_R32G32B32A32_SINT: return VK_FORMAT_R32G32B32A32_UINT;
+        case VK_FORMAT_R16_SFLOAT: return VK_FORMAT_R16_UINT;
+        case VK_FORMAT_R16G16_SFLOAT: return VK_FORMAT_R16G16_UINT;
+        case VK_FORMAT_R16G16B16A16_SFLOAT: return VK_FORMAT_R16G16B16A16_UINT;
+        default: return VK_FORMAT_UNDEFINED;
+    }
+}
+
 std::optional<VkComponentSwizzle> swizzleOf(std::uint32_t select) {
     switch (select) {
         case 0: return VK_COMPONENT_SWIZZLE_ZERO;
@@ -218,10 +256,6 @@ VkImageView VulkanSurface::ShapedStorageView(std::uint32_t level, bool array, bo
         reason = "storage view of a compressed surface";
         return VK_NULL_HANDLE;
     }
-    if (!uintView) {
-        reason = "typed storage view";
-        return VK_NULL_HANDLE;
-    }
     const bool volume = resource.dimension == Graphics::TextureDimension::k3D;
     if (volume) {
         reason = "storage view of a volume";
@@ -241,7 +275,10 @@ VkImageView VulkanSurface::ShapedStorageView(std::uint32_t level, bool array, bo
     info.pNext = &usage;
     info.image = image;
     info.viewType = array ? VK_IMAGE_VIEW_TYPE_2D_ARRAY : VK_IMAGE_VIEW_TYPE_2D;
-    info.format = uintView ? Graphics::TextureDetiler::ImageElementFormat(Graphics::BytesPerElement(resource.format)) : format;
+    const auto storageFormat = linearStorageFormat(Graphics::ResolveTextureFormat(resource.format));
+    const auto packed = packedStorageView(storageFormat);
+    const auto uintFormat = uintView ? uintStorageView(storageFormat) : VK_FORMAT_UNDEFINED;
+    info.format = packed != VK_FORMAT_UNDEFINED ? packed : uintFormat != VK_FORMAT_UNDEFINED ? uintFormat : storageFormat;
     info.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, level, 1u, 0u, array ? std::max(geometry.imageLayers, 1u) : 1u};
     VkImageView created = VK_NULL_HANDLE;
     if (context.Function<PFN_vkCreateImageView>("vkCreateImageView")(context.device, &info, nullptr, &created) != VK_SUCCESS) {

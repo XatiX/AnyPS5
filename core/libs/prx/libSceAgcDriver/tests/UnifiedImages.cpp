@@ -220,6 +220,29 @@ void testBudgetDropsLeastRecentlyUsed() {
 
 }
 
+void testRangesKeepTheirFirstOwner() {
+    FakeDevice device;
+    Events::ChangeLog shared;
+    Events::ChangeLog gpuWrites;
+    SurfaceTable table(device, shared, gpuWrites);
+    std::string reason;
+    Expect(table.OwnerOfRange(0xc00000000ull, 0x10000) == Side::None, "an unclaimed range has no owner");
+    Expect(table.Claim(0xc00000000ull, 0x10000, Side::Record, "target") == Side::Record, "the first claim takes the range");
+    Expect(table.Claim(0xc00008000ull, 0x100, Side::Upstream, "late") == Side::Record, "a later claim inside it does not move it");
+    Expect(table.OwnerOfRange(0xc0000ff00ull, 0x200) == Side::Record, "a range touching it reads the owner");
+    Expect(table.Claim(0xc00010000ull, 0x10000, Side::Upstream, "metadata") == Side::Upstream, "the neighbouring range is claimed separately");
+    Expect(table.OwnerOfRange(0xc0000ff00ull, 0x200) == Side::Upstream, "the existing cache wins a range across both owners");
+    const auto record = table.Seed(table.Adopt(Key(0xc00000000ull), words, reason));
+    Expect(record != nullptr && record->seeded && table.TakeWork().size() == 1u, "a seeded record is queued once for its first content");
+    static_cast<void>(table.Seed(record));
+    Expect(table.TakeWork().empty(), "seeding it again queues nothing");
+    table.Demote(0xc00000000ull, 0x10000, "another shape");
+    Expect(table.OwnerOfRange(0xc00000000ull, 0x10000) == Side::Upstream, "a demoted range belongs to the existing cache");
+    Expect(record->retired && table.Overlapping(0xc00000000ull, 0x10000).empty(), "its record is retired");
+    Expect(table.Claim(0xc00000000ull, 0x10000, Side::Record, "again") == Side::Upstream, "a demoted range is not claimed back");
+    Expect(table.OwnersLine().find("1 demoted") != std::string::npos, "the owners line counts the demotion");
+}
+
 int main() {
     testBudgetDropsLeastRecentlyUsed();
     testGpuWrittenSurfacesAreLeftToTheExistingCache();
@@ -230,6 +253,7 @@ int main() {
     testOwnGpuWritesKeepTheSurface();
     testForeignWritesHandTheSurfaceBack();
     testOverlapQuery();
+    testRangesKeepTheirFirstOwner();
     if (failures != 0) return 1;
     std::printf("unified images tests passed\n");
     return 0;
