@@ -1,7 +1,9 @@
 #include "prx/libSceAgcDriver/Unified/include/VulkanResidency.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/MemoryAccounting.hpp"
 #include "prx/libSceAgcDriver/Execution/include/GuestMemory.hpp"
+#include <algorithm>
 #include <array>
+#include <chrono>
 
 namespace AgcDriver::Unified {
 
@@ -18,6 +20,7 @@ VkBuffer bufferOf(std::uint64_t handle) {
 VulkanResidency::VulkanResidency(const Graphics::Context& context) : context(context) {}
 
 VulkanResidency::~VulkanResidency() {
+    if (bindTimeline != VK_NULL_HANDLE) context.Function<PFN_vkDestroySemaphore>("vkDestroySemaphore")(context.device, bindTimeline, nullptr);
     for (const auto memory : poolMemory) {
         if (memory != VK_NULL_HANDLE) Graphics::MemoryAccounting::Free(context, memory);
     }
@@ -96,27 +99,121 @@ bool VulkanResidency::Bind(std::uint64_t handle, std::span<const ChunkBind> bind
             const auto memory = bind.bound ? poolMemory[bind.chunk.pool] : VK_NULL_HANDLE;
             sparse.push_back({bind.offset, ChunkBytes, memory, bind.bound ? bind.chunk.index * ChunkBytes : 0, 0});
         }
+        if (batched && std::ranges::all_of(binds, &ChunkBind::bound)) {
+            auto& list = queued[handle];
+            list.insert(list.end(), sparse.begin(), sparse.end());
+            counts.queued += sparse.size();
+            return true;
+        }
     }
+    const auto pending = Flush();
     const VkSparseBufferMemoryBindInfo bufferBinds{bufferOf(handle), static_cast<std::uint32_t>(sparse.size()), sparse.data()};
     VkBindSparseInfo bind{VK_STRUCTURE_TYPE_BIND_SPARSE_INFO};
     bind.bufferBindCount = 1;
     bind.pBufferBinds = &bufferBinds;
+    VkTimelineSemaphoreSubmitInfo waitInfo{VK_STRUCTURE_TYPE_TIMELINE_SEMAPHORE_SUBMIT_INFO};
+    if (pending) {
+        waitInfo.waitSemaphoreValueCount = 1;
+        waitInfo.pWaitSemaphoreValues = &pending->second;
+        bind.waitSemaphoreCount = 1;
+        bind.pWaitSemaphores = &pending->first;
+        bind.pNext = &waitInfo;
+    }
     const VkFenceCreateInfo fenceInfo{VK_STRUCTURE_TYPE_FENCE_CREATE_INFO};
     VkFence fence = VK_NULL_HANDLE;
     if (context.Function<PFN_vkCreateFence>("vkCreateFence")(context.device, &fenceInfo, nullptr, &fence) != VK_SUCCESS) return false;
     const bool ownQueue = context.sparseQueue != VK_NULL_HANDLE && context.sparseQueueMutex != nullptr;
     VkResult submitted = VK_SUCCESS;
     VkResult waited = VK_SUCCESS;
+    const auto start = std::chrono::steady_clock::now();
     {
         std::unique_lock<std::mutex> queueLock;
-        std::unique_lock<GuestMemory::GpuMutexType> gpuLock;
+        std::unique_lock<GuestMemory::GpuMutexType> gpuLock(GuestMemory::GpuMutex(), std::defer_lock);
         if (ownQueue) queueLock = std::unique_lock(*context.sparseQueueMutex);
-        else gpuLock = std::unique_lock(GuestMemory::GpuMutex());
+        else if (!GuestMemory::GpuMutex().HeldByThisThread()) gpuLock.lock();
         submitted = context.Function<PFN_vkQueueBindSparse>("vkQueueBindSparse")(ownQueue ? context.sparseQueue : context.queue, 1, &bind, fence);
         if (submitted == VK_SUCCESS) waited = context.Function<PFN_vkWaitForFences>("vkWaitForFences")(context.device, 1, &fence, VK_TRUE, UINT64_MAX);
     }
     context.Function<PFN_vkDestroyFence>("vkDestroyFence")(context.device, fence, nullptr);
+    {
+        std::lock_guard lock(mutex);
+        ++counts.syncCalls;
+        ++counts.calls;
+        counts.chunks += sparse.size();
+        counts.nanoseconds += static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - start).count());
+    }
     return submitted == VK_SUCCESS && waited == VK_SUCCESS;
+}
+
+void VulkanResidency::SetBatched(bool enabled) {
+    std::lock_guard lock(mutex);
+    batched = enabled;
+}
+
+bool VulkanResidency::Queued() const {
+    std::lock_guard lock(mutex);
+    return !queued.empty();
+}
+
+VkSemaphore VulkanResidency::timeline() {
+    if (bindTimeline != VK_NULL_HANDLE) return bindTimeline;
+    VkSemaphoreTypeCreateInfo typeInfo{VK_STRUCTURE_TYPE_SEMAPHORE_TYPE_CREATE_INFO};
+    typeInfo.semaphoreType = VK_SEMAPHORE_TYPE_TIMELINE;
+    typeInfo.initialValue = 0;
+    const VkSemaphoreCreateInfo info{VK_STRUCTURE_TYPE_SEMAPHORE_CREATE_INFO, &typeInfo};
+    if (context.Function<PFN_vkCreateSemaphore>("vkCreateSemaphore")(context.device, &info, nullptr, &bindTimeline) != VK_SUCCESS) bindTimeline = VK_NULL_HANDLE;
+    return bindTimeline;
+}
+
+std::optional<std::pair<VkSemaphore, std::uint64_t>> VulkanResidency::Flush() {
+    std::map<std::uint64_t, std::vector<VkSparseMemoryBind>> taken;
+    VkSemaphore signal = VK_NULL_HANDLE;
+    std::uint64_t value = 0;
+    {
+        std::lock_guard lock(mutex);
+        if (queued.empty()) return std::nullopt;
+        signal = timeline();
+        if (signal == VK_NULL_HANDLE) return std::nullopt;
+        taken.swap(queued);
+        value = ++bindValue;
+    }
+    std::vector<VkSparseBufferMemoryBindInfo> buffers;
+    std::size_t chunks = 0;
+    for (const auto& [handle, list] : taken) {
+        buffers.push_back({bufferOf(handle), static_cast<std::uint32_t>(list.size()), list.data()});
+        chunks += list.size();
+    }
+    const auto start = std::chrono::steady_clock::now();
+    const bool sent = submit(buffers, signal, value);
+    std::lock_guard lock(mutex);
+    ++counts.calls;
+    counts.chunks += chunks;
+    counts.nanoseconds += static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - start).count());
+    if (!sent) return std::nullopt;
+    return std::pair{signal, value};
+}
+
+bool VulkanResidency::submit(std::span<const VkSparseBufferMemoryBindInfo> buffers, VkSemaphore signal, std::uint64_t value) {
+    VkBindSparseInfo bind{VK_STRUCTURE_TYPE_BIND_SPARSE_INFO};
+    bind.bufferBindCount = static_cast<std::uint32_t>(buffers.size());
+    bind.pBufferBinds = buffers.data();
+    VkTimelineSemaphoreSubmitInfo signalInfo{VK_STRUCTURE_TYPE_TIMELINE_SEMAPHORE_SUBMIT_INFO};
+    signalInfo.signalSemaphoreValueCount = 1;
+    signalInfo.pSignalSemaphoreValues = &value;
+    bind.signalSemaphoreCount = 1;
+    bind.pSignalSemaphores = &signal;
+    bind.pNext = &signalInfo;
+    const bool ownQueue = context.sparseQueue != VK_NULL_HANDLE && context.sparseQueueMutex != nullptr;
+    std::unique_lock<std::mutex> queueLock;
+    std::unique_lock<GuestMemory::GpuMutexType> gpuLock(GuestMemory::GpuMutex(), std::defer_lock);
+    if (ownQueue) queueLock = std::unique_lock(*context.sparseQueueMutex);
+    else if (!GuestMemory::GpuMutex().HeldByThisThread()) gpuLock.lock();
+    return context.Function<PFN_vkQueueBindSparse>("vkQueueBindSparse")(ownQueue ? context.sparseQueue : context.queue, 1, &bind, VK_NULL_HANDLE) == VK_SUCCESS;
+}
+
+BindCounts VulkanResidency::TakeCounts() {
+    std::lock_guard lock(mutex);
+    return std::exchange(counts, BindCounts{});
 }
 
 std::uint64_t VulkanResidency::BudgetBytes() const {

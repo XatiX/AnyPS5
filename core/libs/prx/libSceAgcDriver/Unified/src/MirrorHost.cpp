@@ -115,6 +115,7 @@ void Attach(const std::shared_ptr<VulkanDevice>& device) {
     host().Attach(device);
     MemoryCore::Get().SetHost(&host());
     ResidencyService::Get().SetMirrorSpaces(true);
+    ResidencyService::Get().SetBatchedBinds(true);
     ResidencyService::Get().SetKeep([](std::uint64_t address, std::uint64_t size) { return MemoryCore::Get().Written().Any(address, size); });
     GuestMemory::SetMirrorFlushHook([](std::uint64_t address, std::size_t bytes) { MemoryCore::Get().FlushGpuWrites(address, bytes); });
 }

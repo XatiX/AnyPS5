@@ -1,5 +1,6 @@
 #include "prx/libSceAgcDriver/Unified/include/ResidencyService.hpp"
 #include "prx/libSceAgcDriver/Execution/include/GuestMemory.hpp"
+#include "prx/libSceAgcDriver/Graphics/include/Recorder.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/Resources.hpp"
 #include "BdaAbi.hpp"
 #include <algorithm>
@@ -72,6 +73,7 @@ bool ResidencyService::Attach(const Graphics::Context& graphics) {
     }
     context.emplace(graphics);
     device = std::make_unique<VulkanResidency>(*context);
+    device->SetBatched(batchedBinds);
     ledger = std::make_unique<Residency>(*device, 0);
     ledger->SetKeep(keep);
     uploads = std::make_unique<ResidentUploads>(*ledger, GuestMemory::CommittedRanges);
@@ -464,12 +466,26 @@ std::shared_ptr<Graphics::Buffer> ResidencyService::staging(std::size_t bytes) {
 bool ResidencyService::Pending() const {
     if (!Attached()) return false;
     std::lock_guard lock(mutex);
-    return uploads->Pending() || (pages && pages->Dirty());
+    return uploads->Pending() || (pages && pages->Dirty()) || device->Queued();
+}
+
+void ResidencyService::SetBatchedBinds(bool enabled) {
+    std::lock_guard lock(mutex);
+    batchedBinds = enabled;
+    if (device) device->SetBatched(enabled);
 }
 
 std::size_t ResidencyService::Record(VkCommandBuffer commands, std::vector<std::shared_ptr<void>>& kept) {
     if (!Attached()) return 0;
     std::lock_guard lock(mutex);
+    if (const auto hold = device->Flush()) {
+        if (context->recorder != nullptr) {
+            context->recorder->HoldNextSubmit(hold->first, hold->second);
+        } else {
+            const VkSemaphoreWaitInfo wait{VK_STRUCTURE_TYPE_SEMAPHORE_WAIT_INFO, nullptr, 0, 1, &hold->first, &hold->second};
+            context->Function<PFN_vkWaitSemaphoresKHR>("vkWaitSemaphoresKHR")(context->device, &wait, UINT64_MAX);
+        }
+    }
     const auto now = frame.load(std::memory_order_relaxed);
     for (const auto& [address, end] : served) ledger->Touch(address, now);
     auto taken = uploads->Take();
@@ -608,10 +624,16 @@ std::string ResidencyService::Line() const {
         static_cast<unsigned long long>(pageUpdates), static_cast<unsigned long long>(pageUpdateBytes >> 20), static_cast<unsigned long long>(pageLeavesDropped), static_cast<unsigned long long>(ledgerCounts.sharedPages),
         static_cast<unsigned long long>(importPages.size()), static_cast<unsigned long long>(importMaps), static_cast<unsigned long long>(importPagesForgotten), static_cast<unsigned long long>(faultPagesServed), static_cast<unsigned long long>(faultPagesMapped), static_cast<unsigned long long>(faultPagesRefused), static_cast<unsigned long long>(readBacks), static_cast<unsigned long long>(readBackBytes >> 10), static_cast<unsigned long long>(readBackMissedBytes >> 10), static_cast<unsigned long long>(writtenImports.size()), static_cast<unsigned long long>(writtenImportsForgotten), static_cast<unsigned long long>(writtenImportsReturned), static_cast<unsigned long long>(writtenImportsBound));
     std::string spaces;
+    const auto binds = device->TakeCounts();
+    if (binds.calls != 0 || binds.queued != 0) {
+        char text[224];
+        std::snprintf(text, sizeof(text), "[recode-binds] %s: %llu vkQueueBindSparse calls (%llu waited on a fence), %llu chunks, %llu queued, %.1f ms in the calls\n", batchedBinds ? "batched" : "one call per bind", static_cast<unsigned long long>(binds.calls), static_cast<unsigned long long>(binds.syncCalls), static_cast<unsigned long long>(binds.chunks), static_cast<unsigned long long>(binds.queued), static_cast<double>(binds.nanoseconds) / 1e6);
+        spaces += text;
+    }
     if (mirrorSpaces) {
         char text[192];
         std::snprintf(text, sizeof(text), "[recode-mirror-spaces] served %llu, refused %llu, %llu MiB\n", static_cast<unsigned long long>(spacesServed), static_cast<unsigned long long>(spacesRefused), static_cast<unsigned long long>(spaceBytes >> 20));
-        spaces = text;
+        spaces += text;
     }
     return std::string(line) + table + spaces;
 }
