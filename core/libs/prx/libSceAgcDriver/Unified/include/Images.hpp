@@ -52,6 +52,8 @@ struct ImageKey {
 [[nodiscard]] std::optional<ImageKey> KeyOf(std::span<const std::uint32_t, 8> words, std::string& reason);
 [[nodiscard]] std::optional<ImageKey> KeyOf(const Graphics::GuestTextureResource& resource, std::string& reason);
 [[nodiscard]] bool SameBacking(const SurfaceKey& left, const SurfaceKey& right);
+[[nodiscard]] bool OwnersEnabled();
+[[nodiscard]] bool OwnsClass(std::string_view name);
 
 enum class State : std::uint8_t { Pending, Ready, Stale };
 

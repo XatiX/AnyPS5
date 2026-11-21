@@ -3,6 +3,7 @@
 #include "prx/libSceAgcDriver/Graphics/include/TextureFormat.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/TextureTiling.hpp"
 #include <algorithm>
+#include <cstdlib>
 #include <exception>
 
 namespace AgcDriver::Unified::Images {
@@ -60,6 +61,22 @@ std::size_t SurfaceTable::KeyHash::operator()(const SurfaceKey& key) const {
     mix(key.pipeBankXor);
     mix(key.pitch);
     return static_cast<std::size_t>(hash);
+}
+
+bool OwnersEnabled() {
+    static const bool enabled = [] {
+        const char* value = std::getenv("APS5_RECODE_IMAGE_OWNERS");
+        return value == nullptr || (std::string_view(value) != "0" && std::string_view(value) != "off");
+    }();
+    return enabled;
+}
+
+bool OwnsClass(std::string_view name) {
+    if (!OwnersEnabled()) return false;
+    const char* value = std::getenv("APS5_RECODE_IMAGE_OWNERS");
+    if (value == nullptr) return true;
+    const std::string_view text(value);
+    return text == "1" || text == "all" || text.find(name) != std::string_view::npos;
 }
 
 bool SameBacking(const SurfaceKey& left, const SurfaceKey& right) {

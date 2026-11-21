@@ -205,6 +205,7 @@ struct Totals {
     std::uint64_t recordWrites = 0;
     std::uint64_t recordTargetDraws = 0;
     std::uint64_t recordSampled = 0;
+    std::uint64_t directWrites = 0;
     std::uint64_t recordAdoptions = 0;
     std::uint64_t recordAdoptionRefusals = 0;
     std::uint64_t recordTargetRefusals = 0;
@@ -289,6 +290,7 @@ bool copiesBackSmallWrites() {
     return copies;
 }
 
+std::atomic<std::uint32_t> shapeNotes{0};
 std::atomic<std::uint64_t> recordedFills{0};
 std::atomic<std::uint64_t> recordedCopies{0};
 
@@ -300,24 +302,16 @@ bool adoptsUpstream() {
 std::atomic<std::uint64_t> publishedRecords{0};
 
 bool ownsImages() {
-    static const bool owns = std::getenv("APS5_RECODE_IMAGE_OWNERS") != nullptr;
-    return owns;
-}
-
-bool ownsClass(std::string_view name) {
-    const char* value = std::getenv("APS5_RECODE_IMAGE_OWNERS");
-    if (value == nullptr) return false;
-    const std::string_view text(value);
-    return text == "1" || text == "all" || text.find(name) != std::string_view::npos;
+    return Images::OwnersEnabled();
 }
 
 bool ownsTargets() {
-    static const bool owns = ownsClass("targets");
+    static const bool owns = Images::OwnsClass("targets");
     return owns;
 }
 
 bool ownsStorage() {
-    static const bool owns = ownsClass("storage");
+    static const bool owns = Images::OwnsClass("storage");
     return owns;
 }
 
@@ -445,6 +439,15 @@ void countInput(Totals& totals, InputSource source) {
 constexpr std::uint64_t KnownBufferLimitBytes = 256ull << 20u;
 constexpr std::uint64_t KnownCopyLimitBytes = 64ull << 10u;
 constexpr std::uint64_t KnownWriteLimitBytes = 1ull << 20u;
+std::uint32_t coldSmallWrites() {
+    static const std::uint32_t limit = [] {
+        const char* value = std::getenv("APS5_RECODE_DIRECT_SMALL_WRITES");
+        if (value == nullptr) return 4u;
+        if (std::string_view(value) == "all") return 0xffffffffu;
+        return static_cast<std::uint32_t>(std::max(std::atoi(value), 0));
+    }();
+    return limit;
+}
 constexpr std::uint64_t InputCopyLimitBytes = 64ull << 10u;
 constexpr std::uint32_t PagesPerChunk = static_cast<std::uint32_t>(ChunkBytes / PageBytes);
 
@@ -770,6 +773,7 @@ public:
         line += "; batch moved before the pass " + std::to_string(totals.batchMoves);
         line += "; passes " + std::to_string(totals.passesBegun) + " begun, " + std::to_string(totals.passesContinued) + " draws continued, " + std::to_string(totals.passFeedback) + " broken by a target read";
         line += "; storage images written by draws " + std::to_string(totals.drawStorageWrites);
+        line += "; small known writes stored straight through their import " + std::to_string(totals.directWrites) + " (" + std::to_string(smallWrites.size()) + " addresses seen)";
         line += "; target memo " + std::to_string(totals.targetMemoHits) + " hits, " + std::to_string(totals.targetMemoMisses) + " misses; " + std::to_string(totals.deferredReads) + " draws with reads bound at record";
         line += "; residency updates landed " + std::to_string(totals.residencyLands);
         line += "; known buffers " + std::to_string(totals.knownServed) + " served, " + std::to_string(totals.knownMapped) + " mapped (" + std::to_string(totals.knownPaged) + " paged in), " + std::to_string(totals.knownCopied) + " copied (" + std::to_string(totals.knownGpuWritten) + " GPU-written ranges not copied), " + std::to_string(totals.knownRefused) + " unresolved, " + std::to_string(totals.knownPrefixes) + " bound to their mapped prefix (" + std::to_string(totals.importExtensions) + " chunks moved to their written import to make a known buffer contiguous, " + std::to_string(totals.knownSwitches) + " of them from residency), " + std::to_string(totals.knownSkipped) + " skipped (" + std::to_string(totals.knownPointers) + " of them pointers); known writes " + std::to_string(totals.knownWritten) + " direct (" + std::to_string(totals.knownWriteBytes >> 10u) + " KiB landed), " + std::to_string(totals.knownWriteLookups) + " through the page table, " + std::to_string(totals.copyBacks) + " copied back to their import after the dispatch (" + std::to_string(totals.copyBackBytes >> 20u) + " MiB, " + std::to_string(totals.copyBackCovered >> 10u) + " KiB of written pieces not landed, " + std::to_string(totals.importsReturned) + " chunks returned from their import, " + std::to_string(totals.residencyRefreshes) + " residency refreshes before the dispatch, " + std::to_string(totals.refreshKeptPages) + " GPU-written pages kept from them)";
@@ -924,6 +928,37 @@ private:
         }
     }
 
+    std::uint64_t directSmallWrite(const Context& context, std::uint64_t address, std::uint64_t bytes) {
+        if (copiesBackSmallWrites() || bytes == 0u || bytes >= PageBytes) return 0u;
+        auto& count = smallWrites[address];
+        if (count >= coldSmallWrites()) return 0u;
+        const auto* import = Graphics::HostImportFor(context, address, static_cast<std::size_t>(bytes));
+        if (import == nullptr || import->address == 0u || address < import->base || address + bytes > import->base + import->bytes) return 0u;
+        ++count;
+        directWrites.emplace_back(address, address + bytes);
+        if (context.recorder != nullptr) context.recorder->NotePendingWrite(address, static_cast<std::size_t>(bytes));
+        totals.directWrites++;
+        if (Downgrades::Active() && context.recorder != nullptr && count == 1u) {
+            context.recorder->OnComplete([address, bytes] {
+                if (!GuestMemory::Accessible(reinterpret_cast<const std::byte*>(address), static_cast<std::size_t>(bytes), false)) return;
+                std::array<float, 6> values{};
+                std::memcpy(values.data(), reinterpret_cast<const void*>(address), std::min<std::size_t>(sizeof(values), static_cast<std::size_t>(bytes)));
+                std::uint32_t zeros = 0;
+                for (std::uint64_t at = 0; at + 4u <= bytes; at += 4u) {
+                    std::uint32_t word = 0;
+                    std::memcpy(&word, reinterpret_cast<const void*>(address + at), sizeof(word));
+                    if (word == 0u) ++zeros;
+                }
+                std::fprintf(stderr, "[recode-probe] small write 0x%llx+0x%llx after its batch: %u of %llu words zero; first floats %g %g %g %g %g %g\n", static_cast<unsigned long long>(address), static_cast<unsigned long long>(bytes), zeros, static_cast<unsigned long long>(bytes / 4u), values[0], values[1], values[2], values[3], values[4], values[5]);
+            });
+        }
+        return import->address + (address - import->base);
+    }
+
+    bool directlyWritten(std::uint64_t begin, std::uint64_t end) const {
+        return std::ranges::any_of(directWrites, [&](const std::pair<std::uint64_t, std::uint64_t>& range) { return range.first <= begin && end <= range.second; });
+    }
+
     void landKnownWrites(std::uint64_t completed) {
         while (!knownWrites.empty() && knownWrites.front().serial <= completed) {
             const auto& written = knownWrites.front();
@@ -936,7 +971,7 @@ private:
     }
 
     bool queueCopyBack(const Context& context, std::uint64_t address, std::uint64_t bytes) {
-        if (!copyingBack || bytes > KnownBufferLimitBytes || (bytes < PageBytes && !copiesBackSmallWrites() && !MemoryCore::Get().Pages().GpuWrittenIn(address, bytes))) return false;
+        if (!copyingBack || bytes > KnownBufferLimitBytes) return false;
         const auto* import = Graphics::HostImportFor(context, address, static_cast<std::size_t>(bytes));
         if (import == nullptr || address < import->base || address + bytes > import->base + import->bytes) return false;
         returnImports(context, address, bytes, *import);
@@ -1325,6 +1360,11 @@ private:
             }
             if (index < infos.size() && infos[index].written) {
                 auto served = bytes;
+                if (const auto direct = directSmallWrite(context, address, bytes); direct != 0u) {
+                    totals.knownWritten++;
+                    write(direct, bytes);
+                    continue;
+                }
                 const auto mapped = serveKnownWrite(context, address, served, serial, queueCopyBack(context, address, bytes));
                 if (mapped != 0u) totals.knownWritten++;
                 else totals.knownWriteLookups++;
@@ -1856,6 +1896,7 @@ private:
         applySwitches(context, *recorder);
         const auto set = allocateSet(context, main, serial, completed);
         copyBacks.clear();
+        directWrites.clear();
         copyingBack = copiesBackDispatchWrites();
         std::array<std::byte, Graphics::ComputePushConstantBytes> block{};
         const auto& push = stage.program.words.pushConstants;
@@ -1920,10 +1961,14 @@ private:
         writtenRecords.clear();
         if (!writtenRanges.empty()) Events::NoteRanges(writtenRanges);
         if (marksDispatchWrites()) {
-            for (const auto& [begin, end] : writtenRanges) MemoryCore::Get().Pages().NoteGpuWritten(begin, end - begin);
+            for (const auto& [begin, end] : writtenRanges) {
+                if (!directlyWritten(begin, end)) MemoryCore::Get().Pages().NoteGpuWritten(begin, end - begin);
+            }
         }
         if (keepsGpuWrittenPages()) {
-            for (const auto& [begin, end] : writtenRanges) markResidencyNewer(begin, end);
+            for (const auto& [begin, end] : writtenRanges) {
+                if (!directlyWritten(begin, end)) markResidencyNewer(begin, end);
+            }
             if (const auto covered = copiedBack.find(serial); covered != copiedBack.end()) {
                 for (const auto& [begin, end] : covered->second) clearResidencyNewer(begin, end);
             }
@@ -1970,6 +2015,7 @@ private:
     bool record(const Context& context, const Resolve::ResolvedDraw& draw, const Pm4::DrawParameters& parameters, std::string& reason) {
         writtenRecords.clear();
         stageStorageImages.clear();
+        directWrites.clear();
         if (std::ranges::all_of(draw.stages, [](const Resolve::ResolvedStage& stage) { return stage.deferredImages.empty(); })) return recordWithSlots(context, draw, parameters, reason);
         auto bound = draw;
         std::vector<std::shared_ptr<Graphics::StorageTexture>> written;
@@ -2504,6 +2550,10 @@ private:
             if (!record->seeded || record->retired) continue;
             if (Images::SameBacking(record->key, key)) return record;
             why = "another shape of a recode record";
+            if (Downgrades::Active() && shapeNotes.fetch_add(1, std::memory_order_relaxed) < 24u) {
+                const auto& held = record->key;
+                std::fprintf(stderr, "[recode-images] another shape: asked 0x%llx+0x%llx %ux%u depth %u mips %u format %u tile %u dimension %u; record 0x%llx+0x%llx %ux%u depth %u mips %u format %u tile %u dimension %u\n", static_cast<unsigned long long>(key.address), static_cast<unsigned long long>(key.bytes), key.width, key.height, key.depth, key.mips, key.format, key.tileMode, key.dimension, static_cast<unsigned long long>(held.address), static_cast<unsigned long long>(held.bytes), held.width, held.height, held.depth, held.mips, held.format, held.tileMode, held.dimension);
+            }
         }
         return nullptr;
     }
@@ -2642,6 +2692,8 @@ private:
     std::map<std::uint64_t, std::vector<std::pair<std::uint64_t, std::uint64_t>>> copiedBack;
     bool copyingBack = false;
     std::set<std::uint64_t> switches;
+    std::unordered_map<std::uint64_t, std::uint32_t> smallWrites;
+    std::vector<std::pair<std::uint64_t, std::uint64_t>> directWrites;
     std::unordered_map<std::uint64_t, std::uint32_t> writtenPages;
     std::vector<std::shared_ptr<Graphics::Buffer>> spareFaults;
     std::shared_ptr<Graphics::Buffer> groupReads;

@@ -100,6 +100,7 @@ std::string_view KindName(Kind kind) {
         case Kind::SampledAhead: return "sampled-ahead";
         case Kind::ViewMismatch: return "view-mismatch";
         case Kind::ImageResultsDropped: return "image-results-dropped";
+        case Kind::SamplerMode: return "sampler-mode";
         default: return "unknown";
     }
 }
@@ -114,7 +115,8 @@ Severity SeverityOf(Kind kind) {
         case Kind::KnownShort:
         case Kind::SampledAhead:
         case Kind::ViewMismatch:
-        case Kind::ImageResultsDropped: return Severity::Severe;
+        case Kind::ImageResultsDropped:
+        case Kind::SamplerMode: return Severity::Severe;
         case Kind::ExistingPath:
         case Kind::StorageRecordMissing:
         case Kind::UpstreamSampled:

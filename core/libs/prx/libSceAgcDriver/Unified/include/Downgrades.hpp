@@ -31,6 +31,7 @@ enum class Kind : std::uint32_t {
     SampledAhead,
     ViewMismatch,
     ImageResultsDropped,
+    SamplerMode,
     Count,
 };
 

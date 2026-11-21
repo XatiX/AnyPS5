@@ -352,7 +352,7 @@ public:
 
 private:
     static bool storageRecordsOn() {
-        static const bool records = std::getenv("APS5_RECODE_STORAGE_RECORDS") != nullptr || std::getenv("APS5_RECODE_IMAGE_OWNERS") != nullptr;
+        static const bool records = std::getenv("APS5_RECODE_STORAGE_RECORDS") != nullptr || Images::OwnersEnabled();
         return records;
     }
 
@@ -505,6 +505,14 @@ private:
                 }
             }
             counts.requestNanoseconds += elapsed(partStarted);
+            if (Downgrades::Active()) {
+                for (std::size_t index = 0; index < requests.size(); ++index) {
+                    const auto& request = requests[index];
+                    if ((request.flags & Heap::RequestFlag::Sampler) == 0u) continue;
+                    if (((request.words[0] >> 20u) & 1u) != 0u) Downgrades::NoteCurrent(Downgrades::Kind::SamplerMode, static_cast<std::uint32_t>(index), "sampler forces sRGB decoding; its texture is bound without an sRGB view");
+                    if (((request.words[0] >> 15u) & 1u) != 0u) Downgrades::NoteCurrent(Downgrades::Kind::SamplerMode, static_cast<std::uint32_t>(index), "sampler uses unnormalized coordinates; bound as normalized");
+                }
+            }
             partStarted = std::chrono::steady_clock::now();
             ResolvedStage resolved{std::move(stage), {}};
             if (!refill->Fill(requests, resolved.slots, reason, &imageUses, &resolved.owners, &resolved.deferredImages) ||!PatchSlots(*resolved.program.result, resolved.slots, resolved.program.words, reason)) {
@@ -806,8 +814,7 @@ private:
     }
 
     bool ownedByRecord(const Heap::SlotRequest& request) const {
-        static const bool owners = std::getenv("APS5_RECODE_IMAGE_OWNERS") != nullptr;
-        if (!owners) return false;
+        if (!Images::OwnersEnabled()) return false;
         try {
             const auto resource = Graphics::DecodeTextureResource(request.words);
             return surfaces->OwnerOfRange(resource.baseAddress, Graphics::SurfaceGuestBytes(resource)) == Images::Side::Record;
