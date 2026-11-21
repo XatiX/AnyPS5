@@ -58,6 +58,7 @@ public:
     void SetKeep(Residency::Keep next);
     void SetMirrorSpaces(bool enabled);
     void SetBatchedBinds(bool enabled);
+    [[nodiscard]] bool ReadsOffGpuMutex() const;
     std::optional<DeviceSpan> MirrorSpan(std::uint64_t address, std::uint64_t size);
     [[nodiscard]] std::uint64_t Frame() const { return frame.load(std::memory_order_relaxed); }
     [[nodiscard]] std::uint64_t Removals() const;
@@ -73,6 +74,7 @@ private:
     };
 
     void serveSpaces(std::span<const SpaceCommit> commits);
+    bool readOnSettleQueue(std::span<const PendingUpload> pieces, VkBuffer staging);
 
     mutable std::mutex mutex;
     std::optional<Graphics::Context> context;
@@ -81,6 +83,8 @@ private:
     Residency::Keep keep = nullptr;
     std::atomic<bool> mirrorSpaces{false};
     bool batchedBinds = false;
+    std::uint64_t settleReadBacks = 0;
+    std::uint64_t readBackFailures = 0;
     std::uint64_t spacesServed = 0;
     std::uint64_t spacesRefused = 0;
     std::uint64_t spaceBytes = 0;

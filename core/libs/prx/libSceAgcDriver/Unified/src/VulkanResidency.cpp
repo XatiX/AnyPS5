@@ -56,8 +56,10 @@ std::optional<DeviceBuffer> VulkanResidency::CreateBuffer(std::uint64_t bytes) {
     info.flags = VK_BUFFER_CREATE_SPARSE_BINDING_BIT | VK_BUFFER_CREATE_SPARSE_RESIDENCY_BIT;
     info.size = bytes;
     info.usage = VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT | VK_BUFFER_USAGE_INDEX_BUFFER_BIT | VK_BUFFER_USAGE_VERTEX_BUFFER_BIT | VK_BUFFER_USAGE_INDIRECT_BUFFER_BIT | VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT | VK_BUFFER_USAGE_TRANSFER_SRC_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT;
-    const std::array<std::uint32_t, 2> families{context.queueFamily, context.sparseFamily};
-    if (context.sparseQueue != VK_NULL_HANDLE && context.sparseFamily != context.queueFamily) {
+    std::vector<std::uint32_t> families{context.queueFamily};
+    if (context.sparseQueue != VK_NULL_HANDLE && std::ranges::find(families, context.sparseFamily) == families.end()) families.push_back(context.sparseFamily);
+    if (context.settleQueue != VK_NULL_HANDLE && std::ranges::find(families, context.settleFamily) == families.end()) families.push_back(context.settleFamily);
+    if (families.size() > 1) {
         info.sharingMode = VK_SHARING_MODE_CONCURRENT;
         info.queueFamilyIndexCount = static_cast<std::uint32_t>(families.size());
         info.pQueueFamilyIndices = families.data();

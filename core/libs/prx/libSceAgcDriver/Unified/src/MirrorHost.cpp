@@ -18,6 +18,7 @@ namespace {
 
 constexpr std::uint64_t WaitNanoseconds = 2'000'000'000ull;
 constexpr int LockTries = 400;
+constexpr int SubmitTries = 4000;
 
 class Host final : public MemoryHost {
 public:
@@ -36,20 +37,21 @@ public:
         if (held == nullptr) return false;
         if (held->CompletedEpoch() >= serial) return true;
         auto& gpu = GuestMemory::GpuMutex();
-        bool locked = false;
-        for (int tries = 0; tries < LockTries && !locked; ++tries) {
-            locked = gpu.try_lock();
-            if (!locked) std::this_thread::sleep_for(std::chrono::microseconds(500));
+        for (int tries = 0; tries < SubmitTries && held->SubmittedEpoch() < serial; ++tries) {
+            if (gpu.try_lock()) {
+                if (held->SubmittedEpoch() < serial) held->SubmitRecorded(false);
+                gpu.unlock();
+                break;
+            }
+            std::this_thread::sleep_for(std::chrono::microseconds(500));
         }
-        if (!locked) return false;
-        if (held->SubmittedEpoch() < serial) held->SubmitRecorded(false);
-        gpu.unlock();
+        if (held->SubmittedEpoch() < serial) return false;
         return held->WaitRecordedFor(serial, WaitNanoseconds);
     }
 
     bool ReadMirror(std::uint64_t address, std::span<std::byte> out) override {
         std::unique_lock<GuestMemory::GpuMutexType> gpu(GuestMemory::GpuMutex(), std::defer_lock);
-        if (!GuestMemory::GpuMutex().HeldByThisThread()) {
+        if (!ResidencyService::Get().ReadsOffGpuMutex() && !GuestMemory::GpuMutex().HeldByThisThread()) {
             bool locked = false;
             for (int tries = 0; tries < LockTries && !locked; ++tries) {
                 locked = gpu.try_lock();
@@ -115,7 +117,7 @@ void Attach(const std::shared_ptr<VulkanDevice>& device) {
     host().Attach(device);
     MemoryCore::Get().SetHost(&host());
     ResidencyService::Get().SetMirrorSpaces(true);
-    ResidencyService::Get().SetBatchedBinds(true);
+    ResidencyService::Get().SetBatchedBinds(std::getenv("APS5_RECODE_SYNC_BINDS") == nullptr);
     ResidencyService::Get().SetKeep([](std::uint64_t address, std::uint64_t size) { return MemoryCore::Get().Written().Any(address, size); });
     GuestMemory::SetMirrorFlushHook([](std::uint64_t address, std::size_t bytes) { MemoryCore::Get().FlushGpuWrites(address, bytes); });
 }

@@ -433,6 +433,12 @@ bool mirrorMode() {
     return Mirror::WritesEnabled();
 }
 
+bool mirrorPart(const char* part) {
+    static const char* const chosen = std::getenv("APS5_RECODE_MIRROR_PARTS");
+    static const char* const parts = chosen != nullptr ? chosen : "writes,args";
+    return mirrorMode() && std::strstr(parts, part) != nullptr;
+}
+
 bool gpuPending(std::uint64_t address, std::uint64_t bytes) {
     return mirrorMode() && MemoryCore::Get().Written().Any(address, bytes);
 }
@@ -461,7 +467,7 @@ std::optional<DrawInput> drawInput(const Context& context, std::uint64_t address
             source = InputSource::Written;
         }
     }
-    if (mirrorMode() && source != InputSource::Aliased) {
+    if (mirrorPart("inputs") && source != InputSource::Aliased) {
         if (auto input = mirrorInput(address, bytes)) return input;
         if (gpuPending(address, bytes)) return std::nullopt;
         source = InputSource::Imported;
@@ -1627,7 +1633,7 @@ private:
                 write(zero, 0u);
                 continue;
             }
-            if (index < infos.size() && infos[index].written && mirrorMode()) {
+            if (index < infos.size() && infos[index].written && mirrorPart("writes")) {
                 const auto mapped = mirrorKnownWrite(address, bytes, serial);
                 if (mapped != 0u) {
                     totals.knownWritten++;
@@ -2134,7 +2140,7 @@ private:
             totals.snapshotArguments++;
             return true;
         }
-        if (mirrorMode()) {
+        if (mirrorPart("args")) {
             if (const auto input = mirrorInput(address, bytes)) {
                 buffer = input->buffer;
                 offset = input->offset;
@@ -2541,7 +2547,7 @@ private:
                 }
                 const auto readInput = [&](std::uint64_t address, std::uint64_t size, bool& mirrored) -> std::optional<DrawInput> {
                     mirrored = false;
-                    if (mirrorMode()) {
+                    if (mirrorPart("args")) {
                         if (auto input = mirrorInput(address, size)) {
                             mirrored = true;
                             return input;

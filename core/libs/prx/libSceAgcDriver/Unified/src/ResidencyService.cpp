@@ -373,7 +373,13 @@ std::vector<PendingUpload> ResidencyService::ReadBack(std::span<const std::pair<
     }
     if (pieces.empty()) return pieces;
     Graphics::Buffer staging(*context, total, VK_BUFFER_USAGE_TRANSFER_DST_BIT);
-    {
+    if (ReadsOffGpuMutex()) {
+        if (!readOnSettleQueue(pieces, staging.Handle())) {
+            ++readBackFailures;
+            return {};
+        }
+        ++settleReadBacks;
+    } else {
         Graphics::CommandBatch batch(*context);
         Graphics::RecordMemoryBarrier(*context, batch.Handle(), VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, ResidentAccess, VK_ACCESS_TRANSFER_READ_BIT);
         const auto copy = context->Function<PFN_vkCmdCopyBuffer>("vkCmdCopyBuffer");
@@ -396,6 +402,49 @@ std::vector<PendingUpload> ResidencyService::ReadBack(std::span<const std::pair<
     ++readBacks;
     readBackBytes += total;
     return pieces;
+}
+
+bool ResidencyService::ReadsOffGpuMutex() const {
+    return Attached() && context->settleQueue != VK_NULL_HANDLE && context->settleQueueMutex != nullptr && context->settlePool != VK_NULL_HANDLE;
+}
+
+bool ResidencyService::readOnSettleQueue(std::span<const PendingUpload> pieces, VkBuffer staging) {
+    const auto& c = *context;
+    std::lock_guard queueLock(*c.settleQueueMutex);
+    VkCommandBufferAllocateInfo allocate{VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO};
+    allocate.commandPool = c.settlePool;
+    allocate.level = VK_COMMAND_BUFFER_LEVEL_PRIMARY;
+    allocate.commandBufferCount = 1;
+    VkCommandBuffer commands = VK_NULL_HANDLE;
+    if (c.Function<PFN_vkAllocateCommandBuffers>("vkAllocateCommandBuffers")(c.device, &allocate, &commands) != VK_SUCCESS) return false;
+    const VkCommandBufferBeginInfo begin{VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO, nullptr, VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT};
+    bool done = c.Function<PFN_vkBeginCommandBuffer>("vkBeginCommandBuffer")(commands, &begin) == VK_SUCCESS;
+    if (done) {
+        Graphics::RecordMemoryBarrier(c, commands, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, ResidentAccess, VK_ACCESS_TRANSFER_READ_BIT);
+        const auto copy = c.Function<PFN_vkCmdCopyBuffer>("vkCmdCopyBuffer");
+        std::size_t at = 0;
+        for (const auto& piece : pieces) {
+            const VkBufferCopy region{piece.offset, at, piece.bytes.size()};
+            copy(commands, bufferOf(piece.handle), staging, 1, &region);
+            at += piece.bytes.size();
+        }
+        Graphics::RecordMemoryBarrier(c, commands, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_HOST_BIT, VK_ACCESS_TRANSFER_WRITE_BIT, VK_ACCESS_HOST_READ_BIT);
+        done = c.Function<PFN_vkEndCommandBuffer>("vkEndCommandBuffer")(commands) == VK_SUCCESS;
+    }
+    VkFence fence = VK_NULL_HANDLE;
+    if (done) {
+        const VkFenceCreateInfo fenceInfo{VK_STRUCTURE_TYPE_FENCE_CREATE_INFO};
+        done = c.Function<PFN_vkCreateFence>("vkCreateFence")(c.device, &fenceInfo, nullptr, &fence) == VK_SUCCESS;
+    }
+    if (done) {
+        VkSubmitInfo submit{VK_STRUCTURE_TYPE_SUBMIT_INFO};
+        submit.commandBufferCount = 1;
+        submit.pCommandBuffers = &commands;
+        done = c.Function<PFN_vkQueueSubmit>("vkQueueSubmit")(c.settleQueue, 1, &submit, fence) == VK_SUCCESS && c.Function<PFN_vkWaitForFences>("vkWaitForFences")(c.device, 1, &fence, VK_TRUE, UINT64_MAX) == VK_SUCCESS;
+    }
+    if (fence != VK_NULL_HANDLE) c.Function<PFN_vkDestroyFence>("vkDestroyFence")(c.device, fence, nullptr);
+    c.Function<PFN_vkFreeCommandBuffers>("vkFreeCommandBuffers")(c.device, c.settlePool, 1, &commands);
+    return done;
 }
 
 bool ResidencyService::Prepare(std::uint64_t address, std::uint64_t size) {
@@ -628,6 +677,11 @@ std::string ResidencyService::Line() const {
     if (binds.calls != 0 || binds.queued != 0) {
         char text[224];
         std::snprintf(text, sizeof(text), "[recode-binds] %s: %llu vkQueueBindSparse calls (%llu waited on a fence), %llu chunks, %llu queued, %.1f ms in the calls\n", batchedBinds ? "batched" : "one call per bind", static_cast<unsigned long long>(binds.calls), static_cast<unsigned long long>(binds.syncCalls), static_cast<unsigned long long>(binds.chunks), static_cast<unsigned long long>(binds.queued), static_cast<double>(binds.nanoseconds) / 1e6);
+        spaces += text;
+    }
+    if (settleReadBacks != 0 || readBackFailures != 0) {
+        char text[160];
+        std::snprintf(text, sizeof(text), "[recode-readback] %llu read-backs on the settle queue, %llu failed\n", static_cast<unsigned long long>(settleReadBacks), static_cast<unsigned long long>(readBackFailures));
         spaces += text;
     }
     if (mirrorSpaces) {
