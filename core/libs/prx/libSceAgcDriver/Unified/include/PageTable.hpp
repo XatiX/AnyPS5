@@ -72,7 +72,7 @@ public:
     std::vector<DirtyRange> ConsumeDirty(std::vector<ProtectionChange>& changes, const WriteCheck& written = {});
     void AdvanceFrame();
     std::vector<ProtectionChange> MarkGpuOwned(std::uint64_t address, std::uint64_t size);
-    GpuTake TakeForGpu(std::uint64_t address, std::uint64_t size);
+    GpuTake TakeForGpu(std::uint64_t address, std::uint64_t size, bool takeDirty = true);
     std::vector<ProtectionChange> MarkDeviceWritten(std::uint64_t address, std::uint64_t size);
     std::vector<DirtyRange> GpuOwnedIn(std::uint64_t address, std::uint64_t size) const;
     [[nodiscard]] bool CleanIn(std::uint64_t address, std::uint64_t size) const;

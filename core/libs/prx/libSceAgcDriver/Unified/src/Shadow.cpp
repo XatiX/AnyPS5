@@ -182,6 +182,15 @@ std::string memoryLine() {
         owned = ownedLine;
     }
     owned += writeAuditLine();
+    if (Mirror::WritesEnabled()) {
+        const auto written = MemoryCore::Get().Written().Counts();
+        char gpuOwnedLine[512];
+        std::snprintf(gpuOwnedLine, sizeof(gpuOwnedLine), "[recode-gpu-owned] pages owned %llu, open %llu KiB; faults parked %llu, bypassed %llu, resolved %llu, opened stale %llu; read-ahead pages %llu, hot pages landed %llu; landed %llu MiB whole, %llu KiB by diff (%llu KiB unchanged); flushes %llu, pending at flush %llu KiB; pre-images %llu; pending %llu pieces %llu KiB\n",
+            static_cast<unsigned long long>(core.ownedPages), static_cast<unsigned long long>(core.openBytes >> 10), static_cast<unsigned long long>(core.faultsParked), static_cast<unsigned long long>(core.faultsBypassed), static_cast<unsigned long long>(core.faultsResolved), static_cast<unsigned long long>(core.faultsOpenedStale),
+            static_cast<unsigned long long>(core.readAheadPages), static_cast<unsigned long long>(core.hotLandedPages), static_cast<unsigned long long>(core.ownedLandedBytes >> 20), static_cast<unsigned long long>(core.diffLandedBytes >> 10), static_cast<unsigned long long>(core.diffUnchangedBytes >> 10),
+            static_cast<unsigned long long>(core.flushes), static_cast<unsigned long long>(core.flushPendingBytes >> 10), static_cast<unsigned long long>(core.preImages), static_cast<unsigned long long>(written.pieces), static_cast<unsigned long long>(written.bytes >> 10));
+        owned += gpuOwnedLine;
+    }
     return std::string(line) + eventLine + ResidencyService::Get().Line() + owned;
 }
 

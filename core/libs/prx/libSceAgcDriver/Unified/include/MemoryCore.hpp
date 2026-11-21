@@ -89,7 +89,8 @@ public:
     void CollectWrites(std::uint64_t address, std::uint64_t size, PageTable::WrittenRun written, void* context);
     void NoteDriverWrite(std::uint64_t address, std::uint64_t size);
     void SetHost(MemoryHost* next);
-    GpuWriteMark NoteGpuWrite(std::uint64_t address, std::uint64_t size, std::uint64_t serial);
+    GpuWriteMark NoteGpuWrite(std::uint64_t address, std::uint64_t size, std::uint64_t serial, bool takeDirty = true);
+    void NoteLandedGpuWrite(std::uint64_t address, std::uint64_t size, std::uint64_t serial);
     void LandDiff(std::uint64_t address, std::span<const std::byte> before, std::span<const std::byte> after, std::uint64_t serial);
     void FlushGpuWrites(std::uint64_t address, std::uint64_t size);
     void LandAhead();

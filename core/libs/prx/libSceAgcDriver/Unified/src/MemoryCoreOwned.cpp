@@ -32,12 +32,12 @@ void MemoryCore::SetHost(MemoryHost* next) {
     resolverThread = resolver.get_id();
 }
 
-GpuWriteMark MemoryCore::NoteGpuWrite(std::uint64_t address, std::uint64_t size, std::uint64_t serial) {
+GpuWriteMark MemoryCore::NoteGpuWrite(std::uint64_t address, std::uint64_t size, std::uint64_t serial, bool takeDirty) {
     GpuWriteMark mark;
     if (size == 0) return mark;
     written.Note(address, size, serial);
     std::lock_guard lock(mutex);
-    auto take = pages.TakeForGpu(address, size);
+    auto take = pages.TakeForGpu(address, size, takeDirty);
     protector.Apply(take.changes);
     std::uint64_t owned = 0;
     for (const auto& range : take.owned) owned += range.size / PageBytes;
@@ -49,6 +49,11 @@ GpuWriteMark MemoryCore::NoteGpuWrite(std::uint64_t address, std::uint64_t size,
     mark.open = std::move(take.open);
     mark.upload = std::move(take.dirty);
     return mark;
+}
+
+void MemoryCore::NoteLandedGpuWrite(std::uint64_t address, std::uint64_t size, std::uint64_t serial) {
+    if (size == 0) return;
+    written.Take(address, size, serial);
 }
 
 void MemoryCore::LandDiff(std::uint64_t address, std::span<const std::byte> before, std::span<const std::byte> after, std::uint64_t serial) {

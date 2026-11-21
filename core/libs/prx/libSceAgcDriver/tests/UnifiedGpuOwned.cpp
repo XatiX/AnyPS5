@@ -45,6 +45,19 @@ void testTakeForGpuSplitsWholePagesFromEdges() {
     Expect(unknown.owned.empty() && unknown.open.size() == 1 && unknown.open[0].size == 2 * PageBytes, "untracked pages are left open");
 }
 
+void testTakeForGpuAfterCompletionLeavesDirtyPagesOpen() {
+    PageTable table;
+    const std::uint64_t base = 0x50000000;
+    static_cast<void>(table.Register(base, 4 * PageBytes));
+    std::vector<ProtectionChange> changes;
+    static_cast<void>(table.ConsumeDirty(changes));
+    static_cast<void>(table.HandleWrite(base + PageBytes, changes));
+    const auto take = table.TakeForGpu(base, 3 * PageBytes, false);
+    Expect(take.dirty.empty() && take.owned.size() == 2 && take.owned[0].address == base && take.owned[1].address == base + 2 * PageBytes, "clean pages are owned around a dirty one");
+    Expect(take.open.size() == 1 && take.open[0].address == base + PageBytes && take.open[0].size == PageBytes, "a page the CPU wrote after the batch stays open for a byte-wise landing");
+    Expect(table.StateOf(base + PageBytes) == PageState::CpuDirty, "the dirty page keeps its state");
+}
+
 #ifdef _WIN32
 constexpr std::uint64_t Pages = 16;
 
@@ -167,6 +180,7 @@ void testOwnedPagesLandOnFault() {
 
 int main() {
     testTakeForGpuSplitsWholePagesFromEdges();
+    testTakeForGpuAfterCompletionLeavesDirtyPagesOpen();
 #ifdef _WIN32
     testOwnedPagesLandOnFault();
 #endif

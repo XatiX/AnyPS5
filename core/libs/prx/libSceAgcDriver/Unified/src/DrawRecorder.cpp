@@ -20,6 +20,7 @@
 #include "prx/libSceAgcDriver/Unified/include/Events.hpp"
 #include "prx/libSceAgcDriver/Unified/include/ImageDetile.hpp"
 #include "prx/libSceAgcDriver/Unified/include/MemoryCore.hpp"
+#include "prx/libSceAgcDriver/Unified/include/MirrorHost.hpp"
 #include "prx/libSceAgcDriver/Unified/include/ResidencyService.hpp"
 #include "prx/libSceAgcDriver/Unified/include/SlotPatch.hpp"
 #include "prx/libSceAgcDriver/Unified/include/Shadow.hpp"
@@ -163,6 +164,8 @@ struct Totals {
     std::uint64_t faultPages = 0;
     std::uint64_t writtenRanges = 0;
     std::uint64_t writtenLate = 0;
+    std::uint64_t ownedBytes = 0;
+    std::uint64_t openLandedBytes = 0;
     std::uint64_t writtenOverflows = 0;
     std::uint64_t writtenOnImports = 0;
     std::uint64_t importSwitches = 0;
@@ -900,6 +903,10 @@ public:
         line += "; GDS bound " + std::to_string(totals.gdsBindings) + " times;dispatches waited for their pipeline " + std::to_string(totals.pipelineWaits) + " times (" + std::to_string(totals.pipelineWaitNanoseconds / 1000000u) + " ms)";
         std::snprintf(text, sizeof(text), "; fault buffers %zu in flight, %llu read: %llu faults (%llu unmapped), %llu fault pages served, %llu written ranges (%llu pieces landed late), %llu written overflows", faults.size(), static_cast<unsigned long long>(totals.faultReads), static_cast<unsigned long long>(totals.faults), static_cast<unsigned long long>(totals.unmappedFaults), static_cast<unsigned long long>(totals.faultPages), static_cast<unsigned long long>(totals.writtenRanges), static_cast<unsigned long long>(totals.writtenLate), static_cast<unsigned long long>(totals.writtenOverflows));
         line += text;
+        if (Mirror::WritesEnabled()) {
+            std::snprintf(text, sizeof(text), "; late writes left GPU-owned %.1f MiB, landed at once %.1f MiB", static_cast<double>(totals.ownedBytes) / 1048576.0, static_cast<double>(totals.openLandedBytes) / 1048576.0);
+            line += text;
+        }
         std::snprintf(text, sizeof(text), "; GPU-written chunks %llu switched to their import from the written bitmap (%.1f MiB copied over), %llu from other GPU writes, %llu refused, %llu written pieces already on an import", static_cast<unsigned long long>(totals.importSwitches), static_cast<double>(totals.switchBytes) / 1048576.0, static_cast<unsigned long long>(totals.writtenSwitches), static_cast<unsigned long long>(totals.switchRefused), static_cast<unsigned long long>(totals.writtenOnImports));
         line += text;
         for (const auto& [reasonCode, count] : faultReasons) line += "; fault reason " + std::to_string(reasonCode) + " " + std::to_string(count);
@@ -958,13 +965,42 @@ private:
     void landWrites() {
         if (landing.empty()) return;
         const auto written = std::move(landing);
+        const auto serials = std::move(landingSerials);
         landing.clear();
-        for (const auto& [begin, size] : written) Downgrades::NoteGuestWrite("a landed GPU write", begin, size);
-        Shadow::LandGpuWrites(written);
+        landingSerials.clear();
+        if (Mirror::WritesEnabled()) {
+            landOwned(written, serials);
+        } else {
+            for (const auto& [begin, size] : written) Downgrades::NoteGuestWrite("a landed GPU write", begin, size);
+            Shadow::LandGpuWrites(written);
+        }
         std::vector<std::pair<std::uint64_t, std::uint64_t>> ends;
         ends.reserve(written.size());
         for (const auto& [begin, size] : written) ends.emplace_back(begin, begin + size);
         Events::NoteRanges(ends);
+    }
+
+    void landOwned(const std::vector<std::pair<std::uint64_t, std::uint64_t>>& written, const std::vector<std::uint64_t>& serials) {
+        auto& core = MemoryCore::Get();
+        std::vector<std::pair<std::uint64_t, std::uint64_t>> eager;
+        std::vector<std::uint64_t> eagerSerials;
+        for (std::size_t index = 0; index < written.size(); ++index) {
+            const auto [begin, size] = written[index];
+            const auto serial = index < serials.size() ? serials[index] : 0u;
+            const auto mark = core.NoteGpuWrite(begin, size, serial, false);
+            for (const auto& range : mark.owned) totals.ownedBytes += range.size;
+            for (const auto& range : mark.open) {
+                eager.emplace_back(range.address, range.size);
+                eagerSerials.push_back(serial);
+            }
+        }
+        if (eager.empty()) return;
+        for (const auto& [begin, size] : eager) {
+            Downgrades::NoteGuestWrite("a landed GPU write", begin, size);
+            totals.openLandedBytes += size;
+        }
+        Shadow::LandGpuWrites(eager);
+        for (std::size_t index = 0; index < eager.size(); ++index) core.NoteLandedGpuWrite(eager[index].first, eager[index].second, eagerSerials[index]);
     }
 
     bool switchChunk(const Context& context, VkCommandBuffer commands, std::uint64_t chunk, bool copyWritten, bool& copied) {
@@ -1016,7 +1052,7 @@ private:
         if (copied) Graphics::RecordMemoryBarrier(context, commands, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT | VK_PIPELINE_STAGE_HOST_BIT, VK_ACCESS_TRANSFER_WRITE_BIT, VK_ACCESS_MEMORY_READ_BIT | VK_ACCESS_MEMORY_WRITE_BIT | VK_ACCESS_HOST_READ_BIT);
     }
 
-    void landWritten(std::uint64_t begin, std::uint64_t size) {
+    void landWritten(std::uint64_t begin, std::uint64_t size, std::uint64_t serial) {
         auto& residency = ResidencyService::Get();
         for (auto at = begin; at < begin + size;) {
             const auto chunk = at & ~(ChunkBytes - 1u);
@@ -1025,6 +1061,7 @@ private:
                 totals.writtenOnImports++;
             } else {
                 landing.emplace_back(at, next - at);
+                landingSerials.push_back(serial);
                 totals.writtenLate++;
                 for (auto page = (at - chunk) / PageBytes; page <= (next - 1u - chunk) / PageBytes; ++page) writtenPages[chunk] |= 1u << page;
                 if (switchesWrittenChunks()) switches.insert(chunk);
@@ -1068,7 +1105,7 @@ private:
         while (!knownWrites.empty() && knownWrites.front().serial <= completed) {
             const auto& written = knownWrites.front();
             if (!ResidencyService::Get().WrittenImportThroughout(written.address, written.bytes)) {
-                landWritten(written.address, written.bytes);
+                landWritten(written.address, written.bytes, written.serial);
                 totals.knownWriteBytes += written.bytes;
             }
             knownWrites.pop_front();
@@ -1200,10 +1237,10 @@ private:
         }
     }
 
-    void landUncovered(std::uint64_t begin, std::uint64_t size, const std::vector<std::pair<std::uint64_t, std::uint64_t>>* covered) {
+    void landUncovered(std::uint64_t begin, std::uint64_t size, std::uint64_t serial, const std::vector<std::pair<std::uint64_t, std::uint64_t>>* covered) {
         const auto end = begin + size;
         if (covered == nullptr) {
-            landWritten(begin, size);
+            landWritten(begin, size, serial);
             return;
         }
         for (auto at = begin; at < end;) {
@@ -1218,7 +1255,7 @@ private:
             for (const auto& range : *covered) {
                 if (range.first > at && range.first < stop) stop = range.first;
             }
-            landWritten(at, stop - at);
+            landWritten(at, stop - at, serial);
             at = stop;
         }
     }
@@ -1298,7 +1335,7 @@ private:
         if (Abi::ForEachWrittenRange(words, [&](std::uint64_t begin, std::size_t size) { written.emplace_back(begin, size); })) {
             totals.writtenRanges += written.size();
             const auto found = copiedBack.find(serial);
-            for (const auto& [begin, size] : written) landUncovered(begin, size, found == copiedBack.end() ? nullptr : &found->second);
+            for (const auto& [begin, size] : written) landUncovered(begin, size, serial, found == copiedBack.end() ? nullptr : &found->second);
         }
         copiedBack.erase(copiedBack.begin(), copiedBack.upper_bound(serial));
         Abi::Fault report{};
@@ -2819,6 +2856,7 @@ private:
     std::unique_ptr<Images::SurfaceDetiler> surfaceDetiler;
     std::map<std::vector<std::uint64_t>, std::shared_ptr<ComputePipeline>> computePipelines;
     std::vector<std::pair<std::uint64_t, std::uint64_t>> landing;
+    std::vector<std::uint64_t> landingSerials;
     std::set<std::vector<std::uint64_t>> buildingPipelines;
     std::map<std::vector<std::uint64_t>, std::string> failedPipelines;
     std::deque<PipelineJob> pipelineJobs;

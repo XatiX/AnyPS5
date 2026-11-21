@@ -277,7 +277,7 @@ std::vector<ProtectionChange> PageTable::MarkGpuOwned(std::uint64_t address, std
     return changes;
 }
 
-GpuTake PageTable::TakeForGpu(std::uint64_t address, std::uint64_t size) {
+GpuTake PageTable::TakeForGpu(std::uint64_t address, std::uint64_t size, bool takeDirty) {
     GpuTake take;
     if (size == 0) return take;
     const auto append = [](std::vector<DirtyRange>& list, std::uint64_t begin, std::uint64_t end) {
@@ -304,7 +304,7 @@ GpuTake PageTable::TakeForGpu(std::uint64_t address, std::uint64_t size) {
             continue;
         }
         const bool tracked = state == PageState::CpuClean || state == PageState::CpuDirty;
-        if (!tracked || region->busyUntil[slot] != 0) {
+        if (!tracked || region->busyUntil[slot] != 0 || (!takeDirty && state == PageState::CpuDirty)) {
             append(take.open, at, at + PageBytes);
             continue;
         }
