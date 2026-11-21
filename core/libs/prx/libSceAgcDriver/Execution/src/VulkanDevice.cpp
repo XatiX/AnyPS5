@@ -3248,7 +3248,11 @@ int VulkanDevice::WriteLabelOnGpu(std::uint64_t address, std::span<const std::by
     const auto context = graphicsContext();
     const bool syncUnimported = queue == 0 && !recorder.SubmitHeld();
     const auto behindCompletions = [&] {
+#if ANYPS5_UNIFIED
         const bool listed = !state->copiedWriters->empty() || !Graphics::DrawCopiedWriters()->empty() || Unified::Record::LandingsPending();
+#else
+        const bool listed = !state->copiedWriters->empty() || !Graphics::DrawCopiedWriters()->empty();
+#endif
         if (drain) return listed ? 2 : 0;
         const bool storesPending = Graphics::Recorder::PendingCompletionStores() != 0;
         if (bytes.size() <= 8 ? !(listed || storesPending) : !(storesPending && recorder.CompletionLabelIn(address, bytes.size()))) return 0;
