@@ -1,5 +1,6 @@
 #include "prx/libSceAgcDriver/Unified/include/Resolve.hpp"
 #include "prx/libSceAgcDriver/Unified/include/Downgrades.hpp"
+#include "prx/libSceAgcDriver/Unified/include/DrawRecorder.hpp"
 #include "prx/libSceAgcDriver/Execution/include/GuestMemory.hpp"
 #include "prx/libSceAgcDriver/Execution/include/VulkanDevice.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/GuestTextureResource.hpp"
@@ -166,10 +167,15 @@ public:
         if (IsDispatch(operation.kind)) {
             if (!routesQueue(operation.queue)) return;
             std::shared_ptr<const ResolvedDraw> dispatch;
+            std::shared_ptr<VulkanDevice> device;
+            const Graphics::Context* bound = nullptr;
             {
                 std::lock_guard lock(mutex);
                 dispatch = resolveDispatch(operation, state);
+                device = attached;
+                bound = context.get();
             }
+            if (dispatch != nullptr && device != nullptr && bound != nullptr) Record::PrebuildDispatch(*bound, *device, *dispatch);
             dispatchHandoff.Offer(operation.queue, operation.submission, operation.packetOffset, std::move(dispatch));
             return;
         }

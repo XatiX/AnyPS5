@@ -175,6 +175,7 @@ struct Totals {
     std::uint64_t dispatchExisting = 0;
     std::uint64_t dispatchNanoseconds = 0;
     std::uint64_t pipelinesQueued = 0;
+    std::uint64_t pipelinesPrebuilt = 0;
     std::uint64_t pipelineWaits = 0;
     std::uint64_t pipelineWaitNanoseconds = 0;
     std::uint64_t surfaceNanoseconds = 0;
@@ -712,7 +713,7 @@ public:
         line += "; draw inputs " + std::to_string(totals.inputsResident) + " resident, " + std::to_string(totals.inputsImported) + " imported, " + std::to_string(totals.inputsWritten) + " after CPU writes (" + std::to_string(totals.inputsCopied) + " copied into the ring), " + std::to_string(totals.inputsGpuWritten) + " GPU-written, " + std::to_string(totals.inputsAliased) + " aliased, " + std::to_string(totals.inputsMerged) + " served with an overlapping input";
         std::snprintf(text, sizeof(text), "; draw phases surfaces %.1f ms, targets %.1f ms, pipelines %.1f ms, owned uploads %.1f ms", static_cast<double>(totals.surfaceNanoseconds) / 1e6, static_cast<double>(totals.targetNanoseconds) / 1e6, static_cast<double>(totals.graphicsPipelineNanoseconds) / 1e6, static_cast<double>(totals.uploadNanoseconds) / 1e6);
         line += text;
-        std::snprintf(text, sizeof(text), "; dispatches %llu recorded (%llu indirect, %llu storage images written), %llu to the existing path, %.1f us per dispatch; compute pipelines %zu held, %llu queued, %llu built in %.1f ms, %zu building, %zu failed", static_cast<unsigned long long>(totals.dispatches), static_cast<unsigned long long>(totals.indirectDispatches), static_cast<unsigned long long>(totals.storageWrites), static_cast<unsigned long long>(totals.dispatchExisting), totals.dispatches == 0 ? 0.0 : static_cast<double>(totals.dispatchNanoseconds) / 1000.0 / static_cast<double>(totals.dispatches), pipelineCounts.held, static_cast<unsigned long long>(totals.pipelinesQueued), static_cast<unsigned long long>(pipelineCounts.built), static_cast<double>(pipelineCounts.nanoseconds) / 1e6, pipelineCounts.building, pipelineCounts.failed);
+        std::snprintf(text, sizeof(text), "; dispatches %llu recorded (%llu indirect, %llu storage images written), %llu to the existing path, %.1f us per dispatch; compute pipelines %zu held, %llu queued (%llu ahead of recording), %llu built in %.1f ms, %zu building, %zu failed", static_cast<unsigned long long>(totals.dispatches), static_cast<unsigned long long>(totals.indirectDispatches), static_cast<unsigned long long>(totals.storageWrites), static_cast<unsigned long long>(totals.dispatchExisting), totals.dispatches == 0 ? 0.0 : static_cast<double>(totals.dispatchNanoseconds) / 1000.0 / static_cast<double>(totals.dispatches), pipelineCounts.held, static_cast<unsigned long long>(totals.pipelinesQueued), static_cast<unsigned long long>(totals.pipelinesPrebuilt), static_cast<unsigned long long>(pipelineCounts.built), static_cast<double>(pipelineCounts.nanoseconds) / 1e6, pipelineCounts.building, pipelineCounts.failed);
         line += text;
         std::snprintf(text, sizeof(text), "; table maps %llu hits, %llu uploads (%.1f MiB), %llu retired, %zu held (%.1f MiB)", static_cast<unsigned long long>(totals.mapHits), static_cast<unsigned long long>(totals.mapUploads), static_cast<double>(totals.mapUploadBytes) / 1048576.0, static_cast<unsigned long long>(totals.mapRetired), maps.size(), static_cast<double>(mapBytes) / 1048576.0);
         line += text;
@@ -1322,6 +1323,18 @@ private:
         });
     }
 
+    static void noteImage(const Resolve::ResolvedStage& stage, Downgrades::Kind kind, std::uint32_t index, const Heap::SlotRequest& request, const char* what) {
+        if (!Downgrades::Active()) return;
+        char text[96];
+        try {
+            const auto resource = Graphics::DecodeTextureResource(request.words);
+            std::snprintf(text, sizeof(text), "%s 0x%llx %ux%u fmt %u mips %u", what, static_cast<unsigned long long>(resource.baseAddress), resource.width, resource.height, resource.format, resource.mipCount);
+        } catch (const std::exception&) {
+            std::snprintf(text, sizeof(text), "%s (undecodable)", what);
+        }
+        Downgrades::Note(stage.program.codeAddress, kind, index, text);
+    }
+
     static void noteKnown(const Resolve::ResolvedStage& stage, Downgrades::Kind kind, std::uint32_t index, std::uint64_t address, std::uint64_t bytes, std::uint64_t served) {
         if (!Downgrades::Active()) return;
         char text[96];
@@ -1507,6 +1520,19 @@ private:
         return made;
     }
 
+public:
+    void Prebuild(const Context& context, VulkanDevice& owner, const Resolve::ResolvedDraw& dispatch) {
+        std::string reason;
+        std::lock_guard lock(mutex);
+        if (device != context.device || ring == nullptr || dispatch.stages.size() != 1u || dispatch.stages.front().program.result == nullptr || !dispatchPrecheck(dispatch, reason)) return;
+        const auto key = pipelineKey(dispatch);
+        std::lock_guard pipelineLock(pipelineMutex);
+        if (computePipelines.contains(key) || buildingPipelines.contains(key) || failedPipelines.contains(key)) return;
+        if (queuePipeline(context, owner, dispatch, key, reason)) totals.pipelinesPrebuilt++;
+    }
+
+private:
+
     bool pipelineReady(const Context& context, VulkanDevice& owner, const Resolve::ResolvedDraw& dispatch, std::unique_lock<std::mutex>& lock, std::string& reason) {
         const auto key = pipelineKey(dispatch);
         std::unique_lock pipelineLock(pipelineMutex);
@@ -1637,15 +1663,11 @@ private:
         auto& stage = bound.stages.front();
         std::vector<std::shared_ptr<Graphics::StorageTexture>> written;
         written.reserve(stage.deferredImages.size());
+        std::vector<const Heap::DeferredImage*> sampled;
         for (const auto& deferred : stage.deferredImages) {
             std::uint32_t slot = 0;
             if ((deferred.request.flags & Heap::RequestFlag::Storage) == 0u) {
-                publishRequest(context, deferred.request);
-                auto owner = Resolve::BindDeferredSampled(context, deferred.request, slot, reason);
-                if (owner == nullptr) return false;
-                Downgrades::Note(stage.program.codeAddress, Downgrades::Kind::UpstreamSampled, deferred.index, "deferred read from the existing sampled cache");
-                stage.slots[deferred.index] = slot;
-                if (context.recorder != nullptr) context.recorder->Keep(std::const_pointer_cast<void>(owner));
+                sampled.push_back(&deferred);
                 continue;
             }
             auto record = Resolve::BindDeferredRecord(deferred.request, slot);
@@ -1662,14 +1684,24 @@ private:
             publishRequest(context, deferred.request);
             auto texture = Resolve::BindDeferredImage(context, deferred.request, slot, reason);
             if (texture == nullptr) return false;
-            Downgrades::Note(stage.program.codeAddress, Downgrades::Kind::UpstreamStorage, deferred.index, (deferred.request.flags & Heap::RequestFlag::Written) != 0u ? "written storage image from the existing cache" : "storage image from the existing cache");
+            noteImage(stage, Downgrades::Kind::UpstreamStorage, deferred.index, deferred.request, (deferred.request.flags & Heap::RequestFlag::Written) != 0u ? "written storage cache" : "storage cache");
             stage.slots[deferred.index] = slot;
             if (context.recorder != nullptr) context.recorder->Keep(texture);
             if ((deferred.request.flags & Heap::RequestFlag::Written) != 0u) written.push_back(std::move(texture));
         }
+        for (const auto* deferred : sampled) {
+            std::uint32_t slot = 0;
+            publishRequest(context, deferred->request);
+            auto owner = Resolve::BindDeferredSampled(context, deferred->request, slot, reason);
+            if (owner == nullptr) return false;
+            noteImage(stage, Downgrades::Kind::UpstreamSampled, deferred->index, deferred->request, "sampled cache");
+            stage.slots[deferred->index] = slot;
+            if (context.recorder != nullptr) context.recorder->Keep(std::const_pointer_cast<void>(owner));
+        }
         if (!Resolve::PatchSlots(*stage.program.result, stage.slots, stage.program.words, reason)) return false;
         return recordBound(context, bound, groups, written, reason);
     }
+
 
     bool placeDispatchArguments(const Context& context, Graphics::Recorder& recorder, std::uint64_t address, std::uint64_t serial, std::uint64_t completed, VkBuffer& buffer, VkDeviceSize& offset, std::string& reason) {
         constexpr std::size_t bytes = 3u * sizeof(std::uint32_t);
@@ -1862,7 +1894,7 @@ private:
                 publishRequest(context, deferred.request);
                 auto owner = Resolve::BindDeferredSampled(context, deferred.request, slot, reason);
                 if (owner == nullptr) return false;
-                Downgrades::Note(stage.program.codeAddress, Downgrades::Kind::UpstreamSampled, deferred.index, "deferred read from the existing sampled cache");
+                noteImage(stage, Downgrades::Kind::UpstreamSampled, deferred.index, deferred.request, "sampled cache");
                 stage.slots[deferred.index] = slot;
                 if (context.recorder != nullptr) context.recorder->Keep(std::const_pointer_cast<void>(owner));
             }
@@ -2504,6 +2536,12 @@ bool RecordDispatchPrecheck(const Context& context, VulkanDevice& owner, const R
 
 bool RecordDispatch(const Context& context, const Resolve::ResolvedDraw& dispatch, const std::array<std::uint32_t, 3>& groups, std::string& reason) {
     return shared().RecordDispatch(context, dispatch, groups, reason);
+}
+
+void PrebuildDispatch(const Context& context, VulkanDevice& owner, const Resolve::ResolvedDraw& dispatch) {
+    static const bool prebuilds = std::getenv("APS5_RECODE_NO_PIPELINE_PREBUILD") == nullptr;
+    if (!prebuilds || !RecordActive()) return;
+    shared().Prebuild(context, owner, dispatch);
 }
 
 std::string RecordLine() {
