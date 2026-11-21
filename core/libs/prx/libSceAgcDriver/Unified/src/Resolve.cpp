@@ -1,5 +1,6 @@
 #include "prx/libSceAgcDriver/Unified/include/Resolve.hpp"
 #include "prx/libSceAgcDriver/Unified/include/Downgrades.hpp"
+#include "prx/libSceAgcDriver/Unified/include/DrawRecorder.hpp"
 #include "prx/libSceAgcDriver/Execution/include/GuestMemory.hpp"
 #include "prx/libSceAgcDriver/Execution/include/VulkanDevice.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/GuestTextureResource.hpp"
@@ -68,6 +69,62 @@ bool imagesRouted() {
         return value != nullptr && std::string_view(value) == "1";
     }();
     return enabled;
+}
+
+enum class SampledBind : std::uint8_t { Ahead, Record, RecordAll };
+
+SampledBind sampledBind() {
+    static const SampledBind bind = [] {
+        const auto* value = std::getenv("APS5_RECODE_SAMPLED_BIND");
+        if (value == nullptr) return SampledBind::Record;
+        const std::string_view text(value);
+        if (text == "ahead") return SampledBind::Ahead;
+        if (text == "record-all") return SampledBind::RecordAll;
+        return SampledBind::Record;
+    }();
+    return bind;
+}
+
+enum SampledClass : std::size_t { SampledView, SampledCopy, SampledSnapshot, SampledClassCount };
+
+SampledClass sampledClass(const Graphics::Texture& texture) {
+    if (texture.CopyKind() != Graphics::Texture::PerUseCopy::None) return SampledCopy;
+    return texture.ViewsStorageImage() ? SampledView : SampledSnapshot;
+}
+
+VkImageViewType wantedViewType(std::uint32_t kind) {
+    constexpr std::array<VkImageViewType, 7> types{VK_IMAGE_VIEW_TYPE_1D, VK_IMAGE_VIEW_TYPE_1D_ARRAY, VK_IMAGE_VIEW_TYPE_2D, VK_IMAGE_VIEW_TYPE_2D_ARRAY, VK_IMAGE_VIEW_TYPE_2D, VK_IMAGE_VIEW_TYPE_2D_ARRAY, VK_IMAGE_VIEW_TYPE_3D};
+    return types[(kind - ShaderRecompiler::RuntimeAbi::FirstImageBinding) % types.size()];
+}
+
+enum SampledChoice : std::size_t { ChoicePlain, ChoiceFirstLayer, ChoiceArray, ChoiceMismatch, ChoiceCount };
+
+bool choosesViews() {
+    static const bool chooses = std::getenv("APS5_RECODE_PLAIN_VIEWS") == nullptr;
+    return chooses;
+}
+
+VkImageView sampledView(const Graphics::Texture& texture, std::uint32_t kind, SampledChoice& choice) {
+    const auto wanted = wantedViewType(kind);
+    choice = ChoicePlain;
+    if (texture.SampledViewRange(false).type == wanted) return texture.View();
+    choice = ChoiceMismatch;
+    if (!choosesViews()) return texture.View();
+    if (wanted == VK_IMAGE_VIEW_TYPE_2D && texture.FirstLayerView() != VK_NULL_HANDLE && texture.SampledViewRange(true).type == wanted) {
+        choice = ChoiceFirstLayer;
+        return texture.FirstLayerView();
+    }
+    if (wanted == VK_IMAGE_VIEW_TYPE_2D_ARRAY && texture.HasArrayView()) {
+        choice = ChoiceArray;
+        return texture.ArrayView();
+    }
+    return texture.View();
+}
+
+void noteViewMismatch(const Graphics::Texture& texture, const Heap::SlotRequest& request) {
+    char text[96];
+    std::snprintf(text, sizeof(text), "slot wants view type %d, the cache texture has %d", static_cast<int>(wantedViewType(request.kind)), static_cast<int>(texture.SampledViewRange(false).type));
+    Downgrades::NoteCurrent(Downgrades::Kind::ViewMismatch, request.kind, text);
 }
 
 bool memoizesTables() {
@@ -166,10 +223,15 @@ public:
         if (IsDispatch(operation.kind)) {
             if (!routesQueue(operation.queue)) return;
             std::shared_ptr<const ResolvedDraw> dispatch;
+            std::shared_ptr<VulkanDevice> device;
+            const Graphics::Context* bound = nullptr;
             {
                 std::lock_guard lock(mutex);
                 dispatch = resolveDispatch(operation, state);
+                device = attached;
+                bound = context.get();
             }
+            if (dispatch != nullptr && device != nullptr && bound != nullptr) Record::PrebuildDispatch(*bound, *device, *dispatch);
             dispatchHandoff.Offer(operation.queue, operation.submission, operation.packetOffset, std::move(dispatch));
             return;
         }
@@ -180,6 +242,17 @@ public:
             draw = resolve(operation, state);
         }
         handoff.Offer(operation.queue, operation.submission, operation.packetOffset, std::move(draw));
+    }
+
+    void ConsumeFailed(const Operation& operation, const char* what) {
+        const std::string reason = std::string("resolve threw: ") + what;
+        {
+            std::lock_guard lock(refusalMutex);
+            lastRefusal = reason;
+            if (thrown.insert(reason.substr(0, 80)).second) std::fprintf(stderr, "[recode-resolve] first exception while resolving: %s\n", what);
+        }
+        if (IsDispatch(operation.kind)) dispatchHandoff.Offer(operation.queue, operation.submission, operation.packetOffset, nullptr);
+        else if (IsDraw(operation.kind)) handoff.Offer(operation.queue, operation.submission, operation.packetOffset, nullptr);
     }
 
     PacketTable<ResolvedDraw>& Table() { return handoff; }
@@ -217,7 +290,12 @@ public:
             reason = "deferred sampled image not cached";
             return nullptr;
         }
-        slot = table->ImageSlot(request.kind, {reinterpret_cast<std::uint64_t>(texture->View()), static_cast<std::uint32_t>(texture->Layout()), texture});
+        sampledAtRecord[sampledClass(*texture)].fetch_add(1, std::memory_order_relaxed);
+        SampledChoice choice = ChoicePlain;
+        const auto view = sampledView(*texture, request.kind, choice);
+        viewChoices[choice].fetch_add(1, std::memory_order_relaxed);
+        if (choice == ChoiceMismatch) noteViewMismatch(*texture, request);
+        slot = table->ImageSlot(request.kind, {reinterpret_cast<std::uint64_t>(view), static_cast<std::uint32_t>(texture->Layout()), texture});
         if (slot == Heap::NoSlot) {
             reason = "image heap full for kind " + std::to_string(request.kind);
             return nullptr;
@@ -257,7 +335,7 @@ public:
     }
 
     static bool StorageRecordShape(const Heap::SlotRequest& request) {
-        if (!storageRecordsOn() || (request.flags & (Heap::RequestFlag::Atomic | Heap::RequestFlag::Atomic64)) != 0u || (request.flags & Heap::RequestFlag::UintView) == 0u) return false;
+        if (!storageRecordsOn() || (request.flags & (Heap::RequestFlag::Atomic | Heap::RequestFlag::Atomic64)) != 0u) return false;
         const auto shape = (request.kind - Heap::LastSampledKind - 1u) % StorageShapes;
         return shape == Image2DShape || shape == Image2DArrayShape;
     }
@@ -285,14 +363,22 @@ public:
 
 private:
     static bool storageRecordsOn() {
-        static const bool records = std::getenv("APS5_RECODE_STORAGE_RECORDS") != nullptr;
+        static const bool records = std::getenv("APS5_RECODE_STORAGE_RECORDS") != nullptr || Images::OwnersEnabled();
         return records;
     }
+
+public:
+    bool BindViewSlot(const Heap::SlotRequest& request, std::uint64_t view, std::uint32_t layout, std::shared_ptr<const void> owner, std::uint32_t& slot) {
+        if (table == nullptr || view == 0u || owner == nullptr) return false;
+        slot = table->ImageSlot(request.kind, {view, layout, std::move(owner)});
+        return slot != Heap::NoSlot;
+    }
+
+private:
 
     std::shared_ptr<Images::Surface> storageRecordFor(const Heap::SlotRequest& request) {
         if (!storageRecordsOn() || surfaces == nullptr) return nullptr;
         if ((request.flags & (Heap::RequestFlag::Atomic | Heap::RequestFlag::Atomic64)) != 0u) return noteRecordRefusal("atomic storage");
-        if ((request.flags & Heap::RequestFlag::UintView) == 0u) return noteRecordRefusal("typed storage view");
         const auto shape = (request.kind - Heap::LastSampledKind - 1u) % StorageShapes;
         if (shape != Image2DShape && shape != Image2DArrayShape) return noteRecordRefusal("storage shape");
         std::string why;
@@ -313,6 +399,12 @@ private:
         return nullptr;
     }
 
+    std::array<std::atomic<std::uint64_t>, SampledClassCount> sampledAhead{};
+    std::array<std::atomic<std::uint64_t>, SampledClassCount> sampledAtRecord{};
+    std::array<std::atomic<std::uint64_t>, ChoiceCount> viewChoices{};
+    std::mutex refusalMutex;
+    std::string lastRefusal;
+    std::set<std::string> thrown;
     std::mutex recordMutex;
     std::uint64_t storageRecords = 0;
     std::uint64_t storageRecordRefusals = 0;
@@ -323,6 +415,7 @@ private:
         const auto* submission = state.CurrentSubmission();
         if (refill == nullptr || submission == nullptr || submission->shaders == nullptr) {
             totals.noDevice++;
+            noteRefusal("no device");
             return nullptr;
         }
         const auto started = std::chrono::steady_clock::now();
@@ -373,6 +466,7 @@ private:
         const auto* submission = state.CurrentSubmission();
         if (refill == nullptr || submission == nullptr || submission->shaders == nullptr) {
             dispatchTotals.noDevice++;
+            noteRefusal("no device");
             return nullptr;
         }
         const auto started = std::chrono::steady_clock::now();
@@ -416,13 +510,35 @@ private:
             std::vector<Heap::SlotRequest> requests;
             if (stage.result->directHeap) {
                 Heap::SlotStatistics statistics;
-                if (!Heap::BuildSlotRequests(stage.variant->info, stage.capture->snapshot, requests, statistics, reason, &counts == &dispatchTotals && storageDispatches())) {
+                if (!Heap::BuildSlotRequests(stage.variant->info, stage.capture->snapshot, requests, statistics, reason, storageDispatches() && (&counts == &dispatchTotals || storageDraws()))) {
                     refuse(counts, reason);
                     counts.slotNanoseconds += elapsed(slotsStarted);
                     return nullptr;
                 }
             }
             counts.requestNanoseconds += elapsed(partStarted);
+            if (Downgrades::Active()) {
+                for (std::size_t index = 0; index < requests.size(); ++index) {
+                    const auto& request = requests[index];
+                    if ((request.flags & Heap::RequestFlag::Sampler) == 0u) continue;
+                    if (((request.words[0] >> 20u) & 1u) != 0u) Downgrades::NoteCurrent(Downgrades::Kind::SamplerMode, static_cast<std::uint32_t>(index), "sampler forces sRGB decoding; its texture is bound without an sRGB view");
+                    if (((request.words[0] >> 15u) & 1u) != 0u) Downgrades::NoteCurrent(Downgrades::Kind::SamplerMode, static_cast<std::uint32_t>(index), "sampler uses unnormalized coordinates; bound as normalized");
+                }
+                std::uint32_t bindingIndex = 0;
+                for (const auto& binding : stage.result->bindings) {
+                    const auto any = [](const ShaderRecompiler::ElementFlags& flags) {
+                        for (std::size_t element = 0; element < flags.size(); ++element) {
+                            if (flags[element]) return true;
+                        }
+                        return false;
+                    };
+                    if (any(binding.imageUnnormalized)) Downgrades::NoteCurrent(Downgrades::Kind::SamplerMode, 0x100u + bindingIndex, any(binding.imageUnnormalizedBaseLevel) ? "image fetched with unnormalized coordinates at its base level; no base-level view is chosen" : "image fetched with unnormalized coordinates");
+                    if (any(binding.samplerCoordinatesIgnored)) Downgrades::NoteCurrent(Downgrades::Kind::SamplerMode, 0x200u + bindingIndex, "sampler whose coordinates are ignored; its unnormalized bit is not cleared");
+                    if (any(binding.samplerIntegerBorder)) Downgrades::NoteCurrent(Downgrades::Kind::SamplerMode, 0x300u + bindingIndex, "sampler with an integer border colour; bound with a float border");
+                    if (any(binding.samplerUnnormalized)) Downgrades::NoteCurrent(Downgrades::Kind::SamplerMode, 0x400u + bindingIndex, "sampler proven unnormalized; bound as normalized");
+                    ++bindingIndex;
+                }
+            }
             partStarted = std::chrono::steady_clock::now();
             ResolvedStage resolved{std::move(stage), {}};
             if (!refill->Fill(requests, resolved.slots, reason, &imageUses, &resolved.owners, &resolved.deferredImages) ||!PatchSlots(*resolved.program.result, resolved.slots, resolved.program.words, reason)) {
@@ -552,6 +668,9 @@ public:
         std::snprintf(text, sizeof(text), "; per draw: decode %.1f, prepare %.1f, capture %.1f, materialize %.1f, variant %.1f us", perDraw(totals.phases[PhaseDecode]), perDraw(totals.phases[PhasePrepare]), perDraw(totals.phases[PhaseCapture]), perDraw(totals.phases[PhaseMaterialize]), perDraw(totals.phases[PhaseVariant]));
         line += text;
         line += "; gpu lock busy " + std::to_string(totals.lockBusy);
+        const auto taken = [](std::array<std::atomic<std::uint64_t>, SampledClassCount>& counts) { return std::to_string(counts[SampledView].exchange(0, std::memory_order_relaxed)) + " views, " + std::to_string(counts[SampledCopy].exchange(0, std::memory_order_relaxed)) + " per-use copies, " + std::to_string(counts[SampledSnapshot].exchange(0, std::memory_order_relaxed)) + " snapshots"; };
+        line += "; existing-cache sampled textures bound when resolved " + taken(sampledAhead) + "; bound when recorded " + taken(sampledAtRecord);
+        line += "; their views " + std::to_string(viewChoices[ChoicePlain].exchange(0, std::memory_order_relaxed)) + " plain, " + std::to_string(viewChoices[ChoiceFirstLayer].exchange(0, std::memory_order_relaxed)) + " first layer, " + std::to_string(viewChoices[ChoiceArray].exchange(0, std::memory_order_relaxed)) + " array, " + std::to_string(viewChoices[ChoiceMismatch].exchange(0, std::memory_order_relaxed)) + " of another type than the slot";
         {
             std::lock_guard recordLock(recordMutex);
             line += "; storage images on recode surfaces " + std::to_string(storageRecords) + ", " + std::to_string(storageRecordRefusals) + " refused";
@@ -631,8 +750,21 @@ private:
         return static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - from).count());
     }
 
+    void noteRefusal(const std::string& reason) {
+        std::lock_guard lock(refusalMutex);
+        lastRefusal = reason;
+    }
+
+public:
+    std::string TakeRefusal() {
+        std::lock_guard lock(refusalMutex);
+        return std::exchange(lastRefusal, {});
+    }
+
+private:
     void refuse(Totals& counts, const std::string& reason) {
         counts.refused++;
+        noteRefusal(reason);
         Downgrades::NoteCurrent(Downgrades::Kind::ExistingPath, 0u, "resolve: " + reason);
         auto key = reason.substr(0, 60);
         if (seenReasons.insert((&counts == &dispatchTotals ? "dispatch " : "") + key).second) std::fprintf(stderr, "[recode-resolve] first %srefusal: %s\n", &counts == &dispatchTotals ? "dispatch " : "", reason.c_str());
@@ -645,15 +777,19 @@ private:
             firstImage = true;
             std::fprintf(stderr, "[recode-resolve] first image lookup\n");
         }
+        if (surfaces != nullptr && ownedByRecord(request)) return deferredImage(request);
         if (surfaces != nullptr) {
             bool fallback = false;
             auto resolved = surfaceImage(request, fallback);
             if (!fallback) return resolved;
-            if (auto target = targetImage(request)) {
-                Downgrades::NoteCurrent(Downgrades::Kind::UpstreamSampled, request.kind, "render target from the existing target cache");
-                return target;
+            if (sampledBind() != SampledBind::RecordAll) {
+                if (auto target = targetImage(request)) {
+                    Downgrades::NoteCurrent(Downgrades::Kind::UpstreamSampled, request.kind, "render target from the existing target cache");
+                    return target;
+                }
             }
         }
+        if (sampledBind() != SampledBind::Ahead) return deferredImage(request);
         std::shared_ptr<Graphics::Texture> texture;
         {
             GuestMemory::TagGpuLockSite(GuestMemory::GpuLockSite::Try);
@@ -671,12 +807,47 @@ private:
             texture = Graphics::CachedSampledTexture(*context, request.words);
         }
         if (texture == nullptr || texture->Released()) return std::nullopt;
-        Downgrades::NoteCurrent(Downgrades::Kind::UpstreamSampled, request.kind, "existing sampled texture cache");
         const auto resource = Graphics::DecodeTextureResource(request.words);
+        const auto bound = sampledClass(*texture);
+        sampledAhead[bound].fetch_add(1, std::memory_order_relaxed);
+        if (bound == SampledCopy) {
+            Downgrades::NoteCurrent(Downgrades::Kind::SampledAhead, request.kind, "per-use copy refreshed when resolved, ahead of its draw");
+        } else if (bound == SampledSnapshot && Events::GpuWrites().ChangedSince(resource.baseAddress, Graphics::SurfaceGuestBytes(resource), 0u)) {
+            Downgrades::NoteCurrent(Downgrades::Kind::SampledAhead, request.kind, "snapshot of GPU-written memory read when resolved, ahead of its draw");
+        } else {
+            Downgrades::NoteCurrent(Downgrades::Kind::UpstreamSampled, request.kind, "existing sampled texture cache");
+        }
+        SampledChoice choice = ChoicePlain;
+        const auto view = sampledView(*texture, request.kind, choice);
+        viewChoices[choice].fetch_add(1, std::memory_order_relaxed);
+        if (choice == ChoiceMismatch) noteViewMismatch(*texture, request);
         Heap::ResolvedImage resolved;
-        resolved.image = {reinterpret_cast<std::uint64_t>(texture->View()), static_cast<std::uint32_t>(texture->Layout()), texture};
+        resolved.image = {reinterpret_cast<std::uint64_t>(view), static_cast<std::uint32_t>(texture->Layout()), texture};
         resolved.memory = {resource.baseAddress, Graphics::SurfaceGuestBytes(resource)};
         return resolved;
+    }
+
+    std::optional<Heap::ResolvedImage> deferredImage(const Heap::SlotRequest& request) {
+        try {
+            const auto resource = Graphics::DecodeTextureResource(request.words);
+            Heap::ResolvedImage deferred;
+            deferred.memory = {resource.baseAddress, Graphics::SurfaceGuestBytes(resource)};
+            deferred.deferred = true;
+            return deferred;
+        } catch (const std::exception& error) {
+            noteSurfaceReason(std::string("deferred image: ") + error.what());
+            return std::nullopt;
+        }
+    }
+
+    bool ownedByRecord(const Heap::SlotRequest& request) const {
+        if (!Images::OwnersEnabled()) return false;
+        try {
+            const auto resource = Graphics::DecodeTextureResource(request.words);
+            return surfaces->OwnerOfRange(resource.baseAddress, Graphics::SurfaceGuestBytes(resource)) == Images::Side::Record;
+        } catch (const std::exception&) {
+            return false;
+        }
     }
 
     void noteTargetWrites(std::span<const GuestUse> uses) {
@@ -694,6 +865,11 @@ private:
 
     static bool storageDispatches() {
         static const bool storage = std::getenv("APS5_RECODE_NO_STORAGE_DISPATCHES") == nullptr;
+        return storage;
+    }
+
+    static bool storageDraws() {
+        static const bool storage = std::getenv("APS5_RECODE_NO_STORAGE_DRAWS") == nullptr;
         return storage;
     }
 
@@ -810,18 +986,14 @@ private:
 
     std::optional<Heap::ResolvedSampler> sampler(const Heap::SlotRequest& request) {
         if (context->samplerCache == nullptr) return std::nullopt;
-        std::shared_ptr<Graphics::Sampler> found;
-        {
-            GuestMemory::TagGpuLockSite(GuestMemory::GpuLockSite::Try);
-            std::unique_lock gpuLock(GuestMemory::GpuMutex(), std::try_to_lock);
-            if (!gpuLock.owns_lock()) {
-                totals.lockBusy++;
-                return std::nullopt;
-            }
-            found =context->samplerCache->Get(*context, std::span<const std::uint32_t>(request.words).first(4), false, false, true, false);
+        try {
+            const auto found = context->samplerCache->Get(*context, std::span<const std::uint32_t>(request.words).first(4), (request.flags & Heap::RequestFlag::Compare) != 0u, false, true, false);
+            if (found == nullptr) return std::nullopt;
+            return Heap::ResolvedSampler{reinterpret_cast<std::uint64_t>(found->Handle()), found};
+        } catch (const std::exception& error) {
+            noteSurfaceReason(std::string("sampler: ") + error.what());
+            return std::nullopt;
         }
-        if (found == nullptr) return std::nullopt;
-        return Heap::ResolvedSampler{reinterpret_cast<std::uint64_t>(found->Handle()), found};
     }
 
     std::mutex mutex;
@@ -880,11 +1052,23 @@ void Attach(const std::shared_ptr<VulkanDevice>& device) {
 }
 
 void Consume(const Operation& operation, const DecodeState& state) {
-    shared().Consume(operation, state);
+    try {
+        shared().Consume(operation, state);
+    } catch (const std::exception& error) {
+        shared().ConsumeFailed(operation, error.what());
+    }
 }
 
 std::string Line() {
     return shared().Line();
+}
+
+std::string TakeRefusal() {
+    return shared().TakeRefusal();
+}
+
+std::chrono::milliseconds HandoffWait() {
+    return Downgrades::ExistingPathMode() == Downgrades::ExistingPath::Allow ? std::chrono::milliseconds(50) : std::chrono::milliseconds(60000);
 }
 
 PacketTable<ResolvedDraw>& ResolvedDraws() {
@@ -925,6 +1109,10 @@ std::shared_ptr<Images::Surface> BindRecordSlot(const Heap::SlotRequest& request
 
 bool StorageRecordShape(const Heap::SlotRequest& request) {
     return Resolver::StorageRecordShape(request);
+}
+
+bool BindViewSlot(const Heap::SlotRequest& request, std::uint64_t view, std::uint32_t layout, std::shared_ptr<const void> owner, std::uint32_t& slot) {
+    return shared().BindViewSlot(request, view, layout, std::move(owner), slot);
 }
 
 std::shared_ptr<const void> BindDeferredSampled(const Graphics::Context& context, const Heap::SlotRequest& request, std::uint32_t& slot, std::string& reason) {

@@ -3,6 +3,7 @@
 #include "prx/libSceAgcDriver/Graphics/include/TextureFormat.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/TextureTiling.hpp"
 #include <algorithm>
+#include <cstdlib>
 #include <exception>
 
 namespace AgcDriver::Unified::Images {
@@ -60,6 +61,22 @@ std::size_t SurfaceTable::KeyHash::operator()(const SurfaceKey& key) const {
     mix(key.pipeBankXor);
     mix(key.pitch);
     return static_cast<std::size_t>(hash);
+}
+
+bool OwnersEnabled() {
+    static const bool enabled = [] {
+        const char* value = std::getenv("APS5_RECODE_IMAGE_OWNERS");
+        return value == nullptr || (std::string_view(value) != "0" && std::string_view(value) != "off");
+    }();
+    return enabled;
+}
+
+bool OwnsClass(std::string_view name) {
+    if (!OwnersEnabled()) return false;
+    const char* value = std::getenv("APS5_RECODE_IMAGE_OWNERS");
+    if (value == nullptr) return true;
+    const std::string_view text(value);
+    return text == "1" || text == "all" || text.find(name) != std::string_view::npos;
 }
 
 bool SameBacking(const SurfaceKey& left, const SurfaceKey& right) {
@@ -235,6 +252,83 @@ std::vector<std::shared_ptr<Surface>> SurfaceTable::Overlapping(std::uint64_t ad
         if (key.address < end && address < key.address + key.bytes) overlapping.push_back(surface);
     }
     return overlapping;
+}
+
+Side SurfaceTable::OwnerOfRange(std::uint64_t address, std::uint64_t bytes) const {
+    std::lock_guard lock(mutex);
+    auto side = Side::None;
+    for (const auto& claim : claims) {
+        if (claim.begin >= address + bytes || address >= claim.end) continue;
+        if (claim.side == Side::Upstream) return Side::Upstream;
+        side = claim.side;
+    }
+    return side;
+}
+
+Side SurfaceTable::Claim(std::uint64_t address, std::uint64_t bytes, Side side, std::string_view reason) {
+    std::lock_guard lock(mutex);
+    auto owner = Side::None;
+    for (const auto& claim : claims) {
+        if (claim.begin >= address + bytes || address >= claim.end) continue;
+        if (claim.side == Side::Upstream) return Side::Upstream;
+        owner = claim.side;
+    }
+    if (owner != Side::None) return owner;
+    claims.push_back({address, address + bytes, side, std::string(reason)});
+    if (side == Side::Record) {
+        owners.recordRanges++;
+        owners.recordBytes += bytes;
+    } else {
+        owners.upstreamRanges++;
+        owners.upstreamBytes += bytes;
+    }
+    return side;
+}
+
+void SurfaceTable::Demote(std::uint64_t address, std::uint64_t bytes, std::string_view reason) {
+    std::lock_guard lock(mutex);
+    for (auto& claim : claims) {
+        if (claim.begin >= address + bytes || address >= claim.end || claim.side != Side::Record) continue;
+        claim.side = Side::Upstream;
+        claim.reason = "demoted: " + std::string(reason);
+        owners.recordRanges--;
+        owners.recordBytes -= claim.end - claim.begin;
+        owners.upstreamRanges++;
+        owners.upstreamBytes += claim.end - claim.begin;
+        owners.demoted++;
+    }
+    for (auto at = surfaces.begin(); at != surfaces.end();) {
+        const auto& key = at->first;
+        if (key.address >= address + bytes || address >= key.address + key.bytes || !at->second->seeded) {
+            ++at;
+            continue;
+        }
+        at->second->retired = true;
+        heldBytes -= key.bytes;
+        at = surfaces.erase(at);
+    }
+}
+
+std::shared_ptr<Surface> SurfaceTable::Seed(const std::shared_ptr<Surface>& surface) {
+    std::lock_guard lock(mutex);
+    if (surface == nullptr || surface->seeded) return surface;
+    surface->seeded = true;
+    if (surface->state == State::Pending && !surface->gpuNewer) work.push_back(surface);
+    return surface;
+}
+
+std::string SurfaceTable::OwnersLine() const {
+    std::lock_guard lock(mutex);
+    std::string line = "image owners: " + std::to_string(owners.recordRanges) + " ranges on recode records (" + std::to_string(owners.recordBytes >> 20u) + " MiB), " + std::to_string(owners.upstreamRanges) + " on the existing cache (" + std::to_string(owners.upstreamBytes >> 20u) + " MiB), " + std::to_string(owners.demoted) + " demoted";
+    std::vector<std::pair<std::string, std::uint64_t>> reasons;
+    for (const auto& claim : claims) {
+        if (claim.side != Side::Upstream) continue;
+        const auto found = std::ranges::find(reasons, claim.reason, &std::pair<std::string, std::uint64_t>::first);
+        if (found != reasons.end()) found->second++;
+        else if (reasons.size() < 16u) reasons.emplace_back(claim.reason, 1u);
+    }
+    for (const auto& [reason, count] : reasons) line += " [" + reason + " " + std::to_string(count) + "]";
+    return line;
 }
 
 void SurfaceTable::Requeue(const std::shared_ptr<Surface>& surface) {

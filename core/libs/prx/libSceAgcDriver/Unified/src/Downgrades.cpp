@@ -97,6 +97,10 @@ std::string_view KindName(Kind kind) {
         case Kind::UpstreamTarget: return "upstream-target";
         case Kind::TemplateMismatch: return "template-mismatch";
         case Kind::KnownShort: return "known-short";
+        case Kind::SampledAhead: return "sampled-ahead";
+        case Kind::ViewMismatch: return "view-mismatch";
+        case Kind::ImageResultsDropped: return "image-results-dropped";
+        case Kind::SamplerMode: return "sampler-mode";
         default: return "unknown";
     }
 }
@@ -108,7 +112,11 @@ Severity SeverityOf(Kind kind) {
         case Kind::KnownWriteRefused:
         case Kind::PageFault:
         case Kind::TemplateMismatch:
-        case Kind::KnownShort: return Severity::Severe;
+        case Kind::KnownShort:
+        case Kind::SampledAhead:
+        case Kind::ViewMismatch:
+        case Kind::ImageResultsDropped:
+        case Kind::SamplerMode: return Severity::Severe;
         case Kind::ExistingPath:
         case Kind::StorageRecordMissing:
         case Kind::UpstreamSampled:
@@ -360,6 +368,86 @@ void Note(std::uint64_t codeAddress, Kind kind, std::uint32_t binding, std::stri
 
 namespace {
 
+struct GuestWrite {
+    const char* what = nullptr;
+    std::uint64_t begin = 0;
+    std::uint64_t end = 0;
+    std::chrono::steady_clock::time_point at;
+};
+
+constexpr std::size_t JournalEntries = 8192;
+
+struct GuestWriteJournal {
+    std::mutex mutex;
+    std::vector<GuestWrite> entries = std::vector<GuestWrite>(JournalEntries);
+    std::size_t next = 0;
+};
+
+GuestWriteJournal& journal() {
+    static auto* value = new GuestWriteJournal;
+    return *value;
+}
+
+}
+
+void NoteGuestWrite(const char* what, std::uint64_t address, std::uint64_t bytes) {
+    if (!Active() || bytes == 0u) return;
+    auto& log = journal();
+    std::lock_guard lock(log.mutex);
+    log.entries[log.next++ % JournalEntries] = {what, address, address + bytes, std::chrono::steady_clock::now()};
+}
+
+void NoteImageResultsDropped(std::uint64_t address, std::uint64_t bytes) {
+    if (!Active()) return;
+    char text[160];
+    std::snprintf(text, sizeof(text), "image 0x%llx+0x%llx: no recode write to its memory in the journal", static_cast<unsigned long long>(address), static_cast<unsigned long long>(bytes));
+    {
+        auto& log = journal();
+        std::lock_guard lock(log.mutex);
+        const auto now = std::chrono::steady_clock::now();
+        for (std::size_t back = 1; back <= JournalEntries && back <= log.next; ++back) {
+            const auto& entry = log.entries[(log.next - back) % JournalEntries];
+            if (entry.what == nullptr || entry.begin >= address + bytes || address >= entry.end) continue;
+            std::snprintf(text, sizeof(text), "image 0x%llx+0x%llx: last recode write to its memory was %s 0x%llx+0x%llx, %lld ms before", static_cast<unsigned long long>(address), static_cast<unsigned long long>(bytes), entry.what, static_cast<unsigned long long>(entry.begin), static_cast<unsigned long long>(entry.end - entry.begin), static_cast<long long>(std::chrono::duration_cast<std::chrono::milliseconds>(now - entry.at).count()));
+            break;
+        }
+    }
+    NoteHashed(0u, Kind::ImageResultsDropped, static_cast<std::uint32_t>(address >> 16u), text);
+}
+
+ExistingPath ExistingPathMode() {
+    static const ExistingPath mode = [] {
+        const char* value = std::getenv("APS5_RECODE_EXISTING_PATH");
+        if (value == nullptr) return ExistingPath::Abort;
+        if (std::strcmp(value, "allow") == 0) return ExistingPath::Allow;
+        if (std::strcmp(value, "log") == 0) return ExistingPath::Log;
+        return ExistingPath::Abort;
+    }();
+    return mode;
+}
+
+void RefuseExistingPath(std::uint64_t codeAddress, std::string_view work, std::string_view reason) {
+    const auto mode = ExistingPathMode();
+    if (mode == ExistingPath::Allow) return;
+    const auto hash = codeAddress != 0u ? ProgramHash(codeAddress) : std::uint64_t{0};
+    if (mode == ExistingPath::Log) {
+        static std::mutex seenMutex;
+        static std::set<std::string> seen;
+        char key[160];
+        std::snprintf(key, sizeof(key), "%016llx %.*s %.*s", static_cast<unsigned long long>(hash), static_cast<int>(work.size()), work.data(), static_cast<int>(std::min<std::size_t>(reason.size(), 100u)), reason.data());
+        std::lock_guard lock(seenMutex);
+        if (!seen.insert(key).second) return;
+    }
+    std::fprintf(stderr, "[recode-fatal] %.*s of program %016llx (code 0x%llx) cannot be recorded and the recode route has no fallback to the existing path: %.*s\n", static_cast<int>(work.size()), work.data(), static_cast<unsigned long long>(hash), static_cast<unsigned long long>(codeAddress), static_cast<int>(reason.size()), reason.data());
+    if (mode == ExistingPath::Log) return;
+    std::fprintf(stderr, "[recode-fatal] stopping; APS5_RECODE_EXISTING_PATH=log reports every such case and carries on, =allow restores the fallback for comparison runs\n");
+    if (Active()) Report();
+    std::fflush(stderr);
+    std::_Exit(87);
+}
+
+namespace {
+
 thread_local std::uint64_t currentProgram = 0;
 
 }
@@ -424,7 +512,7 @@ void Report() {
         buildTotal += row.buildNanoseconds;
         buildCount += row.builds;
     }
-    std::fprintf(stderr, "[recode-compile] at %lld s: %llu ms waiting on %llu pipeline builds, %llu ms building %llu compute pipelines (one builder thread), %zu programs\n", static_cast<long long>(seconds), static_cast<unsigned long long>(compileTotal / 1000000u), static_cast<unsigned long long>(compileCount), static_cast<unsigned long long>(buildTotal / 1000000u), static_cast<unsigned long long>(buildCount), compiled.size());
+    std::fprintf(stderr, "[recode-compile] at %lld s: %llu ms waiting on %llu pipeline builds, %llu ms building %llu compute pipelines (summed over the builder threads), %zu programs\n", static_cast<long long>(seconds), static_cast<unsigned long long>(compileTotal / 1000000u), static_cast<unsigned long long>(compileCount), static_cast<unsigned long long>(buildTotal / 1000000u), static_cast<unsigned long long>(buildCount), compiled.size());
     for (std::size_t index = 0; index < compiled.size() && index < 12u; ++index) std::fprintf(stderr, "[recode-compile] %016llx waited %llu ms/%llu built %llu ms/%llu (%zu modules, %zu layouts) spirv %llu KiB draws %llu dispatches %llu\n", static_cast<unsigned long long>(compiled[index].hash), static_cast<unsigned long long>(compiled[index].compileNanoseconds / 1000000u), static_cast<unsigned long long>(compiled[index].compiles), static_cast<unsigned long long>(compiled[index].buildNanoseconds / 1000000u), static_cast<unsigned long long>(compiled[index].builds), compiled[index].modules.size(), compiled[index].layouts.size(), static_cast<unsigned long long>(compiled[index].spirvBytes >> 10u), static_cast<unsigned long long>(compiled[index].draws), static_cast<unsigned long long>(compiled[index].dispatches));
     if (!settings().strict) return;
     std::array<std::size_t, static_cast<std::size_t>(Severity::Count)> worst{};

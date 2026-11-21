@@ -513,7 +513,6 @@ void ResidencyService::AdvanceFrame() {
     std::lock_guard lock(mutex);
     ledger->SetBudget(device->BudgetBytes());
     uploads->Evict(now);
-    ledger->Retire(now);
 }
 
 std::uint64_t ResidencyService::Removals() const {

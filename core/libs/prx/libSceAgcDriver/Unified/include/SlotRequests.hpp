@@ -19,6 +19,7 @@ inline constexpr std::uint32_t Written = 16u;
 inline constexpr std::uint32_t Atomic = 32u;
 inline constexpr std::uint32_t Atomic64 = 64u;
 inline constexpr std::uint32_t UintView = 256u;
+inline constexpr std::uint32_t Compare = 512u;
 inline constexpr std::uint32_t MipShift = 16u;
 }
 

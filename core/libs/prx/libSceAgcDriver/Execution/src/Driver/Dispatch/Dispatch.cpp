@@ -412,7 +412,7 @@ void Driver::dispatch(QueueState& queue, std::span<const std::uint32_t> packet, 
         if (Unified::Record::RecordActive() && Unified::Resolve::DispatchesRoutedOn(submission.queue) && (indirectArguments == 0 || (packet[4] & 0x20u) == 0) && recodeCandidate() && !htileClearCompletion.has_value() && htileMask.bytes == 0u) {
             auto& resolvedDispatches = Unified::Resolve::ResolvedDispatches();
             const auto packetOffset = currentPacketOffset();
-            const auto found = resolvedDispatches.Find(submission.queue, submission.serial, packetOffset, std::chrono::milliseconds(50));
+            const auto found = resolvedDispatches.Find(submission.queue, submission.serial, packetOffset, Unified::Resolve::HandoffWait());
             if (found.offered) resolvedDispatches.Release(submission.queue, submission.serial, packetOffset);
             std::array<std::uint32_t, 3> recodeGroups{packet[1], packet[2], packet[3]};
             if ((packet[4] & 0x20u) != 0) {
@@ -446,7 +446,12 @@ void Driver::dispatch(QueueState& queue, std::span<const std::uint32_t> packet, 
                 }, std::move(writes), 0, {}, std::move(reads));
                 return;
             }
+            if (found.value == nullptr) Unified::Record::RefuseUnrecorded("dispatch", address, {});
+            else if (recodeReason.empty()) Unified::Record::RefuseUnrecorded("dispatch", address, "resolved for another program, or a pattern fill or storage image clear left to the existing kernels");
+        } else if (Unified::Record::RecordActive() && Unified::Resolve::DispatchesRoutedOn(submission.queue)) {
+            Unified::Record::RefuseUnrecorded("dispatch", address, htileClearCompletion.has_value() || htileMask.bytes != 0u ? "HTILE clear handled by the existing path" : indirectArguments != 0 && (packet[4] & 0x20u) != 0 ? "indirect dispatch in thread dimensions" : "not a pipeline candidate (resolved ahead, labels pending or dispatch items off)");
         }
+        Unified::Record::NoteExistingDispatch(address, indirectArguments, static_cast<std::uint64_t>(packet[1]) * packet[2] * packet[3]);
 #endif
     }
     if (indirectArguments == 0 && (packet[4] & 0x20u) != 0) {

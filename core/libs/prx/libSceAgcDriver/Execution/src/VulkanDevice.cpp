@@ -6328,6 +6328,9 @@ void VulkanDevice::recordDispatch(RecordedDispatch& record) {
         // Listed after the registration: a throw there leaves nothing that would pin the CPU path forever.
         if (resources.HasCopiedWrites()) writers->push_back(kept);
     }
+#if ANYPS5_UNIFIED
+    Unified::Record::ProbeExistingWrites(recorder, record.programAddress, resources.GpuWrites());
+#endif
     recordStep(PhaseRecordCompletion);
 }
 

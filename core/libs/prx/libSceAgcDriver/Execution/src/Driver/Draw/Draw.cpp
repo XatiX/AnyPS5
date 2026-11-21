@@ -422,7 +422,7 @@ DrawVerdict Driver::draw(QueueState& queue, std::span<const std::uint32_t> packe
     Unified::Shadow::NoteDevice(localDevice);
     if (Unified::Record::RecordActive() && pipelined && !lockedPrepare) {
         auto& resolvedDraws = Unified::Resolve::ResolvedDraws();
-        const auto found = resolvedDraws.Find(submission.queue, submission.serial, packetOffset, std::chrono::milliseconds(50));
+        const auto found = resolvedDraws.Find(submission.queue, submission.serial, packetOffset, Unified::Resolve::HandoffWait());
         std::vector<DrawPipeline::Range> reads;
         std::string recodeReason;
         if (found.value != nullptr && Unified::Record::RecordPrecheck(*found.value, drawParameters, reads, recodeReason)) {
@@ -442,6 +442,9 @@ DrawVerdict Driver::draw(QueueState& queue, std::span<const std::uint32_t> packe
             }, std::move(writes), 0, {}, std::move(reads), true);
             return drawn();
         }
+        if (found.value == nullptr) Unified::Record::RefuseUnrecorded("draw", 0, {});
+    } else if (Unified::Record::RecordActive()) {
+        Unified::Record::RefuseUnrecorded("draw", 0, "draw outside the draw pipeline");
     }
 #endif
     timing.Mark("device_setup");

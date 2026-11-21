@@ -9,6 +9,7 @@
 #include <optional>
 #include <span>
 #include <string>
+#include <string_view>
 #include <unordered_map>
 #include <vector>
 
@@ -51,6 +52,8 @@ struct ImageKey {
 [[nodiscard]] std::optional<ImageKey> KeyOf(std::span<const std::uint32_t, 8> words, std::string& reason);
 [[nodiscard]] std::optional<ImageKey> KeyOf(const Graphics::GuestTextureResource& resource, std::string& reason);
 [[nodiscard]] bool SameBacking(const SurfaceKey& left, const SurfaceKey& right);
+[[nodiscard]] bool OwnersEnabled();
+[[nodiscard]] bool OwnsClass(std::string_view name);
 
 enum class State : std::uint8_t { Pending, Ready, Stale };
 
@@ -77,6 +80,17 @@ struct Surface {
     std::uint64_t used = 0;
     bool retired = false;
     bool gpuNewer = false;
+    bool seeded = false;
+};
+
+enum class Side : std::uint8_t { None, Record, Upstream };
+
+struct OwnerCounts {
+    std::uint64_t recordRanges = 0;
+    std::uint64_t recordBytes = 0;
+    std::uint64_t upstreamRanges = 0;
+    std::uint64_t upstreamBytes = 0;
+    std::uint64_t demoted = 0;
 };
 
 [[nodiscard]] inline std::uintptr_t OwnerOf(const Surface& surface) {
@@ -118,6 +132,11 @@ public:
     void ClearGpuNewer(Surface& surface);
     [[nodiscard]] std::vector<std::shared_ptr<Surface>> Overlapping(std::uint64_t address, std::uint64_t bytes) const;
     void Requeue(const std::shared_ptr<Surface>& surface);
+    [[nodiscard]] Side OwnerOfRange(std::uint64_t address, std::uint64_t bytes) const;
+    Side Claim(std::uint64_t address, std::uint64_t bytes, Side side, std::string_view reason);
+    void Demote(std::uint64_t address, std::uint64_t bytes, std::string_view reason);
+    [[nodiscard]] std::shared_ptr<Surface> Seed(const std::shared_ptr<Surface>& surface);
+    [[nodiscard]] std::string OwnersLine() const;
     [[nodiscard]] TableCounts TakeCounts();
     [[nodiscard]] std::size_t Size() const;
     [[nodiscard]] std::uint64_t HeldBytes() const;
@@ -140,6 +159,14 @@ private:
     std::unordered_map<SurfaceKey, std::shared_ptr<Surface>, KeyHash> surfaces;
     std::vector<std::shared_ptr<Surface>> work;
     std::vector<std::shared_ptr<Surface>> newer;
+    struct Claimed {
+        std::uint64_t begin = 0;
+        std::uint64_t end = 0;
+        Side side = Side::None;
+        std::string reason;
+    };
+    std::vector<Claimed> claims;
+    OwnerCounts owners;
     TableCounts counts;
     std::uint64_t budget = 0;
     std::uint64_t heldBytes = 0;

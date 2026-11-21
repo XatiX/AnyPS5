@@ -62,6 +62,8 @@ struct ResolvedDraw {
 void Attach(const std::shared_ptr<VulkanDevice>& device);
 void Consume(const Operation& operation, const DecodeState& state);
 [[nodiscard]] std::string Line();
+[[nodiscard]] std::string TakeRefusal();
+[[nodiscard]] std::chrono::milliseconds HandoffWait();
 [[nodiscard]] PacketTable<ResolvedDraw>& ResolvedDraws();
 [[nodiscard]] PacketTable<ResolvedDraw>& ResolvedDispatches();
 [[nodiscard]] const Heap::VulkanHeapDevice* HeapDevice();
@@ -70,6 +72,7 @@ void Consume(const Operation& operation, const DecodeState& state);
 [[nodiscard]] std::shared_ptr<Images::Surface> BindDeferredRecord(const Heap::SlotRequest& request, std::uint32_t& slot);
 [[nodiscard]] std::shared_ptr<Images::Surface> BindRecordSlot(const Heap::SlotRequest& request, std::shared_ptr<Images::Surface> record, std::uint32_t& slot);
 [[nodiscard]] bool StorageRecordShape(const Heap::SlotRequest& request);
+[[nodiscard]] bool BindViewSlot(const Heap::SlotRequest& request, std::uint64_t view, std::uint32_t layout, std::shared_ptr<const void> owner, std::uint32_t& slot);
 [[nodiscard]] std::shared_ptr<const void> BindDeferredSampled(const Graphics::Context& context, const Heap::SlotRequest& request, std::uint32_t& slot, std::string& reason);
 
 }
