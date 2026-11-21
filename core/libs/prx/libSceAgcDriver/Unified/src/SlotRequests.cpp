@@ -9,6 +9,24 @@
 
 namespace AgcDriver::Unified::Heap {
 
+namespace {
+
+bool comparesDepth(const ShaderRecompiler::ShaderInfo& info, const ShaderRecompiler::ResourceSnapshot& snapshot, std::uint32_t sampler) {
+    for (const auto& pair : info.sampledPairs) {
+        if (pair.sampler != sampler || pair.image >= info.images.size() || pair.image >= snapshot.images.size() || pair.image >= info.runtimeImageModes.size() || !info.images[pair.image].depthCompare) continue;
+        const auto& modes = info.runtimeImageModes[pair.image];
+        try {
+            const auto mode = ShaderRecompiler::ResourceMaterializer::RuntimeImageMode(info.images[pair.image], snapshot.images[pair.image], modes);
+            if (mode < modes.size() && modes[mode].depthCompare) return true;
+        } catch (const std::exception&) {
+            continue;
+        }
+    }
+    return false;
+}
+
+}
+
 std::uint32_t PointFilterWord(std::uint32_t filter) {
     const bool mipmapped = ((filter >> 26u) & 3u) != 0u;
     return (filter & ~(0xffu << 20u)) | (1u << 24u) | (mipmapped ? 1u << 26u : 0u);
@@ -46,6 +64,7 @@ bool BuildSlotRequests(const ShaderRecompiler::CompiledShaderInfo& compiled, con
                 }
                 std::copy_n(snapshot.samplers[resource].dwords.begin(), 4u, request.words.begin());
                 request.flags = RequestFlag::Sampler;
+                if (comparesDepth(info, snapshot, resource)) request.flags |= RequestFlag::Compare;
                 if ((element & 1u) != 0u) {
                     request.words[2] = PointFilterWord(request.words[2]);
                     request.flags |= RequestFlag::Point;

@@ -818,7 +818,7 @@ private:
                 totals.lockBusy++;
                 return std::nullopt;
             }
-            found =context->samplerCache->Get(*context, std::span<const std::uint32_t>(request.words).first(4), false, false, true, false);
+            found = context->samplerCache->Get(*context, std::span<const std::uint32_t>(request.words).first(4), (request.flags & Heap::RequestFlag::Compare) != 0u, false, true, false);
         }
         if (found == nullptr) return std::nullopt;
         return Heap::ResolvedSampler{reinterpret_cast<std::uint64_t>(found->Handle()), found};
