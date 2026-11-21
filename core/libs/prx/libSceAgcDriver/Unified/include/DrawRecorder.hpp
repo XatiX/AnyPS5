@@ -7,6 +7,7 @@
 #include <array>
 #include <cstdint>
 #include <string>
+#include <string_view>
 
 namespace AgcDriver {
 class VulkanDevice;
@@ -25,6 +26,7 @@ bool RecordResolved(const Graphics::Context& context, const Resolve::ResolvedDra
 bool RecordDispatchPrecheck(const Graphics::Context& context, VulkanDevice& owner, const Resolve::ResolvedDraw& dispatch, std::string& reason);
 bool RecordDispatch(const Graphics::Context& context, const Resolve::ResolvedDraw& dispatch, const std::array<std::uint32_t, 3>& groups, std::string& reason);
 void PrebuildDispatch(const Graphics::Context& context, VulkanDevice& owner, const Resolve::ResolvedDraw& dispatch);
+void RefuseUnrecorded(std::string_view work, std::uint64_t codeAddress, std::string_view reason);
 [[nodiscard]] std::string RecordLine();
 
 }

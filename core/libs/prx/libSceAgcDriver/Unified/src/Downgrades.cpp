@@ -97,6 +97,7 @@ std::string_view KindName(Kind kind) {
         case Kind::UpstreamTarget: return "upstream-target";
         case Kind::TemplateMismatch: return "template-mismatch";
         case Kind::KnownShort: return "known-short";
+        case Kind::SampledAhead: return "sampled-ahead";
         default: return "unknown";
     }
 }
@@ -108,7 +109,8 @@ Severity SeverityOf(Kind kind) {
         case Kind::KnownWriteRefused:
         case Kind::PageFault:
         case Kind::TemplateMismatch:
-        case Kind::KnownShort: return Severity::Severe;
+        case Kind::KnownShort:
+        case Kind::SampledAhead: return Severity::Severe;
         case Kind::ExistingPath:
         case Kind::StorageRecordMissing:
         case Kind::UpstreamSampled:
@@ -356,6 +358,37 @@ void NoteHashed(std::uint64_t hash, Kind kind, std::uint32_t binding, std::strin
 void Note(std::uint64_t codeAddress, Kind kind, std::uint32_t binding, std::string_view detail) {
     if (!Active()) return;
     NoteHashed(ProgramHash(codeAddress), kind, binding, detail);
+}
+
+ExistingPath ExistingPathMode() {
+    static const ExistingPath mode = [] {
+        const char* value = std::getenv("APS5_RECODE_EXISTING_PATH");
+        if (value == nullptr) return ExistingPath::Abort;
+        if (std::strcmp(value, "allow") == 0) return ExistingPath::Allow;
+        if (std::strcmp(value, "log") == 0) return ExistingPath::Log;
+        return ExistingPath::Abort;
+    }();
+    return mode;
+}
+
+void RefuseExistingPath(std::uint64_t codeAddress, std::string_view work, std::string_view reason) {
+    const auto mode = ExistingPathMode();
+    if (mode == ExistingPath::Allow) return;
+    const auto hash = codeAddress != 0u ? ProgramHash(codeAddress) : std::uint64_t{0};
+    if (mode == ExistingPath::Log) {
+        static std::mutex seenMutex;
+        static std::set<std::string> seen;
+        char key[160];
+        std::snprintf(key, sizeof(key), "%016llx %.*s %.*s", static_cast<unsigned long long>(hash), static_cast<int>(work.size()), work.data(), static_cast<int>(std::min<std::size_t>(reason.size(), 100u)), reason.data());
+        std::lock_guard lock(seenMutex);
+        if (!seen.insert(key).second) return;
+    }
+    std::fprintf(stderr, "[recode-fatal] %.*s of program %016llx (code 0x%llx) cannot be recorded and the recode route has no fallback to the existing path: %.*s\n", static_cast<int>(work.size()), work.data(), static_cast<unsigned long long>(hash), static_cast<unsigned long long>(codeAddress), static_cast<int>(reason.size()), reason.data());
+    if (mode == ExistingPath::Log) return;
+    std::fprintf(stderr, "[recode-fatal] stopping; APS5_RECODE_EXISTING_PATH=log reports every such case and carries on, =allow restores the fallback for comparison runs\n");
+    if (Active()) Report();
+    std::fflush(stderr);
+    std::_Exit(87);
 }
 
 namespace {

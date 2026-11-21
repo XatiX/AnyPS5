@@ -62,6 +62,8 @@ struct ResolvedDraw {
 void Attach(const std::shared_ptr<VulkanDevice>& device);
 void Consume(const Operation& operation, const DecodeState& state);
 [[nodiscard]] std::string Line();
+[[nodiscard]] std::string TakeRefusal();
+[[nodiscard]] std::chrono::milliseconds HandoffWait();
 [[nodiscard]] PacketTable<ResolvedDraw>& ResolvedDraws();
 [[nodiscard]] PacketTable<ResolvedDraw>& ResolvedDispatches();
 [[nodiscard]] const Heap::VulkanHeapDevice* HeapDevice();

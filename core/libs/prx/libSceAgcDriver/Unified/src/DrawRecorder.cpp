@@ -168,6 +168,7 @@ struct Totals {
     std::uint64_t importSwitches = 0;
     std::uint64_t writtenSwitches = 0;
     std::uint64_t storageWrites = 0;
+    std::uint64_t drawStorageWrites = 0;
     std::uint64_t switchBytes = 0;
     std::uint64_t switchRefused = 0;
     std::uint64_t nanoseconds = 0;
@@ -279,6 +280,11 @@ bool switchesWrittenChunks() {
 
 bool copiesBackDispatchWrites() {
     static const bool copies = std::getenv("APS5_RECODE_NO_COPY_BACK") == nullptr;
+    return copies;
+}
+
+bool copiesBackSmallWrites() {
+    static const bool copies = std::getenv("APS5_RECODE_COPY_BACK_SMALL_WRITES") != nullptr;
     return copies;
 }
 
@@ -634,8 +640,10 @@ bool excludedStages(const Resolve::ResolvedDraw& draw, std::string& reason) {
 class DrawRecorder {
 public:
     bool Precheck(const Resolve::ResolvedDraw& draw, const Pm4::DrawParameters& parameters, std::vector<std::pair<std::uint64_t, std::uint64_t>>& reads, std::string& reason) {
-        if (!excludedStages(draw, reason) && precheck(draw, parameters, &reads, reason)) return true;
+        const bool excluded = excludedStages(draw, reason);
+        if (!excluded && precheck(draw, parameters, &reads, reason)) return true;
         noteStages(draw, Downgrades::Kind::ExistingPath, reason);
+        if (!excluded) Downgrades::RefuseExistingPath(draw.stages.empty() ? 0u : draw.stages.back().program.codeAddress, "draw", reason);
         std::lock_guard lock(mutex);
         totals.existing++;
         const auto key = "existing path: " + reason.substr(0, 45);
@@ -657,17 +665,21 @@ public:
         if (recorded) {
             totals.recorded++;
             noteStagesWork(draw, Downgrades::Work::Draw, 0);
+            noteUses(draw, "draw");
             return true;
         }
         noteStages(draw, Downgrades::Kind::Dropped, reason);
         refuse(reason);
+        Downgrades::RefuseExistingPath(draw.stages.empty() ? 0u : draw.stages.back().program.codeAddress, "draw", "dropped while recording: " + reason);
         return false;
     }
 
     bool DispatchPrecheck(const Context& context, VulkanDevice& owner, const Resolve::ResolvedDraw& dispatch, std::string& reason) {
         std::unique_lock lock(mutex);
-        if (!excludedStages(dispatch, reason) && dispatchPrecheck(dispatch, reason) && pipelineReady(context, owner, dispatch, lock, reason)) return true;
+        const bool excluded = excludedStages(dispatch, reason);
+        if (!excluded && dispatchPrecheck(dispatch, reason) && pipelineReady(context, owner, dispatch, lock, reason)) return true;
         noteStages(dispatch, Downgrades::Kind::ExistingPath, reason);
+        if (!excluded) Downgrades::RefuseExistingPath(dispatch.stages.empty() ? 0u : dispatch.stages.front().program.codeAddress, "dispatch", reason);
         totals.dispatchExisting++;
         const auto key = "existing path dispatch: " + reason.substr(0, 45);
         if (totals.reasons.size() < 24u || totals.reasons.contains(key)) totals.reasons[key]++;
@@ -689,11 +701,38 @@ public:
             totals.dispatches++;
             const bool indirect = dispatch.operation.dispatch.indirect;
             noteStagesWork(dispatch, indirect ? Downgrades::Work::IndirectDispatch : Downgrades::Work::Dispatch, indirect ? 0u : static_cast<std::uint64_t>(groups[0]) * groups[1] * groups[2]);
+            noteUses(dispatch, "dispatch");
             return true;
         }
         noteStages(dispatch, Downgrades::Kind::Dropped, reason);
         refuse("dispatch " + reason);
+        Downgrades::RefuseExistingPath(dispatch.stages.empty() ? 0u : dispatch.stages.front().program.codeAddress, "dispatch", "dropped while recording: " + reason);
         return false;
+    }
+
+    void noteUses(const Resolve::ResolvedDraw& work, const char* what) {
+        if (!Downgrades::Active() || work.stages.empty()) return;
+        const auto code = work.stages.back().program.codeAddress;
+        if (!usesNoted.insert(code).second) return;
+        std::string line = "[recode-uses] ";
+        char text[96];
+        std::snprintf(text, sizeof(text), "%016llx %s:", static_cast<unsigned long long>(Downgrades::ProgramHash(code)), what);
+        line += text;
+        constexpr std::size_t Shown = 28;
+        for (std::size_t index = 0; index < work.uses.size() && index < Shown; ++index) {
+            const auto& use = work.uses[index];
+            const char* kind = index >= work.imageBegin ? "image" : index >= work.targetBegin && index < work.targetEnd ? "target" : "memory";
+            std::snprintf(text, sizeof(text), " %s %s 0x%llx+0x%llx", use.write ? "WRITE" : "read", kind, static_cast<unsigned long long>(use.address), static_cast<unsigned long long>(use.size));
+            line += text;
+        }
+        if (work.uses.size() > Shown) line += " ... " + std::to_string(work.uses.size() - Shown) + " more";
+        for (const auto& stage : work.stages) {
+            if (stage.program.variant == nullptr) continue;
+            const auto& infos = stage.program.variant->info.info.knownBuffers;
+            const auto written = static_cast<std::size_t>(std::ranges::count_if(infos, [](const ShaderRecompiler::KnownBuffer& known) { return known.written; }));
+            line += "; known buffers " + std::to_string(infos.size()) + " (" + std::to_string(written) + " written), stores through addresses " + (stage.program.result != nullptr && Graphics::ShaderStoresThroughAddresses(stage.program.result->spirv) ? "yes" : "no");
+        }
+        std::fprintf(stderr, "%s\n", line.c_str());
     }
 
     std::string Line() {
@@ -707,6 +746,7 @@ public:
         line += "; linear target stores " + std::to_string(totals.linearStores);
         line += "; batch moved before the pass " + std::to_string(totals.batchMoves);
         line += "; passes " + std::to_string(totals.passesBegun) + " begun, " + std::to_string(totals.passesContinued) + " draws continued, " + std::to_string(totals.passFeedback) + " broken by a target read";
+        line += "; storage images written by draws " + std::to_string(totals.drawStorageWrites);
         line += "; target memo " + std::to_string(totals.targetMemoHits) + " hits, " + std::to_string(totals.targetMemoMisses) + " misses; " + std::to_string(totals.deferredReads) + " draws with reads bound at record";
         line += "; residency updates landed " + std::to_string(totals.residencyLands);
         line += "; known buffers " + std::to_string(totals.knownServed) + " served, " + std::to_string(totals.knownMapped) + " mapped (" + std::to_string(totals.knownPaged) + " paged in), " + std::to_string(totals.knownCopied) + " copied (" + std::to_string(totals.knownGpuWritten) + " GPU-written ranges not copied), " + std::to_string(totals.knownRefused) + " unresolved, " + std::to_string(totals.knownPrefixes) + " bound to their mapped prefix (" + std::to_string(totals.importExtensions) + " chunks moved to their written import to make a known buffer contiguous, " + std::to_string(totals.knownSwitches) + " of them from residency), " + std::to_string(totals.knownSkipped) + " skipped (" + std::to_string(totals.knownPointers) + " of them pointers); known writes " + std::to_string(totals.knownWritten) + " direct (" + std::to_string(totals.knownWriteBytes >> 10u) + " KiB landed), " + std::to_string(totals.knownWriteLookups) + " through the page table, " + std::to_string(totals.copyBacks) + " copied back to their import after the dispatch (" + std::to_string(totals.copyBackBytes >> 20u) + " MiB, " + std::to_string(totals.copyBackCovered >> 10u) + " KiB of written pieces not landed, " + std::to_string(totals.importsReturned) + " chunks returned from their import, " + std::to_string(totals.residencyRefreshes) + " residency refreshes before the dispatch, " + std::to_string(totals.refreshKeptPages) + " GPU-written pages kept from them)";
@@ -868,7 +908,7 @@ private:
     }
 
     bool queueCopyBack(const Context& context, std::uint64_t address, std::uint64_t bytes) {
-        if (!copyingBack || bytes > KnownBufferLimitBytes) return false;
+        if (!copyingBack || bytes > KnownBufferLimitBytes || (bytes < PageBytes && !copiesBackSmallWrites() && !MemoryCore::Get().Pages().GpuWrittenIn(address, bytes))) return false;
         const auto* import = Graphics::HostImportFor(context, address, static_cast<std::size_t>(bytes));
         if (import == nullptr || address < import->base || address + bytes > import->base + import->bytes) return false;
         returnImports(context, address, bytes, *import);
@@ -1658,11 +1698,16 @@ private:
 
     bool recordDispatch(const Context& context, const Resolve::ResolvedDraw& dispatch, const std::array<std::uint32_t, 3>& groups, std::string& reason) {
         writtenRecords.clear();
+        stageStorageImages.clear();
         if (dispatch.stages.size() != 1u || dispatch.stages.front().deferredImages.empty()) return recordBound(context, dispatch, groups, {}, reason);
         auto bound = dispatch;
-        auto& stage = bound.stages.front();
         std::vector<std::shared_ptr<Graphics::StorageTexture>> written;
-        written.reserve(stage.deferredImages.size());
+        if (!bindDeferredImages(context, bound.stages.front(), written, reason)) return false;
+        return recordBound(context, bound, groups, written, reason);
+    }
+
+    bool bindDeferredImages(const Context& context, Resolve::ResolvedStage& stage, std::vector<std::shared_ptr<Graphics::StorageTexture>>& written, std::string& reason) {
+        written.reserve(written.size() + stage.deferredImages.size());
         std::vector<const Heap::DeferredImage*> sampled;
         for (const auto& deferred : stage.deferredImages) {
             std::uint32_t slot = 0;
@@ -1675,10 +1720,12 @@ private:
                 if (auto adopted = adoptStorage(context, deferred.request)) record = Resolve::BindRecordSlot(deferred.request, std::move(adopted), slot);
             }
             if (record == nullptr && Downgrades::Active() && Resolve::StorageRecordShape(deferred.request)) Downgrades::Note(stage.program.codeAddress, Downgrades::Kind::StorageRecordMissing, deferred.index, "bound from the existing cache");
+            const bool storageWritten = (deferred.request.flags & Heap::RequestFlag::Written) != 0u;
             if (record != nullptr) {
                 stage.slots[deferred.index] = slot;
                 if (context.recorder != nullptr) context.recorder->Keep(record);
-                if ((deferred.request.flags & Heap::RequestFlag::Written) != 0u) writtenRecords.push_back(std::move(record));
+                if (const auto* vulkan = dynamic_cast<const Images::VulkanSurface*>(record->device.get())) stageStorageImages.emplace_back(vulkan->Image(), storageWritten);
+                if (storageWritten) writtenRecords.push_back(std::move(record));
                 continue;
             }
             publishRequest(context, deferred.request);
@@ -1687,7 +1734,8 @@ private:
             noteImage(stage, Downgrades::Kind::UpstreamStorage, deferred.index, deferred.request, (deferred.request.flags & Heap::RequestFlag::Written) != 0u ? "written storage cache" : "storage cache");
             stage.slots[deferred.index] = slot;
             if (context.recorder != nullptr) context.recorder->Keep(texture);
-            if ((deferred.request.flags & Heap::RequestFlag::Written) != 0u) written.push_back(std::move(texture));
+            stageStorageImages.emplace_back(texture->Image(), storageWritten);
+            if (storageWritten) written.push_back(std::move(texture));
         }
         for (const auto* deferred : sampled) {
             std::uint32_t slot = 0;
@@ -1698,8 +1746,25 @@ private:
             stage.slots[deferred->index] = slot;
             if (context.recorder != nullptr) context.recorder->Keep(std::const_pointer_cast<void>(owner));
         }
-        if (!Resolve::PatchSlots(*stage.program.result, stage.slots, stage.program.words, reason)) return false;
-        return recordBound(context, bound, groups, written, reason);
+        return Resolve::PatchSlots(*stage.program.result, stage.slots, stage.program.words, reason);
+    }
+
+    void noteStorageWrites(const Context& context, Graphics::Recorder& recorder, std::span<const std::shared_ptr<Graphics::StorageTexture>> written) {
+        for (const auto& texture : written) {
+            recorder.Keep(texture);
+            texture->MarkDirty();
+            static_cast<void>(Graphics::DepthSurfaceStoreBack(context, *texture));
+            totals.storageWrites++;
+        }
+        if (!written.empty() || !writtenRecords.empty()) GuestMemory::BreakProofs();
+        auto* surfaceTable = Resolve::Surfaces();
+        for (const auto& record : writtenRecords) {
+            const auto owner = Images::OwnerOf(*record);
+            static_cast<void>(Events::GpuWrites().Note(record->key.address, record->key.bytes, owner));
+            static_cast<void>(Events::Shared().Note(record->key.address, record->key.bytes, owner));
+            if (surfaceTable != nullptr) surfaceTable->MarkGpuWritten(*record);
+            totals.recordWrites++;
+        }
     }
 
 
@@ -1812,21 +1877,7 @@ private:
         for (const auto& owned : stage.owners) recorder->Keep(std::const_pointer_cast<void>(owned));
         if (stage.tableMap != nullptr) recorder->Keep(std::const_pointer_cast<Tables::Mirror>(stage.tableMap));
         if (pageTable != nullptr) recorder->Keep(pageTable);
-        for (const auto& texture : written) {
-            recorder->Keep(texture);
-            texture->MarkDirty();
-            static_cast<void>(Graphics::DepthSurfaceStoreBack(context, *texture));
-            totals.storageWrites++;
-        }
-        if (!written.empty() || !writtenRecords.empty()) GuestMemory::BreakProofs();
-        auto* surfaceTable = Resolve::Surfaces();
-        for (const auto& record : writtenRecords) {
-            const auto owner = Images::OwnerOf(*record);
-            static_cast<void>(Events::GpuWrites().Note(record->key.address, record->key.bytes, owner));
-            static_cast<void>(Events::Shared().Note(record->key.address, record->key.bytes, owner));
-            if (surfaceTable != nullptr) surfaceTable->MarkGpuWritten(*record);
-            totals.recordWrites++;
-        }
+        noteStorageWrites(context, *recorder, written);
         std::vector<std::pair<std::uint64_t, std::uint64_t>> writtenRanges;
         for (std::size_t index = 0; index < dispatch.uses.size(); ++index) {
             const auto& use = dispatch.uses[index];
@@ -1885,23 +1936,34 @@ private:
     }
 
     bool record(const Context& context, const Resolve::ResolvedDraw& draw, const Pm4::DrawParameters& parameters, std::string& reason) {
+        writtenRecords.clear();
+        stageStorageImages.clear();
         if (std::ranges::all_of(draw.stages, [](const Resolve::ResolvedStage& stage) { return stage.deferredImages.empty(); })) return recordWithSlots(context, draw, parameters, reason);
         auto bound = draw;
+        std::vector<std::shared_ptr<Graphics::StorageTexture>> written;
+        std::vector<std::pair<std::uint64_t, std::uint64_t>> writtenRanges;
+        constexpr auto storageWrite = Heap::RequestFlag::Storage | Heap::RequestFlag::Written;
         for (auto& stage : bound.stages) {
             if (stage.deferredImages.empty()) continue;
+            if (!bindDeferredImages(context, stage, written, reason)) return false;
             for (const auto& deferred : stage.deferredImages) {
-                std::uint32_t slot = 0;
-                publishRequest(context, deferred.request);
-                auto owner = Resolve::BindDeferredSampled(context, deferred.request, slot, reason);
-                if (owner == nullptr) return false;
-                noteImage(stage, Downgrades::Kind::UpstreamSampled, deferred.index, deferred.request, "sampled cache");
-                stage.slots[deferred.index] = slot;
-                if (context.recorder != nullptr) context.recorder->Keep(std::const_pointer_cast<void>(owner));
+                if ((deferred.request.flags & storageWrite) != storageWrite) continue;
+                try {
+                    const auto resource = Graphics::DecodeTextureResource(deferred.request.words);
+                    writtenRanges.emplace_back(resource.baseAddress, resource.baseAddress + Graphics::SurfaceGuestBytes(resource));
+                } catch (const std::exception&) {
+                }
             }
-            if (!Resolve::PatchSlots(*stage.program.result, stage.slots, stage.program.words, reason)) return false;
         }
         totals.deferredReads++;
-        return recordWithSlots(context, bound, parameters, reason);
+        if (!recordWithSlots(context, bound, parameters, reason)) return false;
+        if (!written.empty() || !writtenRecords.empty()) {
+            noteStorageWrites(context, *context.recorder, written);
+            totals.drawStorageWrites += written.size() + writtenRecords.size();
+        }
+        writtenRecords.clear();
+        if (!writtenRanges.empty()) Events::NoteRanges(writtenRanges);
+        return true;
     }
 
     bool recordWithSlots(const Context& context, const Resolve::ResolvedDraw& draw, const Pm4::DrawParameters& parameters, std::string& reason) {
@@ -2170,13 +2232,14 @@ private:
         if (!passWrites.empty()) Shadow::NoteGpuWrites(passWrites);
         std::vector<std::pair<VkImage, bool>> attachments;
         for (const auto& resident : residents) attachments.emplace_back(resident->Image(), true);
-        Graphics::PassAccess access{passReads, passWrites, {}, attachments};
+        Graphics::PassAccess access{passReads, passWrites, stageStorageImages, attachments};
+        const bool storesImages = std::ranges::any_of(stageStorageImages, [](const std::pair<VkImage, bool>& image) { return image.second; });
         access.anyReads = pageTable != nullptr;
         access.anyWrites = pageTable != nullptr && std::ranges::any_of(draw.stages, [](const Resolve::ResolvedStage& stage) { return Graphics::ShaderStoresThroughAddresses(stage.program.result->spirv); });
         const bool feedback = recorder->RenderPassOpen() && overlaps(passReads, passTargets);
         if (feedback) totals.passFeedback++;
         const bool snapshotArguments = parameters.indirect && ring != nullptr && argumentBuffer == ring->Handle();
-        const bool forced = !mergesPasses() || !draw.complete || feedback || (parameters.indirect && !snapshotArguments) || countImport != nullptr;
+        const bool forced = !mergesPasses() || !draw.complete || feedback || storesImages || (parameters.indirect && !snapshotArguments) || countImport != nullptr;
         const bool fenced = state.depth.has_value();
         const auto start = recorder->StartDrawPass(key, forced, fenced, access);
         if (recorder->OpenBatchSerial() != serial) totals.batchMoves++;
@@ -2428,6 +2491,8 @@ private:
     std::deque<KnownWrite> knownWrites;
     std::vector<CopyBack> copyBacks;
     std::vector<std::shared_ptr<Images::Surface>> writtenRecords;
+    std::vector<std::pair<VkImage, bool>> stageStorageImages;
+    std::set<std::uint64_t> usesNoted;
     std::map<std::string, std::uint64_t> recordTargetReasons;
     std::map<std::uint64_t, std::vector<std::pair<std::uint64_t, std::uint64_t>>> copiedBack;
     bool copyingBack = false;
@@ -2542,6 +2607,17 @@ void PrebuildDispatch(const Context& context, VulkanDevice& owner, const Resolve
     static const bool prebuilds = std::getenv("APS5_RECODE_NO_PIPELINE_PREBUILD") == nullptr;
     if (!prebuilds || !RecordActive()) return;
     shared().Prebuild(context, owner, dispatch);
+}
+
+void RefuseUnrecorded(std::string_view work, std::uint64_t codeAddress, std::string_view reason) {
+    if (!RecordActive()) return;
+    if (!reason.empty()) {
+        Downgrades::RefuseExistingPath(codeAddress, work, reason);
+        return;
+    }
+    const auto refusal = Resolve::TakeRefusal();
+    if (refusal == "no device") return;
+    Downgrades::RefuseExistingPath(codeAddress, work, refusal.empty() ? std::string("not resolved in time") : "resolve refused it: " + refusal);
 }
 
 std::string RecordLine() {
