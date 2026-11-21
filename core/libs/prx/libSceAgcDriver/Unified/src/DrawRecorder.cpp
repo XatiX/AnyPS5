@@ -291,6 +291,53 @@ bool copiesBackSmallWrites() {
 }
 
 std::atomic<std::uint32_t> shapeNotes{0};
+
+constexpr std::uint64_t OutputProbeLimitBytes = 4ull << 20u;
+constexpr std::uint32_t OutputProbePrints = 6;
+
+bool probesOutput(std::uint64_t codeAddress) {
+    static const char* list = std::getenv("APS5_RECODE_PROBE_OUTPUT");
+    return list != nullptr && *list != '\0' && Downgrades::Active() && Downgrades::ListedHash(list, Downgrades::ProgramHash(codeAddress));
+}
+
+bool outputProbeDue(std::uint64_t codeAddress) {
+    static std::mutex mutex;
+    static std::unordered_map<std::uint64_t, std::pair<std::uint64_t, std::uint32_t>> seen;
+    static const auto started = std::chrono::steady_clock::now();
+    static const std::uint64_t after = [] {
+        const char* value = std::getenv("APS5_RECODE_PROBE_AFTER");
+        return value != nullptr ? static_cast<std::uint64_t>(std::max(std::atoi(value), 0)) : std::uint64_t{80};
+    }();
+    if (static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::seconds>(std::chrono::steady_clock::now() - started).count()) < after) return false;
+    std::lock_guard lock(mutex);
+    auto& entry = seen[codeAddress];
+    if (entry.second >= OutputProbePrints) return false;
+    ++entry.second;
+    return true;
+}
+
+void printOutput(std::uint64_t codeAddress, const char* route, std::uint64_t address, std::span<const std::byte> bytes) {
+    std::uint64_t nonZero = 0;
+    std::uint64_t sum = 0;
+    std::uint32_t orAll = 0;
+    std::array<std::uint64_t, 16> bits{};
+    const auto words = bytes.size() / sizeof(std::uint32_t);
+    for (std::size_t index = 0; index < words; ++index) {
+        std::uint32_t word = 0;
+        std::memcpy(&word, bytes.data() + index * sizeof(word), sizeof(word));
+        if (word == 0u) continue;
+        ++nonZero;
+        sum += word;
+        orAll |= word;
+        for (std::uint32_t bit = 0; bit < bits.size(); ++bit) bits[bit] += (word >> bit) & 1u;
+    }
+    std::string line;
+    char text[160];
+    std::snprintf(text, sizeof(text), "[recode-output] %016llx %s 0x%llx+0x%llx: %llu of %llu words non-zero, sum 0x%llx, or 0x%08x, bits", static_cast<unsigned long long>(Downgrades::ProgramHash(codeAddress)), route, static_cast<unsigned long long>(address), static_cast<unsigned long long>(bytes.size()), static_cast<unsigned long long>(nonZero), static_cast<unsigned long long>(words), static_cast<unsigned long long>(sum), orAll);
+    line = text;
+    for (const auto count : bits) line += " " + std::to_string(count);
+    std::fprintf(stderr, "%s\n", line.c_str());
+}
 std::atomic<std::uint64_t> recordedFills{0};
 std::atomic<std::uint64_t> recordedCopies{0};
 
@@ -704,6 +751,17 @@ public:
         std::unique_lock lock(mutex);
         const bool excluded = excludedStages(dispatch, reason);
         if (!excluded && dispatchPrecheck(dispatch, reason) && pipelineReady(context, owner, dispatch, lock, reason)) return true;
+        if (excluded && !dispatch.stages.empty() && context.recorder != nullptr && probesOutput(dispatch.stages.front().program.codeAddress) && outputProbeDue(dispatch.stages.front().program.codeAddress)) {
+            const auto codeAddress = dispatch.stages.front().program.codeAddress;
+            for (std::size_t index = 0; index < dispatch.uses.size() && index < dispatch.imageBegin; ++index) {
+                const auto& use = dispatch.uses[index];
+                if (!use.write || use.size == 0u || use.size > OutputProbeLimitBytes) continue;
+                context.recorder->OnComplete([codeAddress, address = use.address, size = use.size] {
+                    if (!GuestMemory::Accessible(reinterpret_cast<const std::byte*>(address), static_cast<std::size_t>(size), false)) return;
+                    printOutput(codeAddress, "existing-path", address, std::span(reinterpret_cast<const std::byte*>(address), static_cast<std::size_t>(size)));
+                });
+            }
+        }
         noteStages(dispatch, Downgrades::Kind::ExistingPath, reason);
         if (!excluded) Downgrades::RefuseExistingPath(dispatch.stages.empty() ? 0u : dispatch.stages.front().program.codeAddress, "dispatch", reason);
         totals.dispatchExisting++;
@@ -734,6 +792,34 @@ public:
         refuse("dispatch " + reason);
         Downgrades::RefuseExistingPath(dispatch.stages.empty() ? 0u : dispatch.stages.front().program.codeAddress, "dispatch", "dropped while recording: " + reason);
         return false;
+    }
+
+    void probeOutputs(const Context& context, Graphics::Recorder& recorder, VkCommandBuffer commands, const Resolve::ResolvedDraw& dispatch, std::uint64_t codeAddress) {
+        auto& residency = ResidencyService::Get();
+        const auto copy = context.Function<PFN_vkCmdCopyBuffer>("vkCmdCopyBuffer");
+        for (std::size_t index = 0; index < dispatch.uses.size() && index < dispatch.imageBegin; ++index) {
+            const auto& use = dispatch.uses[index];
+            if (!use.write || use.size == 0u || use.size > OutputProbeLimitBytes) continue;
+            VkBuffer source = VK_NULL_HANDLE;
+            VkDeviceSize offset = 0;
+            const char* where = "residency";
+            if (const auto span = residency.WrittenImportAny(use.address, use.size) ? std::nullopt : residency.Translate(use.address, use.size)) {
+                source = reinterpret_cast<VkBuffer>(static_cast<std::uintptr_t>(span->handle));
+                offset = span->offset;
+            } else if (const auto* import = Graphics::HostImportFor(context, use.address, static_cast<std::size_t>(use.size)); import != nullptr) {
+                source = import->buffer;
+                offset = Graphics::HostImportOffset(*import, use.address);
+                where = "import";
+            }
+            if (source == VK_NULL_HANDLE) continue;
+            auto buffer = std::make_shared<Graphics::Buffer>(context, static_cast<std::size_t>(use.size), VK_BUFFER_USAGE_TRANSFER_DST_BIT);
+            Graphics::RecordMemoryBarrier(context, commands, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_ACCESS_SHADER_WRITE_BIT | VK_ACCESS_TRANSFER_WRITE_BIT, VK_ACCESS_TRANSFER_READ_BIT);
+            const VkBufferCopy region{offset, 0, use.size};
+            copy(commands, source, buffer->Handle(), 1, &region);
+            Graphics::RecordMemoryBarrier(context, commands, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT | VK_PIPELINE_STAGE_HOST_BIT, VK_ACCESS_TRANSFER_WRITE_BIT, VK_ACCESS_HOST_READ_BIT | VK_ACCESS_MEMORY_READ_BIT);
+            recorder.Keep(buffer);
+            recorder.OnComplete([buffer, codeAddress, address = use.address, where] { printOutput(codeAddress, where, address, buffer->Bytes()); });
+        }
     }
 
     void noteUses(const Resolve::ResolvedDraw& work, const char* what) {
@@ -1945,6 +2031,7 @@ private:
         recorder->EndGpuTiming(dispatchTiming);
         Graphics::RecordMemoryBarrier(context, commands, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT | VK_PIPELINE_STAGE_HOST_BIT, VK_ACCESS_SHADER_WRITE_BIT, VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT | VK_ACCESS_UNIFORM_READ_BIT | VK_ACCESS_TRANSFER_READ_BIT | VK_ACCESS_TRANSFER_WRITE_BIT | VK_ACCESS_INDIRECT_COMMAND_READ_BIT | VK_ACCESS_INDEX_READ_BIT | VK_ACCESS_VERTEX_ATTRIBUTE_READ_BIT | VK_ACCESS_COLOR_ATTACHMENT_READ_BIT | VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_READ_BIT | VK_ACCESS_HOST_READ_BIT);
         recordCopyBacks(context, commands, serial);
+        if (probesOutput(stage.program.codeAddress) && outputProbeDue(stage.program.codeAddress)) probeOutputs(context, *recorder, commands, dispatch, stage.program.codeAddress);
 
         recorder->Keep(pipeline);
         for (const auto& owned : stage.owners) recorder->Keep(std::const_pointer_cast<void>(owned));

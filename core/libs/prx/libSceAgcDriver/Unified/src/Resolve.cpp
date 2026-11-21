@@ -512,6 +512,20 @@ private:
                     if (((request.words[0] >> 20u) & 1u) != 0u) Downgrades::NoteCurrent(Downgrades::Kind::SamplerMode, static_cast<std::uint32_t>(index), "sampler forces sRGB decoding; its texture is bound without an sRGB view");
                     if (((request.words[0] >> 15u) & 1u) != 0u) Downgrades::NoteCurrent(Downgrades::Kind::SamplerMode, static_cast<std::uint32_t>(index), "sampler uses unnormalized coordinates; bound as normalized");
                 }
+                std::uint32_t bindingIndex = 0;
+                for (const auto& binding : stage.result->bindings) {
+                    const auto any = [](const ShaderRecompiler::ElementFlags& flags) {
+                        for (std::size_t element = 0; element < flags.size(); ++element) {
+                            if (flags[element]) return true;
+                        }
+                        return false;
+                    };
+                    if (any(binding.imageUnnormalized)) Downgrades::NoteCurrent(Downgrades::Kind::SamplerMode, 0x100u + bindingIndex, any(binding.imageUnnormalizedBaseLevel) ? "image fetched with unnormalized coordinates at its base level; no base-level view is chosen" : "image fetched with unnormalized coordinates");
+                    if (any(binding.samplerCoordinatesIgnored)) Downgrades::NoteCurrent(Downgrades::Kind::SamplerMode, 0x200u + bindingIndex, "sampler whose coordinates are ignored; its unnormalized bit is not cleared");
+                    if (any(binding.samplerIntegerBorder)) Downgrades::NoteCurrent(Downgrades::Kind::SamplerMode, 0x300u + bindingIndex, "sampler with an integer border colour; bound with a float border");
+                    if (any(binding.samplerUnnormalized)) Downgrades::NoteCurrent(Downgrades::Kind::SamplerMode, 0x400u + bindingIndex, "sampler proven unnormalized; bound as normalized");
+                    ++bindingIndex;
+                }
             }
             partStarted = std::chrono::steady_clock::now();
             ResolvedStage resolved{std::move(stage), {}};
