@@ -35,6 +35,7 @@
 #include <algorithm>
 #include <array>
 #include <chrono>
+#include <cmath>
 #include <condition_variable>
 #include <cstdio>
 #include <cstdlib>
@@ -506,6 +507,7 @@ bool copiesInputs() {
     return copies;
 }
 
+constexpr std::size_t ExtentsShown = 3;
 bool shaderDataBinding(const Resolve::ResolvedStage& stage, std::uint32_t index) {
     const auto& bindings = stage.program.result->bindings;
     return index < bindings.size() && bindings[index].role == ShaderRecompiler::DescriptorRole::ShaderData;
@@ -757,6 +759,7 @@ public:
         if (excluded && !dispatch.stages.empty() && context.recorder != nullptr && probesOutput(dispatch.stages.front().program.codeAddress) && outputProbeDue(dispatch.stages.front().program.codeAddress)) {
             const auto codeAddress = dispatch.stages.front().program.codeAddress;
             for (std::size_t index = 0; index < dispatch.uses.size() && index < dispatch.imageBegin; ++index) {
+            noteExtent(draw);
                 const auto& use = dispatch.uses[index];
                 if (!use.write || use.size == 0u || use.size > OutputProbeLimitBytes) continue;
                 context.recorder->OnComplete([codeAddress, address = use.address, size = use.size] {
@@ -929,6 +932,7 @@ private:
             reason = "residency service did not attach";
             return false;
         }
+        line += "\n" + extentLine();
         device = context.device;
         alignment = std::max<std::uint64_t>(context.limits.minStorageBufferOffsetAlignment, 16u);
         const auto ringMemory = ResidencyService::ShaderReadMemory(context, RingBytes);
@@ -936,6 +940,43 @@ private:
         ring = std::make_shared<Graphics::Buffer>(context, RingBytes + RingZeroBytes, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_INDIRECT_BUFFER_BIT | VK_BUFFER_USAGE_VERTEX_BUFFER_BIT | VK_BUFFER_USAGE_INDEX_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_SRC_BIT | addressable, ringMemory);
         std::memset(ring->Bytes().data() + RingBytes, 0, RingZeroBytes);
         ringAddress = addressable != 0u ? ring->DeviceAddress() : 0u;
+    void noteExtent(const Resolve::ResolvedDraw& draw) {
+        if (draw.state == nullptr) return;
+        const auto width = static_cast<std::uint32_t>(std::lround(std::fabs(draw.state->viewport.width)));
+        const auto height = static_cast<std::uint32_t>(std::lround(std::fabs(draw.state->viewport.height)));
+        ++extents[{width, height}];
+    }
+
+    std::string extentLine() {
+        std::vector<std::pair<std::uint64_t, std::pair<std::uint32_t, std::uint32_t>>> ranked;
+        std::uint64_t total = 0;
+        std::uint64_t draws = 0;
+        for (const auto& [size, count] : extents) {
+            const auto pixels = count * size.first * size.second;
+            ranked.emplace_back(pixels, size);
+            total += pixels;
+            draws += count;
+        }
+        extents.clear();
+        if (total == 0u) return "[recode-extent] none";
+        std::ranges::sort(ranked, std::greater{});
+        std::string line = "[recode-extent]";
+        std::uint64_t shown = 0;
+        char part[64];
+        for (std::size_t index = 0; index < ranked.size() && index < ExtentsShown; ++index) {
+            const auto& [count, size] = ranked[index];
+            std::snprintf(part, sizeof(part), " %ux%u %llu%%", size.first, size.second, static_cast<unsigned long long>(count * 100u / total));
+            line += part;
+            shown += count;
+        }
+        if (shown < total) {
+            std::snprintf(part, sizeof(part), " other %llu%%", static_cast<unsigned long long>((total - shown) * 100u / total));
+            line += part;
+        }
+        std::snprintf(part, sizeof(part), " of the pixels drawn; %llu draws", static_cast<unsigned long long>(draws));
+        return line + part;
+    }
+
         space.emplace(RingBytes, alignment);
         std::fprintf(stderr, "[recode-record] ring %llu MiB, alignment %llu, %s memory\n", static_cast<unsigned long long>(RingBytes >> 20u), static_cast<unsigned long long>(alignment), (ringMemory & VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT) != 0 ? "device" : "host");
         return true;
@@ -2912,6 +2953,7 @@ void PublishRecords(const Graphics::Context& context, std::uint64_t address, std
         const auto commands = context.recorder->Commands();
         const auto levels = std::min(static_cast<std::uint32_t>(std::max<std::size_t>(vulkan->Geometry().mips.size(), 1u)), std::max(descriptor.mipCount, 1u));
         const auto layers = std::min(std::max(vulkan->Geometry().imageLayers, 1u), std::max(upstream->ImageLayers(), 1u));
+    std::map<std::pair<std::uint32_t, std::uint32_t>, std::uint64_t> extents;
         Images::CopyImageContent(context, commands, vulkan->Image(), upstream->Image(), resource.width, resource.height, levels, layers);
         context.recorder->Keep(record);
         context.recorder->Keep(upstream);
