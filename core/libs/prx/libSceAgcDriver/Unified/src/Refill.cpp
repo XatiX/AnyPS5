@@ -1,4 +1,5 @@
 #include "prx/libSceAgcDriver/Unified/include/Refill.hpp"
+#include <cstdlib>
 #include <utility>
 
 namespace AgcDriver::Unified::Heap {
@@ -73,9 +74,12 @@ std::uint32_t Refill::FillOne(const SlotRequest& request, std::string& reason, S
 std::uint32_t Refill::image(const SlotRequest& request, std::string& reason, Span& memory, std::shared_ptr<const void>& owner) {
     if ((request.flags & RequestFlag::Inactive) != 0u) return 0u;
     const auto key = KeyOf(request);
-    if (const auto hit = memo.Find(key, &memory, &owner)) {
-        counts.memoHits++;
-        return *hit;
+    static const bool memoized = std::getenv("APS5_RECODE_NO_IMAGE_MEMO") == nullptr;
+    if (memoized) {
+        if (const auto hit = memo.Find(key, &memory, &owner)) {
+            counts.memoHits++;
+            return *hit;
+        }
     }
     const auto before = memo.Now();
     counts.lookups++;
