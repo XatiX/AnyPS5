@@ -99,6 +99,7 @@ std::string_view KindName(Kind kind) {
         case Kind::KnownShort: return "known-short";
         case Kind::SampledAhead: return "sampled-ahead";
         case Kind::ViewMismatch: return "view-mismatch";
+        case Kind::ImageResultsDropped: return "image-results-dropped";
         default: return "unknown";
     }
 }
@@ -112,7 +113,8 @@ Severity SeverityOf(Kind kind) {
         case Kind::TemplateMismatch:
         case Kind::KnownShort:
         case Kind::SampledAhead:
-        case Kind::ViewMismatch: return Severity::Severe;
+        case Kind::ViewMismatch:
+        case Kind::ImageResultsDropped: return Severity::Severe;
         case Kind::ExistingPath:
         case Kind::StorageRecordMissing:
         case Kind::UpstreamSampled:
@@ -360,6 +362,55 @@ void NoteHashed(std::uint64_t hash, Kind kind, std::uint32_t binding, std::strin
 void Note(std::uint64_t codeAddress, Kind kind, std::uint32_t binding, std::string_view detail) {
     if (!Active()) return;
     NoteHashed(ProgramHash(codeAddress), kind, binding, detail);
+}
+
+namespace {
+
+struct GuestWrite {
+    const char* what = nullptr;
+    std::uint64_t begin = 0;
+    std::uint64_t end = 0;
+    std::chrono::steady_clock::time_point at;
+};
+
+constexpr std::size_t JournalEntries = 8192;
+
+struct GuestWriteJournal {
+    std::mutex mutex;
+    std::vector<GuestWrite> entries = std::vector<GuestWrite>(JournalEntries);
+    std::size_t next = 0;
+};
+
+GuestWriteJournal& journal() {
+    static auto* value = new GuestWriteJournal;
+    return *value;
+}
+
+}
+
+void NoteGuestWrite(const char* what, std::uint64_t address, std::uint64_t bytes) {
+    if (!Active() || bytes == 0u) return;
+    auto& log = journal();
+    std::lock_guard lock(log.mutex);
+    log.entries[log.next++ % JournalEntries] = {what, address, address + bytes, std::chrono::steady_clock::now()};
+}
+
+void NoteImageResultsDropped(std::uint64_t address, std::uint64_t bytes) {
+    if (!Active()) return;
+    char text[160];
+    std::snprintf(text, sizeof(text), "image 0x%llx+0x%llx: no recode write to its memory in the journal", static_cast<unsigned long long>(address), static_cast<unsigned long long>(bytes));
+    {
+        auto& log = journal();
+        std::lock_guard lock(log.mutex);
+        const auto now = std::chrono::steady_clock::now();
+        for (std::size_t back = 1; back <= JournalEntries && back <= log.next; ++back) {
+            const auto& entry = log.entries[(log.next - back) % JournalEntries];
+            if (entry.what == nullptr || entry.begin >= address + bytes || address >= entry.end) continue;
+            std::snprintf(text, sizeof(text), "image 0x%llx+0x%llx: last recode write to its memory was %s 0x%llx+0x%llx, %lld ms before", static_cast<unsigned long long>(address), static_cast<unsigned long long>(bytes), entry.what, static_cast<unsigned long long>(entry.begin), static_cast<unsigned long long>(entry.end - entry.begin), static_cast<long long>(std::chrono::duration_cast<std::chrono::milliseconds>(now - entry.at).count()));
+            break;
+        }
+    }
+    NoteHashed(0u, Kind::ImageResultsDropped, static_cast<std::uint32_t>(address >> 16u), text);
 }
 
 ExistingPath ExistingPathMode() {

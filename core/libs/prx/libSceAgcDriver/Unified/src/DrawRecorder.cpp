@@ -824,6 +824,7 @@ private:
         if (landing.empty()) return;
         const auto written = std::move(landing);
         landing.clear();
+        for (const auto& [begin, size] : written) Downgrades::NoteGuestWrite("a landed GPU write", begin, size);
         Shadow::LandGpuWrites(written);
         std::vector<std::pair<std::uint64_t, std::uint64_t>> ends;
         ends.reserve(written.size());
@@ -858,6 +859,7 @@ private:
             copied = true;
             const VkBufferCopy region{span->offset, Graphics::HostImportOffset(*import, begin), bytes};
             copy(commands, reinterpret_cast<VkBuffer>(static_cast<std::uintptr_t>(span->handle)), import->buffer, 1, &region);
+            Downgrades::NoteGuestWrite("a chunk switch copying residency pages to the import", begin, bytes);
             totals.switchBytes += bytes;
         }
         return residency.MapWrittenImport(chunk, import->address + (chunk - import->base));
@@ -1019,6 +1021,7 @@ private:
             }
             covered.emplace_back(back.address, end);
             ends.emplace_back(back.address, end);
+            Downgrades::NoteGuestWrite("a copy-back to the import", back.address, back.bytes);
             if (keepsGpuWrittenPages()) clearResidencyNewer(back.address, end);
             totals.copyBacks++;
         }

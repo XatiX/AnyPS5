@@ -30,6 +30,7 @@ enum class Kind : std::uint32_t {
     KnownShort,
     SampledAhead,
     ViewMismatch,
+    ImageResultsDropped,
     Count,
 };
 
@@ -93,6 +94,8 @@ void NotePipeline(std::uint64_t pipeline, std::uint64_t codeAddress, std::uint64
 enum class ExistingPath : std::uint8_t { Abort, Log, Allow };
 [[nodiscard]] ExistingPath ExistingPathMode();
 void RefuseExistingPath(std::uint64_t codeAddress, std::string_view work, std::string_view reason);
+void NoteGuestWrite(const char* what, std::uint64_t address, std::uint64_t bytes);
+void NoteImageResultsDropped(std::uint64_t address, std::uint64_t bytes);
 void DumpModule(std::uint64_t codeAddress, std::uint64_t module, std::span<const std::uint32_t> words);
 void Report();
 

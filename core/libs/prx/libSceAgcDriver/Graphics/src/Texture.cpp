@@ -61,6 +61,7 @@
 #include <unistd.h>
 #endif
 #if ANYPS5_UNIFIED
+#include "prx/libSceAgcDriver/Unified/include/Downgrades.hpp"
 #include "prx/libSceAgcDriver/Unified/include/Events.hpp"
 #include "prx/libSceAgcDriver/Unified/include/Targets.hpp"
 #endif
@@ -2937,6 +2938,9 @@ bool StorageTexture::refresh(std::uint32_t firstLayer, std::uint32_t lastLayer) 
     if (pendingResults) {
         static std::atomic<int> reports{0};
         if (reports.fetch_add(1) < 8) std::fprintf(stderr, "[gpu] storage image 0x%llx: guest memory changed while GPU results were pending; keeping the CPU's blocks\n", static_cast<unsigned long long>(descriptor.baseAddress));
+#if ANYPS5_UNIFIED
+        AgcDriver::Unified::Downgrades::NoteImageResultsDropped(descriptor.baseAddress, guestBytes);
+#endif
     }
     if (anyStored) {
         const auto previous = std::exchange(flushReason, "refresh");
