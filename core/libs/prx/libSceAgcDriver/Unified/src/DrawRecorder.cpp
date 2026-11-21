@@ -1574,7 +1574,7 @@ private:
         buildingPipelines.insert(key);
         pipelineJobs.push_back(std::move(job));
         totals.pipelinesQueued++;
-        if (!builder.joinable()) builder = std::thread([this] { buildPipelines(); });
+        while (builders.size() < pipelineBuilderCount()) builders.emplace_back([this] { buildPipelines(); });
         jobsReady.notify_one();
         return true;
     }
@@ -1599,10 +1599,16 @@ private:
             const auto built = elapsed(started);
             if (job->result != nullptr) Downgrades::DumpModule(job->codeAddress, job->result->spirv.ContentHash().low, std::span<const std::uint32_t>(job->result->spirv.data(), job->result->spirv.size()));
             Downgrades::NoteBuild(job->codeAddress, built, job->result != nullptr ? job->result->spirv.size() * sizeof(std::uint32_t) : 0u, job->result != nullptr ? job->result->spirv.ContentHash().low : 0u, job->key.size() > 2u ? Downgrades::HashCode(std::as_bytes(std::span(job->key).subspan(2))) : 0u);
+            bool save = false;
             {
                 std::lock_guard lock(pipelineMutex);
                 buildingPipelines.erase(job->key);
                 buildNanoseconds += built;
+                unsavedBuildNanoseconds += made != nullptr ? built : 0u;
+                if (unsavedBuildNanoseconds >= UnsavedBuildNanoseconds && job->owner != nullptr) {
+                    save = true;
+                    unsavedBuildNanoseconds = 0;
+                }
                 if (made != nullptr) {
                     computePipelines.emplace(std::move(job->key), std::move(made));
                     builtPipelines++;
@@ -1612,12 +1618,16 @@ private:
                 }
                 pipelinesDone.notify_all();
             }
-            unsavedBuildNanoseconds += made != nullptr ? built : 0u;
-            if (unsavedBuildNanoseconds >= UnsavedBuildNanoseconds && job->owner != nullptr) {
-                job->owner->SavePipelineCache();
-                unsavedBuildNanoseconds = 0;
-            }
+            if (save) job->owner->SavePipelineCache();
         }
+    }
+
+    static std::uint32_t pipelineBuilderCount() {
+        static const std::uint32_t count = [] {
+            if (const char* value = std::getenv("APS5_RECODE_PIPELINE_BUILDERS"); value != nullptr && std::atoi(value) > 0) return static_cast<std::uint32_t>(std::atoi(value));
+            return std::clamp(std::thread::hardware_concurrency() / 2u, 1u, 4u);
+        }();
+        return count;
     }
 
     bool recordDispatch(const Context& context, const Resolve::ResolvedDraw& dispatch, const std::array<std::uint32_t, 3>& groups, std::string& reason) {
@@ -2417,7 +2427,7 @@ private:
     std::mutex pipelineMutex;
     std::condition_variable jobsReady;
     std::condition_variable pipelinesDone;
-    std::thread builder;
+    std::vector<std::thread> builders;
     VkDescriptorSetLayout emptyLayout = VK_NULL_HANDLE;
     Totals totals;
 };
