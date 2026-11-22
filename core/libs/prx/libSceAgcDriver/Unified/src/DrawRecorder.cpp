@@ -2424,7 +2424,10 @@ private:
             const double mean = counted == 0u ? 0.0 : sum / static_cast<double>(counted);
             if (read) std::fprintf(stderr, "[recode-nan-read] %u program %016llx reads record 0x%llx %ux%u mips %u vk%u: %llu non-finite values, %llu at or above 32768, mean %.4f", sequence, static_cast<unsigned long long>(program), static_cast<unsigned long long>(address), width, height, mips, static_cast<unsigned>(format), static_cast<unsigned long long>(bad), static_cast<unsigned long long>(huge), mean);
             if (read) std::fputc(10, stderr);
-            else if (bad != 0u || huge != 0u) std::fprintf(stderr, read ? "[recode-nan-read] %u program %016llx reads record 0x%llx %ux%u mips %u vk%u: %llu non-finite values, %llu at or above 32768\n" : "[recode-nan] %u program %016llx record 0x%llx %ux%u mips %u vk%u: %llu non-finite values, %llu at or above 32768\n", sequence, static_cast<unsigned long long>(program), static_cast<unsigned long long>(address), width, height, mips, static_cast<unsigned>(format), static_cast<unsigned long long>(bad), static_cast<unsigned long long>(huge));
+            else if (censusSize().first != 0u) {
+                std::fprintf(stderr, "[recode-nan] %u program %016llx record 0x%llx %ux%u mips %u vk%u: %llu non-finite values, %llu at or above 32768, mean %.4f", sequence, static_cast<unsigned long long>(program), static_cast<unsigned long long>(address), width, height, mips, static_cast<unsigned>(format), static_cast<unsigned long long>(bad), static_cast<unsigned long long>(huge), mean);
+                std::fputc(10, stderr);
+            } else if (bad != 0u || huge != 0u) std::fprintf(stderr, read ? "[recode-nan-read] %u program %016llx reads record 0x%llx %ux%u mips %u vk%u: %llu non-finite values, %llu at or above 32768\n" : "[recode-nan] %u program %016llx record 0x%llx %ux%u mips %u vk%u: %llu non-finite values, %llu at or above 32768\n", sequence, static_cast<unsigned long long>(program), static_cast<unsigned long long>(address), width, height, mips, static_cast<unsigned>(format), static_cast<unsigned long long>(bad), static_cast<unsigned long long>(huge));
         });
     }
 
