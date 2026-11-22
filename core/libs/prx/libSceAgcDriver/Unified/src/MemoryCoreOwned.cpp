@@ -3,7 +3,9 @@
 #include "prx/libSceAgcDriver/Unified/include/Events.hpp"
 #include <algorithm>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
+#include <string_view>
 
 namespace AgcDriver::Unified {
 
@@ -11,6 +13,14 @@ namespace {
 
 constexpr std::uint64_t pageOf(std::uint64_t address) {
     return address & ~(PageBytes - 1);
+}
+
+bool chainsLandings() {
+    static const bool chains = [] {
+        const char* value = std::getenv("APS5_RECODE_CHAINED_LANDINGS");
+        return value == nullptr || std::string_view(value) != "0";
+    }();
+    return chains;
 }
 
 }
@@ -39,29 +49,23 @@ GpuWriteMark MemoryCore::NoteGpuWrite(std::uint64_t address, std::uint64_t size,
     if (size == 0) return mark;
     written.Note(address, size, serial);
     auto* current = host.load(std::memory_order_acquire);
-    if (current == nullptr || current->View(address, static_cast<std::size_t>(size)) == nullptr) {
-        if (current != nullptr && unviewedReports.fetch_add(1, std::memory_order_relaxed) < UnviewedReports) {
-            const auto firstPage = pageOf(address);
-            const auto lastPage = pageOf(address + size - 1);
-            std::fprintf(stderr, "[recode-gpu-owned] write outside the second view: 0x%llx+0x%llx, %s memory; first page %s, last page %s\n", static_cast<unsigned long long>(address), static_cast<unsigned long long>(size), Protector::RegionKind(address), current->View(firstPage, PageBytes) != nullptr ? "viewed" : "not viewed", current->View(lastPage, PageBytes) != nullptr ? "viewed" : "not viewed");
-        }
-        std::uint64_t readableBytes = 0;
-        for (const auto& range : Protector::ReadableRanges(address, size)) {
-            mark.open.push_back(range);
-            readableBytes += range.size;
-        }
-        unviewedBytes.fetch_add(readableBytes, std::memory_order_relaxed);
-        gpuOnlyBytes.fetch_add(size - readableBytes, std::memory_order_relaxed);
-        if (readableBytes != size) {
-            std::uint64_t cursor = address;
-            for (const auto& range : mark.open) {
-                if (range.address > cursor) written.Discard(cursor, range.address - cursor);
-                cursor = range.address + range.size;
-            }
-            if (cursor < address + size) written.Discard(cursor, address + size - cursor);
-        }
+    if (current != nullptr && current->PatientView(address, static_cast<std::size_t>(size)) != nullptr) {
+        takeViewed(mark, address, size, takeDirty);
         return mark;
     }
+    const auto viewed = current != nullptr ? current->ViewedPieces(address, size) : std::vector<DirtyRange>{};
+    auto cursor = address;
+    for (const auto& piece : viewed) {
+        if (piece.address > cursor) leaveUnviewed(mark, cursor, piece.address - cursor, current);
+        takeViewed(mark, piece.address, piece.size, takeDirty);
+        cursor = piece.address + piece.size;
+    }
+    if (cursor < address + size) leaveUnviewed(mark, cursor, address + size - cursor, current);
+    if (!viewed.empty()) pieceWrites.fetch_add(1, std::memory_order_relaxed);
+    return mark;
+}
+
+void MemoryCore::takeViewed(GpuWriteMark& mark, std::uint64_t address, std::uint64_t size, bool takeDirty) {
     std::lock_guard lock(mutex);
     auto take = pages.TakeForGpu(address, size, takeDirty);
     protector.Apply(take.changes);
@@ -72,10 +76,38 @@ GpuWriteMark MemoryCore::NoteGpuWrite(std::uint64_t address, std::uint64_t size,
     for (const auto& range : take.open) open += range.size;
     ownedPages.fetch_add(owned, std::memory_order_relaxed);
     openBytes.fetch_add(open, std::memory_order_relaxed);
-    mark.owned = std::move(take.owned);
-    mark.open = std::move(take.open);
-    mark.upload = std::move(take.dirty);
-    return mark;
+    mark.owned.insert(mark.owned.end(), take.owned.begin(), take.owned.end());
+    mark.open.insert(mark.open.end(), take.open.begin(), take.open.end());
+    mark.upload.insert(mark.upload.end(), take.dirty.begin(), take.dirty.end());
+}
+
+void MemoryCore::leaveUnviewed(GpuWriteMark& mark, std::uint64_t address, std::uint64_t size, MemoryHost* current) {
+    if (current != nullptr && unviewedReports.fetch_add(1, std::memory_order_relaxed) < UnviewedReports) {
+        const auto firstPage = pageOf(address);
+        const auto lastPage = pageOf(address + size - 1);
+        std::fprintf(stderr, "[recode-gpu-owned] write outside the second view: 0x%llx+0x%llx, %s memory; first page %s, last page %s\n", static_cast<unsigned long long>(address), static_cast<unsigned long long>(size), Protector::RegionKind(address), current->View(firstPage, PageBytes) != nullptr ? "viewed" : "not viewed", current->View(lastPage, PageBytes) != nullptr ? "viewed" : "not viewed");
+    }
+    const auto drop = [&](std::uint64_t begin, std::uint64_t stop) {
+        std::lock_guard lock(mutex);
+        for (auto at = begin; at < stop;) {
+            const auto next = std::min(stop, pageOf(at) + PageBytes);
+            if (pages.StateOf(pageOf(at)) == PageState::GpuOwned) {
+                ownedUnviewedBytes.fetch_add(next - at, std::memory_order_relaxed);
+            } else {
+                written.Discard(at, next - at);
+                gpuOnlyBytes.fetch_add(next - at, std::memory_order_relaxed);
+            }
+            at = next;
+        }
+    };
+    auto cursor = address;
+    for (const auto& range : Protector::ReadableRanges(address, size)) {
+        if (range.address > cursor) drop(cursor, range.address);
+        mark.open.push_back(range);
+        unviewedBytes.fetch_add(range.size, std::memory_order_relaxed);
+        cursor = range.address + range.size;
+    }
+    if (cursor < address + size) drop(cursor, address + size);
 }
 
 void MemoryCore::NoteLandedGpuWrite(std::uint64_t address, std::uint64_t size, std::uint64_t serial) {
@@ -88,9 +120,21 @@ void MemoryCore::LandDiff(std::uint64_t address, std::span<const std::byte> befo
     if (bytes == 0) return;
     auto* current = host.load(std::memory_order_acquire);
     if (current == nullptr) return;
+    if (auto* view = current->PatientView(address, bytes); view != nullptr) {
+        landDiffThrough(view, address, before.first(bytes), after.first(bytes), serial, *current);
+        return;
+    }
+    for (const auto& piece : current->ViewedPieces(address, bytes)) {
+        auto* view = current->View(piece.address, static_cast<std::size_t>(piece.size));
+        if (view == nullptr) continue;
+        const auto offset = static_cast<std::size_t>(piece.address - address);
+        landDiffThrough(view, piece.address, before.subspan(offset, static_cast<std::size_t>(piece.size)), after.subspan(offset, static_cast<std::size_t>(piece.size)), serial, *current);
+    }
+}
+
+void MemoryCore::landDiffThrough(std::byte* view, std::uint64_t address, std::span<const std::byte> before, std::span<const std::byte> after, std::uint64_t serial, MemoryHost& current) {
+    const auto bytes = before.size();
     std::unique_lock lock(mutex);
-    auto* view = current->View(address, bytes);
-    if (view == nullptr) return;
     Downgrades::WatchTouch("a diff landing", address, bytes);
     std::uint64_t changed = 0;
     for (std::size_t at = 0; at < bytes;) {
@@ -104,13 +148,39 @@ void MemoryCore::LandDiff(std::uint64_t address, std::span<const std::byte> befo
         changed += stop - at;
         at = stop;
     }
+    const auto last = landedDiffs.find(address);
+    const std::byte* previous = last != landedDiffs.end() && last->second.size() == bytes ? last->second.data() : nullptr;
+    std::uint64_t chained = 0;
+    std::uint64_t foreign = 0;
+    for (std::size_t at = 0; at < bytes; ++at) {
+        if (view[at] == after[at]) continue;
+        if (previous == nullptr || view[at] != previous[at] || before[at] == previous[at]) {
+            ++foreign;
+            continue;
+        }
+        ++chained;
+        if (chainsLandings()) view[at] = after[at];
+    }
+    if (last != landedDiffs.end()) landedDiffBytes -= last->second.size();
+    if (landedDiffBytes + bytes > LandedDiffBudgetBytes) {
+        landedDiffs.clear();
+        landedDiffBytes = 0;
+    }
+    landedDiffs[address].assign(after.begin(), after.end());
+    landedDiffBytes += bytes;
+    if ((chained != 0 || foreign != 0) && diffReports.fetch_add(1, std::memory_order_relaxed) < DiffReports) {
+        std::fprintf(stderr, "[recode-gpu-owned] diff landing 0x%llx+0x%llx (batch %llu): %llu bytes behind an older landing%s, %llu bytes left unlike the mirror\n", static_cast<unsigned long long>(address), static_cast<unsigned long long>(bytes), static_cast<unsigned long long>(serial), static_cast<unsigned long long>(chained), chainsLandings() ? " brought up" : " left", static_cast<unsigned long long>(foreign));
+    }
+    diffChainedBytes.fetch_add(chained, std::memory_order_relaxed);
+    diffForeignBytes.fetch_add(foreign, std::memory_order_relaxed);
+    if (chainsLandings()) changed += chained;
     written.Take(address, bytes, serial);
     diffLandedBytes.fetch_add(changed, std::memory_order_relaxed);
     diffUnchangedBytes.fetch_add(bytes - changed, std::memory_order_relaxed);
     if (changed != 0) Events::Shared().Note(address, bytes);
     const bool stale = std::memcmp(view, after.data(), bytes) != 0;
     lock.unlock();
-    if (stale) current->Upload(address, bytes);
+    if (stale) current.Upload(address, bytes);
 }
 
 void MemoryCore::openWithPreImage(std::uint64_t page) {

@@ -1722,8 +1722,8 @@ private:
         for (const auto& range : mark.open) {
             if (!knownWrites.empty() && knownWrites.back().serial == serial && knownWrites.back().address == range.address && knownWrites.back().bytes == range.size) continue;
             std::shared_ptr<const std::vector<std::byte>> before;
-            const auto* view = static_cast<const std::byte*>(GuestMemory::OwnStoreTarget(range.address, static_cast<std::size_t>(range.size)));
-            if (view != reinterpret_cast<const std::byte*>(range.address) && range.size <= KnownBufferLimitBytes) {
+            const auto* view = Mirror::PatientView(range.address, static_cast<std::size_t>(range.size));
+            if (view != nullptr && range.size <= KnownBufferLimitBytes) {
                 before = std::make_shared<const std::vector<std::byte>>(view, view + range.size);
                 totals.edgeSnapshotBytes += range.size;
             }
