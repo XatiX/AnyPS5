@@ -579,7 +579,10 @@ bool dumpsRecords() {
 }
 
 bool recordsMipChains() {
-    static const bool records = std::getenv("APS5_RECODE_MIP_CHAIN_RECORDS") != nullptr;
+    static const bool records = [] {
+        const char* value = std::getenv("APS5_RECODE_MIP_CHAIN_RECORDS");
+        return value == nullptr || std::string_view(value) != "0";
+    }();
     return records;
 }
 
