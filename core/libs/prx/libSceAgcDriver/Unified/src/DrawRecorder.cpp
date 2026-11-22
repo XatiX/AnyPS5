@@ -2477,7 +2477,7 @@ private:
         auto* vulkan = dynamic_cast<Images::VulkanSurface*>(record->device.get());
         if (vulkan == nullptr || vulkan->Compressed()) return;
         const auto format = vulkan->Format();
-        if (format != VK_FORMAT_R16G16B16A16_SFLOAT && format != VK_FORMAT_R32G32B32A32_SFLOAT && format != VK_FORMAT_R32_SFLOAT && format != VK_FORMAT_R16G16_SFLOAT && format != VK_FORMAT_R16_SFLOAT && format != VK_FORMAT_B10G11R11_UFLOAT_PACK32 && !read && censusDump().count == 0u) return;
+        if (format != VK_FORMAT_R16G16B16A16_SFLOAT && format != VK_FORMAT_R32G32B32A32_SFLOAT && format != VK_FORMAT_R32G32_SFLOAT && format != VK_FORMAT_R32_SFLOAT && format != VK_FORMAT_R16G16_SFLOAT && format != VK_FORMAT_R16_SFLOAT && format != VK_FORMAT_B10G11R11_UFLOAT_PACK32 && !read && censusDump().count == 0u) return;
         const auto sequence = censusDraws++;
         const auto width = record->key.width;
         const auto height = record->key.height;
@@ -2524,7 +2524,7 @@ private:
             std::uint64_t huge = 0;
             double sum = 0.0;
             std::uint64_t counted = 0;
-            const bool floating = format == VK_FORMAT_R16G16B16A16_SFLOAT || format == VK_FORMAT_R32G32B32A32_SFLOAT || format == VK_FORMAT_R32_SFLOAT || format == VK_FORMAT_R16G16_SFLOAT || format == VK_FORMAT_R16_SFLOAT || format == VK_FORMAT_B10G11R11_UFLOAT_PACK32;
+            const bool floating = format == VK_FORMAT_R16G16B16A16_SFLOAT || format == VK_FORMAT_R32G32B32A32_SFLOAT || format == VK_FORMAT_R32G32_SFLOAT || format == VK_FORMAT_R32_SFLOAT || format == VK_FORMAT_R16G16_SFLOAT || format == VK_FORMAT_R16_SFLOAT || format == VK_FORMAT_B10G11R11_UFLOAT_PACK32;
             if (!floating) {
                 for (const auto value : bytes) sum += static_cast<double>(std::to_integer<std::uint8_t>(value));
                 counted = bytes.size();
@@ -2535,7 +2535,7 @@ private:
                     if (((word >> 6u) & 0x1fu) == 0x1fu || ((word >> 17u) & 0x1fu) == 0x1fu || ((word >> 27u) & 0x1fu) == 0x1fu) ++bad;
                     else if (((word >> 6u) & 0x1fu) == 0x1eu || ((word >> 17u) & 0x1fu) == 0x1eu || ((word >> 27u) & 0x1fu) == 0x1eu) ++huge;
                 }
-            } else if (format == VK_FORMAT_R32G32B32A32_SFLOAT || format == VK_FORMAT_R32_SFLOAT) {
+            } else if (format == VK_FORMAT_R32G32B32A32_SFLOAT || format == VK_FORMAT_R32G32_SFLOAT || format == VK_FORMAT_R32_SFLOAT) {
                 for (std::size_t at = 0; at + 4u <= bytes.size(); at += 4u) {
                     std::uint32_t word = 0;
                     std::memcpy(&word, bytes.data() + at, 4u);
