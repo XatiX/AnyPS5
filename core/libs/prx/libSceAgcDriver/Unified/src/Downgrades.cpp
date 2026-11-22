@@ -430,6 +430,13 @@ WatchState& watchState() {
         auto* created = new WatchState;
         const char* offset = std::getenv("APS5_RECODE_WATCH_OFFSET");
         created->offset = offset != nullptr ? std::strtoull(offset, nullptr, 16) : 0xfff8u;
+        const auto& list = watchList();
+        for (auto at = list.find('@'); at != std::string::npos; at = list.find('@', at + 1u)) {
+            char* end = nullptr;
+            const auto address = std::strtoull(list.c_str() + at + 1u, &end, 16);
+            const auto bytes = end != nullptr && *end == '+' ? std::strtoull(end + 1, nullptr, 16) : 0ull;
+            if (bytes != 0u) created->ranges.push_back({address, address + bytes, 0u});
+        }
         return created;
     }();
     return *state;

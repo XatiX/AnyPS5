@@ -3,6 +3,7 @@
 #include "prx/libSceAgcDriver/Graphics/include/TextureFormat.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/TextureTiling.hpp"
 #include <algorithm>
+#include <cstdio>
 #include <cstdlib>
 #include <exception>
 
@@ -281,6 +282,24 @@ bool SurfaceTable::ChangedSinceWrite(const Surface& surface) const {
     std::lock_guard lock(mutex);
     const auto owner = OwnerOf(surface);
     return shared.ChangedSince(surface.key.address, surface.key.bytes, surface.stamp, owner) || gpuWrites.ChangedSince(surface.key.address, surface.key.bytes, surface.imageStamp, owner);
+}
+
+std::string SurfaceTable::ChangeOf(const Surface& surface) const {
+    std::lock_guard lock(mutex);
+    const auto own = OwnerOf(surface);
+    const auto describe = [&](const char* log, std::uintptr_t owner) {
+        std::string text = std::string(log) + " owner " + (owner == 0u ? std::string("none (CPU or untracked)") : std::to_string(owner));
+        for (const auto& [key, other] : surfaces) {
+            if (OwnerOf(*other) != owner || owner == 0u) continue;
+            char held[160];
+            std::snprintf(held, sizeof(held), ": record 0x%llx+0x%llx %ux%u depth %u mips %u format %u dimension %u%s", static_cast<unsigned long long>(key.address), static_cast<unsigned long long>(key.bytes), key.width, key.height, key.depth, key.mips, key.format, key.dimension, other->retired ? " (retired)" : "");
+            return text + held;
+        }
+        return text + (owner == own ? ": itself" : ": not a live record");
+    };
+    if (shared.ChangedSince(surface.key.address, surface.key.bytes, surface.stamp, own)) return describe("shared", shared.ChangedOwner(surface.key.address, surface.key.bytes, surface.stamp));
+    if (gpuWrites.ChangedSince(surface.key.address, surface.key.bytes, surface.imageStamp, own)) return describe("gpu writes", gpuWrites.ChangedOwner(surface.key.address, surface.key.bytes, surface.imageStamp));
+    return "unchanged";
 }
 
 std::vector<std::shared_ptr<Surface>> SurfaceTable::Overlapping(std::uint64_t address, std::uint64_t bytes) const {

@@ -136,6 +136,7 @@ public:
     void MarkWrittenBack(Surface& surface);
     [[nodiscard]] std::vector<std::shared_ptr<Surface>> StaleOverlapping(std::uint64_t address, std::uint64_t bytes) const;
     [[nodiscard]] bool ChangedSinceWrite(const Surface& surface) const;
+    [[nodiscard]] std::string ChangeOf(const Surface& surface) const;
     [[nodiscard]] std::vector<std::shared_ptr<Surface>> Overlapping(std::uint64_t address, std::uint64_t bytes) const;
     void Requeue(const std::shared_ptr<Surface>& surface);
     [[nodiscard]] Side OwnerOfRange(std::uint64_t address, std::uint64_t bytes) const;

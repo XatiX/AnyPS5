@@ -117,7 +117,10 @@ std::vector<DirtyRange> MemoryCore::ConsumeDirty() {
         ranges.push_back({page * PageBytes, PageBytes});
         rearmedChanged.fetch_add(1, std::memory_order_relaxed);
     }
-    for (const auto& range : ranges) Events::Shared().Note(range.address, range.size);
+    for (const auto& range : ranges) {
+        Downgrades::WatchTouch("a CPU change found on consume", range.address, range.size);
+        Events::Shared().Note(range.address, range.size);
+    }
     return ranges;
 }
 
@@ -152,6 +155,7 @@ bool MemoryCore::HandleFault(std::uint64_t address, bool write) {
     }
     std::vector<ProtectionChange> changes;
     if (!pages.HandleWrite(address, changes)) return false;
+    Downgrades::WatchTouch("a CPU write fault", address & ~(PageBytes - 1), PageBytes);
     Events::Shared().Note(address & ~(PageBytes - 1), PageBytes);
     bool held = false;
     protector.Apply(changes, &held);
@@ -161,6 +165,7 @@ bool MemoryCore::HandleFault(std::uint64_t address, bool write) {
 
 void MemoryCore::PrepareHostWrite(std::uint64_t address, std::uint64_t size) {
     if (size == 0) return;
+    Downgrades::WatchTouch("a host write", address, size);
     Events::Shared().Note(address, size);
     std::lock_guard lock(mutex);
     std::vector<ProtectionChange> changes;
