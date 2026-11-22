@@ -2543,7 +2543,7 @@ private:
             if (state.depth) {
                 views.push_back(Graphics::DepthSurfaceViewWithStencilWriteIntent(context, *state.depth, state.depthWrite, state.stencilTest, writesStencil(state)));
                 if (Downgrades::Active()) {
-                    for (const auto& stage : draw.stages) Downgrades::Note(stage.program.codeAddress, Downgrades::Kind::UpstreamTarget, 8u, "depth target from the existing depth surfaces");
+                    for (const auto& stage : draw.stages) Downgrades::Note(stage.program.codeAddress, Downgrades::Kind::UpstreamDepth, 8u, "depth target from the existing depth surfaces");
                 }
             }
         }

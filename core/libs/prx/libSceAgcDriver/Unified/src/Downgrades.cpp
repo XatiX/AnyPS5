@@ -102,6 +102,7 @@ std::string_view KindName(Kind kind) {
         case Kind::ViewMismatch: return "view-mismatch";
         case Kind::ImageResultsDropped: return "image-results-dropped";
         case Kind::SamplerMode: return "sampler-mode";
+        case Kind::UpstreamDepth: return "upstream-depth";
         default: return "unknown";
     }
 }
@@ -122,7 +123,8 @@ Severity SeverityOf(Kind kind) {
         case Kind::StorageRecordMissing:
         case Kind::UpstreamSampled:
         case Kind::UpstreamStorage:
-        case Kind::UpstreamTarget: return Severity::Fallback;
+        case Kind::UpstreamTarget:
+        case Kind::UpstreamDepth: return Severity::Fallback;
         case Kind::KnownNull:
         case Kind::KnownPrefix: return Severity::Warn;
         default: return Severity::Info;
