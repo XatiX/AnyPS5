@@ -2423,7 +2423,13 @@ private:
         recorder.Keep(buffer);
         const auto address = record->key.address;
         const auto mips = record->key.mips;
-        recorder.OnComplete([buffer, sequence, program, address, width, height, mips, format, read, layers, layerBytes] {
+        std::uint64_t guestNonzero = 0;
+        if (read) {
+            if (const auto* view = static_cast<const std::byte*>(GuestMemory::OwnStoreTarget(address, static_cast<std::size_t>(record->key.bytes))); view != nullptr && view != reinterpret_cast<const std::byte*>(address)) {
+                for (std::uint64_t at = 0; at < record->key.bytes; at += 64u) guestNonzero += view[at] != std::byte{0} ? 1u : 0u;
+            }
+        }
+        recorder.OnComplete([buffer, sequence, program, address, width, height, mips, format, read, layers, layerBytes, guestNonzero] {
             buffer->Invalidate();
             const auto bytes = buffer->Bytes();
             std::uint32_t filledLayers = 0;
@@ -2475,10 +2481,11 @@ private:
             }
             const double mean = counted == 0u ? 0.0 : sum / static_cast<double>(counted);
             if (read) std::fprintf(stderr, "[recode-nan-read] %u program %016llx reads record 0x%llx %ux%u mips %u vk%u: %llu non-finite values, %llu at or above 32768, mean %.4f", sequence, static_cast<unsigned long long>(program), static_cast<unsigned long long>(address), width, height, mips, static_cast<unsigned>(format), static_cast<unsigned long long>(bad), static_cast<unsigned long long>(huge), mean);
-            if (read) std::fprintf(stderr, ", layers with content %u of %u", filledLayers, layers);
+            if (read) std::fprintf(stderr, ", layers with content %u of %u, guest memory samples non-zero %llu", filledLayers, layers, static_cast<unsigned long long>(guestNonzero));
             if (read) std::fputc(10, stderr);
             else if (!censusSizes().empty()) {
                 std::fprintf(stderr, "[recode-nan] %u program %016llx record 0x%llx %ux%u mips %u vk%u: %llu non-finite values, %llu at or above 32768, mean %.4f", sequence, static_cast<unsigned long long>(program), static_cast<unsigned long long>(address), width, height, mips, static_cast<unsigned>(format), static_cast<unsigned long long>(bad), static_cast<unsigned long long>(huge), mean);
+                std::fprintf(stderr, ", content %s", filledLayers != 0u ? "yes" : "none");
                 std::fputc(10, stderr);
             } else if (bad != 0u || huge != 0u) std::fprintf(stderr, read ? "[recode-nan-read] %u program %016llx reads record 0x%llx %ux%u mips %u vk%u: %llu non-finite values, %llu at or above 32768\n" : "[recode-nan] %u program %016llx record 0x%llx %ux%u mips %u vk%u: %llu non-finite values, %llu at or above 32768\n", sequence, static_cast<unsigned long long>(program), static_cast<unsigned long long>(address), width, height, mips, static_cast<unsigned>(format), static_cast<unsigned long long>(bad), static_cast<unsigned long long>(huge));
         });
