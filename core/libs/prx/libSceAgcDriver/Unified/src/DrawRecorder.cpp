@@ -25,6 +25,7 @@
 #include "prx/libSceAgcDriver/Unified/include/MirrorHost.hpp"
 #include "prx/libSceAgcDriver/Unified/include/Releases.hpp"
 #include "prx/libSceAgcDriver/Unified/include/UploadClash.hpp"
+#include "prx/libSceAgcDriver/Unified/include/MetadataWatch.hpp"
 #include "prx/libSceAgcDriver/Unified/include/ResidencyService.hpp"
 #include "prx/libSceAgcDriver/Unified/include/SlotPatch.hpp"
 #include "prx/libSceAgcDriver/Unified/include/Shadow.hpp"
@@ -3046,12 +3047,13 @@ private:
     }
 
     static void noteClashWrites(const Resolve::ResolvedDraw& work) {
-        if (!UploadClash::Active() || work.stages.empty()) return;
+        if ((!UploadClash::Active() && !MetadataWatch::Active()) || work.stages.empty()) return;
         const auto program = Downgrades::ProgramHash(work.stages.back().program.codeAddress);
         for (std::size_t index = 0; index < work.uses.size() && index < work.imageBegin; ++index) {
             const auto& use = work.uses[index];
             if (!use.write || use.size == 0u || (index >= work.targetBegin && index < work.targetEnd)) continue;
             UploadClash::NoteWrite(use.address, use.size, program);
+            MetadataWatch::CheckWrite(use.address, use.size, false, program);
         }
     }
 
@@ -3208,6 +3210,7 @@ private:
             if (recordsTargets() && !state.colors.empty()) {
                 std::vector<VkImageView> recordViews;
                 for (const auto& color : state.colors) {
+                    MetadataWatch::NoteTarget(color);
                     VkImageView view = VK_NULL_HANDLE;
                     auto record = targetRecord(context, color, view);
                     if (record != nullptr && !targetTraceList().empty() && !draw.stages.empty() && tracedProgram(Downgrades::ProgramHash(draw.stages.back().program.codeAddress)) && targetTraceLines.fetch_add(1, std::memory_order_relaxed) < (targetTraceList() == "all" ? 20000u : 400u)) {

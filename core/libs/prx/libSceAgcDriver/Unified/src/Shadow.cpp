@@ -14,6 +14,7 @@
 #include "prx/libSceAgcDriver/Unified/include/Resolve.hpp"
 #include "prx/libSceAgcDriver/Unified/include/UploadClash.hpp"
 #include "prx/libSceAgcDriver/Unified/include/DepthRecords.hpp"
+#include "prx/libSceAgcDriver/Unified/include/MetadataWatch.hpp"
 #include <atomic>
 #include "prx/libSceAgcDriver/Execution/include/PerformanceOverlay.hpp"
 #include <chrono>
@@ -202,7 +203,7 @@ std::string memoryLine() {
         owned += gpuOwnedLine;
         owned += "[recode-gpu-owned] landing uploads skipped over later GPU writes: " + std::to_string(Mirror::SkippedUploadBytes() >> 10) + " KiB; CPU faults on records not yet written back: " + std::to_string(core.imageFaults) + " reads, " + std::to_string(core.imageWriteFaults) + " writes; view lookups that waited: " + std::to_string(Mirror::ViewWaits().waited) + " (" + std::to_string(Mirror::ViewWaits().found) + " found, " + std::to_string(Mirror::ViewWaits().microseconds / 1000u) + " ms); writes taken in pieces: " + std::to_string(core.pieceWrites) + ", outside the second view on pages already GPU-owned: " + std::to_string(core.ownedUnviewedBytes >> 10) + " KiB; diff landings: " + std::to_string(core.diffChainedBytes) + " bytes behind an older landing, " + std::to_string(core.diffForeignBytes) + " bytes left unlike the mirror\n";
     }
-    return std::string(line) + eventLine + ResidencyService::Get().Line() + owned + UploadClash::Line();
+    return std::string(line) + eventLine + ResidencyService::Get().Line() + owned + UploadClash::Line() + MetadataWatch::Line();
 }
 
 void report() {
@@ -404,6 +405,7 @@ namespace {
 
 void coreNoteWritten(std::uintptr_t address, std::size_t bytes) {
     MemoryCore::Get().NoteDriverWrite(address, bytes);
+    MetadataWatch::CheckWrite(address, bytes, true, 0u);
     if (Images::DepthRecordsOn() && Images::Depths().NoteHtileWrites(address, bytes) != 0u) {
         static std::atomic<bool> told{false};
         if (!told.exchange(true)) std::fprintf(stderr, "[recode-depth] first driver write over a depth record's HTILE: 0x%llx+0x%llx\n", static_cast<unsigned long long>(address), static_cast<unsigned long long>(bytes));
