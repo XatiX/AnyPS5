@@ -2353,6 +2353,7 @@ private:
             }
             publishRequest(context, deferred.request);
             claimUpstreamRequest(context, deferred.request, "storage on the existing cache");
+            Downgrades::RefuseExistingPath(stage.program.codeAddress, "storage image", "storage image from the existing cache");
             auto texture = Resolve::BindDeferredImage(context, deferred.request, slot, reason);
             if (texture == nullptr) return false;
             noteImage(stage, Downgrades::Kind::UpstreamStorage, deferred.index, deferred.request, (deferred.request.flags & Heap::RequestFlag::Written) != 0u ? "written storage cache" : "storage cache");
@@ -2367,6 +2368,7 @@ private:
             if (ownsImages() && bindOwnedSampled(context, stage, *deferred)) continue;
             if (Downgrades::Active()) noteStaleRecordRead(stage, *deferred);
             publishRequest(context, deferred->request);
+            Downgrades::RefuseExistingPath(stage.program.codeAddress, "sampled image", "sampled texture from the existing cache");
             auto owner = Resolve::BindDeferredSampled(context, deferred->request, slot, reason);
             if (owner == nullptr) return false;
             noteImage(stage, Downgrades::Kind::UpstreamSampled, deferred->index, deferred->request, "sampled cache");
@@ -2967,6 +2969,7 @@ private:
                     return false;
                 }
                 views.push_back(resident->AttachmentView(color.format, color.mip, color.depthSlice, color.layers, color.arraySlice));
+                Downgrades::RefuseExistingPath(draw.stages.empty() ? 0u : draw.stages.back().program.codeAddress, "colour target", "colour target from the existing surface cache: " + (lastTargetRefusal.empty() ? std::string("not offered to records") : lastTargetRefusal));
                 if (Downgrades::Active()) {
                     char detail[256];
                     std::snprintf(detail, sizeof(detail), "colour target 0x%llx mip %u from the existing surface cache: %s", static_cast<unsigned long long>(Graphics::SurfaceForTarget(color).baseAddress), color.mip, lastTargetRefusal.empty() ? "not offered to records" : lastTargetRefusal.c_str());
@@ -2992,6 +2995,7 @@ private:
                 totals.depthRecordDraws++;
             } else if (state.depth) {
                 views.push_back(Graphics::DepthSurfaceViewWithStencilWriteIntent(context, *state.depth, state.depthWrite, state.stencilTest, writesStencil(state)));
+                Downgrades::RefuseExistingPath(draw.stages.empty() ? 0u : draw.stages.back().program.codeAddress, "depth target", "depth target from the existing depth surfaces");
                 if (Downgrades::Active()) {
                     for (const auto& stage : draw.stages) Downgrades::Note(stage.program.codeAddress, Downgrades::Kind::UpstreamDepth, 8u, "depth target from the existing depth surfaces");
                 }
