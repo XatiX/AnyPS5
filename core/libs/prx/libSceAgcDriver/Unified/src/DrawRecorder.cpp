@@ -3576,6 +3576,9 @@ private:
         auto viewKey = key->view;
         viewKey.baseArray += layer;
         viewKey.lastArray += layer;
+        if (record != nullptr && !targetTraceList().empty() && Downgrades::ListedHash(targetTraceList(), Downgrades::ProgramHash(stage.program.codeAddress)) && targetTraceLines.fetch_add(1, std::memory_order_relaxed) < 400u) {
+            std::fprintf(stderr, "[recode-sampled] program %016llx slot %u kind %u 0x%llx %ux%u mips %u view levels %u-%u layers %u-%u format %u -> record 0x%llx mips %u\n", static_cast<unsigned long long>(Downgrades::ProgramHash(stage.program.codeAddress)), deferred.index, deferred.request.kind, static_cast<unsigned long long>(surface.address), surface.width, surface.height, surface.mips, viewKey.baseLevel, viewKey.lastLevel, viewKey.baseArray, viewKey.lastArray, viewKey.format, static_cast<unsigned long long>(record->key.address), record->key.mips);
+        }
         const auto view = record != nullptr ? record->device->View(viewKey, deferred.request.kind, why) : std::uint64_t{0};
         std::uint32_t slot = 0;
         if (view == 0u || !Resolve::BindViewSlot(deferred.request, view, record->device->Layout(), record, slot)) {
