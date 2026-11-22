@@ -462,6 +462,15 @@ bool recordsMipChains() {
     return records;
 }
 
+std::uint32_t mipChainMinWidth() {
+    static const std::uint32_t width = [] {
+        const char* value = std::getenv("APS5_RECODE_MIP_CHAIN_RECORDS");
+        if (value == nullptr || std::string_view(value).rfind("min:", 0) != 0) return 0u;
+        return static_cast<std::uint32_t>(std::strtoul(value + 4, nullptr, 10));
+    }();
+    return width;
+}
+
 bool recordsMipTailTargets() {
     static const bool records = std::getenv("APS5_RECODE_NO_MIP_TAIL_TARGETS") == nullptr;
     return records;
@@ -2978,7 +2987,7 @@ private:
             const auto ownedKey = Images::KeyOf(ownedResource, ownedWhy);
             if (!ownedKey.has_value()) return refuse("target key: " + ownedWhy);
             if (table->OwnerOfRange(ownedKey->surface.address, ownedKey->surface.bytes) == Images::Side::Upstream) return refuse("target owned by the existing cache");
-            if ((ownedKey->surface.mips > 1u || color.mipTail) && !recordsMipChains()) return refuse("target with a mip chain");
+            if ((ownedKey->surface.mips > 1u || color.mipTail) && (!recordsMipChains() || ownedKey->surface.width < mipChainMinWidth())) return refuse("target with a mip chain");
             auto owned = ownedRecord(context, *table, ownedKey->surface, ownedWhy);
             if (owned == nullptr && ownedWhy.empty()) owned = table->Seed(table->AdoptResource(ownedKey->surface, ownedResource, ownedWhy));
             if (owned == nullptr) return refuse("target surface: " + ownedWhy);
