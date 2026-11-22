@@ -16,6 +16,7 @@
 #include "prx/libSceAgcDriver/Graphics/include/TextureFormat.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/VertexInput.hpp"
 #include "prx/libSceAgcDriver/Unified/include/DataRing.hpp"
+#include "prx/libSceAgcDriver/Unified/include/DepthRecords.hpp"
 #include "prx/libSceAgcDriver/Unified/include/Downgrades.hpp"
 #include "prx/libSceAgcDriver/Unified/include/Events.hpp"
 #include "prx/libSceAgcDriver/Unified/include/ImageDetile.hpp"
@@ -222,6 +223,7 @@ struct Totals {
     std::uint64_t writeBackRefusals = 0;
     std::uint64_t shapesHandedOver = 0;
     std::uint64_t layerTargets = 0;
+    std::uint64_t depthRecordDraws = 0;
     std::uint64_t recordsRefreshed = 0;
     std::uint64_t layersAbsorbed = 0;
     std::uint64_t layersAbsorbedOverChanges = 0;
@@ -1143,7 +1145,7 @@ public:
         line += text;
         line += "; record ranges noted GPU-written for the memory core " + std::to_string(totals.recordRangesNoted) + "; records made for a sampled shape after a hand-over " + std::to_string(totals.sampledRecordsCreated) + "; new chains zeroed " + std::to_string(totals.zeroedChains);
         line += "; records written back for buffer readers " + std::to_string(totals.readerWriteBacks) + " (" + std::to_string(totals.readerWriteBackBytes >> 20u) + " MiB, " + std::to_string(totals.readerWriteBackRefusals) + " refused, " + std::to_string(totals.readerStale) + " skipped: memory changed since their GPU write)";
-        line += "; records handed to another shape " + std::to_string(totals.shapesHandedOver) + " (" + std::to_string(totals.writeBacks) + " written back into the mirror, " + std::to_string(totals.writeBackBytes >> 20u) + " MiB, " + std::to_string(totals.writeBackRefusals) + " refused, " + std::to_string(totals.staleShapes) + " not written back: memory changed since their GPU write); targets and sampled views served as layers of a containing record " + std::to_string(totals.layerTargets) + ", records copied in as layers of a new record " + std::to_string(totals.layersAbsorbed) + " (" + std::to_string(totals.layersAbsorbedOverChanges) + " over a change note); CPU-content records detiled again after their memory changed " + std::to_string(totals.recordsRefreshed);
+        line += "; records handed to another shape " + std::to_string(totals.shapesHandedOver) + " (" + std::to_string(totals.writeBacks) + " written back into the mirror, " + std::to_string(totals.writeBackBytes >> 20u) + " MiB, " + std::to_string(totals.writeBackRefusals) + " refused, " + std::to_string(totals.staleShapes) + " not written back: memory changed since their GPU write); draws with a recode depth record " + std::to_string(totals.depthRecordDraws) + " (" + std::to_string(Images::Depths().Size()) + " records, " + std::to_string(Images::Depths().Counts().cleared) + " started from their clear value, " + std::to_string(Images::Depths().Counts().refused) + " refused); targets and sampled views served as layers of a containing record " + std::to_string(totals.layerTargets) + ", records copied in as layers of a new record " + std::to_string(totals.layersAbsorbed) + " (" + std::to_string(totals.layersAbsorbedOverChanges) + " over a change note); CPU-content records detiled again after their memory changed " + std::to_string(totals.recordsRefreshed);
         line += "; images adopted from the existing cache " + std::to_string(totals.recordAdoptions) + " (" + std::to_string(totals.recordAdoptionRefusals) + " refused), published back " + std::to_string(publishedRecords.load(std::memory_order_relaxed)) + " (" + std::to_string(staleRecordsKept.load(std::memory_order_relaxed)) + " not published: guest memory changed since their GPU write, " + std::to_string(publishNoSurface.load(std::memory_order_relaxed)) + " without an existing surface, " + std::to_string(publishShape.load(std::memory_order_relaxed)) + " of another shape, " + std::to_string(publishCompressed.load(std::memory_order_relaxed)) + " compressed); flips from a GPU-written record " + std::to_string(flipsFromNewRecords.load(std::memory_order_relaxed)) + ", over a record not GPU-written " + std::to_string(flipsFromOldRecords.load(std::memory_order_relaxed)) + ", with no record " + std::to_string(flipsWithoutRecords.load(std::memory_order_relaxed));
         {
             auto& landings = batchLandings();
@@ -2963,7 +2965,20 @@ private:
                 owners.push_back(resident);
                 residents.push_back(std::move(resident));
             }
-            if (state.depth) {
+            std::shared_ptr<Images::DepthRecord> depthRecord;
+            if (state.depth && Images::DepthRecordsOn()) {
+                std::string why;
+                depthRecord = Images::Depths().Find(context, *state.depth, why);
+                if (depthRecord != nullptr && !depthRecord->Initialized()) {
+                    depthRecord->Initialize(recorder->Commands(), state.depth->clearDepth, state.depth->clearStencil);
+                    Images::Depths().NoteCleared();
+                }
+            }
+            if (depthRecord != nullptr) {
+                views.push_back(depthRecord->View());
+                recorder->Keep(depthRecord);
+                totals.depthRecordDraws++;
+            } else if (state.depth) {
                 views.push_back(Graphics::DepthSurfaceViewWithStencilWriteIntent(context, *state.depth, state.depthWrite, state.stencilTest, writesStencil(state)));
                 if (Downgrades::Active()) {
                     for (const auto& stage : draw.stages) Downgrades::Note(stage.program.codeAddress, Downgrades::Kind::UpstreamDepth, 8u, "depth target from the existing depth surfaces");
