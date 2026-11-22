@@ -92,6 +92,15 @@ bool imagesRouted() {
 
 enum class SampledBind : std::uint8_t { Ahead, Record, RecordAll };
 
+}
+
+bool SampledRecordsAll() {
+    static const bool all = std::getenv("APS5_RECODE_SAMPLED_RECORDS_ALL") != nullptr;
+    return all;
+}
+
+namespace {
+
 SampledBind sampledBind() {
     static const SampledBind bind = [] {
         const auto* value = std::getenv("APS5_RECODE_SAMPLED_BIND");
@@ -875,7 +884,8 @@ private:
         if (!Images::OwnersEnabled()) return false;
         try {
             const auto resource = Graphics::DecodeTextureResource(request.words);
-            return surfaces->OwnerOfRange(resource.baseAddress, Graphics::SurfaceGuestBytes(resource)) == Images::Side::Record;
+            const auto side = surfaces->OwnerOfRange(resource.baseAddress, Graphics::SurfaceGuestBytes(resource));
+            return side == Images::Side::Record || (side == Images::Side::None && SampledRecordsAll());
         } catch (const std::exception&) {
             return false;
         }

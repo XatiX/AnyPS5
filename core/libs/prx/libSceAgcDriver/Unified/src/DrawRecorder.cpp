@@ -3595,7 +3595,8 @@ private:
             return false;
         }
         const auto& surface = key->surface;
-        if (table->OwnerOfRange(surface.address, surface.bytes) != Images::Side::Record) return false;
+        const auto side = table->OwnerOfRange(surface.address, surface.bytes);
+        if (side != Images::Side::Record && !(side == Images::Side::None && Resolve::SampledRecordsAll())) return false;
         std::uint32_t layer = 0;
         Absorbed absorbed;
         auto record = ownedRecord(context, *table, surface, why, &layer, &absorbed);
