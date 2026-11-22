@@ -27,6 +27,7 @@ public:
     [[nodiscard]] VkImageView AttachmentView(VkFormat viewFormat, std::uint32_t level, std::uint32_t layer, std::uint32_t layers, std::string& reason);
     [[nodiscard]] bool Attachable() const { return attachable; }
     [[nodiscard]] VkImage Image() const { return image; }
+    [[nodiscard]] VkFormat Format() const { return format; }
     [[nodiscard]] const Graphics::GuestTextureResource& Resource() const { return resource; }
     [[nodiscard]] const Graphics::SurfaceGeometry& Geometry() const { return geometry; }
     [[nodiscard]] bool Initialized() const { return initialized; }

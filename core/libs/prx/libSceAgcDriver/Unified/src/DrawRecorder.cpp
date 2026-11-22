@@ -228,6 +228,7 @@ struct Totals {
     std::uint64_t readerStale = 0;
     std::uint64_t recordRangesNoted = 0;
     std::uint64_t sampledRecordsCreated = 0;
+    std::uint64_t zeroedChains = 0;
     std::uint64_t recordTargetRefusals = 0;
     std::uint64_t indirectDispatches = 0;
     std::uint64_t gdsBindings = 0;
@@ -455,6 +456,36 @@ bool bindsGds() {
 bool notesRecordRanges() {
     static const bool notes = std::getenv("APS5_RECODE_NOTE_RECORD_RANGES") != nullptr;
     return notes;
+}
+
+struct RecordDumpRequest {
+    std::uint32_t width = 0;
+    std::int64_t seconds = 0;
+    std::string directory;
+};
+
+const RecordDumpRequest& recordDumpRequest() {
+    static const RecordDumpRequest request = [] {
+        RecordDumpRequest parsed;
+        const char* value = std::getenv("APS5_RECODE_DUMP_RECORDS");
+        const char* directory = std::getenv("APS5_RECODE_DUMP_DIR");
+        if (value == nullptr || directory == nullptr) return parsed;
+        char* end = nullptr;
+        parsed.width = static_cast<std::uint32_t>(std::strtoul(value, &end, 10));
+        if (end != nullptr && *end == ':') parsed.seconds = std::strtoll(end + 1, nullptr, 10);
+        parsed.directory = directory;
+        return parsed;
+    }();
+    return request;
+}
+
+bool zeroesNewChains() {
+    static const bool zeroes = std::getenv("APS5_RECODE_ZERO_NEW_CHAINS") != nullptr;
+    return zeroes;
+}
+
+bool dumpsRecords() {
+    return recordDumpRequest().width != 0u;
 }
 
 bool recordsMipChains() {
@@ -1007,7 +1038,7 @@ public:
         line += text;
         std::snprintf(text, sizeof(text), "; table maps %llu hits, %llu uploads (%.1f MiB), %llu retired, %zu held (%.1f MiB)", static_cast<unsigned long long>(totals.mapHits), static_cast<unsigned long long>(totals.mapUploads), static_cast<double>(totals.mapUploadBytes) / 1048576.0, static_cast<unsigned long long>(totals.mapRetired), maps.size(), static_cast<double>(mapBytes) / 1048576.0);
         line += text;
-        line += "; record ranges noted GPU-written for the memory core " + std::to_string(totals.recordRangesNoted) + "; records made for a sampled shape after a hand-over " + std::to_string(totals.sampledRecordsCreated);
+        line += "; record ranges noted GPU-written for the memory core " + std::to_string(totals.recordRangesNoted) + "; records made for a sampled shape after a hand-over " + std::to_string(totals.sampledRecordsCreated) + "; new chains zeroed " + std::to_string(totals.zeroedChains);
         line += "; records written back for buffer readers " + std::to_string(totals.readerWriteBacks) + " (" + std::to_string(totals.readerWriteBackBytes >> 20u) + " MiB, " + std::to_string(totals.readerWriteBackRefusals) + " refused, " + std::to_string(totals.readerStale) + " skipped: memory changed since their GPU write)";
         line += "; records handed to another shape " + std::to_string(totals.shapesHandedOver) + " (" + std::to_string(totals.writeBacks) + " written back into the mirror, " + std::to_string(totals.writeBackBytes >> 20u) + " MiB, " + std::to_string(totals.writeBackRefusals) + " refused, " + std::to_string(totals.staleShapes) + " not written back: memory changed since their GPU write)";
         line += "; images adopted from the existing cache " + std::to_string(totals.recordAdoptions) + " (" + std::to_string(totals.recordAdoptionRefusals) + " refused), published back " + std::to_string(publishedRecords.load(std::memory_order_relaxed)) + " (" + std::to_string(staleRecordsKept.load(std::memory_order_relaxed)) + " not published: guest memory changed since their GPU write)";
@@ -2246,6 +2277,73 @@ private:
         }
     }
 
+    void zeroRecord(const Context& context, Graphics::Recorder& recorder, Images::SurfaceTable& table, Images::Surface& record) {
+        auto* vulkan = dynamic_cast<Images::VulkanSurface*>(record.device.get());
+        if (vulkan == nullptr) return;
+        const auto commands = recorder.Commands();
+        VkImageMemoryBarrier barrier{VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER};
+        barrier.srcAccessMask = 0u;
+        barrier.dstAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
+        barrier.oldLayout = VK_IMAGE_LAYOUT_UNDEFINED;
+        barrier.newLayout = VK_IMAGE_LAYOUT_GENERAL;
+        barrier.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+        barrier.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+        barrier.image = vulkan->Image();
+        barrier.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0u, VK_REMAINING_MIP_LEVELS, 0u, VK_REMAINING_ARRAY_LAYERS};
+        context.Resolved(&Graphics::DeviceFunctions::cmdPipelineBarrier, "vkCmdPipelineBarrier")(commands, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 0, nullptr, 0, nullptr, 1, &barrier);
+        const VkClearColorValue zero{};
+        context.Function<PFN_vkCmdClearColorImage>("vkCmdClearColorImage")(commands, vulkan->Image(), VK_IMAGE_LAYOUT_GENERAL, &zero, 1, &barrier.subresourceRange);
+        barrier.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
+        barrier.dstAccessMask = VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_COLOR_ATTACHMENT_READ_BIT | VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT;
+        barrier.oldLayout = VK_IMAGE_LAYOUT_GENERAL;
+        context.Resolved(&Graphics::DeviceFunctions::cmdPipelineBarrier, "vkCmdPipelineBarrier")(commands, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, 0, 0, nullptr, 0, nullptr, 1, &barrier);
+        vulkan->SetInitialized();
+        table.MarkReady(record, Events::Shared().Serial(), Events::GpuWrites().Serial());
+        totals.zeroedChains++;
+    }
+
+    void maybeDumpRecord(const Context& context, Graphics::Recorder& recorder, const std::shared_ptr<Images::Surface>& record) {
+        const auto& request = recordDumpRequest();
+        if (record->key.width < request.width || record->key.mips <= 1u) return;
+        const auto now = std::chrono::steady_clock::now();
+        if (!dumpClock.has_value()) dumpClock = now;
+        if (now - *dumpClock < std::chrono::seconds(request.seconds) || dumpedRecords.size() >= 8u || dumpedRecords.contains(record->key.address)) return;
+        auto* vulkan = dynamic_cast<Images::VulkanSurface*>(record->device.get());
+        if (vulkan == nullptr || vulkan->Compressed()) return;
+        dumpedRecords.insert(record->key.address);
+        const auto elementBytes = Graphics::BytesPerElement(vulkan->Resource().format);
+        const auto levels = static_cast<std::uint32_t>(std::max<std::size_t>(vulkan->Geometry().mips.size(), 1u));
+        const auto commands = recorder.Commands();
+        Graphics::RecordMemoryBarrier(context, commands, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT | VK_ACCESS_SHADER_WRITE_BIT | VK_ACCESS_TRANSFER_WRITE_BIT, VK_ACCESS_TRANSFER_READ_BIT);
+        for (const auto level : {0u, std::min(1u, levels - 1u), levels - 1u}) {
+            const auto width = std::max(record->key.width >> level, 1u);
+            const auto height = std::max(record->key.height >> level, 1u);
+            auto buffer = std::make_shared<Graphics::Buffer>(context, static_cast<std::size_t>(width) * height * elementBytes, VK_BUFFER_USAGE_TRANSFER_DST_BIT);
+            VkBufferImageCopy region{};
+            region.imageSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, level, 0u, 1u};
+            region.imageExtent = {width, height, 1u};
+            context.Resolved(&Graphics::DeviceFunctions::cmdCopyImageToBuffer, "vkCmdCopyImageToBuffer")(commands, vulkan->Image(), VK_IMAGE_LAYOUT_GENERAL, buffer->Handle(), 1, &region);
+            recorder.Keep(buffer);
+            char name[192];
+            std::snprintf(name, sizeof(name), "record-%llx-L%u-%ux%u-vk%u.raw", static_cast<unsigned long long>(record->key.address), level, width, height, static_cast<unsigned>(vulkan->Format()));
+            recorder.OnComplete([buffer, file = request.directory + "\\" + name] {
+                auto* out = std::fopen(file.c_str(), "wb");
+                if (out == nullptr) {
+                    std::fprintf(stderr, "[recode-dump] cannot write %s\n", file.c_str());
+                    return;
+                }
+                buffer->Invalidate();
+                const auto bytes = buffer->Bytes();
+                std::fwrite(bytes.data(), 1, bytes.size(), out);
+                std::fclose(out);
+                std::fprintf(stderr, "[recode-dump] wrote %s (%zu bytes)\n", file.c_str(), bytes.size());
+            });
+            if (levels == 1u) break;
+        }
+        Graphics::RecordMemoryBarrier(context, commands, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT | VK_PIPELINE_STAGE_HOST_BIT, VK_ACCESS_TRANSFER_READ_BIT | VK_ACCESS_TRANSFER_WRITE_BIT, VK_ACCESS_HOST_READ_BIT | VK_ACCESS_MEMORY_WRITE_BIT);
+        std::fprintf(stderr, "[recode-dump] record 0x%llx %ux%u %u levels format %u written at %lld s\n", static_cast<unsigned long long>(record->key.address), record->key.width, record->key.height, levels, record->key.format, static_cast<long long>(std::chrono::duration_cast<std::chrono::seconds>(now - *dumpClock).count()));
+    }
+
     void markRecordWritten(Graphics::Recorder& recorder, Images::SurfaceTable& table, Images::Surface& record) {
         const bool wasStale = record.mirrorStale;
         table.MarkGpuWritten(record);
@@ -2876,6 +2974,7 @@ private:
                 static_cast<void>(Events::GpuWrites().Note(record->key.address, record->key.bytes, owner));
                 static_cast<void>(Events::Shared().Note(record->key.address, record->key.bytes, owner));
                 if (surfaceTable != nullptr) markRecordWritten(*recorder, *surfaceTable, *record);
+                if (dumpsRecords()) maybeDumpRecord(context, *recorder, record);
                 recorder->Keep(record);
             }
         }
@@ -2989,7 +3088,11 @@ private:
             if (table->OwnerOfRange(ownedKey->surface.address, ownedKey->surface.bytes) == Images::Side::Upstream) return refuse("target owned by the existing cache");
             if ((ownedKey->surface.mips > 1u || color.mipTail) && (!recordsMipChains() || ownedKey->surface.width < mipChainMinWidth())) return refuse("target with a mip chain");
             auto owned = ownedRecord(context, *table, ownedKey->surface, ownedWhy);
-            if (owned == nullptr && ownedWhy.empty()) owned = table->Seed(table->AdoptResource(ownedKey->surface, ownedResource, ownedWhy));
+            if (owned == nullptr && ownedWhy.empty()) {
+                auto adopted = table->AdoptResource(ownedKey->surface, ownedResource, ownedWhy);
+                if (adopted != nullptr && ownedKey->surface.mips > 1u && zeroesNewChains() && context.recorder != nullptr) zeroRecord(context, *context.recorder, *table, *adopted);
+                owned = table->Seed(adopted);
+            }
             if (owned == nullptr) return refuse("target surface: " + ownedWhy);
             auto* ownedVulkan = dynamic_cast<Images::VulkanSurface*>(owned->device.get());
             if (ownedVulkan == nullptr) return refuse("target surface without a Vulkan image");
@@ -3244,6 +3347,8 @@ private:
     std::map<std::uint64_t, MapBuffer> maps;
     std::uint64_t mapBytes = 0;
     std::set<std::string> seen;
+    std::optional<std::chrono::steady_clock::time_point> dumpClock;
+    std::set<std::uint64_t> dumpedRecords;
     std::set<std::uint32_t> seenFaults;
     std::unique_ptr<Images::SurfaceDetiler> surfaceDetiler;
     std::map<std::vector<std::uint64_t>, std::shared_ptr<ComputePipeline>> computePipelines;
