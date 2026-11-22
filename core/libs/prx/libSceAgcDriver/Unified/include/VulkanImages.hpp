@@ -23,7 +23,7 @@ public:
     [[nodiscard]] std::uint64_t View(const ViewKey& view, std::uint32_t kind, std::string& reason) override;
     [[nodiscard]] std::uint32_t Layout() const override { return VK_IMAGE_LAYOUT_GENERAL; }
     [[nodiscard]] VkImageView StorageView(std::uint32_t level, std::uint32_t layer, std::uint32_t elementBytes);
-    [[nodiscard]] VkImageView ShapedStorageView(std::uint32_t level, StorageShape shape, bool uintView, bool atomic, std::string& reason);
+    [[nodiscard]] VkImageView ShapedStorageView(std::uint32_t level, StorageShape shape, bool uintView, bool atomic, std::string& reason, std::uint32_t layer = 0);
     [[nodiscard]] VkImageView AttachmentView(VkFormat viewFormat, std::uint32_t level, std::uint32_t layer, std::uint32_t layers, std::string& reason);
     [[nodiscard]] bool Attachable() const { return attachable; }
     [[nodiscard]] VkImage Image() const { return image; }
@@ -48,7 +48,7 @@ private:
     std::mutex mutex;
     std::map<std::tuple<std::uint32_t, std::uint32_t, std::uint32_t, std::uint32_t, std::uint32_t, std::uint32_t, std::uint32_t>, VkImageView> views;
     std::map<std::tuple<std::uint32_t, std::uint32_t, std::uint32_t>, VkImageView> storageViews;
-    std::map<std::tuple<std::uint32_t, std::uint32_t, bool, bool>, VkImageView> shapedStorageViews;
+    std::map<std::tuple<std::uint32_t, std::uint32_t, bool, bool, std::uint32_t>, VkImageView> shapedStorageViews;
     std::map<std::tuple<std::uint32_t, std::uint32_t, std::uint32_t, std::uint32_t>, VkImageView> attachmentViews;
     bool attachable = false;
 };

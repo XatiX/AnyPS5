@@ -2410,20 +2410,27 @@ private:
         const auto width = record->key.width;
         const auto height = record->key.height;
         const auto elementBytes = Graphics::BytesPerElement(vulkan->Resource().format);
-        auto buffer = std::make_shared<Graphics::Buffer>(context, static_cast<std::size_t>(width) * height * elementBytes, VK_BUFFER_USAGE_TRANSFER_DST_BIT);
+        const std::uint32_t layers = read ? std::max(vulkan->Geometry().imageLayers, 1u) : 1u;
+        const std::size_t layerBytes = static_cast<std::size_t>(width) * height * elementBytes;
+        auto buffer = std::make_shared<Graphics::Buffer>(context, layerBytes * layers, VK_BUFFER_USAGE_TRANSFER_DST_BIT);
         const auto commands = recorder.Commands();
         Graphics::RecordMemoryBarrier(context, commands, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT | VK_ACCESS_SHADER_WRITE_BIT | VK_ACCESS_TRANSFER_WRITE_BIT, VK_ACCESS_TRANSFER_READ_BIT);
         VkBufferImageCopy region{};
-        region.imageSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0u, 0u, 1u};
+        region.imageSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0u, 0u, layers};
         region.imageExtent = {width, height, 1u};
         context.Resolved(&Graphics::DeviceFunctions::cmdCopyImageToBuffer, "vkCmdCopyImageToBuffer")(commands, vulkan->Image(), VK_IMAGE_LAYOUT_GENERAL, buffer->Handle(), 1, &region);
         Graphics::RecordMemoryBarrier(context, commands, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT | VK_PIPELINE_STAGE_HOST_BIT, VK_ACCESS_TRANSFER_READ_BIT | VK_ACCESS_TRANSFER_WRITE_BIT, VK_ACCESS_HOST_READ_BIT | VK_ACCESS_MEMORY_WRITE_BIT);
         recorder.Keep(buffer);
         const auto address = record->key.address;
         const auto mips = record->key.mips;
-        recorder.OnComplete([buffer, sequence, program, address, width, height, mips, format, read] {
+        recorder.OnComplete([buffer, sequence, program, address, width, height, mips, format, read, layers, layerBytes] {
             buffer->Invalidate();
             const auto bytes = buffer->Bytes();
+            std::uint32_t filledLayers = 0;
+            for (std::uint32_t layer = 0; layer < layers; ++layer) {
+                const auto chunk = bytes.subspan(layer * layerBytes, std::min(layerBytes, bytes.size() - std::min(bytes.size(), layer * layerBytes)));
+                if (std::ranges::any_of(chunk, [](std::byte value) { return value != std::byte{0}; })) ++filledLayers;
+            }
             std::uint64_t bad = 0;
             std::uint64_t huge = 0;
             double sum = 0.0;
@@ -2468,6 +2475,7 @@ private:
             }
             const double mean = counted == 0u ? 0.0 : sum / static_cast<double>(counted);
             if (read) std::fprintf(stderr, "[recode-nan-read] %u program %016llx reads record 0x%llx %ux%u mips %u vk%u: %llu non-finite values, %llu at or above 32768, mean %.4f", sequence, static_cast<unsigned long long>(program), static_cast<unsigned long long>(address), width, height, mips, static_cast<unsigned>(format), static_cast<unsigned long long>(bad), static_cast<unsigned long long>(huge), mean);
+            if (read) std::fprintf(stderr, ", layers with content %u of %u", filledLayers, layers);
             if (read) std::fputc(10, stderr);
             else if (!censusSizes().empty()) {
                 std::fprintf(stderr, "[recode-nan] %u program %016llx record 0x%llx %ux%u mips %u vk%u: %llu non-finite values, %llu at or above 32768, mean %.4f", sequence, static_cast<unsigned long long>(program), static_cast<unsigned long long>(address), width, height, mips, static_cast<unsigned>(format), static_cast<unsigned long long>(bad), static_cast<unsigned long long>(huge), mean);
@@ -3596,9 +3604,13 @@ private:
             claimUpstream(context, surface.address, surface.bytes, "storage with a typed view, atomics or another shape");
             return nullptr;
         }
-        auto record = ownedRecord(context, *table, surface, why);
-        if (record == nullptr && why.empty()) record = table->Seed(table->Adopt(surface, request.words, why));
-        if (record != nullptr) record = Resolve::BindRecordSlot(request, std::move(record), slot);
+        std::uint32_t layer = 0;
+        auto record = ownedRecord(context, *table, surface, why, &layer);
+        if (record == nullptr && why.empty()) {
+            layer = 0;
+            record = table->Seed(table->Adopt(surface, request.words, why));
+        }
+        if (record != nullptr) record = Resolve::BindRecordSlot(request, std::move(record), slot, layer);
         if (record == nullptr) {
             claimUpstream(context, surface.address, surface.bytes, "storage: " + (why.empty() ? std::string("no view") : why));
             return nullptr;

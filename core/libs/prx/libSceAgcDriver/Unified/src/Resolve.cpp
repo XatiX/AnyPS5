@@ -382,7 +382,7 @@ public:
         return recordStorageShape((request.kind - Heap::LastSampledKind - 1u) % StorageShapes);
     }
 
-    std::shared_ptr<Images::Surface> BindRecordSlot(const Heap::SlotRequest& request, std::shared_ptr<Images::Surface> record, std::uint32_t& slot) {
+    std::shared_ptr<Images::Surface> BindRecordSlot(const Heap::SlotRequest& request, std::shared_ptr<Images::Surface> record, std::uint32_t& slot, std::uint32_t layer = 0) {
         if (table == nullptr || record == nullptr) return nullptr;
         auto* vulkan = dynamic_cast<Images::VulkanSurface*>(record->device.get());
         if (vulkan == nullptr) return noteRecordRefusal("storage surface without a Vulkan image");
@@ -391,7 +391,7 @@ public:
             const auto shape = (request.kind - Heap::LastSampledKind - 1u) % StorageShapes;
             const auto resource = Graphics::DecodeTextureResource(request.words);
             const auto mip = std::min(request.flags >> Heap::RequestFlag::MipShift, std::max(resource.mipCount, 1u) - 1u);
-            const auto view = vulkan->ShapedStorageView(mip, storageShapeOf(shape), (request.flags & Heap::RequestFlag::UintView) != 0u, (request.flags & Heap::RequestFlag::Atomic) != 0u, why);
+            const auto view = vulkan->ShapedStorageView(mip, storageShapeOf(shape), (request.flags & Heap::RequestFlag::UintView) != 0u, (request.flags & Heap::RequestFlag::Atomic) != 0u, why, layer + resource.baseArray);
             if (view == VK_NULL_HANDLE) return noteRecordRefusal(why);
             slot = table->ImageSlot(request.kind, {reinterpret_cast<std::uint64_t>(view), static_cast<std::uint32_t>(VK_IMAGE_LAYOUT_GENERAL), record});
             if (slot == Heap::NoSlot) return noteRecordRefusal("image heap full");
@@ -1159,8 +1159,8 @@ std::shared_ptr<Images::Surface> BindDeferredRecord(const Heap::SlotRequest& req
     return shared().BindDeferredRecord(request, slot);
 }
 
-std::shared_ptr<Images::Surface> BindRecordSlot(const Heap::SlotRequest& request, std::shared_ptr<Images::Surface> record, std::uint32_t& slot) {
-    return shared().BindRecordSlot(request, std::move(record), slot);
+std::shared_ptr<Images::Surface> BindRecordSlot(const Heap::SlotRequest& request, std::shared_ptr<Images::Surface> record, std::uint32_t& slot, std::uint32_t layer) {
+    return shared().BindRecordSlot(request, std::move(record), slot, layer);
 }
 
 bool StorageRecordShape(const Heap::SlotRequest& request) {
