@@ -37,6 +37,25 @@ constexpr std::uint32_t Image2DShape = 2u;
 constexpr std::uint32_t Image2DArrayShape = 3u;
 constexpr std::uint32_t MultisampleShape = 4u;
 constexpr std::uint32_t MultisampleArrayShape = 5u;
+constexpr std::uint32_t Image3DShape = 6u;
+
+bool storageShapeRecords() {
+    static const bool records = std::getenv("APS5_RECODE_STORAGE_SHAPE_RECORDS") != nullptr;
+    return records;
+}
+
+bool recordStorageShape(std::uint32_t shape) {
+    return shape == Image2DShape || shape == Image2DArrayShape || (shape == Image3DShape && storageShapeRecords());
+}
+
+bool recordStorageAtomics(std::uint32_t flags) {
+    if ((flags & Heap::RequestFlag::Atomic64) != 0u) return false;
+    return (flags & Heap::RequestFlag::Atomic) == 0u || storageShapeRecords();
+}
+
+Images::StorageShape storageShapeOf(std::uint32_t shape) {
+    return shape == Image3DShape ? Images::StorageShape::Volume : shape == Image2DArrayShape ? Images::StorageShape::Array : Images::StorageShape::Flat;
+}
 
 enum class DispatchRoute : std::uint8_t { None, Graphics, Compute, All };
 
@@ -335,9 +354,8 @@ public:
     }
 
     static bool StorageRecordShape(const Heap::SlotRequest& request) {
-        if (!storageRecordsOn() || (request.flags & (Heap::RequestFlag::Atomic | Heap::RequestFlag::Atomic64)) != 0u) return false;
-        const auto shape = (request.kind - Heap::LastSampledKind - 1u) % StorageShapes;
-        return shape == Image2DShape || shape == Image2DArrayShape;
+        if (!storageRecordsOn() || !recordStorageAtomics(request.flags)) return false;
+        return recordStorageShape((request.kind - Heap::LastSampledKind - 1u) % StorageShapes);
     }
 
     std::shared_ptr<Images::Surface> BindRecordSlot(const Heap::SlotRequest& request, std::shared_ptr<Images::Surface> record, std::uint32_t& slot) {
@@ -349,7 +367,7 @@ public:
             const auto shape = (request.kind - Heap::LastSampledKind - 1u) % StorageShapes;
             const auto resource = Graphics::DecodeTextureResource(request.words);
             const auto mip = std::min(request.flags >> Heap::RequestFlag::MipShift, std::max(resource.mipCount, 1u) - 1u);
-            const auto view = vulkan->ShapedStorageView(mip, shape == Image2DArrayShape, (request.flags & Heap::RequestFlag::UintView) != 0u, why);
+            const auto view = vulkan->ShapedStorageView(mip, storageShapeOf(shape), (request.flags & Heap::RequestFlag::UintView) != 0u, (request.flags & Heap::RequestFlag::Atomic) != 0u, why);
             if (view == VK_NULL_HANDLE) return noteRecordRefusal(why);
             slot = table->ImageSlot(request.kind, {reinterpret_cast<std::uint64_t>(view), static_cast<std::uint32_t>(VK_IMAGE_LAYOUT_GENERAL), record});
             if (slot == Heap::NoSlot) return noteRecordRefusal("image heap full");
@@ -378,9 +396,8 @@ private:
 
     std::shared_ptr<Images::Surface> storageRecordFor(const Heap::SlotRequest& request) {
         if (!storageRecordsOn() || surfaces == nullptr) return nullptr;
-        if ((request.flags & (Heap::RequestFlag::Atomic | Heap::RequestFlag::Atomic64)) != 0u) return noteRecordRefusal("atomic storage");
-        const auto shape = (request.kind - Heap::LastSampledKind - 1u) % StorageShapes;
-        if (shape != Image2DShape && shape != Image2DArrayShape) return noteRecordRefusal("storage shape");
+        if (!recordStorageAtomics(request.flags)) return noteRecordRefusal("atomic storage");
+        if (!recordStorageShape((request.kind - Heap::LastSampledKind - 1u) % StorageShapes)) return noteRecordRefusal("storage shape");
         std::string why;
         const auto key = Images::KeyOf(request.words, why);
         if (!key.has_value()) return noteRecordRefusal("storage key: " + why);

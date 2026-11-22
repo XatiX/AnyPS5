@@ -11,6 +11,8 @@
 
 namespace AgcDriver::Unified::Images {
 
+enum class StorageShape : std::uint32_t { Flat, Array, Volume };
+
 class VulkanSurface final : public DeviceSurface {
 public:
     VulkanSurface(const Graphics::Context& context, const Graphics::GuestTextureResource& resource, Graphics::SurfaceGeometry geometry, VkFormat format);
@@ -21,7 +23,7 @@ public:
     [[nodiscard]] std::uint64_t View(const ViewKey& view, std::uint32_t kind, std::string& reason) override;
     [[nodiscard]] std::uint32_t Layout() const override { return VK_IMAGE_LAYOUT_GENERAL; }
     [[nodiscard]] VkImageView StorageView(std::uint32_t level, std::uint32_t layer, std::uint32_t elementBytes);
-    [[nodiscard]] VkImageView ShapedStorageView(std::uint32_t level, bool array, bool uintView, std::string& reason);
+    [[nodiscard]] VkImageView ShapedStorageView(std::uint32_t level, StorageShape shape, bool uintView, bool atomic, std::string& reason);
     [[nodiscard]] VkImageView AttachmentView(VkFormat viewFormat, std::uint32_t level, std::uint32_t layer, std::uint32_t layers, std::string& reason);
     [[nodiscard]] bool Attachable() const { return attachable; }
     [[nodiscard]] VkImage Image() const { return image; }
@@ -45,7 +47,7 @@ private:
     std::mutex mutex;
     std::map<std::tuple<std::uint32_t, std::uint32_t, std::uint32_t, std::uint32_t, std::uint32_t, std::uint32_t, std::uint32_t>, VkImageView> views;
     std::map<std::tuple<std::uint32_t, std::uint32_t, std::uint32_t>, VkImageView> storageViews;
-    std::map<std::tuple<std::uint32_t, bool, bool>, VkImageView> shapedStorageViews;
+    std::map<std::tuple<std::uint32_t, std::uint32_t, bool, bool>, VkImageView> shapedStorageViews;
     std::map<std::tuple<std::uint32_t, std::uint32_t, std::uint32_t, std::uint32_t>, VkImageView> attachmentViews;
     bool attachable = false;
 };
