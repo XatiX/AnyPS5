@@ -303,8 +303,22 @@ void testRangesKeepTheirFirstOwner() {
     Expect(table.OwnersLine().find("1 demoted") != std::string::npos, "the owners line counts the demotion");
 }
 
+void testArrayClaimOutlivesItsSlices() {
+    FakeDevice device;
+    Events::ChangeLog shared;
+    Events::ChangeLog gpuWrites;
+    SurfaceTable table(device, shared, gpuWrites);
+    std::string reason;
+    const auto slice = table.Seed(table.Adopt(Key(0xc00020000ull), words, reason));
+    Expect(slice != nullptr && table.Claim(0xc00020000ull, 0x10000, Side::Record, "target") == Side::Record, "a slice claims its own range");
+    Expect(table.Claim(0xc00000000ull, 0x40000, Side::Record, "sampled") == Side::Record, "an array over the slice is a record range too");
+    table.Retire(slice);
+    Expect(table.OwnerOfRange(0xc00000000ull, 0x40000) == Side::Record, "retiring the slice leaves the array's claim");
+}
+
 int main() {
     testBudgetDropsLeastRecentlyUsed();
+    testArrayClaimOutlivesItsSlices();
     testGpuWrittenSurfacesAreLeftToTheExistingCache();
     testImageSetNotesAreNotGpuWrites();
     testSurfacesAreSharedAndQueued();

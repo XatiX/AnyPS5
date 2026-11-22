@@ -326,12 +326,14 @@ Side SurfaceTable::OwnerOfRange(std::uint64_t address, std::uint64_t bytes) cons
 Side SurfaceTable::Claim(std::uint64_t address, std::uint64_t bytes, Side side, std::string_view reason) {
     std::lock_guard lock(mutex);
     auto owner = Side::None;
+    bool covered = false;
     for (const auto& claim : claims) {
         if (claim.begin >= address + bytes || address >= claim.end) continue;
         if (claim.side == Side::Upstream) return Side::Upstream;
         owner = claim.side;
+        covered = covered || (claim.begin <= address && address + bytes <= claim.end);
     }
-    if (owner != Side::None) return owner;
+    if (owner != Side::None && (covered || side != Side::Record || owner != Side::Record)) return owner;
     claims.push_back({address, address + bytes, side, std::string(reason)});
     if (side == Side::Record) {
         owners.recordRanges++;
