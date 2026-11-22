@@ -502,6 +502,16 @@ struct NanCensus {
     std::uint32_t draws = 0;
 };
 
+const std::string& targetTraceList() {
+    static const std::string list = [] {
+        const char* value = std::getenv("APS5_RECODE_TRACE_TARGETS");
+        return std::string(value == nullptr ? "" : value);
+    }();
+    return list;
+}
+
+std::atomic<std::uint32_t> targetTraceLines{0};
+
 const std::string& censusReads() {
     static const std::string list = [] {
         const char* value = std::getenv("APS5_RECODE_NAN_CENSUS_READS");
@@ -2337,7 +2347,7 @@ private:
         auto* vulkan = dynamic_cast<Images::VulkanSurface*>(record->device.get());
         if (vulkan == nullptr || vulkan->Compressed()) return;
         const auto format = vulkan->Format();
-        if (format != VK_FORMAT_R16G16B16A16_SFLOAT && format != VK_FORMAT_R32G32B32A32_SFLOAT && format != VK_FORMAT_R32_SFLOAT && format != VK_FORMAT_R16G16_SFLOAT && format != VK_FORMAT_R16_SFLOAT && format != VK_FORMAT_B10G11R11_UFLOAT_PACK32) return;
+        if (format != VK_FORMAT_R16G16B16A16_SFLOAT && format != VK_FORMAT_R32G32B32A32_SFLOAT && format != VK_FORMAT_R32_SFLOAT && format != VK_FORMAT_R16G16_SFLOAT && format != VK_FORMAT_R16_SFLOAT && format != VK_FORMAT_B10G11R11_UFLOAT_PACK32 && !read) return;
         const auto sequence = censusDraws++;
         const auto width = record->key.width;
         const auto height = record->key.height;
@@ -2358,7 +2368,13 @@ private:
             const auto bytes = buffer->Bytes();
             std::uint64_t bad = 0;
             std::uint64_t huge = 0;
-            if (format == VK_FORMAT_B10G11R11_UFLOAT_PACK32) {
+            double sum = 0.0;
+            std::uint64_t counted = 0;
+            const bool floating = format == VK_FORMAT_R16G16B16A16_SFLOAT || format == VK_FORMAT_R32G32B32A32_SFLOAT || format == VK_FORMAT_R32_SFLOAT || format == VK_FORMAT_R16G16_SFLOAT || format == VK_FORMAT_R16_SFLOAT || format == VK_FORMAT_B10G11R11_UFLOAT_PACK32;
+            if (!floating) {
+                for (const auto value : bytes) sum += static_cast<double>(std::to_integer<std::uint8_t>(value));
+                counted = bytes.size();
+            } else if (format == VK_FORMAT_B10G11R11_UFLOAT_PACK32) {
                 for (std::size_t at = 0; at + 4u <= bytes.size(); at += 4u) {
                     std::uint32_t word = 0;
                     std::memcpy(&word, bytes.data() + at, 4u);
@@ -2370,17 +2386,32 @@ private:
                     std::uint32_t word = 0;
                     std::memcpy(&word, bytes.data() + at, 4u);
                     if ((word & 0x7f800000u) == 0x7f800000u) ++bad;
-                    else if (((word >> 23u) & 0xffu) >= 142u) ++huge;
+                    else {
+                        if (((word >> 23u) & 0xffu) >= 142u) ++huge;
+                        float value = 0.0f;
+                        std::memcpy(&value, &word, 4u);
+                        sum += std::fabs(static_cast<double>(value));
+                        ++counted;
+                    }
                 }
             } else {
                 for (std::size_t at = 0; at + 2u <= bytes.size(); at += 2u) {
                     std::uint16_t half = 0;
                     std::memcpy(&half, bytes.data() + at, 2u);
                     if ((half & 0x7c00u) == 0x7c00u) ++bad;
-                    else if ((half & 0x7c00u) == 0x7800u) ++huge;
+                    else {
+                        if ((half & 0x7c00u) == 0x7800u) ++huge;
+                        const auto exponent = static_cast<int>((half >> 10u) & 0x1fu);
+                        const auto mantissa = static_cast<double>(half & 0x3ffu);
+                        sum += exponent == 0 ? mantissa * std::ldexp(1.0, -24) : (1.0 + mantissa / 1024.0) * std::ldexp(1.0, exponent - 15);
+                        ++counted;
+                    }
                 }
             }
-            if (bad != 0u || huge != 0u) std::fprintf(stderr, read ? "[recode-nan-read] %u program %016llx reads record 0x%llx %ux%u mips %u vk%u: %llu non-finite values, %llu at or above 32768\n" : "[recode-nan] %u program %016llx record 0x%llx %ux%u mips %u vk%u: %llu non-finite values, %llu at or above 32768\n", sequence, static_cast<unsigned long long>(program), static_cast<unsigned long long>(address), width, height, mips, static_cast<unsigned>(format), static_cast<unsigned long long>(bad), static_cast<unsigned long long>(huge));
+            const double mean = counted == 0u ? 0.0 : sum / static_cast<double>(counted);
+            if (read) std::fprintf(stderr, "[recode-nan-read] %u program %016llx reads record 0x%llx %ux%u mips %u vk%u: %llu non-finite values, %llu at or above 32768, mean %.4f", sequence, static_cast<unsigned long long>(program), static_cast<unsigned long long>(address), width, height, mips, static_cast<unsigned>(format), static_cast<unsigned long long>(bad), static_cast<unsigned long long>(huge), mean);
+            if (read) std::fputc(10, stderr);
+            else if (bad != 0u || huge != 0u) std::fprintf(stderr, read ? "[recode-nan-read] %u program %016llx reads record 0x%llx %ux%u mips %u vk%u: %llu non-finite values, %llu at or above 32768\n" : "[recode-nan] %u program %016llx record 0x%llx %ux%u mips %u vk%u: %llu non-finite values, %llu at or above 32768\n", sequence, static_cast<unsigned long long>(program), static_cast<unsigned long long>(address), width, height, mips, static_cast<unsigned>(format), static_cast<unsigned long long>(bad), static_cast<unsigned long long>(huge));
         });
     }
 
@@ -2605,7 +2636,7 @@ private:
         if (stage.tableMap != nullptr) recorder->Keep(std::const_pointer_cast<Tables::Mirror>(stage.tableMap));
         if (pageTable != nullptr) recorder->Keep(pageTable);
         noteStorageWrites(context, *recorder, written);
-        if (nanCensus().draws != 0u) {
+        if (nanCensus().draws != 0u && censusReads().empty()) {
             for (const auto& record : writtenRecords) censusRecord(context, *recorder, record, Downgrades::ProgramHash(stage.program.codeAddress));
         }
         std::vector<std::pair<std::uint64_t, std::uint64_t>> writtenRanges;
@@ -2809,6 +2840,10 @@ private:
                 for (const auto& color : state.colors) {
                     VkImageView view = VK_NULL_HANDLE;
                     auto record = targetRecord(context, color, view);
+                    if (record != nullptr && !targetTraceList().empty() && !draw.stages.empty() && Downgrades::ListedHash(targetTraceList(), Downgrades::ProgramHash(draw.stages.back().program.codeAddress)) && targetTraceLines.fetch_add(1, std::memory_order_relaxed) < 400u) {
+                        const auto resource = Graphics::SurfaceForTarget(color);
+                        std::fprintf(stderr, "[recode-target] program %016llx color 0x%llx %ux%u mip %u tail %u slice %u extent %ux%u -> record 0x%llx+0x%llx %ux%u mips %u dimension %u\n", static_cast<unsigned long long>(Downgrades::ProgramHash(draw.stages.back().program.codeAddress)), static_cast<unsigned long long>(resource.baseAddress), resource.width, resource.height, color.mip, color.mipTail ? 1u : 0u, color.arraySlice, color.extent.width, color.extent.height, static_cast<unsigned long long>(record->key.address), static_cast<unsigned long long>(record->key.bytes), record->key.width, record->key.height, record->key.mips, record->key.dimension);
+                    }
                     if (record == nullptr) break;
                     recordViews.push_back(view);
                     targetRecords.push_back(std::move(record));
@@ -3110,7 +3145,7 @@ private:
                 static_cast<void>(Events::GpuWrites().Note(record->key.address, record->key.bytes, owner));
                 static_cast<void>(Events::Shared().Note(record->key.address, record->key.bytes, owner));
                 if (surfaceTable != nullptr) markRecordWritten(*recorder, *surfaceTable, *record);
-                if (nanCensus().draws != 0u) censusRecord(context, *recorder, record, draw.stages.empty() ? std::uint64_t{0} : Downgrades::ProgramHash(draw.stages.back().program.codeAddress));
+                if (nanCensus().draws != 0u && censusReads().empty()) censusRecord(context, *recorder, record, draw.stages.empty() ? std::uint64_t{0} : Downgrades::ProgramHash(draw.stages.back().program.codeAddress));
                 if (dumpsRecords()) maybeDumpRecord(context, *recorder, record, draw.stages.empty() ? std::uint64_t{0} : Downgrades::ProgramHash(draw.stages.back().program.codeAddress));
                 recorder->Keep(record);
             }

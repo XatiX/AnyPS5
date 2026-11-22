@@ -801,7 +801,15 @@ private:
             if (!fallback) return resolved;
             if (sampledBind() != SampledBind::RecordAll) {
                 if (auto target = targetImage(request)) {
-                    Downgrades::NoteCurrent(Downgrades::Kind::UpstreamSampled, request.kind, "render target from the existing target cache");
+                    std::string detail = "render target from the existing target cache";
+                    try {
+                        const auto resource = Graphics::DecodeTextureResource(request.words);
+                        char where[96];
+                        std::snprintf(where, sizeof(where), " 0x%llx %ux%u fmt %u mips %u", static_cast<unsigned long long>(resource.baseAddress), resource.width, resource.height, static_cast<unsigned>(resource.format), resource.mipCount);
+                        detail += where;
+                    } catch (const std::exception&) {
+                    }
+                    Downgrades::NoteCurrent(Downgrades::Kind::UpstreamSampled, request.kind, detail);
                     return target;
                 }
             }
