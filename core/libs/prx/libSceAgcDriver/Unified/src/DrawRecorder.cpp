@@ -3918,7 +3918,7 @@ void RefuseUnrecorded(std::string_view work, std::uint64_t codeAddress, std::str
         return;
     }
     const auto refusal = Resolve::TakeRefusal();
-    if (refusal == "no device") return;
+    if (refusal == "no device" || (refusal.empty() && Resolve::Surfaces() == nullptr)) return;
     Downgrades::RefuseExistingPath(codeAddress, work, refusal.empty() ? std::string("not resolved in time") : "resolve refused it: " + refusal);
 }
 
