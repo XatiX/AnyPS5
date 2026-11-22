@@ -251,6 +251,7 @@ struct Totals {
     std::uint64_t inputsCopied = 0;
     std::uint64_t inputsGpuWritten = 0;
     std::uint64_t inputsPending = 0;
+    std::uint64_t inputsMirrored = 0;
     std::uint64_t inputsAliased = 0;
     std::uint64_t inputsMerged = 0;
     std::map<std::string, std::uint64_t> reasons;
@@ -680,7 +681,7 @@ struct DrawInput {
     VkDeviceSize offset = 0;
 };
 
-enum class InputSource : std::uint8_t { Imported, Resident, Written, GpuWritten, Pending, Aliased };
+enum class InputSource : std::uint8_t { Imported, Resident, Written, GpuWritten, Pending, Mirrored, Aliased };
 
 std::optional<DrawInput> importedInput(const Context& context, std::uint64_t address, std::uint64_t bytes) {
     const auto* import = Graphics::HostImportFor(context, address, static_cast<std::size_t>(bytes));
@@ -742,7 +743,14 @@ std::optional<DrawInput> drawInput(const Context& context, std::uint64_t address
         if (gpuPending(address, bytes)) return std::nullopt;
         source = InputSource::Imported;
     }
-    return importedInput(context, address, bytes);
+    auto imported = importedInput(context, address, bytes);
+    if (!imported && source == InputSource::GpuWritten && mirrorMode()) {
+        if (auto input = mirrorInput(address, bytes)) {
+            source = InputSource::Mirrored;
+            return input;
+        }
+    }
+    return imported;
 }
 
 struct InputRange {
@@ -783,6 +791,7 @@ void countInput(Totals& totals, InputSource source) {
         case InputSource::Written: ++totals.inputsWritten; break;
         case InputSource::GpuWritten: ++totals.inputsGpuWritten; break;
         case InputSource::Pending: ++totals.inputsPending; break;
+        case InputSource::Mirrored: ++totals.inputsMirrored; break;
         case InputSource::Aliased: ++totals.inputsAliased; break;
         case InputSource::Imported: ++totals.inputsImported; break;
     }
@@ -1191,7 +1200,7 @@ public:
         line += "; target memo " + std::to_string(totals.targetMemoHits) + " hits, " + std::to_string(totals.targetMemoMisses) + " misses; " + std::to_string(totals.deferredReads) + " draws with reads bound at record";
         line += "; residency updates landed " + std::to_string(totals.residencyLands);
         line += "; known buffers " + std::to_string(totals.knownServed) + " served, " + std::to_string(totals.knownMapped) + " mapped (" + std::to_string(totals.knownPaged) + " paged in), " + std::to_string(totals.knownCopied) + " copied (" + std::to_string(totals.knownGpuWritten) + " GPU-written ranges not copied), " + std::to_string(totals.knownRefused) + " unresolved, " + std::to_string(totals.knownPrefixes) + " bound to their mapped prefix (" + std::to_string(totals.importExtensions) + " chunks moved to their written import to make a known buffer contiguous, " + std::to_string(totals.knownSwitches) + " of them from residency), " + std::to_string(totals.knownSkipped) + " skipped (" + std::to_string(totals.knownPointers) + " of them pointers); known writes " + std::to_string(totals.knownWritten) + " direct (" + std::to_string(totals.knownWriteBytes >> 10u) + " KiB landed), " + std::to_string(totals.knownWriteLookups) + " through the page table, " + std::to_string(totals.copyBacks) + " copied back to their import after the dispatch (" + std::to_string(totals.copyBackBytes >> 20u) + " MiB, " + std::to_string(totals.copyBackCovered >> 10u) + " KiB of written pieces not landed, " + std::to_string(totals.importsReturned) + " chunks returned from their import, " + std::to_string(totals.residencyRefreshes) + " residency refreshes before the dispatch, " + std::to_string(totals.refreshKeptPages) + " GPU-written pages kept from them)";
-        line += "; draw inputs " + std::to_string(totals.inputsResident) + " resident, " + std::to_string(totals.inputsImported) + " imported, " + std::to_string(totals.inputsWritten) + " after CPU writes (" + std::to_string(totals.inputsCopied) + " copied into the ring), " + std::to_string(totals.inputsGpuWritten) + " GPU-written, " + std::to_string(totals.inputsPending) + " with GPU bytes pending read from the mirror, " + std::to_string(totals.inputsAliased) + " aliased, " + std::to_string(totals.inputsMerged) + " served with an overlapping input";
+        line += "; draw inputs " + std::to_string(totals.inputsResident) + " resident, " + std::to_string(totals.inputsImported) + " imported, " + std::to_string(totals.inputsWritten) + " after CPU writes (" + std::to_string(totals.inputsCopied) + " copied into the ring), " + std::to_string(totals.inputsGpuWritten) + " GPU-written, " + std::to_string(totals.inputsPending) + " with GPU bytes pending read from the mirror, " + std::to_string(totals.inputsMirrored) + " GPU-written without an import read from the mirror, " + std::to_string(totals.inputsAliased) + " aliased, " + std::to_string(totals.inputsMerged) + " served with an overlapping input";
         std::snprintf(text, sizeof(text), "; draw phases surfaces %.1f ms, targets %.1f ms, pipelines %.1f ms, owned uploads %.1f ms", static_cast<double>(totals.surfaceNanoseconds) / 1e6, static_cast<double>(totals.targetNanoseconds) / 1e6, static_cast<double>(totals.graphicsPipelineNanoseconds) / 1e6, static_cast<double>(totals.uploadNanoseconds) / 1e6);
         line += text;
         std::snprintf(text, sizeof(text), "; dispatches %llu recorded (%llu indirect, %llu storage images written), %llu to the existing path, %.1f us per dispatch; compute pipelines %zu held, %llu queued (%llu ahead of recording), %llu built in %.1f ms, %zu building, %zu failed", static_cast<unsigned long long>(totals.dispatches), static_cast<unsigned long long>(totals.indirectDispatches), static_cast<unsigned long long>(totals.storageWrites), static_cast<unsigned long long>(totals.dispatchExisting), totals.dispatches == 0 ? 0.0 : static_cast<double>(totals.dispatchNanoseconds) / 1000.0 / static_cast<double>(totals.dispatches), pipelineCounts.held, static_cast<unsigned long long>(totals.pipelinesQueued), static_cast<unsigned long long>(totals.pipelinesPrebuilt), static_cast<unsigned long long>(pipelineCounts.built), static_cast<double>(pipelineCounts.nanoseconds) / 1e6, pipelineCounts.building, pipelineCounts.failed);
