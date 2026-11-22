@@ -667,7 +667,7 @@ public:
             line += text;
             if (surfaces != nullptr) {
                 const auto surfaceCounts = surfaces->TakeCounts();
-                std::snprintf(text, sizeof(text), "; surfaces %zu held (%llu MiB), %llu evicted, %llu lookups, %llu created, %llu ready, %llu pending, %llu stale, %llu detiled, %llu GPU-written to the existing cache, %llu refused", surfaces->Size(), static_cast<unsigned long long>(surfaces->HeldBytes() >> 20u), static_cast<unsigned long long>(surfaceCounts.evicted),static_cast<unsigned long long>(surfaceCounts.lookups), static_cast<unsigned long long>(surfaceCounts.created), static_cast<unsigned long long>(surfaceCounts.ready), static_cast<unsigned long long>(surfaceCounts.pending), static_cast<unsigned long long>(surfaceCounts.stale), static_cast<unsigned long long>(surfaceCounts.detiled), static_cast<unsigned long long>(surfaceCounts.gpuWritten), static_cast<unsigned long long>(totals.surfaceRefusals));
+                std::snprintf(text, sizeof(text), "; surfaces %zu held (%llu MiB), %llu evicted (%llu GPU-written kept), %llu lookups, %llu created, %llu ready, %llu pending, %llu stale, %llu detiled, %llu GPU-written to the existing cache, %llu refused", surfaces->Size(), static_cast<unsigned long long>(surfaces->HeldBytes() >> 20u), static_cast<unsigned long long>(surfaceCounts.evicted), static_cast<unsigned long long>(surfaceCounts.evictionsKept), static_cast<unsigned long long>(surfaceCounts.lookups), static_cast<unsigned long long>(surfaceCounts.created), static_cast<unsigned long long>(surfaceCounts.ready), static_cast<unsigned long long>(surfaceCounts.pending), static_cast<unsigned long long>(surfaceCounts.stale), static_cast<unsigned long long>(surfaceCounts.detiled), static_cast<unsigned long long>(surfaceCounts.gpuWritten), static_cast<unsigned long long>(totals.surfaceRefusals));
                 line += text;
                 for (const auto& [why, count] : surfaceReasons) line += "; surface " + why + " " + std::to_string(count);
                 surfaceReasons.clear();
@@ -753,7 +753,7 @@ private:
 
     static std::uint64_t surfaceBudget() {
         const auto* value = std::getenv("APS5_RECODE_SURFACE_MB");
-        const std::uint64_t megabytes = value == nullptr || *value == '\0' ? 2048u : std::strtoull(value, nullptr, 10);
+        const std::uint64_t megabytes = value == nullptr || *value == '\0' ? 4096u : std::strtoull(value, nullptr, 10);
         return megabytes << 20u;
     }
 

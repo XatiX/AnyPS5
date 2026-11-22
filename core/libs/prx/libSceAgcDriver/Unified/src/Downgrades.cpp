@@ -477,6 +477,20 @@ void WatchProgramWrite(std::uint64_t codeAddress, std::uint64_t address, std::ui
     std::fprintf(stderr, "[recode-watch] %lld ms: %016llx writes 0x%llx+0x%llx (sampling +0x%llx)\n", watchMs(state), static_cast<unsigned long long>(hash), static_cast<unsigned long long>(address), static_cast<unsigned long long>(bytes), static_cast<unsigned long long>(state.offset));
 }
 
+void WatchProgramRead(std::uint64_t codeAddress, std::uint64_t address, std::uint64_t bytes) {
+    if (!Watching() || bytes == 0u || bytes > 0x10000u) return;
+    const auto hash = ProgramHash(codeAddress);
+    if (!ListedHash(watchList(), hash)) return;
+    auto& state = watchState();
+    std::lock_guard lock(state.mutex);
+    for (const auto& range : state.ranges) {
+        if (range.begin == address && range.end == address + bytes) return;
+    }
+    if (state.ranges.size() >= WatchedRanges) state.ranges.erase(state.ranges.begin());
+    state.ranges.push_back({address, address + bytes, hash});
+    std::fprintf(stderr, "[recode-watch] %lld ms: %016llx reads 0x%llx+0x%llx (sampling +0x%llx)\n", watchMs(state), static_cast<unsigned long long>(hash), static_cast<unsigned long long>(address), static_cast<unsigned long long>(bytes), static_cast<unsigned long long>(state.offset));
+}
+
 void WatchTouch(const char* what, std::uint64_t address, std::uint64_t bytes) {
     if (!Watching() || bytes == 0u) return;
     auto& state = watchState();

@@ -115,6 +115,7 @@ struct TableCounts {
     std::uint64_t detiled = 0;
     std::uint64_t gpuWritten = 0;
     std::uint64_t evicted = 0;
+    std::uint64_t evictionsKept = 0;
     std::uint64_t ownWrites = 0;
     std::uint64_t ownServed = 0;
     std::uint64_t aliasServed = 0;
@@ -138,6 +139,7 @@ public:
     [[nodiscard]] bool ChangedSinceWrite(const Surface& surface) const;
     [[nodiscard]] std::string ChangeOf(const Surface& surface) const;
     bool RefreshIfChanged(const std::shared_ptr<Surface>& surface);
+    void Touch(Surface& surface);
     [[nodiscard]] std::vector<std::shared_ptr<Surface>> Overlapping(std::uint64_t address, std::uint64_t bytes) const;
     void Requeue(const std::shared_ptr<Surface>& surface);
     [[nodiscard]] Side OwnerOfRange(std::uint64_t address, std::uint64_t bytes) const;

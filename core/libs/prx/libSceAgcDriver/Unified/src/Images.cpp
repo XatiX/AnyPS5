@@ -174,6 +174,10 @@ void SurfaceTable::evict() {
     for (const auto& [used, key] : order) {
         if (heldBytes <= target || surfaces.size() <= 1u) break;
         const auto found = surfaces.find(key);
+        if (found->second->gpuNewer) {
+            counts.evictionsKept++;
+            continue;
+        }
         found->second->retired = true;
         dropStale(*found->second);
         heldBytes -= key.bytes;
@@ -282,6 +286,11 @@ bool SurfaceTable::ChangedSinceWrite(const Surface& surface) const {
     std::lock_guard lock(mutex);
     const auto owner = OwnerOf(surface);
     return shared.ChangedSince(surface.key.address, surface.key.bytes, surface.stamp, owner) || gpuWrites.ChangedSince(surface.key.address, surface.key.bytes, surface.imageStamp, owner);
+}
+
+void SurfaceTable::Touch(Surface& surface) {
+    std::lock_guard lock(mutex);
+    surface.used = ++clock;
 }
 
 bool SurfaceTable::RefreshIfChanged(const std::shared_ptr<Surface>& surface) {

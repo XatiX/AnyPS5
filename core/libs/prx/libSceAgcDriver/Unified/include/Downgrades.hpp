@@ -101,6 +101,7 @@ void NoteGuestWrite(const char* what, std::uint64_t address, std::uint64_t bytes
 void NoteImageResultsDropped(std::uint64_t address, std::uint64_t bytes);
 [[nodiscard]] bool Watching();
 void WatchProgramWrite(std::uint64_t codeAddress, std::uint64_t address, std::uint64_t bytes);
+void WatchProgramRead(std::uint64_t codeAddress, std::uint64_t address, std::uint64_t bytes);
 void WatchTouch(const char* what, std::uint64_t address, std::uint64_t bytes);
 void WatchPoll();
 void DumpModule(std::uint64_t codeAddress, std::uint64_t module, std::span<const std::uint32_t> words);

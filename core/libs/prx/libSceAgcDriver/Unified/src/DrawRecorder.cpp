@@ -3441,6 +3441,7 @@ private:
         const auto overlapping = table.Overlapping(key.address, key.bytes);
         for (const auto& record : overlapping) {
             if (!record->seeded || record->retired || !Images::SameBacking(record->key, key)) continue;
+            table.Touch(*record);
             if (refreshesRecords() && table.RefreshIfChanged(record)) {
                 totals.recordsRefreshed++;
                 if (context.recorder != nullptr) drainSurfaces(context, *context.recorder);
@@ -3449,6 +3450,7 @@ private:
         }
         if (layer != nullptr) {
             if (auto containing = layersOfRecord(overlapping, key, *layer)) {
+                table.Touch(*containing);
                 totals.layerTargets++;
                 return containing;
             }
@@ -3597,6 +3599,7 @@ private:
                 totals.sampledRecordsCreated++;
             }
         }
+        if (Downgrades::Watching()) Downgrades::WatchProgramRead(stage.program.codeAddress, surface.address, surface.bytes);
         auto viewKey = key->view;
         viewKey.baseArray += layer;
         viewKey.lastArray += layer;
