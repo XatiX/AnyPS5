@@ -564,7 +564,10 @@ const NanCensus& nanCensus() {
 }
 
 bool refreshesRecords() {
-    static const bool refreshes = std::getenv("APS5_RECODE_RECORD_REFRESH") != nullptr;
+    static const bool refreshes = [] {
+        const char* value = std::getenv("APS5_RECODE_RECORD_REFRESH");
+        return value == nullptr || std::string_view(value) != "0";
+    }();
     return refreshes;
 }
 

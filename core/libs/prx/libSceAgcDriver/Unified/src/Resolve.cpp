@@ -41,7 +41,10 @@ constexpr std::uint32_t MultisampleArrayShape = 5u;
 constexpr std::uint32_t Image3DShape = 6u;
 
 bool storageShapeRecords() {
-    static const bool records = std::getenv("APS5_RECODE_STORAGE_SHAPE_RECORDS") != nullptr;
+    static const bool records = [] {
+        const char* value = std::getenv("APS5_RECODE_STORAGE_SHAPE_RECORDS");
+        return value == nullptr || std::string_view(value) != "0";
+    }();
     return records;
 }
 
@@ -98,7 +101,7 @@ enum class SampledBind : std::uint8_t { Ahead, Record, RecordAll };
 bool SampledRecordsAll() {
     static const bool all = [] {
         const char* value = std::getenv("APS5_RECODE_SAMPLED_RECORDS_ALL");
-        return value != nullptr && std::string_view(value) != "gpu" && std::string_view(value) != "0";
+        return value == nullptr || (std::string_view(value) != "gpu" && std::string_view(value) != "0");
     }();
     return all;
 }
