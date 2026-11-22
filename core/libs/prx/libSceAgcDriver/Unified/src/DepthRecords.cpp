@@ -144,7 +144,10 @@ DepthRecords& Depths() {
 }
 
 bool DepthRecordsOn() {
-    static const bool on = std::getenv("APS5_RECODE_DEPTH_RECORDS") != nullptr;
+    static const bool on = [] {
+        const char* value = std::getenv("APS5_RECODE_DEPTH_RECORDS");
+        return value == nullptr || std::string_view(value) != "0";
+    }();
     return on;
 }
 
