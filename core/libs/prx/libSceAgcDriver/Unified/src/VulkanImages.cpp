@@ -206,12 +206,12 @@ void VulkanSurface::EnsureGeneral(VkCommandBuffer commands) {
     initialized = true;
 }
 
-void CopyImageContent(const Graphics::Context& context, VkCommandBuffer commands, VkImage source, VkImage destination, std::uint32_t width, std::uint32_t height, std::uint32_t levels, std::uint32_t layers) {
+void CopyImageContent(const Graphics::Context& context, VkCommandBuffer commands, VkImage source, VkImage destination, std::uint32_t width, std::uint32_t height, std::uint32_t levels, std::uint32_t layers, std::uint32_t destinationLayer) {
     std::vector<VkImageCopy> regions;
     for (std::uint32_t level = 0; level < levels; ++level) {
         VkImageCopy region{};
         region.srcSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, level, 0u, layers};
-        region.dstSubresource = region.srcSubresource;
+        region.dstSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, level, destinationLayer, layers};
         region.extent = {std::max(width >> level, 1u), std::max(height >> level, 1u), 1u};
         regions.push_back(region);
     }

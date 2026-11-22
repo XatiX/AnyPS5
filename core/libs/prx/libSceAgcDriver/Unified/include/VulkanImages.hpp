@@ -53,7 +53,7 @@ private:
     bool attachable = false;
 };
 
-void CopyImageContent(const Graphics::Context& context, VkCommandBuffer commands, VkImage source, VkImage destination, std::uint32_t width, std::uint32_t height, std::uint32_t levels, std::uint32_t layers);
+void CopyImageContent(const Graphics::Context& context, VkCommandBuffer commands, VkImage source, VkImage destination, std::uint32_t width, std::uint32_t height, std::uint32_t levels, std::uint32_t layers, std::uint32_t destinationLayer = 0);
 
 class VulkanSurfaceDevice final : public SurfaceDevice {
 public:

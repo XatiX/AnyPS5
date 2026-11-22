@@ -222,6 +222,8 @@ struct Totals {
     std::uint64_t writeBackRefusals = 0;
     std::uint64_t shapesHandedOver = 0;
     std::uint64_t layerTargets = 0;
+    std::uint64_t layersAbsorbed = 0;
+    std::uint64_t layersAbsorbedOverChanges = 0;
     std::uint64_t staleShapes = 0;
     std::uint64_t readerWriteBacks = 0;
     std::uint64_t readerWriteBackBytes = 0;
@@ -1082,7 +1084,7 @@ public:
         line += text;
         line += "; record ranges noted GPU-written for the memory core " + std::to_string(totals.recordRangesNoted) + "; records made for a sampled shape after a hand-over " + std::to_string(totals.sampledRecordsCreated) + "; new chains zeroed " + std::to_string(totals.zeroedChains);
         line += "; records written back for buffer readers " + std::to_string(totals.readerWriteBacks) + " (" + std::to_string(totals.readerWriteBackBytes >> 20u) + " MiB, " + std::to_string(totals.readerWriteBackRefusals) + " refused, " + std::to_string(totals.readerStale) + " skipped: memory changed since their GPU write)";
-        line += "; records handed to another shape " + std::to_string(totals.shapesHandedOver) + " (" + std::to_string(totals.writeBacks) + " written back into the mirror, " + std::to_string(totals.writeBackBytes >> 20u) + " MiB, " + std::to_string(totals.writeBackRefusals) + " refused, " + std::to_string(totals.staleShapes) + " not written back: memory changed since their GPU write); targets and sampled views served as layers of a containing record " + std::to_string(totals.layerTargets);
+        line += "; records handed to another shape " + std::to_string(totals.shapesHandedOver) + " (" + std::to_string(totals.writeBacks) + " written back into the mirror, " + std::to_string(totals.writeBackBytes >> 20u) + " MiB, " + std::to_string(totals.writeBackRefusals) + " refused, " + std::to_string(totals.staleShapes) + " not written back: memory changed since their GPU write); targets and sampled views served as layers of a containing record " + std::to_string(totals.layerTargets) + ", records copied in as layers of a new record " + std::to_string(totals.layersAbsorbed) + " (" + std::to_string(totals.layersAbsorbedOverChanges) + " over a change note)";
         line += "; images adopted from the existing cache " + std::to_string(totals.recordAdoptions) + " (" + std::to_string(totals.recordAdoptionRefusals) + " refused), published back " + std::to_string(publishedRecords.load(std::memory_order_relaxed)) + " (" + std::to_string(staleRecordsKept.load(std::memory_order_relaxed)) + " not published: guest memory changed since their GPU write)";
         {
             auto& landings = batchLandings();
@@ -3206,11 +3208,13 @@ private:
             if (table->OwnerOfRange(ownedKey->surface.address, ownedKey->surface.bytes) == Images::Side::Upstream) return refuse("target owned by the existing cache");
             if ((ownedKey->surface.mips > 1u || color.mipTail) && (!recordsMipChains() || ownedKey->surface.width < mipChainMinWidth())) return refuse("target with a mip chain");
             std::uint32_t containingLayer = 0;
-            auto owned = ownedRecord(context, *table, ownedKey->surface, ownedWhy, &containingLayer);
+            Absorbed absorbed;
+            auto owned = ownedRecord(context, *table, ownedKey->surface, ownedWhy, &containingLayer, &absorbed);
             if (owned == nullptr && ownedWhy.empty()) {
                 auto adopted = table->AdoptResource(ownedKey->surface, ownedResource, ownedWhy);
                 if (adopted != nullptr && (ownedKey->surface.mips > 1u || zeroesAllNewTargets()) && zeroesNewChains() && context.recorder != nullptr) zeroRecord(context, *context.recorder, *table, *adopted);
                 owned = table->Seed(adopted);
+                absorbLayers(context, *table, owned, absorbed);
             }
             if (owned == nullptr) return refuse("target surface: " + ownedWhy);
             auto* ownedVulkan = dynamic_cast<Images::VulkanSurface*>(owned->device.get());
@@ -3252,7 +3256,7 @@ private:
         for (const auto& record : overlapping) {
             if (!record->seeded || record->retired) continue;
             const auto& held = record->key;
-            if (!layered(held.dimension) || held.format != key.format || held.tileMode != key.tileMode || held.width != key.width || held.height != key.height || held.mips != key.mips || held.pipeBankXor != key.pipeBankXor || held.pitch != key.pitch) continue;
+            if (!layered(held.dimension) || held.format != key.format || held.tileMode != key.tileMode || held.width != key.width || held.height != key.height || held.mips != key.mips || held.pitch != key.pitch) continue;
             auto* vulkan = dynamic_cast<Images::VulkanSurface*>(record->device.get());
             if (vulkan == nullptr) continue;
             const auto layers = std::max(vulkan->Geometry().imageLayers, 1u);
@@ -3268,7 +3272,50 @@ private:
         return nullptr;
     }
 
-    std::shared_ptr<Images::Surface> ownedRecord(const Context& context, Images::SurfaceTable& table, const Images::SurfaceKey& key, std::string& why, std::uint32_t* layer = nullptr) {
+    using Absorbed = std::vector<std::pair<std::shared_ptr<Images::Surface>, std::uint32_t>>;
+
+    static bool layerRunIn(const Images::Surface& record, const Images::SurfaceKey& key, std::uint32_t& first) {
+        const auto& held = record.key;
+        if (!layered(key.dimension) || !layered(held.dimension) || held.format != key.format || held.tileMode != key.tileMode || held.width != key.width || held.height != key.height || held.mips != key.mips || held.pitch != key.pitch) return false;
+        auto* vulkan = dynamic_cast<Images::VulkanSurface*>(record.device.get());
+        if (vulkan == nullptr) return false;
+        const auto layers = std::max(vulkan->Geometry().imageLayers, 1u);
+        if (held.bytes % layers != 0u || held.address < key.address || held.address + held.bytes > key.address + key.bytes) return false;
+        const auto stride = held.bytes / layers;
+        if ((held.address - key.address) % stride != 0u) return false;
+        first = static_cast<std::uint32_t>((held.address - key.address) / stride);
+        return true;
+    }
+
+    void absorbLayers(const Context& context, Images::SurfaceTable& table, const std::shared_ptr<Images::Surface>& record, const Absorbed& absorbed) {
+        if (absorbed.empty() || record == nullptr) return;
+        auto* target = dynamic_cast<Images::VulkanSurface*>(record->device.get());
+        bool copied = false;
+        if (target != nullptr && context.recorder != nullptr) {
+            drainSurfaces(context, *context.recorder);
+            const auto targetLevels = static_cast<std::uint32_t>(std::max<std::size_t>(target->Geometry().mips.size(), 1u));
+            const auto targetLayers = std::max(target->Geometry().imageLayers, 1u);
+            for (const auto& [held, first] : absorbed) {
+                auto* source = dynamic_cast<Images::VulkanSurface*>(held->device.get());
+                if (!held->gpuNewer || source == nullptr) continue;
+                const auto layers = std::max(source->Geometry().imageLayers, 1u);
+                if (first + layers > targetLayers) continue;
+                const auto commands = context.recorder->Commands();
+                source->EnsureGeneral(commands);
+                target->EnsureGeneral(commands);
+                const auto levels = std::min(targetLevels, static_cast<std::uint32_t>(std::max<std::size_t>(source->Geometry().mips.size(), 1u)));
+                Images::CopyImageContent(context, commands, source->Image(), target->Image(), record->key.width, record->key.height, levels, layers, first);
+                context.recorder->Keep(held);
+                if (table.ChangedSinceWrite(*held)) totals.layersAbsorbedOverChanges++;
+                totals.layersAbsorbed++;
+                copied = true;
+            }
+        }
+        for (const auto& [held, first] : absorbed) table.Retire(held);
+        if (copied) markRecordWritten(*context.recorder, table, *record);
+    }
+
+    std::shared_ptr<Images::Surface> ownedRecord(const Context& context, Images::SurfaceTable& table, const Images::SurfaceKey& key, std::string& why, std::uint32_t* layer = nullptr, Absorbed* absorbed = nullptr) {
         const auto overlapping = table.Overlapping(key.address, key.bytes);
         for (const auto& record : overlapping) {
             if (record->seeded && !record->retired && Images::SameBacking(record->key, key)) return record;
@@ -3281,9 +3328,14 @@ private:
         }
         for (const auto& record : overlapping) {
             if (!record->seeded || record->retired) continue;
+            std::uint32_t first = 0;
+            if (absorbed != nullptr && layerRunIn(*record, key, first)) {
+                absorbed->emplace_back(record, first);
+                continue;
+            }
             if (Downgrades::Active() && firstShapePair(key, record->key)) {
                 const auto& held = record->key;
-                std::fprintf(stderr, "[recode-images] another shape: asked 0x%llx+0x%llx %ux%u depth %u mips %u format %u tile %u dimension %u; record 0x%llx+0x%llx %ux%u depth %u mips %u format %u tile %u dimension %u%s\n", static_cast<unsigned long long>(key.address), static_cast<unsigned long long>(key.bytes), key.width, key.height, key.depth, key.mips, key.format, key.tileMode, key.dimension, static_cast<unsigned long long>(held.address), static_cast<unsigned long long>(held.bytes), held.width, held.height, held.depth, held.mips, held.format, held.tileMode, held.dimension, record->gpuNewer ? " (GPU-written: written back)" : "");
+                std::fprintf(stderr, "[recode-images] another shape: asked 0x%llx+0x%llx %ux%u depth %u mips %u format %u tile %u dimension %u pitch %u xor %u; record 0x%llx+0x%llx %ux%u depth %u mips %u format %u tile %u dimension %u pitch %u xor %u layers %u%s\n", static_cast<unsigned long long>(key.address), static_cast<unsigned long long>(key.bytes), key.width, key.height, key.depth, key.mips, key.format, key.tileMode, key.dimension, key.pitch, key.pipeBankXor, static_cast<unsigned long long>(held.address), static_cast<unsigned long long>(held.bytes), held.width, held.height, held.depth, held.mips, held.format, held.tileMode, held.dimension, held.pitch, held.pipeBankXor, record->device != nullptr && dynamic_cast<Images::VulkanSurface*>(record->device.get()) != nullptr ? dynamic_cast<Images::VulkanSurface*>(record->device.get())->Geometry().imageLayers : 0u, record->gpuNewer ? " (GPU-written: written back)" : "");
             }
             if (!handOverShape(context, table, record, why)) return nullptr;
         }
@@ -3406,13 +3458,15 @@ private:
         const auto& surface = key->surface;
         if (table->OwnerOfRange(surface.address, surface.bytes) != Images::Side::Record) return false;
         std::uint32_t layer = 0;
-        auto record = ownedRecord(context, *table, surface, why, &layer);
+        Absorbed absorbed;
+        auto record = ownedRecord(context, *table, surface, why, &layer, &absorbed);
         if (record == nullptr && why.empty()) {
             layer = 0;
             record = table->Seed(table->Adopt(surface, deferred.request.words, why));
             if (record != nullptr) {
                 static_cast<void>(table->Claim(surface.address, surface.bytes, Images::Side::Record, "sampled"));
                 if (context.recorder != nullptr) drainSurfaces(context, *context.recorder);
+                absorbLayers(context, *table, record, absorbed);
                 totals.sampledRecordsCreated++;
             }
         }
