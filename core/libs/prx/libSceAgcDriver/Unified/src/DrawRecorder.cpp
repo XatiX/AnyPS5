@@ -3354,7 +3354,7 @@ private:
         if (table == nullptr) return refuse("no surface table");
         if (ownsImages()) {
             if (color.samples != 1u) return refuse("multisampled target");
-            if (color.dccAddress != 0u || color.cmaskAddress != 0u) return refuse("target with DCC or CMASK metadata");
+            if ((color.dccAddress != 0u || color.cmaskAddress != 0u) && !Images::MetadataRecords()) return refuse("target with DCC or CMASK metadata");
             if (color.staged) return refuse("staged target");
             if (color.depthSlice != 0u) return refuse("target slice of a volume");
         } else if (color.samples != 1u || color.mipTail || color.dccAddress != 0u || color.cmaskAddress != 0u || color.staged || color.depthSlice != 0u) {

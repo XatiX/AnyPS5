@@ -36,7 +36,7 @@ std::optional<ImageKey> KeyOf(const Graphics::GuestTextureResource& resource, st
         reason = "multisampled image";
         return std::nullopt;
     }
-    if (resource.dccAddress != 0u) {
+    if (resource.dccAddress != 0u && !MetadataRecords()) {
         reason = "compressed image metadata";
         return std::nullopt;
     }
@@ -45,6 +45,14 @@ std::optional<ImageKey> KeyOf(const Graphics::GuestTextureResource& resource, st
     const auto swizzle = static_cast<std::uint32_t>(resource.dstSelX) | static_cast<std::uint32_t>(resource.dstSelY) << 4u | static_cast<std::uint32_t>(resource.dstSelZ) << 8u | static_cast<std::uint32_t>(resource.dstSelW) << 12u | static_cast<std::uint32_t>(resource.bcSwizzle) << 16u;
     key.view = {resource.baseLevel, resource.lastLevel, resource.baseArray, resource.depthOrLastArray, swizzle, resource.format};
     return key;
+}
+
+bool MetadataRecords() {
+    static const bool records = [] {
+        const char* value = std::getenv("APS5_RECODE_METADATA_RECORDS");
+        return value == nullptr || std::string_view(value) != "0";
+    }();
+    return records;
 }
 
 std::size_t SurfaceTable::KeyHash::operator()(const SurfaceKey& key) const {
