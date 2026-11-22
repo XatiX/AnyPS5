@@ -3605,6 +3605,7 @@ private:
                 std::fprintf(stderr, "[recode-images] not written back: record 0x%llx+0x%llx %ux%u depth %u mips %u format %u dimension %u; %s\n", static_cast<unsigned long long>(held.address), static_cast<unsigned long long>(held.bytes), held.width, held.height, held.depth, held.mips, held.format, held.dimension, table.ChangeOf(*record).c_str());
             }
             totals.staleShapes++;
+            if (Downgrades::Watching()) Downgrades::WatchTouch(("a GPU-written record dropped at a hand-over, " + table.ChangeOf(*record)).c_str(), record->key.address, record->key.bytes);
         } else if (record->gpuNewer) {
             std::string reason = "no recorder";
             if (context.recorder != nullptr) {
@@ -3614,6 +3615,7 @@ private:
             if (!reason.empty()) {
                 totals.writeBacksUnserved++;
                 if (seen.insert("unwritten hand-over: " + reason).second) std::fprintf(stderr, "[recode-images] first record retired unwritten at a hand-over: %s\n", reason.c_str());
+                if (Downgrades::Watching()) Downgrades::WatchTouch(("a GPU-written record retired unwritten at a hand-over, " + reason).c_str(), record->key.address, record->key.bytes);
             } else {
                 noteWrittenBack(*context.recorder, record->key.address, record->key.bytes);
                 totals.writeBacks++;
@@ -3742,6 +3744,7 @@ private:
                 if (context.recorder != nullptr) drainSurfaces(context, *context.recorder);
                 absorbLayers(context, *table, record, absorbed);
                 totals.sampledRecordsCreated++;
+                Downgrades::WatchTouch("a record made from memory for a sampled read", surface.address, surface.bytes);
             }
         }
         if (Downgrades::Watching()) Downgrades::WatchProgramRead(stage.program.codeAddress, surface.address, surface.bytes);

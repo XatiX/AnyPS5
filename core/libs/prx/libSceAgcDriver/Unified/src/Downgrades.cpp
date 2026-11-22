@@ -414,6 +414,8 @@ struct WatchState {
     std::vector<Watched> ranges;
     std::uint64_t offset = 0;
     std::uint64_t lines = 0;
+    long long afterMs = 0;
+    bool reads = true;
     std::chrono::steady_clock::time_point start = std::chrono::steady_clock::now();
 };
 
@@ -430,6 +432,10 @@ WatchState& watchState() {
         auto* created = new WatchState;
         const char* offset = std::getenv("APS5_RECODE_WATCH_OFFSET");
         created->offset = offset != nullptr ? std::strtoull(offset, nullptr, 16) : 0xfff8u;
+        const char* after = std::getenv("APS5_RECODE_WATCH_AFTER");
+        created->afterMs = after != nullptr ? std::strtoll(after, nullptr, 10) * 1000 : 0;
+        const char* reads = std::getenv("APS5_RECODE_WATCH_READS");
+        created->reads = reads == nullptr || std::strcmp(reads, "0") != 0;
         const auto& list = watchList();
         for (auto at = list.find('@'); at != std::string::npos; at = list.find('@', at + 1u)) {
             char* end = nullptr;
@@ -482,6 +488,7 @@ void WatchProgramRead(std::uint64_t codeAddress, std::uint64_t address, std::uin
     const auto hash = ProgramHash(codeAddress);
     if (!ListedHash(watchList(), hash)) return;
     auto& state = watchState();
+    if (!state.reads) return;
     std::lock_guard lock(state.mutex);
     for (const auto& range : state.ranges) {
         if (range.begin == address && range.end == address + bytes) return;
@@ -494,6 +501,7 @@ void WatchProgramRead(std::uint64_t codeAddress, std::uint64_t address, std::uin
 void WatchTouch(const char* what, std::uint64_t address, std::uint64_t bytes) {
     if (!Watching() || bytes == 0u) return;
     auto& state = watchState();
+    if (watchMs(state) < state.afterMs) return;
     std::lock_guard lock(state.mutex);
     for (const auto& range : state.ranges) {
         if (address >= range.end || range.begin >= address + bytes) continue;
