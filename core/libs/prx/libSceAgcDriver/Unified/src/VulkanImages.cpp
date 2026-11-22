@@ -309,10 +309,6 @@ std::shared_ptr<DeviceSurface> VulkanSurfaceDevice::CreateFromResource(const Sur
             return nullptr;
         }
         auto geometry = Graphics::DescribeSurface(resource);
-        if (geometry.thick) {
-            reason = "thick surface";
-            return nullptr;
-        }
         const auto format = Graphics::SampledTextureFormat(context, resource.format);
         if (format == VK_FORMAT_UNDEFINED) {
             reason = "surface format";

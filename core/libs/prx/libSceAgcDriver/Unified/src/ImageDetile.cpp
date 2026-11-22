@@ -28,6 +28,11 @@ void imageBarrier(const Graphics::Context& context, VkCommandBuffer commands, Vk
     context.Resolved(&Graphics::DeviceFunctions::cmdPipelineBarrier, "vkCmdPipelineBarrier")(commands, sourceStage, destinationStage, 0, 0, nullptr, 0, nullptr, 1, &barrier);
 }
 
+std::uint32_t copyLayers(const Graphics::SurfaceGeometry& geometry) {
+    if (geometry.imageDepth > 1u) return std::max(geometry.layers, geometry.imageDepth);
+    return std::min(geometry.layers, std::max(geometry.imageLayers, 1u));
+}
+
 }
 
 SurfaceDetiler::SurfaceDetiler(const Graphics::Context& context) : context(context), detiler(std::make_unique<Graphics::TextureDetiler>(context)) {}
@@ -100,8 +105,8 @@ void SurfaceDetiler::recordOne(Graphics::Recorder& recorder, VkCommandBuffer com
     const auto& resource = vulkan.Resource();
     const auto& geometry = vulkan.Geometry();
     const auto elementBytes = Graphics::BytesPerElement(resource.format);
-    const auto layers = std::min(geometry.layers, std::max(geometry.imageLayers, 1u));
-    if (vulkan.Compressed()) {
+    const auto layers = copyLayers(geometry);
+    if (vulkan.Compressed() || geometry.thick || geometry.imageDepth > 1u) {
         std::string reason;
         if (!recordThroughBuffer(recorder, commands, vulkan, buffer, base, layers, reason)) throw std::runtime_error(reason);
     } else {
@@ -147,7 +152,8 @@ bool SurfaceDetiler::recordThroughBuffer(Graphics::Recorder& recorder, VkCommand
             region.bufferOffset = static_cast<std::uint64_t>(layer) * layerBytes + mip.linearOffset;
             region.bufferRowLength = rowTexels;
             region.bufferImageHeight = 0u;
-            region.imageSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, level, layer, 1u};
+            region.imageSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, level, geometry.CopyLayer(layer), 1u};
+            region.imageOffset = {0, 0, geometry.CopyDepth(layer)};
             region.imageExtent = {std::max(resource.width >> level, 1u), std::max(resource.height >> level, 1u), 1u};
             regions.push_back(region);
         }
@@ -158,7 +164,7 @@ bool SurfaceDetiler::recordThroughBuffer(Graphics::Recorder& recorder, VkCommand
         const auto& mip = geometry.mips[level];
         for (std::uint32_t layer = 0; layer < layers; ++layer) {
             if (!geometry.HasLayer(level, layer)) continue;
-            detiler->Dispatch(commands, resource.tileMode, elementBytes, source, base + geometry.GuestOffset(layer, mip), scratch->Handle(), regions[index++].bufferOffset, mip, false, layer, false, window);
+            detiler->Dispatch(commands, resource.tileMode, elementBytes, source, base + geometry.GuestOffset(layer, mip), scratch->Handle(), regions[index++].bufferOffset, mip, false, layer, geometry.thick, window);
             counts.dispatches++;
         }
     }
@@ -182,6 +188,10 @@ bool SurfaceDetiler::WriteBack(Graphics::Recorder& recorder, const std::shared_p
     }
     if (vulkan->Compressed()) {
         reason = "block-compressed record";
+        return false;
+    }
+    if (vulkan->Geometry().thick || vulkan->Geometry().imageDepth > 1u) {
+        reason = "thick or volume record";
         return false;
     }
     const auto& key = surface->key;
