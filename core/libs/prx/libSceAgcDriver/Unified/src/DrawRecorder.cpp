@@ -1989,6 +1989,30 @@ private:
         });
     }
 
+    void probeDrawArguments(const Context& context, Graphics::Recorder& recorder, VkCommandBuffer commands, const Pm4::DrawParameters::IndirectDraw& args, bool indexed, const char* source, VkBuffer arguments, VkDeviceSize offset, const std::optional<DrawInput>& count, std::uint64_t codeAddress) {
+        constexpr std::uint32_t Slots = 1024;
+        constexpr VkDeviceSize SlotBytes = 32;
+        constexpr VkDeviceSize CountOffset = 24;
+        if (!Downgrades::Active() || args.count == 0u || args.recordBytes > CountOffset) return;
+        const auto seen = ++argumentProbes[codeAddress];
+        if (seen > 2u && seen % 200u != 0u) return;
+        if (argumentReads == nullptr) argumentReads = std::make_shared<Graphics::Buffer>(context, Slots * SlotBytes, VK_BUFFER_USAGE_TRANSFER_DST_BIT);
+        const auto slot = nextArgumentRead++ % Slots;
+        Graphics::RecordMemoryBarrier(context, commands, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_ACCESS_SHADER_WRITE_BIT | VK_ACCESS_TRANSFER_WRITE_BIT, VK_ACCESS_TRANSFER_READ_BIT);
+        Graphics::CopyBuffer(context, commands, arguments, offset, argumentReads->Handle(), slot * SlotBytes, args.recordBytes);
+        if (count) Graphics::CopyBuffer(context, commands, count->buffer, count->offset, argumentReads->Handle(), slot * SlotBytes + CountOffset, sizeof(std::uint32_t));
+        Graphics::RecordMemoryBarrier(context, commands, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_HOST_BIT, VK_ACCESS_TRANSFER_WRITE_BIT, VK_ACCESS_HOST_READ_BIT);
+        recorder.Keep(argumentReads);
+        recorder.OnComplete([buffer = argumentReads, slot, codeAddress, indexed, source, seen, records = args.count, guest = args.arguments, counted = count.has_value()] {
+            std::uint32_t words[8] = {};
+            std::memcpy(words, buffer->Bytes().data() + slot * SlotBytes, sizeof(words));
+            char counter[48] = "";
+            if (counted) std::snprintf(counter, sizeof(counter), ", count buffer holds %u", words[6]);
+            if (indexed) std::fprintf(stderr, "[recode-arguments] %016llx indirect draw %u (%s, %u records at 0x%llx%s): first record indices %u instances %u first index %u vertex offset %d first instance %u\n", static_cast<unsigned long long>(Downgrades::ProgramHash(codeAddress)), seen, source, records, static_cast<unsigned long long>(guest), counter, words[0], words[1], words[2], static_cast<std::int32_t>(words[3]), words[4]);
+            else std::fprintf(stderr, "[recode-arguments] %016llx indirect draw %u (%s, %u records at 0x%llx%s): first record vertices %u instances %u first vertex %u first instance %u\n", static_cast<unsigned long long>(Downgrades::ProgramHash(codeAddress)), seen, source, records, static_cast<unsigned long long>(guest), counter, words[0], words[1], words[2], words[3]);
+        });
+    }
+
     static void noteImage(const Resolve::ResolvedStage& stage, Downgrades::Kind kind, std::uint32_t index, const Heap::SlotRequest& request, const char* what) {
         if (!Downgrades::Active()) return;
         char text[96];
@@ -3246,6 +3270,7 @@ private:
                 PatchIndirectArguments(context, commands, *parameters.indirect, argumentPatch->source, argumentPatch->sourceOffset, ring->Handle(), argumentPatch->ringOffset);
                 totals.patchedArguments++;
             }
+            if (parameters.indirect && !snapshotArguments) probeDrawArguments(context, *recorder, commands, *parameters.indirect, parameters.indexed, argumentPatch ? "patched copy" : "read in place", argumentBuffer, argumentOffset, indirectCount, draw.stages.empty() ? 0u : draw.stages.back().program.codeAddress);
             if (parameters.indirect) Graphics::RecordMemoryBarrier(context, commands, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT | VK_PIPELINE_STAGE_HOST_BIT, VK_PIPELINE_STAGE_DRAW_INDIRECT_BIT, VK_ACCESS_SHADER_WRITE_BIT | VK_ACCESS_TRANSFER_WRITE_BIT | VK_ACCESS_HOST_WRITE_BIT, VK_ACCESS_INDIRECT_COMMAND_READ_BIT);
             pipeline->Begin(recording, *framebuffer, state.renderExtent, state, maskedState);
         }
@@ -3793,6 +3818,9 @@ private:
     std::vector<std::shared_ptr<Graphics::Buffer>> spareFaults;
     std::shared_ptr<Graphics::Buffer> groupReads;
     std::uint32_t nextGroupRead = 0;
+    std::shared_ptr<Graphics::Buffer> argumentReads;
+    std::uint32_t nextArgumentRead = 0;
+    std::unordered_map<std::uint64_t, std::uint32_t> argumentProbes;
     std::map<std::uint32_t, std::uint64_t> faultReasons;
     std::optional<RingSpace> space;
     std::map<std::vector<std::uint32_t>, VkDescriptorSetLayout> layouts;
