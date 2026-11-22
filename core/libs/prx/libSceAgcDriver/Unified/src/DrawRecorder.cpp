@@ -3846,6 +3846,10 @@ bool RecordActive() {
     return enabled;
 }
 
+bool DropsUnrecorded() {
+    return RecordActive() && Downgrades::ExistingPathMode() == Downgrades::ExistingPath::Drop;
+}
+
 bool RecordsKernels(std::uint32_t queue) {
     static const bool records = std::getenv("APS5_RECODE_NO_KERNEL_RECORD") == nullptr;
     return records && RecordActive() && Resolve::DispatchesRoutedOn(queue);

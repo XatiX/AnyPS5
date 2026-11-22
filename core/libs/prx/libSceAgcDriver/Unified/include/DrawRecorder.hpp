@@ -21,6 +21,7 @@ class VulkanDevice;
 namespace AgcDriver::Unified::Record {
 
 [[nodiscard]] bool RecordActive();
+[[nodiscard]] bool DropsUnrecorded();
 [[nodiscard]] bool RecordsKernels(std::uint32_t queue);
 enum class Kernel : std::uint8_t { Fill, Copy };
 void NoteKernel(Kernel kernel);
