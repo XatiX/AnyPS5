@@ -502,6 +502,14 @@ struct NanCensus {
     std::uint32_t draws = 0;
 };
 
+const std::string& censusReads() {
+    static const std::string list = [] {
+        const char* value = std::getenv("APS5_RECODE_NAN_CENSUS_READS");
+        return std::string(value == nullptr ? "" : value);
+    }();
+    return list;
+}
+
 const NanCensus& nanCensus() {
     static const NanCensus census = [] {
         NanCensus parsed;
@@ -2321,7 +2329,7 @@ private:
         }
     }
 
-    void censusRecord(const Context& context, Graphics::Recorder& recorder, const std::shared_ptr<Images::Surface>& record, std::uint64_t program) {
+    void censusRecord(const Context& context, Graphics::Recorder& recorder, const std::shared_ptr<Images::Surface>& record, std::uint64_t program, bool read = false) {
         const auto& census = nanCensus();
         const auto now = std::chrono::steady_clock::now();
         if (!censusClock.has_value()) censusClock = now;
@@ -2345,30 +2353,34 @@ private:
         recorder.Keep(buffer);
         const auto address = record->key.address;
         const auto mips = record->key.mips;
-        recorder.OnComplete([buffer, sequence, program, address, width, height, mips, format] {
+        recorder.OnComplete([buffer, sequence, program, address, width, height, mips, format, read] {
             buffer->Invalidate();
             const auto bytes = buffer->Bytes();
             std::uint64_t bad = 0;
+            std::uint64_t huge = 0;
             if (format == VK_FORMAT_B10G11R11_UFLOAT_PACK32) {
                 for (std::size_t at = 0; at + 4u <= bytes.size(); at += 4u) {
                     std::uint32_t word = 0;
                     std::memcpy(&word, bytes.data() + at, 4u);
                     if (((word >> 6u) & 0x1fu) == 0x1fu || ((word >> 17u) & 0x1fu) == 0x1fu || ((word >> 27u) & 0x1fu) == 0x1fu) ++bad;
+                    else if (((word >> 6u) & 0x1fu) == 0x1eu || ((word >> 17u) & 0x1fu) == 0x1eu || ((word >> 27u) & 0x1fu) == 0x1eu) ++huge;
                 }
             } else if (format == VK_FORMAT_R32G32B32A32_SFLOAT || format == VK_FORMAT_R32_SFLOAT) {
                 for (std::size_t at = 0; at + 4u <= bytes.size(); at += 4u) {
                     std::uint32_t word = 0;
                     std::memcpy(&word, bytes.data() + at, 4u);
                     if ((word & 0x7f800000u) == 0x7f800000u) ++bad;
+                    else if (((word >> 23u) & 0xffu) >= 142u) ++huge;
                 }
             } else {
                 for (std::size_t at = 0; at + 2u <= bytes.size(); at += 2u) {
                     std::uint16_t half = 0;
                     std::memcpy(&half, bytes.data() + at, 2u);
                     if ((half & 0x7c00u) == 0x7c00u) ++bad;
+                    else if ((half & 0x7c00u) == 0x7800u) ++huge;
                 }
             }
-            if (bad != 0u) std::fprintf(stderr, "[recode-nan] %u program %016llx record 0x%llx %ux%u mips %u vk%u: %llu non-finite values\n", sequence, static_cast<unsigned long long>(program), static_cast<unsigned long long>(address), width, height, mips, static_cast<unsigned>(format), static_cast<unsigned long long>(bad));
+            if (bad != 0u || huge != 0u) std::fprintf(stderr, read ? "[recode-nan-read] %u program %016llx reads record 0x%llx %ux%u mips %u vk%u: %llu non-finite values, %llu at or above 32768\n" : "[recode-nan] %u program %016llx record 0x%llx %ux%u mips %u vk%u: %llu non-finite values, %llu at or above 32768\n", sequence, static_cast<unsigned long long>(program), static_cast<unsigned long long>(address), width, height, mips, static_cast<unsigned>(format), static_cast<unsigned long long>(bad), static_cast<unsigned long long>(huge));
         });
     }
 
@@ -2426,7 +2438,7 @@ private:
         const auto levels = static_cast<std::uint32_t>(std::max<std::size_t>(vulkan->Geometry().mips.size(), 1u));
         const auto commands = recorder.Commands();
         Graphics::RecordMemoryBarrier(context, commands, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT | VK_ACCESS_SHADER_WRITE_BIT | VK_ACCESS_TRANSFER_WRITE_BIT, VK_ACCESS_TRANSFER_READ_BIT);
-        for (const auto level : {0u, std::min(1u, levels - 1u), levels - 1u}) {
+        for (std::uint32_t level = 0; level < levels; ++level) {
             if (request.trace && level != 0u) break;
             const auto width = std::max(record->key.width >> level, 1u);
             const auto height = std::max(record->key.height >> level, 1u);
@@ -2593,6 +2605,9 @@ private:
         if (stage.tableMap != nullptr) recorder->Keep(std::const_pointer_cast<Tables::Mirror>(stage.tableMap));
         if (pageTable != nullptr) recorder->Keep(pageTable);
         noteStorageWrites(context, *recorder, written);
+        if (nanCensus().draws != 0u) {
+            for (const auto& record : writtenRecords) censusRecord(context, *recorder, record, Downgrades::ProgramHash(stage.program.codeAddress));
+        }
         std::vector<std::pair<std::uint64_t, std::uint64_t>> writtenRanges;
         for (std::size_t index = 0; index < dispatch.uses.size(); ++index) {
             const auto& use = dispatch.uses[index];
@@ -2824,7 +2839,9 @@ private:
                 }
                 views.push_back(resident->AttachmentView(color.format, color.mip, color.depthSlice, color.layers, color.arraySlice));
                 if (Downgrades::Active()) {
-                    for (const auto& stage : draw.stages) Downgrades::Note(stage.program.codeAddress, Downgrades::Kind::UpstreamTarget, static_cast<std::uint32_t>(views.size() - 1u), "colour target from the existing surface cache");
+                    char detail[256];
+                    std::snprintf(detail, sizeof(detail), "colour target 0x%llx mip %u from the existing surface cache: %s", static_cast<unsigned long long>(Graphics::SurfaceForTarget(color).baseAddress), color.mip, lastTargetRefusal.empty() ? "not offered to records" : lastTargetRefusal.c_str());
+                    for (const auto& stage : draw.stages) Downgrades::Note(stage.program.codeAddress, Downgrades::Kind::UpstreamTarget, static_cast<std::uint32_t>(views.size() - 1u), detail);
                 }
                 Images::Targets().Note(resident);
                 owners.push_back(resident);
@@ -3481,6 +3498,7 @@ private:
         }
         stage.slots[deferred.index] = slot;
         if (context.recorder != nullptr) context.recorder->Keep(record);
+        if (context.recorder != nullptr && nanCensus().draws != 0u && !censusReads().empty() && Downgrades::ListedHash(censusReads(), Downgrades::ProgramHash(stage.program.codeAddress))) censusRecord(context, *context.recorder, record, Downgrades::ProgramHash(stage.program.codeAddress), true);
         totals.recordSampled++;
         return true;
     }
