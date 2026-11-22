@@ -293,7 +293,9 @@ std::vector<std::shared_ptr<Surface>> SurfaceTable::StaleOverlapping(std::uint64
 bool SurfaceTable::ChangedSinceWrite(const Surface& surface) const {
     std::lock_guard lock(mutex);
     const auto owner = OwnerOf(surface);
-    return shared.ChangedSince(surface.key.address, surface.key.bytes, surface.stamp, owner) || gpuWrites.ChangedSince(surface.key.address, surface.key.bytes, surface.imageStamp, owner);
+    if (shared.ChangedSince(surface.key.address, surface.key.bytes, surface.stamp, owner)) return true;
+    if (!gpuWrites.ChangedSince(surface.key.address, surface.key.bytes, surface.imageStamp, owner)) return false;
+    return gpuWrites.ChangedOwner(surface.key.address, surface.key.bytes, surface.imageStamp) != Events::TargetOwner;
 }
 
 void SurfaceTable::Touch(Surface& surface) {
