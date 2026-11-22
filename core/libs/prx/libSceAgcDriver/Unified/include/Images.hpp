@@ -116,6 +116,7 @@ struct TableCounts {
     std::uint64_t ownWrites = 0;
     std::uint64_t ownServed = 0;
     std::uint64_t aliasServed = 0;
+    std::uint64_t retired = 0;
 };
 
 class SurfaceTable {
@@ -136,6 +137,7 @@ public:
     [[nodiscard]] Side OwnerOfRange(std::uint64_t address, std::uint64_t bytes) const;
     Side Claim(std::uint64_t address, std::uint64_t bytes, Side side, std::string_view reason);
     void Demote(std::uint64_t address, std::uint64_t bytes, std::string_view reason);
+    void Retire(const std::shared_ptr<Surface>& surface);
     [[nodiscard]] std::shared_ptr<Surface> Seed(const std::shared_ptr<Surface>& surface);
     [[nodiscard]] std::string OwnersLine() const;
     [[nodiscard]] TableCounts TakeCounts();

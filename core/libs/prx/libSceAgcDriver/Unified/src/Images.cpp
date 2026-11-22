@@ -315,6 +315,29 @@ void SurfaceTable::Demote(std::uint64_t address, std::uint64_t bytes, std::strin
     }
 }
 
+void SurfaceTable::Retire(const std::shared_ptr<Surface>& surface) {
+    std::lock_guard lock(mutex);
+    if (surface == nullptr || surface->retired) return;
+    surface->retired = true;
+    surface->gpuNewer = false;
+    const auto found = surfaces.find(surface->key);
+    if (found != surfaces.end() && found->second == surface) {
+        heldBytes -= surface->key.bytes;
+        surfaces.erase(found);
+    }
+    std::erase_if(newer, [&](const std::shared_ptr<Surface>& other) { return other == surface; });
+    for (auto at = claims.begin(); at != claims.end();) {
+        if (at->side != Side::Record || at->begin != surface->key.address || at->end != surface->key.address + surface->key.bytes) {
+            ++at;
+            continue;
+        }
+        owners.recordRanges--;
+        owners.recordBytes -= at->end - at->begin;
+        at = claims.erase(at);
+    }
+    counts.retired++;
+}
+
 std::shared_ptr<Surface> SurfaceTable::Seed(const std::shared_ptr<Surface>& surface) {
     std::lock_guard lock(mutex);
     if (surface == nullptr || surface->seeded) return surface;

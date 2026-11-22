@@ -170,6 +170,69 @@ bool SurfaceDetiler::recordThroughBuffer(Graphics::Recorder& recorder, VkCommand
     return true;
 }
 
+bool SurfaceDetiler::WriteBack(Graphics::Recorder& recorder, const std::shared_ptr<Surface>& surface, std::string& reason) {
+    auto* vulkan = dynamic_cast<VulkanSurface*>(surface->device.get());
+    if (vulkan == nullptr) {
+        reason = "record without a Vulkan image";
+        return false;
+    }
+    if (!vulkan->Initialized()) {
+        reason = "record never filled";
+        return false;
+    }
+    if (vulkan->Compressed()) {
+        reason = "block-compressed record";
+        return false;
+    }
+    const auto& key = surface->key;
+    Shadow::OwnedSpan span;
+    if (!Shadow::ServeOwned(context, key.address, key.bytes, &span) || span.handle == 0u || key.address < span.origin) {
+        reason = "record memory not resident";
+        return false;
+    }
+    const auto buffer = reinterpret_cast<VkBuffer>(static_cast<std::uintptr_t>(span.handle));
+    const auto base = key.address - span.origin;
+    const auto serial = recorder.OpenBatchSerial();
+    if (serial != batch) {
+        detiler->BeginBatch();
+        batch = serial;
+    }
+    const auto commands = recorder.Commands();
+    const auto timing = recorder.BeginGpuTiming(DetileTimingKey);
+    std::vector<std::shared_ptr<void>> kept;
+    if (Shadow::RecordOwnedUploads(commands, kept) != 0u) {
+        for (auto& object : kept) recorder.Keep(std::move(object));
+    }
+    imageBarrier(context, commands, vulkan->Image(), VK_IMAGE_LAYOUT_GENERAL, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_ACCESS_SHADER_WRITE_BIT | VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT | VK_ACCESS_TRANSFER_WRITE_BIT, VK_ACCESS_SHADER_READ_BIT);
+    Graphics::RecordMemoryBarrier(context, commands, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_ACCESS_TRANSFER_WRITE_BIT | VK_ACCESS_SHADER_WRITE_BIT | VK_ACCESS_SHADER_READ_BIT, VK_ACCESS_SHADER_WRITE_BIT);
+    const auto& resource = vulkan->Resource();
+    const auto& geometry = vulkan->Geometry();
+    const auto elementBytes = Graphics::BytesPerElement(resource.format);
+    const auto layers = std::min(geometry.layers, std::max(geometry.imageLayers, 1u));
+    Graphics::DetileWindow window;
+    window.pipeBankXor = resource.pipeBankXor;
+    try {
+        for (std::uint32_t level = 0; level < geometry.mips.size(); ++level) {
+            const auto& mip = geometry.mips[level];
+            for (std::uint32_t layer = 0; layer < layers; ++layer) {
+                if (!geometry.HasLayer(level, layer)) continue;
+                detiler->DispatchImage(commands, resource.tileMode, elementBytes, buffer, base + geometry.GuestOffset(layer, mip), vulkan->StorageView(level, layer, elementBytes), mip, true, layer, window);
+                counts.writeBackDispatches++;
+            }
+        }
+    } catch (const std::exception& error) {
+        recorder.EndGpuTiming(timing);
+        reason = std::string("write-back: ") + error.what();
+        return false;
+    }
+    Graphics::RecordMemoryBarrier(context, commands, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_ACCESS_SHADER_WRITE_BIT, VK_ACCESS_MEMORY_READ_BIT | VK_ACCESS_MEMORY_WRITE_BIT);
+    recorder.EndGpuTiming(timing);
+    recorder.Keep(surface);
+    counts.writeBacks++;
+    counts.writeBackBytes += key.bytes;
+    return true;
+}
+
 DetileCounts SurfaceDetiler::TakeCounts() {
     const auto taken = counts;
     counts = {};

@@ -217,6 +217,11 @@ struct Totals {
     std::uint64_t directWrites = 0;
     std::uint64_t recordAdoptions = 0;
     std::uint64_t recordAdoptionRefusals = 0;
+    std::uint64_t writeBacks = 0;
+    std::uint64_t writeBackBytes = 0;
+    std::uint64_t writeBackRefusals = 0;
+    std::uint64_t shapesHandedOver = 0;
+    std::uint64_t staleShapes = 0;
     std::uint64_t recordTargetRefusals = 0;
     std::uint64_t indirectDispatches = 0;
     std::uint64_t gdsBindings = 0;
@@ -977,6 +982,7 @@ public:
         line += text;
         std::snprintf(text, sizeof(text), "; table maps %llu hits, %llu uploads (%.1f MiB), %llu retired, %zu held (%.1f MiB)", static_cast<unsigned long long>(totals.mapHits), static_cast<unsigned long long>(totals.mapUploads), static_cast<double>(totals.mapUploadBytes) / 1048576.0, static_cast<unsigned long long>(totals.mapRetired), maps.size(), static_cast<double>(mapBytes) / 1048576.0);
         line += text;
+        line += "; records handed to another shape " + std::to_string(totals.shapesHandedOver) + " (" + std::to_string(totals.writeBacks) + " written back into the mirror, " + std::to_string(totals.writeBackBytes >> 20u) + " MiB, " + std::to_string(totals.writeBackRefusals) + " refused, " + std::to_string(totals.staleShapes) + " not written back: memory changed since their GPU write)";
         line += "; images adopted from the existing cache " + std::to_string(totals.recordAdoptions) + " (" + std::to_string(totals.recordAdoptionRefusals) + " refused), published back " + std::to_string(publishedRecords.load(std::memory_order_relaxed)) + " (" + std::to_string(staleRecordsKept.load(std::memory_order_relaxed)) + " not published: guest memory changed since their GPU write)";
         {
             auto& landings = batchLandings();
@@ -2915,7 +2921,7 @@ private:
             if (!ownedKey.has_value()) return refuse("target key: " + ownedWhy);
             if (table->OwnerOfRange(ownedKey->surface.address, ownedKey->surface.bytes) == Images::Side::Upstream) return refuse("target owned by the existing cache");
             if (ownedKey->surface.mips > 1u || color.mipTail) return refuse("target with a mip chain");
-            auto owned = ownedRecord(*table, ownedKey->surface, ownedWhy);
+            auto owned = ownedRecord(context, *table, ownedKey->surface, ownedWhy);
             if (owned == nullptr && ownedWhy.empty()) owned = table->Seed(table->AdoptResource(ownedKey->surface, ownedResource, ownedWhy));
             if (owned == nullptr) return refuse("target surface: " + ownedWhy);
             auto* ownedVulkan = dynamic_cast<Images::VulkanSurface*>(owned->device.get());
@@ -2948,17 +2954,51 @@ private:
         return record;
     }
 
-    static std::shared_ptr<Images::Surface> ownedRecord(Images::SurfaceTable& table, const Images::SurfaceKey& key, std::string& why) {
-        for (auto& record : table.Overlapping(key.address, key.bytes)) {
+    std::shared_ptr<Images::Surface> ownedRecord(const Context& context, Images::SurfaceTable& table, const Images::SurfaceKey& key, std::string& why) {
+        const auto overlapping = table.Overlapping(key.address, key.bytes);
+        for (const auto& record : overlapping) {
+            if (record->seeded && !record->retired && Images::SameBacking(record->key, key)) return record;
+        }
+        for (const auto& record : overlapping) {
             if (!record->seeded || record->retired) continue;
-            if (Images::SameBacking(record->key, key)) return record;
-            why = "another shape of a recode record";
             if (Downgrades::Active() && shapeNotes.fetch_add(1, std::memory_order_relaxed) < 24u) {
                 const auto& held = record->key;
-                std::fprintf(stderr, "[recode-images] another shape: asked 0x%llx+0x%llx %ux%u depth %u mips %u format %u tile %u dimension %u; record 0x%llx+0x%llx %ux%u depth %u mips %u format %u tile %u dimension %u\n", static_cast<unsigned long long>(key.address), static_cast<unsigned long long>(key.bytes), key.width, key.height, key.depth, key.mips, key.format, key.tileMode, key.dimension, static_cast<unsigned long long>(held.address), static_cast<unsigned long long>(held.bytes), held.width, held.height, held.depth, held.mips, held.format, held.tileMode, held.dimension);
+                std::fprintf(stderr, "[recode-images] another shape: asked 0x%llx+0x%llx %ux%u depth %u mips %u format %u tile %u dimension %u; record 0x%llx+0x%llx %ux%u depth %u mips %u format %u tile %u dimension %u%s\n", static_cast<unsigned long long>(key.address), static_cast<unsigned long long>(key.bytes), key.width, key.height, key.depth, key.mips, key.format, key.tileMode, key.dimension, static_cast<unsigned long long>(held.address), static_cast<unsigned long long>(held.bytes), held.width, held.height, held.depth, held.mips, held.format, held.tileMode, held.dimension, record->gpuNewer ? " (GPU-written: written back)" : "");
             }
+            if (!handOverShape(context, table, record, why)) return nullptr;
         }
         return nullptr;
+    }
+
+    bool handOverShape(const Context& context, Images::SurfaceTable& table, const std::shared_ptr<Images::Surface>& record, std::string& why) {
+        if (record->gpuNewer && table.ChangedSinceWrite(*record)) {
+            totals.staleShapes++;
+        } else if (record->gpuNewer) {
+            std::string reason = "no recorder";
+            if (context.recorder != nullptr) {
+                if (surfaceDetiler == nullptr) surfaceDetiler = std::make_unique<Images::SurfaceDetiler>(context);
+                if (surfaceDetiler->WriteBack(*context.recorder, record, reason)) reason.clear();
+            }
+            if (!reason.empty()) {
+                why = "another shape of a recode record: " + reason;
+                totals.writeBackRefusals++;
+                return false;
+            }
+            noteWrittenBack(*context.recorder, record->key.address, record->key.bytes);
+            totals.writeBacks++;
+            totals.writeBackBytes += record->key.bytes;
+        }
+        table.Retire(record);
+        totals.shapesHandedOver++;
+        return true;
+    }
+
+    void noteWrittenBack(Graphics::Recorder& recorder, std::uint64_t address, std::uint64_t bytes) {
+        if (!Mirror::WritesEnabled()) return;
+        const auto mark = MemoryCore::Get().NoteGpuWrite(address, bytes, recorder.OpenBatchSerial());
+        if (!mark.upload.empty()) ResidencyService::Get().NoteDirty(mark.upload);
+        const std::array written{std::pair{address, address + bytes}};
+        Events::NoteRanges(written);
     }
 
     void claimUpstream(const Context& context, std::uint64_t address, std::uint64_t bytes, std::string_view why) {
@@ -2999,7 +3039,7 @@ private:
             claimUpstream(context, surface.address, surface.bytes, "storage with a typed view, atomics or another shape");
             return nullptr;
         }
-        auto record = ownedRecord(*table, surface, why);
+        auto record = ownedRecord(context, *table, surface, why);
         if (record == nullptr && why.empty()) record = table->Seed(table->Adopt(surface, request.words, why));
         if (record != nullptr) record = Resolve::BindRecordSlot(request, std::move(record), slot);
         if (record == nullptr) {
@@ -3021,7 +3061,7 @@ private:
         }
         const auto& surface = key->surface;
         if (table->OwnerOfRange(surface.address, surface.bytes) != Images::Side::Record) return false;
-        const auto record = ownedRecord(*table, surface, why);
+        const auto record = ownedRecord(context, *table, surface, why);
         const auto view = record != nullptr ? record->device->View(key->view, deferred.request.kind, why) : std::uint64_t{0};
         std::uint32_t slot = 0;
         if (view == 0u || !Resolve::BindViewSlot(deferred.request, view, record->device->Layout(), record, slot)) {

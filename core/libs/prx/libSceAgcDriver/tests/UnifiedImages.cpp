@@ -199,6 +199,25 @@ void testCpuReuseMakesARecordStale() {
     Expect(table.ChangedSinceWrite(*created->surface), "a CPU store into the record's memory after its GPU write makes it stale");
 }
 
+void testRetiredRecordLeavesTheTable() {
+    FakeDevice device;
+    Events::ChangeLog shared;
+    Events::ChangeLog gpuWrites;
+    SurfaceTable table(device, shared, gpuWrites);
+    std::string reason;
+    const auto key = Key(0xc00000000ull);
+    const auto created = table.Find(key, words, reason);
+    auto work = table.TakeWork();
+    table.MarkReady(*work.front(), shared.Serial(), gpuWrites.Serial());
+    table.MarkGpuWritten(*created->surface);
+    static_cast<void>(table.Claim(key.address, key.bytes, Side::Record, "target"));
+    table.Retire(created->surface);
+    Expect(created->surface->retired && !created->surface->gpuNewer, "a retired record is no longer newer than memory");
+    Expect(table.Overlapping(key.address, key.bytes).empty() && table.Size() == 0u, "a retired record leaves the table");
+    Expect(table.OwnerOfRange(key.address, key.bytes) == Side::None, "its claim goes with it, so another shape can claim the range");
+    Expect(table.TakeCounts().retired == 1u, "the retirement is counted");
+}
+
 void testOverlapQuery() {
     FakeDevice device;
     Events::ChangeLog shared;
@@ -272,6 +291,7 @@ int main() {
     testOwnGpuWritesKeepTheSurface();
     testForeignWritesHandTheSurfaceBack();
     testCpuReuseMakesARecordStale();
+    testRetiredRecordLeavesTheTable();
     testOverlapQuery();
     testRangesKeepTheirFirstOwner();
     if (failures != 0) return 1;
