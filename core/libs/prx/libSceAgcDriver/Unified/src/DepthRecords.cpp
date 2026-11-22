@@ -101,6 +101,16 @@ VkImageView DepthRecord::SampledView(bool stencil) {
     return made;
 }
 
+bool DepthRecords::Overlaps(std::uint64_t address, std::uint64_t bytes) const {
+    std::lock_guard lock(mutex);
+    for (const auto& [key, record] : records) {
+        const std::uint64_t plane = static_cast<std::uint64_t>(key.width) * key.height * 4u;
+        if (address < key.address + plane && key.address < address + bytes) return true;
+        if (key.stencilAddress != 0u && address < key.stencilAddress + plane / 4u && key.stencilAddress < address + bytes) return true;
+    }
+    return false;
+}
+
 std::shared_ptr<DepthRecord> DepthRecords::At(std::uint64_t address, bool& stencil) {
     std::lock_guard lock(mutex);
     for (const auto& [key, record] : records) {

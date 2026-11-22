@@ -69,6 +69,7 @@ class DepthRecords {
 public:
     [[nodiscard]] std::shared_ptr<DepthRecord> Find(const Graphics::Context& context, const Graphics::DepthTarget& target, std::string& reason);
     [[nodiscard]] std::shared_ptr<DepthRecord> At(std::uint64_t address, bool& stencil);
+    [[nodiscard]] bool Overlaps(std::uint64_t address, std::uint64_t bytes) const;
     void NoteCleared() {
         std::lock_guard lock(mutex);
         counts.cleared++;
