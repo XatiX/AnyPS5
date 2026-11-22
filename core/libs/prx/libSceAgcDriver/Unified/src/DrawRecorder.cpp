@@ -254,6 +254,7 @@ struct Totals {
     std::uint64_t inputsPending = 0;
     std::uint64_t inputsMirrored = 0;
     std::uint64_t storageRecordsSeeded = 0;
+    std::uint64_t poisonedRecords = 0;
     std::uint64_t inputsAliased = 0;
     std::uint64_t inputsMerged = 0;
     std::map<std::string, std::uint64_t> reasons;
@@ -634,6 +635,23 @@ bool seedsStorageRecords() {
 bool zeroesNewChains() {
     static const bool zeroes = std::getenv("APS5_RECODE_ZERO_NEW_CHAINS") != nullptr;
     return zeroes;
+}
+
+std::optional<VkClearColorValue> poisonValue() {
+    static const auto value = []() -> std::optional<VkClearColorValue> {
+        const char* text = std::getenv("APS5_RECODE_POISON_NEW");
+        if (text == nullptr) return std::nullopt;
+        const std::string_view name(text);
+        std::uint32_t word = 0;
+        if (name == "nan") word = 0x7fc00000u;
+        else if (name == "big") word = 0x47000000u;
+        else if (name == "one") word = 0x3f800000u;
+        else if (name != "zero") return std::nullopt;
+        VkClearColorValue clear{};
+        for (auto& channel : clear.uint32) channel = word;
+        return clear;
+    }();
+    return value;
 }
 
 bool zeroesAllNewTargets() {
@@ -1221,7 +1239,7 @@ public:
         line += text;
         std::snprintf(text, sizeof(text), "; table maps %llu hits, %llu uploads (%.1f MiB), %llu retired, %zu held (%.1f MiB)", static_cast<unsigned long long>(totals.mapHits), static_cast<unsigned long long>(totals.mapUploads), static_cast<double>(totals.mapUploadBytes) / 1048576.0, static_cast<unsigned long long>(totals.mapRetired), maps.size(), static_cast<double>(mapBytes) / 1048576.0);
         line += text;
-        line += "; record ranges noted GPU-written for the memory core " + std::to_string(totals.recordRangesNoted) + "; records made for a sampled shape after a hand-over " + std::to_string(totals.sampledRecordsCreated) + ", new storage records started from their memory " + std::to_string(totals.storageRecordsSeeded) + "; new chains zeroed " + std::to_string(totals.zeroedChains);
+        line += "; record ranges noted GPU-written for the memory core " + std::to_string(totals.recordRangesNoted) + "; records made for a sampled shape after a hand-over " + std::to_string(totals.sampledRecordsCreated) + ", new storage records started from their memory " + std::to_string(totals.storageRecordsSeeded) + "; new chains zeroed " + std::to_string(totals.zeroedChains) + ", new records poisoned " + std::to_string(totals.poisonedRecords);
         line += "; records written back for buffer readers " + std::to_string(totals.readerWriteBacks) + " (" + std::to_string(totals.readerWriteBackBytes >> 20u) + " MiB, " + std::to_string(totals.readerWriteBackRefusals) + " refused, " + std::to_string(totals.readerStale) + " skipped: memory changed since their GPU write), handed over before a buffer writer " + std::to_string(totals.writerHandOvers);
         line += "; records handed to another shape " + std::to_string(totals.shapesHandedOver) + " (" + std::to_string(totals.writeBacks) + " written back into the mirror, " + std::to_string(totals.writeBackBytes >> 20u) + " MiB, " + std::to_string(totals.writeBackRefusals) + " refused, " + std::to_string(totals.staleShapes) + " not written back: memory changed since their GPU write, " + std::to_string(totals.writeBacksUnserved) + " retired unwritten: the write-back was refused); draws with a recode depth record " + std::to_string(totals.depthRecordDraws) + " (" + std::to_string(Images::Depths().Size()) + " records, " + std::to_string(Images::Depths().Counts().cleared) + " started from their clear value, " + std::to_string(Images::Depths().Counts().refused) + " refused, " + std::to_string(totals.depthRecordsSampled) + " sampled reads of them, " + std::to_string(totals.depthBufferReads) + " buffer reads of their memory not written back); targets and sampled views served as layers of a containing record " + std::to_string(totals.layerTargets) + ", records copied in as layers of a new record " + std::to_string(totals.layersAbsorbed) + " (" + std::to_string(totals.layersAbsorbedOverChanges) + " over a change note); CPU-content records detiled again after their memory changed " + std::to_string(totals.recordsRefreshed);
         line += "; images adopted from the existing cache " + std::to_string(totals.recordAdoptions) + " (" + std::to_string(totals.recordAdoptionRefusals) + " refused), published back " + std::to_string(publishedRecords.load(std::memory_order_relaxed)) + " (" + std::to_string(staleRecordsKept.load(std::memory_order_relaxed)) + " not published: guest memory changed since their GPU write, " + std::to_string(publishNoSurface.load(std::memory_order_relaxed)) + " without an existing surface, " + std::to_string(publishShape.load(std::memory_order_relaxed)) + " of another shape, " + std::to_string(publishCompressed.load(std::memory_order_relaxed)) + " compressed); flips from a GPU-written record " + std::to_string(flipsFromNewRecords.load(std::memory_order_relaxed)) + ", over a record not GPU-written " + std::to_string(flipsFromOldRecords.load(std::memory_order_relaxed)) + ", with no record " + std::to_string(flipsWithoutRecords.load(std::memory_order_relaxed)) + ", presented straight from the record " + std::to_string(flipsPresentedFromRecords.load(std::memory_order_relaxed));
@@ -2611,6 +2629,22 @@ private:
     void zeroRecord(const Context& context, Graphics::Recorder& recorder, Images::SurfaceTable& table, Images::Surface& record) {
         auto* vulkan = dynamic_cast<Images::VulkanSurface*>(record.device.get());
         if (vulkan == nullptr) return;
+        clearRecord(context, recorder, *vulkan, VkClearColorValue{});
+        table.MarkReady(record, Events::Shared().Serial(), Events::GpuWrites().Serial());
+        totals.zeroedChains++;
+    }
+
+    void poisonRecord(const Context& context, Images::Surface* record) {
+        const auto value = poisonValue();
+        if (!value.has_value() || record == nullptr || context.recorder == nullptr) return;
+        auto* vulkan = dynamic_cast<Images::VulkanSurface*>(record->device.get());
+        if (vulkan == nullptr || vulkan->Initialized() || vulkan->Compressed()) return;
+        clearRecord(context, *context.recorder, *vulkan, *value);
+        totals.poisonedRecords++;
+    }
+
+    static void clearRecord(const Context& context, Graphics::Recorder& recorder, Images::VulkanSurface& surface, const VkClearColorValue& value) {
+        auto* vulkan = &surface;
         const auto commands = recorder.Commands();
         VkImageMemoryBarrier barrier{VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER};
         barrier.srcAccessMask = 0u;
@@ -2622,15 +2656,12 @@ private:
         barrier.image = vulkan->Image();
         barrier.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0u, VK_REMAINING_MIP_LEVELS, 0u, VK_REMAINING_ARRAY_LAYERS};
         context.Resolved(&Graphics::DeviceFunctions::cmdPipelineBarrier, "vkCmdPipelineBarrier")(commands, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 0, nullptr, 0, nullptr, 1, &barrier);
-        const VkClearColorValue zero{};
-        context.Function<PFN_vkCmdClearColorImage>("vkCmdClearColorImage")(commands, vulkan->Image(), VK_IMAGE_LAYOUT_GENERAL, &zero, 1, &barrier.subresourceRange);
+        context.Function<PFN_vkCmdClearColorImage>("vkCmdClearColorImage")(commands, vulkan->Image(), VK_IMAGE_LAYOUT_GENERAL, &value, 1, &barrier.subresourceRange);
         barrier.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
-        barrier.dstAccessMask = VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_COLOR_ATTACHMENT_READ_BIT | VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT;
+        barrier.dstAccessMask = VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT | VK_ACCESS_COLOR_ATTACHMENT_READ_BIT | VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT;
         barrier.oldLayout = VK_IMAGE_LAYOUT_GENERAL;
         context.Resolved(&Graphics::DeviceFunctions::cmdPipelineBarrier, "vkCmdPipelineBarrier")(commands, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, 0, 0, nullptr, 0, nullptr, 1, &barrier);
         vulkan->SetInitialized();
-        table.MarkReady(record, Events::Shared().Serial(), Events::GpuWrites().Serial());
-        totals.zeroedChains++;
     }
 
     void maybeDumpRecord(const Context& context, Graphics::Recorder& recorder, const std::shared_ptr<Images::Surface>& record, std::uint64_t program, std::uint32_t writtenLevel = 0) {
@@ -3548,6 +3579,7 @@ private:
             auto owned = ownedRecord(context, *table, ownedKey->surface, ownedWhy, &containingLayer, &absorbed);
             if (owned == nullptr && ownedWhy.empty()) {
                 auto adopted = table->AdoptResource(ownedKey->surface, ownedResource, ownedWhy);
+                poisonRecord(context, adopted.get());
                 if (adopted != nullptr && (ownedKey->surface.mips > 1u || zeroesAllNewTargets()) && zeroesNewChains() && context.recorder != nullptr) zeroRecord(context, *context.recorder, *table, *adopted);
                 owned = table->Seed(adopted);
                 absorbLayers(context, *table, owned, absorbed);
@@ -3767,7 +3799,9 @@ private:
         auto record = ownedRecord(context, *table, surface, why, &layer);
         if (record == nullptr && why.empty()) {
             layer = 0;
-            record = table->Seed(table->Adopt(surface, request.words, why));
+            record = table->Adopt(surface, request.words, why);
+            poisonRecord(context, record.get());
+            record = table->Seed(record);
             if (record != nullptr && seedsStorageRecords() && context.recorder != nullptr) {
                 drainSurfaces(context, *context.recorder);
                 totals.storageRecordsSeeded++;
@@ -3829,7 +3863,9 @@ private:
         auto record = ownedRecord(context, *table, surface, why, &layer, &absorbed);
         if (record == nullptr && why.empty()) {
             layer = 0;
-            record = table->Seed(table->Adopt(surface, deferred.request.words, why));
+            record = table->Adopt(surface, deferred.request.words, why);
+            poisonRecord(context, record.get());
+            record = table->Seed(record);
             if (record != nullptr) {
                 static_cast<void>(table->Claim(surface.address, surface.bytes, Images::Side::Record, "sampled"));
                 if (context.recorder != nullptr) drainSurfaces(context, *context.recorder);
