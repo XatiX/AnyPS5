@@ -512,6 +512,18 @@ const std::string& targetTraceList() {
 
 std::atomic<std::uint32_t> targetTraceLines{0};
 
+const std::pair<std::uint32_t, std::uint32_t>& censusSize() {
+    static const std::pair<std::uint32_t, std::uint32_t> size = [] {
+        const char* value = std::getenv("APS5_RECODE_NAN_CENSUS_SIZE");
+        if (value == nullptr) return std::pair<std::uint32_t, std::uint32_t>{0u, 0u};
+        char* end = nullptr;
+        const auto width = static_cast<std::uint32_t>(std::strtoul(value, &end, 10));
+        const auto height = end != nullptr && *end == 0x78 ? static_cast<std::uint32_t>(std::strtoul(end + 1, nullptr, 10)) : 0u;
+        return std::pair<std::uint32_t, std::uint32_t>{width, height};
+    }();
+    return size;
+}
+
 const std::string& censusReads() {
     static const std::string list = [] {
         const char* value = std::getenv("APS5_RECODE_NAN_CENSUS_READS");
@@ -2343,6 +2355,7 @@ private:
     void censusRecord(const Context& context, Graphics::Recorder& recorder, const std::shared_ptr<Images::Surface>& record, std::uint64_t program, bool read = false) {
         const auto& census = nanCensus();
         const auto now = std::chrono::steady_clock::now();
+        if (censusSize().first != 0u && (record->key.width != censusSize().first || record->key.height != censusSize().second)) return;
         if (now - censusClock < std::chrono::seconds(census.seconds) || censusDraws >= census.draws) return;
         auto* vulkan = dynamic_cast<Images::VulkanSurface*>(record->device.get());
         if (vulkan == nullptr || vulkan->Compressed()) return;
@@ -2496,6 +2509,43 @@ private:
         }
         Graphics::RecordMemoryBarrier(context, commands, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT | VK_PIPELINE_STAGE_HOST_BIT, VK_ACCESS_TRANSFER_READ_BIT | VK_ACCESS_TRANSFER_WRITE_BIT, VK_ACCESS_HOST_READ_BIT | VK_ACCESS_MEMORY_WRITE_BIT);
         std::fprintf(stderr, "[recode-dump] record 0x%llx %ux%u %u levels format %u written at %lld s\n", static_cast<unsigned long long>(record->key.address), record->key.width, record->key.height, levels, record->key.format, static_cast<long long>(std::chrono::duration_cast<std::chrono::seconds>(now - dumpClock).count()));
+    }
+
+    void maybeDumpUpstream(const Context& context, Graphics::Recorder& recorder, const std::shared_ptr<Graphics::StorageTexture>& resident, std::uint64_t program, std::uint32_t level) {
+        const auto& request = recordDumpRequest();
+        const auto& descriptor = resident->Descriptor();
+        if (!request.trace || descriptor.width != request.width || descriptor.mipCount <= 1u || level >= descriptor.mipCount) return;
+        if (std::chrono::steady_clock::now() - dumpClock < std::chrono::seconds(request.seconds)) return;
+        if (traceAddress == 0u) traceAddress = descriptor.baseAddress;
+        if (descriptor.baseAddress != traceAddress || traceDumps >= 40u) return;
+        if (!request.program.empty()) {
+            char hash[20];
+            std::snprintf(hash, sizeof(hash), "%016llx", static_cast<unsigned long long>(program));
+            if (std::string_view(hash).rfind(request.program, 0) != 0) return;
+        }
+        if (request.every > 1u && traceSeen++ % request.every != 0u) return;
+        const auto elementBytes = Graphics::BytesPerElement(descriptor.format);
+        const auto width = std::max(descriptor.width >> level, 1u);
+        const auto height = std::max(descriptor.height >> level, 1u);
+        const auto commands = recorder.Commands();
+        Graphics::RecordMemoryBarrier(context, commands, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT | VK_ACCESS_SHADER_WRITE_BIT | VK_ACCESS_TRANSFER_WRITE_BIT, VK_ACCESS_TRANSFER_READ_BIT);
+        auto buffer = std::make_shared<Graphics::Buffer>(context, static_cast<std::size_t>(width) * height * elementBytes, VK_BUFFER_USAGE_TRANSFER_DST_BIT);
+        VkBufferImageCopy region{};
+        region.imageSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, level, 0u, 1u};
+        region.imageExtent = {width, height, 1u};
+        context.Resolved(&Graphics::DeviceFunctions::cmdCopyImageToBuffer, "vkCmdCopyImageToBuffer")(commands, resident->Image(), VK_IMAGE_LAYOUT_GENERAL, buffer->Handle(), 1, &region);
+        Graphics::RecordMemoryBarrier(context, commands, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT | VK_PIPELINE_STAGE_HOST_BIT, VK_ACCESS_TRANSFER_READ_BIT | VK_ACCESS_TRANSFER_WRITE_BIT, VK_ACCESS_HOST_READ_BIT | VK_ACCESS_MEMORY_WRITE_BIT);
+        recorder.Keep(buffer);
+        char name[192];
+        std::snprintf(name, sizeof(name), "trace%02u-p%016llx-upstream-%llx-L%u-%ux%u-vk%u.raw", traceDumps++, static_cast<unsigned long long>(program), static_cast<unsigned long long>(descriptor.baseAddress), level, width, height, static_cast<unsigned>(resident->ImageFormat()));
+        recorder.OnComplete([buffer, file = request.directory + "/" + name] {
+            auto* out = std::fopen(file.c_str(), "wb");
+            if (out == nullptr) return;
+            buffer->Invalidate();
+            const auto bytes = buffer->Bytes();
+            std::fwrite(bytes.data(), 1, bytes.size(), out);
+            std::fclose(out);
+        });
     }
 
     void markRecordWritten(Graphics::Recorder& recorder, Images::SurfaceTable& table, Images::Surface& record) {
@@ -3157,6 +3207,7 @@ private:
             if (resident->Descriptor().tileMode == Graphics::TextureTileMode::kLinear) storeNow[index] = !resident->MarkDrawn(state.colors[index].arraySlice, 1u, state.scissor) || !resident->Cached();
             else resident->MarkSliceDirty(state.colors[index].arraySlice, 1u);
             recorder->Keep(resident);
+            if (dumpsRecords()) maybeDumpUpstream(context, *recorder, resident, draw.stages.empty() ? std::uint64_t{0} : Downgrades::ProgramHash(draw.stages.back().program.codeAddress), state.colors[index].mip);
         }
         for (std::size_t index = 0; index < residents.size(); ++index) {
             if (storeNow[index]) Graphics::StorageTexture::FlushPending(residents[index]->Descriptor().baseAddress, static_cast<std::size_t>(residents[index]->GuestBytes()), nullptr, "linear target");

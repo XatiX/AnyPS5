@@ -807,6 +807,12 @@ private:
                         char where[96];
                         std::snprintf(where, sizeof(where), " 0x%llx %ux%u fmt %u mips %u", static_cast<unsigned long long>(resource.baseAddress), resource.width, resource.height, static_cast<unsigned>(resource.format), resource.mipCount);
                         detail += where;
+                        for (const auto& record : surfaces->StaleOverlapping(resource.baseAddress, Graphics::SurfaceGuestBytes(resource))) {
+                            char stale[160];
+                            std::snprintf(stale, sizeof(stale), "existing target cache reads 0x%llx %ux%u over record 0x%llx+0x%llx %ux%u mips %u", static_cast<unsigned long long>(resource.baseAddress), resource.width, resource.height, static_cast<unsigned long long>(record->key.address), static_cast<unsigned long long>(record->key.bytes), record->key.width, record->key.height, record->key.mips);
+                            Downgrades::NoteCurrent(Downgrades::Kind::SampledStaleRecord, request.kind, stale);
+                            break;
+                        }
                     } catch (const std::exception&) {
                     }
                     Downgrades::NoteCurrent(Downgrades::Kind::UpstreamSampled, request.kind, detail);
