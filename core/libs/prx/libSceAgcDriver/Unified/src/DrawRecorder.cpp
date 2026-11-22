@@ -222,6 +222,10 @@ struct Totals {
     std::uint64_t writeBackRefusals = 0;
     std::uint64_t shapesHandedOver = 0;
     std::uint64_t staleShapes = 0;
+    std::uint64_t readerWriteBacks = 0;
+    std::uint64_t readerWriteBackBytes = 0;
+    std::uint64_t readerWriteBackRefusals = 0;
+    std::uint64_t readerStale = 0;
     std::uint64_t recordTargetRefusals = 0;
     std::uint64_t indirectDispatches = 0;
     std::uint64_t gdsBindings = 0;
@@ -982,6 +986,7 @@ public:
         line += text;
         std::snprintf(text, sizeof(text), "; table maps %llu hits, %llu uploads (%.1f MiB), %llu retired, %zu held (%.1f MiB)", static_cast<unsigned long long>(totals.mapHits), static_cast<unsigned long long>(totals.mapUploads), static_cast<double>(totals.mapUploadBytes) / 1048576.0, static_cast<unsigned long long>(totals.mapRetired), maps.size(), static_cast<double>(mapBytes) / 1048576.0);
         line += text;
+        line += "; records written back for buffer readers " + std::to_string(totals.readerWriteBacks) + " (" + std::to_string(totals.readerWriteBackBytes >> 20u) + " MiB, " + std::to_string(totals.readerWriteBackRefusals) + " refused, " + std::to_string(totals.readerStale) + " skipped: memory changed since their GPU write)";
         line += "; records handed to another shape " + std::to_string(totals.shapesHandedOver) + " (" + std::to_string(totals.writeBacks) + " written back into the mirror, " + std::to_string(totals.writeBackBytes >> 20u) + " MiB, " + std::to_string(totals.writeBackRefusals) + " refused, " + std::to_string(totals.staleShapes) + " not written back: memory changed since their GPU write)";
         line += "; images adopted from the existing cache " + std::to_string(totals.recordAdoptions) + " (" + std::to_string(totals.recordAdoptionRefusals) + " refused), published back " + std::to_string(publishedRecords.load(std::memory_order_relaxed)) + " (" + std::to_string(staleRecordsKept.load(std::memory_order_relaxed)) + " not published: guest memory changed since their GPU write)";
         {
@@ -2146,6 +2151,7 @@ private:
     bool recordDispatch(const Context& context, const Resolve::ResolvedDraw& dispatch, const std::array<std::uint32_t, 3>& groups, std::string& reason) {
         writtenRecords.clear();
         stageStorageImages.clear();
+        writeBackForReaders(context, dispatch);
         if (dispatch.stages.size() != 1u || dispatch.stages.front().deferredImages.empty()) return recordBound(context, dispatch, groups, {}, reason);
         auto bound = dispatch;
         std::vector<std::shared_ptr<Graphics::StorageTexture>> written;
@@ -2406,10 +2412,39 @@ private:
         return mask;
     }
 
+    void writeBackForReaders(const Context& context, const Resolve::ResolvedDraw& work) {
+        auto* table = Resolve::Surfaces();
+        if (table == nullptr || context.recorder == nullptr || !ownsImages()) return;
+        for (std::size_t index = 0; index < work.uses.size() && index < work.imageBegin; ++index) {
+            const auto& use = work.uses[index];
+            if (use.write || use.size == 0u || (index >= work.targetBegin && index < work.targetEnd)) continue;
+            for (const auto& record : table->StaleOverlapping(use.address, use.size)) {
+                if (record->retired) continue;
+                if (table->ChangedSinceWrite(*record)) {
+                    table->MarkWrittenBack(*record);
+                    totals.readerStale++;
+                    continue;
+                }
+                if (surfaceDetiler == nullptr) surfaceDetiler = std::make_unique<Images::SurfaceDetiler>(context);
+                std::string reason;
+                if (!surfaceDetiler->WriteBack(*context.recorder, record, reason)) {
+                    totals.readerWriteBackRefusals++;
+                    if (seen.insert("reader write-back: " + reason).second) std::fprintf(stderr, "[recode-record] first refused write-back for a buffer reader: %s\n", reason.c_str());
+                    continue;
+                }
+                noteWrittenBack(*context.recorder, record->key.address, record->key.bytes);
+                table->MarkWrittenBack(*record);
+                totals.readerWriteBacks++;
+                totals.readerWriteBackBytes += record->key.bytes;
+            }
+        }
+    }
+
     bool record(const Context& context, const Resolve::ResolvedDraw& draw, const Pm4::DrawParameters& parameters, std::string& reason) {
         writtenRecords.clear();
         stageStorageImages.clear();
         directWrites.clear();
+        writeBackForReaders(context, draw);
         if (std::ranges::all_of(draw.stages, [](const Resolve::ResolvedStage& stage) { return stage.deferredImages.empty(); })) return recordWithSlots(context, draw, parameters, reason);
         auto bound = draw;
         std::vector<std::shared_ptr<Graphics::StorageTexture>> written;

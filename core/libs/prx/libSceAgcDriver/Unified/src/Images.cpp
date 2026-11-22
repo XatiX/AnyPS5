@@ -174,6 +174,7 @@ void SurfaceTable::evict() {
         if (heldBytes <= target || surfaces.size() <= 1u) break;
         const auto found = surfaces.find(key);
         found->second->retired = true;
+        dropStale(*found->second);
         heldBytes -= key.bytes;
         surfaces.erase(found);
         counts.evicted++;
@@ -237,11 +238,43 @@ void SurfaceTable::MarkGpuWritten(Surface& surface) {
     surface.stamp = shared.Serial();
     surface.imageStamp = gpuWrites.Serial();
     counts.ownWrites++;
+    if (surface.mirrorStale) return;
+    if (const auto found = surfaces.find(surface.key); found != surfaces.end() && found->second.get() == &surface) {
+        surface.mirrorStale = true;
+        std::lock_guard staleLock(staleMutex);
+        stale[surface.key.address] = found->second;
+        staleSpan = std::max(staleSpan, surface.key.bytes);
+    }
 }
 
 void SurfaceTable::ClearGpuNewer(Surface& surface) {
     std::lock_guard lock(mutex);
     surface.gpuNewer = false;
+    dropStale(surface);
+}
+
+void SurfaceTable::MarkWrittenBack(Surface& surface) {
+    std::lock_guard lock(mutex);
+    dropStale(surface);
+}
+
+void SurfaceTable::dropStale(Surface& surface) {
+    if (!surface.mirrorStale) return;
+    surface.mirrorStale = false;
+    std::lock_guard staleLock(staleMutex);
+    if (const auto found = stale.find(surface.key.address); found != stale.end() && found->second.get() == &surface) stale.erase(found);
+}
+
+std::vector<std::shared_ptr<Surface>> SurfaceTable::StaleOverlapping(std::uint64_t address, std::uint64_t bytes) const {
+    std::vector<std::shared_ptr<Surface>> found;
+    std::lock_guard staleLock(staleMutex);
+    if (stale.empty() || bytes == 0u) return found;
+    const auto end = address + bytes;
+    for (auto at = stale.lower_bound(address > staleSpan ? address - staleSpan : 0u); at != stale.end() && at->first < end; ++at) {
+        const auto& surface = at->second;
+        if (surface->key.address + surface->key.bytes > address) found.push_back(surface);
+    }
+    return found;
 }
 
 bool SurfaceTable::ChangedSinceWrite(const Surface& surface) const {
@@ -310,6 +343,7 @@ void SurfaceTable::Demote(std::uint64_t address, std::uint64_t bytes, std::strin
             continue;
         }
         at->second->retired = true;
+        dropStale(*at->second);
         heldBytes -= key.bytes;
         at = surfaces.erase(at);
     }
@@ -320,6 +354,7 @@ void SurfaceTable::Retire(const std::shared_ptr<Surface>& surface) {
     if (surface == nullptr || surface->retired) return;
     surface->retired = true;
     surface->gpuNewer = false;
+    dropStale(*surface);
     const auto found = surfaces.find(surface->key);
     if (found != surfaces.end() && found->second == surface) {
         heldBytes -= surface->key.bytes;

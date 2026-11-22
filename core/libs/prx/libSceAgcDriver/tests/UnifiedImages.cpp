@@ -218,6 +218,28 @@ void testRetiredRecordLeavesTheTable() {
     Expect(table.TakeCounts().retired == 1u, "the retirement is counted");
 }
 
+void testStaleMirrorIndex() {
+    FakeDevice device;
+    Events::ChangeLog shared;
+    Events::ChangeLog gpuWrites;
+    SurfaceTable table(device, shared, gpuWrites);
+    std::string reason;
+    const auto key = Key(0xd00000000ull);
+    const auto created = table.Find(key, words, reason);
+    auto work = table.TakeWork();
+    table.MarkReady(*work.front(), shared.Serial(), gpuWrites.Serial());
+    Expect(table.StaleOverlapping(key.address, key.bytes).empty(), "a record no GPU work wrote leaves the mirror current");
+    table.MarkGpuWritten(*created->surface);
+    Expect(table.StaleOverlapping(key.address + 0x100u, 4u).size() == 1u, "a buffer read inside a GPU-written record finds it");
+    Expect(table.StaleOverlapping(key.address + key.bytes, 4u).empty() && table.StaleOverlapping(key.address - 4u, 4u).empty(), "reads next to it do not");
+    table.MarkWrittenBack(*created->surface);
+    Expect(table.StaleOverlapping(key.address, key.bytes).empty(), "a written-back record leaves the index");
+    table.MarkGpuWritten(*created->surface);
+    Expect(table.StaleOverlapping(key.address, 4u).size() == 1u, "the next GPU write makes it stale again");
+    table.Retire(created->surface);
+    Expect(table.StaleOverlapping(key.address, key.bytes).empty(), "a retired record leaves the index");
+}
+
 void testOverlapQuery() {
     FakeDevice device;
     Events::ChangeLog shared;
@@ -292,6 +314,7 @@ int main() {
     testForeignWritesHandTheSurfaceBack();
     testCpuReuseMakesARecordStale();
     testRetiredRecordLeavesTheTable();
+    testStaleMirrorIndex();
     testOverlapQuery();
     testRangesKeepTheirFirstOwner();
     if (failures != 0) return 1;
