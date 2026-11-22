@@ -9,6 +9,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <string>
 
 namespace AgcDriver::Unified {
 
@@ -133,12 +134,10 @@ std::optional<DeviceSpan> ResidencyService::Serve(std::uint64_t address, std::ui
             ledger->RemoveUnboundInside(owner, ownerSize);
             if (ledger->Add(owner, ownerSize)) ++ownerRanges;
         }
-        if (!ledger->Owns(address, size)) {
-            ledger->RemoveUnboundInside(address, size);
-            if (!ledger->Add(address, size)) {
-                ++serveRefusals;
-                return std::nullopt;
-            }
+        if (!claim(address, size, ownerSize != 0 ? "owned" : "mirror")) {
+            ++serveRefusals;
+            noteRefusal("the ledger takes no range there", address, size);
+            return std::nullopt;
         }
     }
     if (auto [at, added] = served.try_emplace(address, end); !added) at->second = std::max(at->second, end);
@@ -148,9 +147,11 @@ std::optional<DeviceSpan> ResidencyService::Serve(std::uint64_t address, std::ui
         const auto last = std::min(to, end);
         if (first < last && !uploads->Prepare(first, last - first, now)) {
             ++serveRefusals;
+            noteRefusal("a committed part could not be made resident", first, last - first);
             return std::nullopt;
         }
     }
+    if (auto whole = ledger->Translate(address, size)) return whole;
     auto base = ledger->Base(address);
     if (base) base->bytes = std::min(base->bytes, size);
     return base;
@@ -171,10 +172,7 @@ bool ResidencyService::ServeFaultPage(std::uint64_t page, std::uint64_t allocati
             ledger->RemoveUnboundInside(allocation, allocationBytes);
             added = ledger->Add(allocation, allocationBytes);
         }
-        if (!added) {
-            ledger->RemoveUnboundInside(page, GpuPageBytes);
-            added = ledger->Add(page, GpuPageBytes);
-        }
+        if (!added) added = claim(page, GpuPageBytes, "page");
         if (!added) {
             ++faultPagesRefused;
             return false;
@@ -307,10 +305,7 @@ std::optional<DeviceSpan> ResidencyService::ReturnWrittenImport(std::uint64_t ch
     if (found == writtenImports.end()) return std::nullopt;
     auto bound = ledger->Translate(chunk, GpuPageBytes);
     if (!bound) {
-        if (!ledger->Owns(chunk, GpuPageBytes)) {
-            ledger->RemoveUnboundInside(chunk, GpuPageBytes);
-            if (!ledger->Add(chunk, GpuPageBytes)) return std::nullopt;
-        }
+        if (!claim(chunk, GpuPageBytes, "chunk")) return std::nullopt;
         if (!uploads->PrepareFilled(chunk, GpuPageBytes, frame.load(std::memory_order_relaxed))) return std::nullopt;
         bound = ledger->Translate(chunk, GpuPageBytes);
         if (!bound) return std::nullopt;
@@ -618,20 +613,49 @@ std::optional<DeviceSpan> ResidencyService::MirrorSpan(std::uint64_t address, st
     return Translate(address, size);
 }
 
+bool ResidencyService::claim(std::uint64_t address, std::uint64_t size, const char* user) {
+    if (ledger->Owns(address, size) || !ledger->Covering(address, size).empty()) return true;
+    ledger->RemoveUnboundInside(address, size);
+    if (ledger->Add(address, size)) return true;
+    static const char* const chosen = std::getenv("APS5_RECODE_COVER");
+    static const std::string covered = chosen != nullptr ? chosen : "mirror";
+    if (covered != "all" && covered.find(user) == std::string::npos) return false;
+    std::vector<GuestSpan> gaps;
+    if (!ledger->Cover(address, size, &gaps)) return false;
+    if (++coveredSpans <= 16) {
+        std::string line = "[recode-residency] span covered across ranges (" + std::string(user) + "): ";
+        char text[64];
+        std::snprintf(text, sizeof(text), "0x%llx+0x%llx; gaps", static_cast<unsigned long long>(address), static_cast<unsigned long long>(size));
+        line += text;
+        for (const auto& gap : gaps) {
+            std::snprintf(text, sizeof(text), " 0x%llx+0x%llx", static_cast<unsigned long long>(gap.address), static_cast<unsigned long long>(gap.size));
+            line += text;
+        }
+        std::fprintf(stderr, "%s\n", line.c_str());
+    }
+    return true;
+}
+
+void ResidencyService::noteRefusal(const char* why, std::uint64_t address, std::uint64_t size) {
+    if (refusalLines >= 8) return;
+    ++refusalLines;
+    std::fprintf(stderr, "[recode-residency] serve refused, %s: 0x%llx+0x%llx\n", why, static_cast<unsigned long long>(address), static_cast<unsigned long long>(size));
+}
+
 void ResidencyService::serveSpaces(std::span<const SpaceCommit> commits) {
     const auto now = frame.load(std::memory_order_relaxed);
     for (const auto& commit : commits) {
         const auto size = commit.size;
-        if (!ledger->Owns(commit.address, size)) {
-            ledger->RemoveUnboundInside(commit.address, size);
-            if (!ledger->Add(commit.address, size)) {
-                ++spacesRefused;
-                continue;
-            }
+        if (!claim(commit.address, size, "space")) {
+            ++spacesRefused;
+            noteRefusal("the ledger takes no range for a space there", commit.address, size);
+            continue;
         }
         bool served = true;
         for (const auto& [from, to] : commit.committed) {
-            if (to > from && !uploads->Prepare(from, to - from, now)) served = false;
+            if (to <= from || uploads->Prepare(from, to - from, now)) continue;
+            served = false;
+            noteRefusal("a committed part of a space could not be made resident", from, to - from);
         }
         if (served) {
             ++spacesServed;
@@ -662,11 +686,11 @@ std::string ResidencyService::Line() const {
     std::uint64_t stagingHeld = 0;
     for (const auto& buffer : stagingPool) stagingHeld += buffer->Bytes().size();
     char line[768];
-    std::snprintf(line, sizeof(line), "[recode-residency] ranges %llu, pools %llu, bound %llu MiB of %llu MiB budget, chunks bound %llu, evicted %llu, refused %llu; uploads dirty %llu (%llu MiB) full %llu (%llu MiB) not resident %llu MiB; recorded %llu (%llu MiB); staging %llu created, %llu reused, %llu held (%llu MiB); served %llu, serves refused %llu, allocation ranges %llu\n",
+    std::snprintf(line, sizeof(line), "[recode-residency] ranges %llu, pools %llu, bound %llu MiB of %llu MiB budget, chunks bound %llu, evicted %llu, refused %llu; uploads dirty %llu (%llu MiB) full %llu (%llu MiB) not resident %llu MiB; recorded %llu (%llu MiB); staging %llu created, %llu reused, %llu held (%llu MiB); served %llu, serves refused %llu, allocation ranges %llu, spans covered across ranges %llu (%llu gap ranges)\n",
         static_cast<unsigned long long>(ledgerCounts.ranges), static_cast<unsigned long long>(ledgerCounts.pools), static_cast<unsigned long long>(ledgerCounts.boundBytes >> 20), static_cast<unsigned long long>(ledgerCounts.budget >> 20),
         static_cast<unsigned long long>(ledgerCounts.bound), static_cast<unsigned long long>(ledgerCounts.evicted), static_cast<unsigned long long>(ledgerCounts.refused),
         static_cast<unsigned long long>(uploadCounts.dirtyUploads), static_cast<unsigned long long>(uploadCounts.dirtyBytes >> 20), static_cast<unsigned long long>(uploadCounts.fullUploads), static_cast<unsigned long long>(uploadCounts.fullBytes >> 20), static_cast<unsigned long long>(uploadCounts.skippedBytes >> 20),
-        static_cast<unsigned long long>(recordedUploads), static_cast<unsigned long long>(recordedBytes >> 20), static_cast<unsigned long long>(stagingCreated), static_cast<unsigned long long>(stagingReused), static_cast<unsigned long long>(stagingPool.size()), static_cast<unsigned long long>(stagingHeld >> 20), static_cast<unsigned long long>(served.size()), static_cast<unsigned long long>(serveRefusals), static_cast<unsigned long long>(ownerRanges));
+        static_cast<unsigned long long>(recordedUploads), static_cast<unsigned long long>(recordedBytes >> 20), static_cast<unsigned long long>(stagingCreated), static_cast<unsigned long long>(stagingReused), static_cast<unsigned long long>(stagingPool.size()), static_cast<unsigned long long>(stagingHeld >> 20), static_cast<unsigned long long>(served.size()), static_cast<unsigned long long>(serveRefusals), static_cast<unsigned long long>(ownerRanges), static_cast<unsigned long long>(coveredSpans), static_cast<unsigned long long>(ledgerCounts.gapRanges));
     if (!pages) return line;
     char table[768];
     std::snprintf(table, sizeof(table), "[recode-page-table] leaves %u of %u, updates %llu (%llu MiB), leaves dropped %llu, shared pages %llu; imports mapped %llu pages, %llu spaces, %llu pages of retired imports dropped; fault pages served %llu, already mapped %llu, refused %llu; read backs %llu (%llu KiB), not resident %llu KiB; GPU-written chunks on their import %llu (%llu forgotten, %llu returned, %llu of them bound on return)\n", pages->Leaves(), PageTableLeafCapacity,

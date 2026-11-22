@@ -74,6 +74,8 @@ private:
     };
 
     void serveSpaces(std::span<const SpaceCommit> commits);
+    bool claim(std::uint64_t address, std::uint64_t size, const char* user);
+    void noteRefusal(const char* why, std::uint64_t address, std::uint64_t size);
     bool readOnSettleQueue(std::span<const PendingUpload> pieces, VkBuffer staging);
 
     mutable std::mutex mutex;
@@ -113,6 +115,8 @@ private:
     std::uint64_t importPagesForgotten = 0;
     std::uint64_t faultPagesMapped = 0;
     std::uint64_t serveRefusals = 0;
+    std::uint64_t refusalLines = 0;
+    std::uint64_t coveredSpans = 0;
     std::uint64_t ownerRanges = 0;
     std::atomic<std::uint64_t> frame{1};
     std::atomic<bool> attached{false};

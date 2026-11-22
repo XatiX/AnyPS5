@@ -274,6 +274,42 @@ void testSpansAcrossAdjacentRangesTranslate() {
     Expect(device.bound.size() == 1, "the shared chunk is unbound with its last holder");
 }
 
+void testCoverFillsTheGapsBetweenRanges() {
+    FakeDevice device;
+    Residency residency(device, 0);
+    residency.Add(0x60010000, 0x8000);
+    residency.Add(0x60030000, 0x10000);
+    residency.MakeResident(0x60010000, 0x8000, 1);
+    Expect(!residency.Add(0x60014000, 0x30000), "a span that partly overlaps a bound range is not added as one range");
+    Expect(residency.Covering(0x60014000, 0x30000).empty(), "a span with gaps between ranges is not covered");
+    Expect(residency.Cover(0x60014000, 0x30000), "the gaps of a span become ranges");
+    const auto pieces = residency.Covering(0x60014000, 0x30000);
+    Expect(pieces.size() == 4 && pieces[0].address == 0x60014000 && pieces[0].size == 0x4000 && pieces[1].address == 0x60018000 && pieces[1].size == 0x18000 && pieces[2].address == 0x60030000 && pieces[2].size == 0x10000 && pieces[3].address == 0x60040000 && pieces[3].size == 0x4000, "a covered span lists its part of each range in order");
+    Expect(residency.Counts().ranges == 4 && residency.Counts().gapRanges == 2, "two gap ranges join the two ranges that were there");
+    Expect(residency.Owns(0x60010000, 0x8000) && residency.Owns(0x60030000, 0x10000) && residency.Translate(0x60010000, 0x8000).has_value(), "the ranges that were there keep their bytes and their memory");
+    Expect(residency.Cover(0x60014000, 0x30000) && residency.Counts().gapRanges == 2, "covering a covered span adds nothing");
+    Expect(!residency.Cover((std::uint64_t{2} << MirrorSegmentBits) - ChunkBytes, 2 * ChunkBytes), "a span across two segments is not covered");
+}
+
+void testSpansOverSeveralRangesAreMadeResidentTogether() {
+    FakeDevice device;
+    Residency residency(device, 0);
+    ResidentUploads uploads(residency);
+    GuestBlock guest;
+    for (std::uint64_t at = 0; at < 4 * ChunkBytes; ++at) *guest.At(at) = static_cast<std::byte>(at * 13 + (at >> 16u));
+    residency.Add(guest.base, ChunkBytes + 0x4000);
+    Expect(uploads.Prepare(guest.base, ChunkBytes + 0x4000, 1), "the first range is made resident");
+    static_cast<void>(uploads.Take());
+    Expect(!uploads.Prepare(guest.base + 0x8000, 3 * ChunkBytes, 1), "a span reaching past its range is refused until it is covered");
+    Expect(residency.Cover(guest.base + 0x8000, 3 * ChunkBytes), "the rest of the span becomes a range");
+    Expect(uploads.Prepare(guest.base + 0x8000, 3 * ChunkBytes, 2), "a span over two ranges is made resident");
+    const auto taken = uploads.Take();
+    Expect(taken.size() == 1 && taken[0].guest == guest.base + ChunkBytes + 0x4000 && taken[0].bytes.size() == 2 * ChunkBytes + 0x4000 && std::memcmp(taken[0].bytes.data(), guest.At(ChunkBytes + 0x4000), 2 * ChunkBytes + 0x4000) == 0, "only the bytes of the new range are uploaded");
+    const auto span = residency.Translate(guest.base + 0x8000, 3 * ChunkBytes);
+    Expect(span && span->offset == guest.Mirror(0x8000) && span->bytes == 3 * ChunkBytes, "the span is one device range");
+    Expect(device.bound.size() == 4 && residency.Counts().sharedChunks == 1, "the chunk both ranges share is bound once");
+}
+
 std::vector<std::pair<std::uint64_t, std::uint64_t>> committedHalf(std::uint64_t address, std::size_t bytes, bool) {
     return {{address, address + bytes / 2}};
 }
@@ -346,6 +382,8 @@ int main() {
     testFailedBindKeepsChunksFree();
     testRemovedRangesKeepTheMirror();
     testSpansAcrossAdjacentRangesTranslate();
+    testCoverFillsTheGapsBetweenRanges();
+    testSpansOverSeveralRangesAreMadeResidentTogether();
     if (failures != 0) {
         std::fprintf(stderr, "%d failure(s)\n", failures);
         return 1;
