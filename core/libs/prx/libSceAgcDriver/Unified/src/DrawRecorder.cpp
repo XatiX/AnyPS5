@@ -462,6 +462,7 @@ struct RecordDumpRequest {
     std::uint32_t width = 0;
     std::int64_t seconds = 0;
     std::string directory;
+    bool trace = false;
 };
 
 const RecordDumpRequest& recordDumpRequest() {
@@ -474,6 +475,7 @@ const RecordDumpRequest& recordDumpRequest() {
         parsed.width = static_cast<std::uint32_t>(std::strtoul(value, &end, 10));
         if (end != nullptr && *end == ':') parsed.seconds = std::strtoll(end + 1, nullptr, 10);
         parsed.directory = directory;
+        parsed.trace = std::getenv("APS5_RECODE_DUMP_DRAWS") != nullptr;
         return parsed;
     }();
     return request;
@@ -2302,12 +2304,22 @@ private:
         totals.zeroedChains++;
     }
 
-    void maybeDumpRecord(const Context& context, Graphics::Recorder& recorder, const std::shared_ptr<Images::Surface>& record) {
+    void maybeDumpRecord(const Context& context, Graphics::Recorder& recorder, const std::shared_ptr<Images::Surface>& record, std::uint64_t program) {
         const auto& request = recordDumpRequest();
         if (record->key.width < request.width || record->key.mips <= 1u) return;
         const auto now = std::chrono::steady_clock::now();
         if (!dumpClock.has_value()) dumpClock = now;
-        if (now - *dumpClock < std::chrono::seconds(request.seconds) || dumpedRecords.size() >= 8u || dumpedRecords.contains(record->key.address)) return;
+        if (now - *dumpClock < std::chrono::seconds(request.seconds)) return;
+        std::string prefix;
+        if (request.trace) {
+            if (traceAddress == 0u) traceAddress = record->key.address;
+            if (record->key.address != traceAddress || traceDumps >= 40u) return;
+            char tag[48];
+            std::snprintf(tag, sizeof(tag), "trace%02u-p%016llx-", traceDumps++, static_cast<unsigned long long>(program));
+            prefix = tag;
+        } else if (dumpedRecords.size() >= 8u || dumpedRecords.contains(record->key.address)) {
+            return;
+        }
         auto* vulkan = dynamic_cast<Images::VulkanSurface*>(record->device.get());
         if (vulkan == nullptr || vulkan->Compressed()) return;
         dumpedRecords.insert(record->key.address);
@@ -2316,6 +2328,7 @@ private:
         const auto commands = recorder.Commands();
         Graphics::RecordMemoryBarrier(context, commands, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT | VK_ACCESS_SHADER_WRITE_BIT | VK_ACCESS_TRANSFER_WRITE_BIT, VK_ACCESS_TRANSFER_READ_BIT);
         for (const auto level : {0u, std::min(1u, levels - 1u), levels - 1u}) {
+            if (request.trace && level != 0u) break;
             const auto width = std::max(record->key.width >> level, 1u);
             const auto height = std::max(record->key.height >> level, 1u);
             auto buffer = std::make_shared<Graphics::Buffer>(context, static_cast<std::size_t>(width) * height * elementBytes, VK_BUFFER_USAGE_TRANSFER_DST_BIT);
@@ -2325,7 +2338,7 @@ private:
             context.Resolved(&Graphics::DeviceFunctions::cmdCopyImageToBuffer, "vkCmdCopyImageToBuffer")(commands, vulkan->Image(), VK_IMAGE_LAYOUT_GENERAL, buffer->Handle(), 1, &region);
             recorder.Keep(buffer);
             char name[192];
-            std::snprintf(name, sizeof(name), "record-%llx-L%u-%ux%u-vk%u.raw", static_cast<unsigned long long>(record->key.address), level, width, height, static_cast<unsigned>(vulkan->Format()));
+            std::snprintf(name, sizeof(name), "%srecord-%llx-L%u-%ux%u-vk%u.raw", prefix.c_str(), static_cast<unsigned long long>(record->key.address), level, width, height, static_cast<unsigned>(vulkan->Format()));
             recorder.OnComplete([buffer, file = request.directory + "\\" + name] {
                 auto* out = std::fopen(file.c_str(), "wb");
                 if (out == nullptr) {
@@ -2974,7 +2987,7 @@ private:
                 static_cast<void>(Events::GpuWrites().Note(record->key.address, record->key.bytes, owner));
                 static_cast<void>(Events::Shared().Note(record->key.address, record->key.bytes, owner));
                 if (surfaceTable != nullptr) markRecordWritten(*recorder, *surfaceTable, *record);
-                if (dumpsRecords()) maybeDumpRecord(context, *recorder, record);
+                if (dumpsRecords()) maybeDumpRecord(context, *recorder, record, draw.stages.empty() ? std::uint64_t{0} : Downgrades::ProgramHash(draw.stages.back().program.codeAddress));
                 recorder->Keep(record);
             }
         }
@@ -3349,6 +3362,8 @@ private:
     std::set<std::string> seen;
     std::optional<std::chrono::steady_clock::time_point> dumpClock;
     std::set<std::uint64_t> dumpedRecords;
+    std::uint64_t traceAddress = 0;
+    std::uint32_t traceDumps = 0;
     std::set<std::uint32_t> seenFaults;
     std::unique_ptr<Images::SurfaceDetiler> surfaceDetiler;
     std::map<std::vector<std::uint64_t>, std::shared_ptr<ComputePipeline>> computePipelines;
