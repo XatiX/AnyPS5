@@ -23,6 +23,7 @@
 #include "prx/libSceAgcDriver/Unified/include/IndirectArguments.hpp"
 #include "prx/libSceAgcDriver/Unified/include/MemoryCore.hpp"
 #include "prx/libSceAgcDriver/Unified/include/MirrorHost.hpp"
+#include "prx/libSceAgcDriver/Unified/include/Releases.hpp"
 #include "prx/libSceAgcDriver/Unified/include/ResidencyService.hpp"
 #include "prx/libSceAgcDriver/Unified/include/SlotPatch.hpp"
 #include "prx/libSceAgcDriver/Unified/include/Shadow.hpp"
@@ -418,7 +419,10 @@ BatchLandings& batchLandings() {
 }
 
 bool landsInCompletions() {
-    static const bool lands = std::getenv("APS5_RECODE_BATCH_LANDINGS") != nullptr;
+    static const bool lands = [] {
+        const char* value = std::getenv("APS5_RECODE_BATCH_LANDINGS");
+        return value == nullptr || std::string_view(value) != "0";
+    }();
     return lands && Mirror::WritesEnabled() && ResidencyService::Get().ReadsOffGpuMutex();
 }
 
@@ -448,6 +452,7 @@ void landInCompletion(const std::vector<KnownWrite>& writes) {
         core.LandDiff(written.address, *written.before, after, written.serial);
         landings.landedBytes.fetch_add(written.bytes, std::memory_order_relaxed);
     }
+    core.LandAhead();
     landings.ran.fetch_add(1, std::memory_order_relaxed);
 }
 
@@ -1246,6 +1251,7 @@ public:
         faultReasons.clear();
         for (const auto& [why, count] : totals.reasons) line += "; " + why + " " + std::to_string(count);
         line += "\n" + extentLine();
+        if (Releases::FlipsFollowWork() || landsInCompletions()) line += "\n" + Releases::Line();
         const auto pools = totals.pools;
         totals = {};
         totals.pools = pools;
@@ -3985,7 +3991,9 @@ bool RecordsKernels(std::uint32_t queue) {
 }
 
 bool LandingsPending() {
-    return batchLandings().pending.load(std::memory_order_acquire) != 0u;
+    if (batchLandings().pending.load(std::memory_order_acquire) == 0u) return false;
+    Releases::NoteLabelBehindLandings();
+    return true;
 }
 
 void PublishRecords(const Graphics::Context& context, std::uint64_t address, std::uint64_t bytes) {
