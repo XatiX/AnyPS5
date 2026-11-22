@@ -33,6 +33,7 @@ enum class Kind : std::uint32_t {
     ImageResultsDropped,
     SamplerMode,
     UpstreamDepth,
+    SampledStaleRecord,
     Count,
 };
 

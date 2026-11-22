@@ -2208,6 +2208,7 @@ private:
         for (const auto* deferred : sampled) {
             std::uint32_t slot = 0;
             if (ownsImages() && bindOwnedSampled(context, stage, *deferred)) continue;
+            if (Downgrades::Active()) noteStaleRecordRead(stage, *deferred);
             publishRequest(context, deferred->request);
             auto owner = Resolve::BindDeferredSampled(context, deferred->request, slot, reason);
             if (owner == nullptr) return false;
@@ -3107,6 +3108,23 @@ private:
         }
         static_cast<void>(table->Claim(surface.address, surface.bytes, Images::Side::Record, "storage"));
         return record;
+    }
+
+    void noteStaleRecordRead(const Resolve::ResolvedStage& stage, const Heap::DeferredImage& deferred) {
+        auto* table = Resolve::Surfaces();
+        if (table == nullptr) return;
+        try {
+            const auto resource = Graphics::DecodeTextureResource(deferred.request.words);
+            const auto bytes = Graphics::SurfaceGuestBytes(resource);
+            for (const auto& record : table->StaleOverlapping(resource.baseAddress, bytes)) {
+                char detail[160];
+                const auto& held = record->key;
+                std::snprintf(detail, sizeof(detail), "existing cache reads 0x%llx %ux%u fmt %u over record 0x%llx+0x%llx %ux%u fmt %u", static_cast<unsigned long long>(resource.baseAddress), resource.width, resource.height, resource.format, static_cast<unsigned long long>(held.address), static_cast<unsigned long long>(held.bytes), held.width, held.height, held.format);
+                Downgrades::Note(stage.program.codeAddress, Downgrades::Kind::SampledStaleRecord, deferred.index, detail);
+                break;
+            }
+        } catch (const std::exception&) {
+        }
     }
 
     bool bindOwnedSampled(const Context& context, Resolve::ResolvedStage& stage, const Heap::DeferredImage& deferred) {
