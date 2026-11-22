@@ -73,6 +73,7 @@ void Consume(const Operation& operation, const DecodeState& state);
 [[nodiscard]] std::shared_ptr<Images::Surface> BindRecordSlot(const Heap::SlotRequest& request, std::shared_ptr<Images::Surface> record, std::uint32_t& slot);
 [[nodiscard]] bool StorageRecordShape(const Heap::SlotRequest& request);
 [[nodiscard]] bool SampledRecordsAll();
+[[nodiscard]] bool SampledRecordFor(std::uint64_t address, std::uint64_t bytes);
 [[nodiscard]] bool BindViewSlot(const Heap::SlotRequest& request, std::uint64_t view, std::uint32_t layout, std::shared_ptr<const void> owner, std::uint32_t& slot);
 [[nodiscard]] std::shared_ptr<const void> BindDeferredSampled(const Graphics::Context& context, const Heap::SlotRequest& request, std::uint32_t& slot, std::string& reason);
 

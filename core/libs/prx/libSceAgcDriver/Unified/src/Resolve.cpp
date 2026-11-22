@@ -1,4 +1,5 @@
 #include "prx/libSceAgcDriver/Unified/include/Resolve.hpp"
+#include "prx/libSceAgcDriver/Unified/include/MemoryCore.hpp"
 #include "prx/libSceAgcDriver/Unified/include/Downgrades.hpp"
 #include "prx/libSceAgcDriver/Unified/include/DrawRecorder.hpp"
 #include "prx/libSceAgcDriver/Execution/include/GuestMemory.hpp"
@@ -95,8 +96,19 @@ enum class SampledBind : std::uint8_t { Ahead, Record, RecordAll };
 }
 
 bool SampledRecordsAll() {
-    static const bool all = std::getenv("APS5_RECODE_SAMPLED_RECORDS_ALL") != nullptr;
+    static const bool all = [] {
+        const char* value = std::getenv("APS5_RECODE_SAMPLED_RECORDS_ALL");
+        return value != nullptr && std::string_view(value) != "gpu" && std::string_view(value) != "0";
+    }();
     return all;
+}
+
+bool SampledRecordFor(std::uint64_t address, std::uint64_t bytes) {
+    static const bool gpu = [] {
+        const char* value = std::getenv("APS5_RECODE_SAMPLED_RECORDS_ALL");
+        return value != nullptr && std::string_view(value) == "gpu";
+    }();
+    return SampledRecordsAll() || (gpu && MemoryCore::Get().Pages().GpuWrittenIn(address, bytes));
 }
 
 namespace {
@@ -885,7 +897,7 @@ private:
         try {
             const auto resource = Graphics::DecodeTextureResource(request.words);
             const auto side = surfaces->OwnerOfRange(resource.baseAddress, Graphics::SurfaceGuestBytes(resource));
-            return side == Images::Side::Record || (side == Images::Side::None && SampledRecordsAll());
+            return side == Images::Side::Record || (side == Images::Side::None && SampledRecordFor(resource.baseAddress, Graphics::SurfaceGuestBytes(resource)));
         } catch (const std::exception&) {
             return false;
         }
