@@ -27,6 +27,13 @@ class RecipeTests(unittest.TestCase):
                 "build_dir": "build", "games": [str(game)], "titles": str(titles), "seconds": 20,
                 "repetitions": 3, "regression_pct": 5, "max_spread_pct": 3}
 
+    def test_loads_bom_prefixed_utf8_recipe(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            path = root / "recipe.json"
+            path.write_text(json.dumps(self.make_recipe(root)), encoding="utf-8-sig")
+            self.assertEqual(performance_bisect.load_recipe(path)["title_id"], "PPSA00000")
+
     def test_loads_valid_recipe_and_normalizes_external_paths(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
@@ -135,6 +142,16 @@ class RecipeTests(unittest.TestCase):
 
 
 class SummaryValidationTests(unittest.TestCase):
+    def test_sample_rejects_a_non_object_title_catalog(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "summary.json"
+            summary = {"build": {"commit": GOOD[:7], "dirty": False}, "machine": IDENTITY}
+            for catalog in (None, [], "PPSA00000", 1):
+                with self.subTest(catalog=catalog):
+                    path.write_text(json.dumps(dict(summary, titles=catalog)), encoding="utf-8")
+                    with self.assertRaisesRegex(ValueError, "missing machine or title data"):
+                        performance_bisect.sample_summary(path, "PPSA00000", GOOD)
+
     def test_sample_requires_clean_expected_commit_and_rendering_result(self):
         with tempfile.TemporaryDirectory() as directory:
             path = Path(directory) / "summary.json"
@@ -158,7 +175,7 @@ class SummaryValidationTests(unittest.TestCase):
             summary = {"build": {"commit": GOOD[:7], "dirty": False}, "machine": IDENTITY,
                        "titles": {"PPSA00000": {"name": "Example", "version": "01.00",
                                                    "runs": [{"outcome": "stalled", "fps": 60}]}}}
-            for outcome, fps in (("stalled", 60), ("rendering", math.inf), ("rendering", 0)):
+            for outcome, fps in (("stalled", 60), ("rendering", math.inf), ("rendering", 0), ("rendering", 10**309)):
                 summary["titles"]["PPSA00000"]["runs"] = [{"outcome": outcome, "fps": fps}]
                 path.write_text(json.dumps(summary), encoding="utf-8")
                 with self.subTest(outcome=outcome, fps=fps), self.assertRaisesRegex(ValueError, "did not render"):
@@ -181,6 +198,10 @@ class MeasurementStabilityTests(unittest.TestCase):
     def test_regression_requires_the_declared_slowdown_threshold(self):
         self.assertFalse(performance_bisect.is_regression(58, 60, 5))
         self.assertTrue(performance_bisect.is_regression(57, 60, 5))
+
+    def test_regression_counts_a_decimal_value_at_the_threshold(self):
+        self.assertTrue(performance_bisect.is_regression(43.7, 46.0, 5.0))
+        self.assertFalse(performance_bisect.is_regression(43.7000000001, 46.0, 5.0))
 
     def test_candidate_identity_must_match_baseline(self):
         with self.assertRaisesRegex(ValueError, "identity changed"):
