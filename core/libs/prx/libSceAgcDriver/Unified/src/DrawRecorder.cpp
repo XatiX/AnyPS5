@@ -227,6 +227,7 @@ struct Totals {
     std::uint64_t readerWriteBackRefusals = 0;
     std::uint64_t readerStale = 0;
     std::uint64_t recordRangesNoted = 0;
+    std::uint64_t sampledRecordsCreated = 0;
     std::uint64_t recordTargetRefusals = 0;
     std::uint64_t indirectDispatches = 0;
     std::uint64_t gdsBindings = 0;
@@ -449,6 +450,11 @@ bool keepsGpuWrittenPages() {
 bool bindsGds() {
     static const bool binds = std::getenv("APS5_RECODE_NO_GDS") == nullptr;
     return binds;
+}
+
+bool notesRecordRanges() {
+    static const bool notes = std::getenv("APS5_RECODE_NOTE_RECORD_RANGES") != nullptr;
+    return notes;
 }
 
 bool recordsMipChains() {
@@ -992,7 +998,7 @@ public:
         line += text;
         std::snprintf(text, sizeof(text), "; table maps %llu hits, %llu uploads (%.1f MiB), %llu retired, %zu held (%.1f MiB)", static_cast<unsigned long long>(totals.mapHits), static_cast<unsigned long long>(totals.mapUploads), static_cast<double>(totals.mapUploadBytes) / 1048576.0, static_cast<unsigned long long>(totals.mapRetired), maps.size(), static_cast<double>(mapBytes) / 1048576.0);
         line += text;
-        line += "; record ranges noted GPU-written for the memory core " + std::to_string(totals.recordRangesNoted);
+        line += "; record ranges noted GPU-written for the memory core " + std::to_string(totals.recordRangesNoted) + "; records made for a sampled shape after a hand-over " + std::to_string(totals.sampledRecordsCreated);
         line += "; records written back for buffer readers " + std::to_string(totals.readerWriteBacks) + " (" + std::to_string(totals.readerWriteBackBytes >> 20u) + " MiB, " + std::to_string(totals.readerWriteBackRefusals) + " refused, " + std::to_string(totals.readerStale) + " skipped: memory changed since their GPU write)";
         line += "; records handed to another shape " + std::to_string(totals.shapesHandedOver) + " (" + std::to_string(totals.writeBacks) + " written back into the mirror, " + std::to_string(totals.writeBackBytes >> 20u) + " MiB, " + std::to_string(totals.writeBackRefusals) + " refused, " + std::to_string(totals.staleShapes) + " not written back: memory changed since their GPU write)";
         line += "; images adopted from the existing cache " + std::to_string(totals.recordAdoptions) + " (" + std::to_string(totals.recordAdoptionRefusals) + " refused), published back " + std::to_string(publishedRecords.load(std::memory_order_relaxed)) + " (" + std::to_string(staleRecordsKept.load(std::memory_order_relaxed)) + " not published: guest memory changed since their GPU write)";
@@ -2233,7 +2239,7 @@ private:
     void markRecordWritten(Graphics::Recorder& recorder, Images::SurfaceTable& table, Images::Surface& record) {
         const bool wasStale = record.mirrorStale;
         table.MarkGpuWritten(record);
-        if (wasStale || !record.mirrorStale || !Mirror::WritesEnabled()) return;
+        if (wasStale || !record.mirrorStale || !Mirror::WritesEnabled() || !notesRecordRanges()) return;
         const auto mark = MemoryCore::Get().NoteGpuWrite(record.key.address, record.key.bytes, recorder.OpenBatchSerial());
         if (!mark.upload.empty()) ResidencyService::Get().NoteDirty(mark.upload);
         totals.recordRangesNoted++;
@@ -3046,8 +3052,10 @@ private:
 
     void noteWrittenBack(Graphics::Recorder& recorder, std::uint64_t address, std::uint64_t bytes) {
         if (!Mirror::WritesEnabled()) return;
-        const auto mark = MemoryCore::Get().NoteGpuWrite(address, bytes, recorder.OpenBatchSerial());
-        if (!mark.upload.empty()) ResidencyService::Get().NoteDirty(mark.upload);
+        if (notesRecordRanges()) {
+            const auto mark = MemoryCore::Get().NoteGpuWrite(address, bytes, recorder.OpenBatchSerial());
+            if (!mark.upload.empty()) ResidencyService::Get().NoteDirty(mark.upload);
+        }
         const std::array written{std::pair{address, address + bytes}};
         Events::NoteRanges(written);
     }
@@ -3112,7 +3120,15 @@ private:
         }
         const auto& surface = key->surface;
         if (table->OwnerOfRange(surface.address, surface.bytes) != Images::Side::Record) return false;
-        const auto record = ownedRecord(context, *table, surface, why);
+        auto record = ownedRecord(context, *table, surface, why);
+        if (record == nullptr && why.empty()) {
+            record = table->Seed(table->Adopt(surface, deferred.request.words, why));
+            if (record != nullptr) {
+                static_cast<void>(table->Claim(surface.address, surface.bytes, Images::Side::Record, "sampled"));
+                if (context.recorder != nullptr) drainSurfaces(context, *context.recorder);
+                totals.sampledRecordsCreated++;
+            }
+        }
         const auto view = record != nullptr ? record->device->View(key->view, deferred.request.kind, why) : std::uint64_t{0};
         std::uint32_t slot = 0;
         if (view == 0u || !Resolve::BindViewSlot(deferred.request, view, record->device->Layout(), record, slot)) {
