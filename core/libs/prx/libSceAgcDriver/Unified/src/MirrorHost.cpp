@@ -4,6 +4,7 @@
 #include "prx/libSceAgcDriver/Unified/include/MemoryCore.hpp"
 #include "prx/libSceAgcDriver/Unified/include/ResidencyService.hpp"
 #include <array>
+#include <numeric>
 #include <atomic>
 #include <chrono>
 #include <cstdio>
@@ -19,6 +20,8 @@ namespace {
 constexpr std::uint64_t WaitNanoseconds = 2'000'000'000ull;
 constexpr int LockTries = 400;
 constexpr int SubmitTries = 4000;
+
+std::atomic<std::uint64_t> skippedUploadBytes{0};
 
 class Host final : public MemoryHost {
 public:
@@ -80,7 +83,9 @@ public:
 
     void Upload(std::uint64_t address, std::uint64_t size) override {
         const std::array ranges{DirtyRange{address, size}};
-        ResidencyService::Get().NoteDirty(ranges);
+        const auto kept = MemoryCore::Get().WithoutGpuWritten(ranges);
+        if (kept.size() != 1u || kept.front().size != size) skippedUploadBytes.fetch_add(size - std::accumulate(kept.begin(), kept.end(), std::uint64_t{0}, [](std::uint64_t sum, const DirtyRange& range) { return sum + range.size; }), std::memory_order_relaxed);
+        if (!kept.empty()) ResidencyService::Get().NoteDirty(kept);
     }
 
     bool Bypass() override {
@@ -103,6 +108,10 @@ Host& host() {
     return shared;
 }
 
+}
+
+std::uint64_t SkippedUploadBytes() {
+    return skippedUploadBytes.load(std::memory_order_relaxed);
 }
 
 bool WritesEnabled() {
