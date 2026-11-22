@@ -463,6 +463,8 @@ struct RecordDumpRequest {
     std::int64_t seconds = 0;
     std::string directory;
     bool trace = false;
+    std::string program;
+    std::uint32_t every = 1;
 };
 
 const RecordDumpRequest& recordDumpRequest() {
@@ -476,6 +478,8 @@ const RecordDumpRequest& recordDumpRequest() {
         if (end != nullptr && *end == ':') parsed.seconds = std::strtoll(end + 1, nullptr, 10);
         parsed.directory = directory;
         parsed.trace = std::getenv("APS5_RECODE_DUMP_DRAWS") != nullptr;
+        if (const char* program = std::getenv("APS5_RECODE_DUMP_PROGRAM")) parsed.program = program;
+        if (const char* every = std::getenv("APS5_RECODE_DUMP_EVERY")) parsed.every = std::max<std::uint32_t>(static_cast<std::uint32_t>(std::strtoul(every, nullptr, 10)), 1u);
         return parsed;
     }();
     return request;
@@ -2306,7 +2310,7 @@ private:
 
     void maybeDumpRecord(const Context& context, Graphics::Recorder& recorder, const std::shared_ptr<Images::Surface>& record, std::uint64_t program) {
         const auto& request = recordDumpRequest();
-        if (record->key.width < request.width || record->key.mips <= 1u) return;
+        if (record->key.width < request.width || record->key.mips <= 1u || (request.trace && record->key.width != request.width)) return;
         const auto now = std::chrono::steady_clock::now();
         if (!dumpClock.has_value()) dumpClock = now;
         if (now - *dumpClock < std::chrono::seconds(request.seconds)) return;
@@ -2314,6 +2318,12 @@ private:
         if (request.trace) {
             if (traceAddress == 0u) traceAddress = record->key.address;
             if (record->key.address != traceAddress || traceDumps >= 40u) return;
+            if (!request.program.empty()) {
+                char hash[20];
+                std::snprintf(hash, sizeof(hash), "%016llx", static_cast<unsigned long long>(program));
+                if (std::string_view(hash).rfind(request.program, 0) != 0) return;
+            }
+            if (request.every > 1u && traceSeen++ % request.every != 0u) return;
             char tag[48];
             std::snprintf(tag, sizeof(tag), "trace%02u-p%016llx-", traceDumps++, static_cast<unsigned long long>(program));
             prefix = tag;
@@ -3364,6 +3374,7 @@ private:
     std::set<std::uint64_t> dumpedRecords;
     std::uint64_t traceAddress = 0;
     std::uint32_t traceDumps = 0;
+    std::uint32_t traceSeen = 0;
     std::set<std::uint32_t> seenFaults;
     std::unique_ptr<Images::SurfaceDetiler> surfaceDetiler;
     std::map<std::vector<std::uint64_t>, std::shared_ptr<ComputePipeline>> computePipelines;
