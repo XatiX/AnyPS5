@@ -2970,6 +2970,7 @@ private:
             if (state.depth && Images::DepthRecordsOn()) {
                 std::string why;
                 depthRecord = Images::Depths().Find(context, *state.depth, why);
+                if (depthRecord == nullptr && seen.insert("depth: " + why).second) std::fprintf(stderr, "[recode-depth] first refusal: %s (0x%llx %ux%u format %d samples %u slices %u-%u)", why.c_str(), static_cast<unsigned long long>(state.depth->address), state.depth->extent.width, state.depth->extent.height, static_cast<int>(state.depth->format), state.depth->samples, state.depth->firstSlice, state.depth->lastSlice), std::fputc(10, stderr);
                 if (depthRecord != nullptr && !depthRecord->Initialized()) {
                     depthRecord->Initialize(recorder->Commands(), state.depth->clearDepth, state.depth->clearStencil);
                     Images::Depths().NoteCleared();

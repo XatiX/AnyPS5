@@ -104,7 +104,7 @@ VkImageView DepthRecord::SampledView(bool stencil) {
 std::shared_ptr<DepthRecord> DepthRecords::At(std::uint64_t address, bool& stencil) {
     std::lock_guard lock(mutex);
     for (const auto& [key, record] : records) {
-        if (key.address == address || (key.stencilAddress != 0u && key.stencilAddress == address)) {
+        if (key.slice == 0u && (key.address == address || (key.stencilAddress != 0u && key.stencilAddress == address))) {
             stencil = key.address != address;
             return record->Initialized() ? record : nullptr;
         }
@@ -119,13 +119,13 @@ std::shared_ptr<DepthRecord> DepthRecords::Find(const Graphics::Context& context
         counts.refused++;
         return nullptr;
     }
-    if (target.firstSlice != 0u || target.lastSlice != 0u) {
+    if (target.firstSlice != target.lastSlice) {
         reason = "layered depth target";
         std::lock_guard lock(mutex);
         counts.refused++;
         return nullptr;
     }
-    const DepthKey key{target.address, target.stencilAddress, target.htileAddress, target.extent.width, target.extent.height, target.format};
+    const DepthKey key{target.address, target.stencilAddress, target.htileAddress, target.extent.width, target.extent.height, target.format, target.firstSlice};
     std::lock_guard lock(mutex);
     if (const auto found = records.find(key); found != records.end()) {
         counts.found++;

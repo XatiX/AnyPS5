@@ -19,9 +19,10 @@ struct DepthKey {
     std::uint32_t width = 0;
     std::uint32_t height = 0;
     VkFormat format = VK_FORMAT_UNDEFINED;
+    std::uint32_t slice = 0;
 
     bool operator<(const DepthKey& other) const {
-        return std::tie(address, stencilAddress, htileAddress, width, height, format) < std::tie(other.address, other.stencilAddress, other.htileAddress, other.width, other.height, other.format);
+        return std::tie(address, stencilAddress, htileAddress, width, height, format, slice) < std::tie(other.address, other.stencilAddress, other.htileAddress, other.width, other.height, other.format, other.slice);
     }
 };
 
