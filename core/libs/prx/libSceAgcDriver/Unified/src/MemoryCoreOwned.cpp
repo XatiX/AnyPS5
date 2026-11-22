@@ -240,6 +240,7 @@ bool MemoryCore::resolveOwnedFault(std::uint64_t address, bool write) {
     const auto page = pageOf(address);
     auto* current = host.load(std::memory_order_acquire);
     if (current == nullptr) return false;
+    if (current->ImagePage(page)) (write ? imageWriteFaults : imageFaults).fetch_add(1, std::memory_order_relaxed);
     if (current->Bypass() || std::this_thread::get_id() == resolverThread) {
         if (std::this_thread::get_id() != resolverThread && written.Pending(page, PageBytes) <= current->Completed()) {
             bypassLanded.fetch_add(1, std::memory_order_relaxed);

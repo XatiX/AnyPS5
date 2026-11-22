@@ -196,7 +196,7 @@ std::string memoryLine() {
             static_cast<unsigned long long>(core.readAheadPages), static_cast<unsigned long long>(core.hotLandedPages), static_cast<unsigned long long>(core.ownedLandedBytes >> 20), static_cast<unsigned long long>(core.diffLandedBytes >> 10), static_cast<unsigned long long>(core.diffUnchangedBytes >> 10), static_cast<unsigned long long>(core.smallReads), static_cast<unsigned long long>(core.smallReadBytes),
             static_cast<unsigned long long>(core.flushes), static_cast<unsigned long long>(core.flushPendingBytes >> 10), static_cast<unsigned long long>(core.preImages), static_cast<unsigned long long>(core.unviewedBytes >> 10), static_cast<unsigned long long>(core.gpuOnlyBytes >> 20), static_cast<unsigned long long>(core.unreadableHashes), static_cast<unsigned long long>(written.pieces), static_cast<unsigned long long>(written.bytes >> 10));
         owned += gpuOwnedLine;
-        owned += "[recode-gpu-owned] landing uploads skipped over later GPU writes: " + std::to_string(Mirror::SkippedUploadBytes() >> 10) + " KiB\n";
+        owned += "[recode-gpu-owned] landing uploads skipped over later GPU writes: " + std::to_string(Mirror::SkippedUploadBytes() >> 10) + " KiB; CPU faults on records not yet written back: " + std::to_string(core.imageFaults) + " reads, " + std::to_string(core.imageWriteFaults) + " writes\n";
     }
     return std::string(line) + eventLine + ResidencyService::Get().Line() + owned;
 }

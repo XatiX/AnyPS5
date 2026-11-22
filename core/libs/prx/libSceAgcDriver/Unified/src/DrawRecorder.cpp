@@ -226,6 +226,7 @@ struct Totals {
     std::uint64_t readerWriteBackBytes = 0;
     std::uint64_t readerWriteBackRefusals = 0;
     std::uint64_t readerStale = 0;
+    std::uint64_t recordRangesNoted = 0;
     std::uint64_t recordTargetRefusals = 0;
     std::uint64_t indirectDispatches = 0;
     std::uint64_t gdsBindings = 0;
@@ -986,6 +987,7 @@ public:
         line += text;
         std::snprintf(text, sizeof(text), "; table maps %llu hits, %llu uploads (%.1f MiB), %llu retired, %zu held (%.1f MiB)", static_cast<unsigned long long>(totals.mapHits), static_cast<unsigned long long>(totals.mapUploads), static_cast<double>(totals.mapUploadBytes) / 1048576.0, static_cast<unsigned long long>(totals.mapRetired), maps.size(), static_cast<double>(mapBytes) / 1048576.0);
         line += text;
+        line += "; record ranges noted GPU-written for the memory core " + std::to_string(totals.recordRangesNoted);
         line += "; records written back for buffer readers " + std::to_string(totals.readerWriteBacks) + " (" + std::to_string(totals.readerWriteBackBytes >> 20u) + " MiB, " + std::to_string(totals.readerWriteBackRefusals) + " refused, " + std::to_string(totals.readerStale) + " skipped: memory changed since their GPU write)";
         line += "; records handed to another shape " + std::to_string(totals.shapesHandedOver) + " (" + std::to_string(totals.writeBacks) + " written back into the mirror, " + std::to_string(totals.writeBackBytes >> 20u) + " MiB, " + std::to_string(totals.writeBackRefusals) + " refused, " + std::to_string(totals.staleShapes) + " not written back: memory changed since their GPU write)";
         line += "; images adopted from the existing cache " + std::to_string(totals.recordAdoptions) + " (" + std::to_string(totals.recordAdoptionRefusals) + " refused), published back " + std::to_string(publishedRecords.load(std::memory_order_relaxed)) + " (" + std::to_string(staleRecordsKept.load(std::memory_order_relaxed)) + " not published: guest memory changed since their GPU write)";
@@ -2218,9 +2220,18 @@ private:
             const auto owner = Images::OwnerOf(*record);
             static_cast<void>(Events::GpuWrites().Note(record->key.address, record->key.bytes, owner));
             static_cast<void>(Events::Shared().Note(record->key.address, record->key.bytes, owner));
-            if (surfaceTable != nullptr) surfaceTable->MarkGpuWritten(*record);
+            if (surfaceTable != nullptr) markRecordWritten(recorder, *surfaceTable, *record);
             totals.recordWrites++;
         }
+    }
+
+    void markRecordWritten(Graphics::Recorder& recorder, Images::SurfaceTable& table, Images::Surface& record) {
+        const bool wasStale = record.mirrorStale;
+        table.MarkGpuWritten(record);
+        if (wasStale || !record.mirrorStale || !Mirror::WritesEnabled()) return;
+        const auto mark = MemoryCore::Get().NoteGpuWrite(record.key.address, record.key.bytes, recorder.OpenBatchSerial());
+        if (!mark.upload.empty()) ResidencyService::Get().NoteDirty(mark.upload);
+        totals.recordRangesNoted++;
     }
 
 
@@ -2843,7 +2854,7 @@ private:
                 const auto owner = Images::OwnerOf(*record);
                 static_cast<void>(Events::GpuWrites().Note(record->key.address, record->key.bytes, owner));
                 static_cast<void>(Events::Shared().Note(record->key.address, record->key.bytes, owner));
-                if (surfaceTable != nullptr) surfaceTable->MarkGpuWritten(*record);
+                if (surfaceTable != nullptr) markRecordWritten(*recorder, *surfaceTable, *record);
                 recorder->Keep(record);
             }
         }

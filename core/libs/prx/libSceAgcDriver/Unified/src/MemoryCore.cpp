@@ -265,6 +265,8 @@ MemoryCoreCounts MemoryCore::Counts() const {
     counts.gpuOnlyBytes = gpuOnlyBytes.load(std::memory_order_relaxed);
     counts.bypassLanded = bypassLanded.load(std::memory_order_relaxed);
     counts.smallReads = smallReads.load(std::memory_order_relaxed);
+    counts.imageFaults = imageFaults.load(std::memory_order_relaxed);
+    counts.imageWriteFaults = imageWriteFaults.load(std::memory_order_relaxed);
     counts.smallReadBytes = smallReadBytes.load(std::memory_order_relaxed);
     return counts;
 }

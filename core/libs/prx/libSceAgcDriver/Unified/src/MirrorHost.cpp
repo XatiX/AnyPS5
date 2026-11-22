@@ -1,7 +1,9 @@
 #include "prx/libSceAgcDriver/Unified/include/MirrorHost.hpp"
 #include "prx/libSceAgcDriver/Execution/include/GuestMemory.hpp"
 #include "prx/libSceAgcDriver/Execution/include/VulkanDevice.hpp"
+#include "prx/libSceAgcDriver/Unified/include/Images.hpp"
 #include "prx/libSceAgcDriver/Unified/include/MemoryCore.hpp"
+#include "prx/libSceAgcDriver/Unified/include/Resolve.hpp"
 #include "prx/libSceAgcDriver/Unified/include/ResidencyService.hpp"
 #include <array>
 #include <numeric>
@@ -90,6 +92,11 @@ public:
 
     bool Bypass() override {
         return GuestMemory::GpuMutex().HeldByThisThread();
+    }
+
+    bool ImagePage(std::uint64_t page) override {
+        const auto* table = Resolve::Surfaces();
+        return table != nullptr && !table->StaleOverlapping(page, PageBytes).empty();
     }
 
 private:
