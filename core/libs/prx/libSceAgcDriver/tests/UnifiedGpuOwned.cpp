@@ -1,4 +1,5 @@
 #include "prx/libSceAgcDriver/Unified/include/MemoryCore.hpp"
+#include "prx/libSceAgcDriver/Unified/include/MirrorHost.hpp"
 #include <atomic>
 #include <chrono>
 #include <cstdint>
@@ -80,6 +81,8 @@ public:
     std::atomic<std::uint64_t> waits{0};
     std::atomic<std::uint64_t> uploads{0};
     std::atomic<bool> bypass{false};
+    std::atomic<bool> hidden{false};
+    std::atomic<std::uint64_t> split{0};
 
     std::uint64_t Completed() override { return completed.load(); }
     bool WaitFor(std::uint64_t serial) override {
@@ -93,7 +96,17 @@ public:
         std::memcpy(out.data(), mirror.data() + (address - base), out.size());
         return true;
     }
-    std::byte* View(std::uint64_t address, std::size_t) override { return shadow.data() + (address - base); }
+    std::byte* View(std::uint64_t address, std::size_t bytes) override {
+        const auto boundary = split.load();
+        if (hidden.load() || (address < boundary && address + bytes > boundary)) return nullptr;
+        return shadow.data() + (address - base);
+    }
+    std::vector<DirtyRange> ViewedPieces(std::uint64_t address, std::uint64_t size) override {
+        const auto boundary = split.load();
+        if (hidden.load()) return {};
+        if (address >= boundary || address + size <= boundary) return {{address, size}};
+        return {{address, boundary - address}, {boundary, address + size - boundary}};
+    }
     void Upload(std::uint64_t, std::uint64_t) override { uploads.fetch_add(1); }
     bool Bypass() override { return bypass.load(); }
 };
@@ -183,11 +196,122 @@ void testOwnedPagesLandOnFault() {
     const auto kept = core.WithoutGpuWritten(dirty);
     Expect(kept.size() == 2 && kept[0].size == 0x80 && kept[1].address == base + 13 * PageBytes + 0x100, "an upload skips the bytes the GPU wrote and has not landed");
 
+    const auto chainedAt = 12 * PageBytes + 0x400;
+    const std::vector<std::byte> snapshot(8, std::byte{0x10});
+    std::vector<std::byte> firstResult(8, std::byte{0x10});
+    firstResult[2] = std::byte{0x20};
+    const std::vector<std::byte> secondResult(8, std::byte{0x10});
+    std::memset(fake.shadow.data() + chainedAt, 0x10, 8);
+    const auto chainedBefore = core.Counts();
+    core.LandDiff(base + chainedAt, snapshot, firstResult, 20);
+    Expect(fake.shadow[chainedAt + 2] == std::byte{0x20}, "the first of two landings lands the byte it changed");
+    core.LandDiff(base + chainedAt, snapshot, secondResult, 21);
+    Expect(fake.shadow[chainedAt + 2] == std::byte{0x10} && core.Counts().diffChainedBytes == chainedBefore.diffChainedBytes + 1, "a landing whose snapshot was taken before an older landing brings that byte up to the mirror");
+    fake.shadow[chainedAt + 5] = std::byte{0x77};
+    core.LandDiff(base + chainedAt, snapshot, secondResult, 22);
+    Expect(fake.shadow[chainedAt + 5] == std::byte{0x77} && core.Counts().diffForeignBytes == chainedBefore.diffForeignBytes + 1, "a byte the CPU wrote since the last landing is left alone");
+
+    fake.split.store(base + 15 * PageBytes);
+    const auto pieceWrites = core.Counts().pieceWrites;
+    const auto spanning = core.NoteGpuWrite(base + 14 * PageBytes, 2 * PageBytes, 13);
+    Expect(spanning.owned.size() == 2 && spanning.open.empty() && core.Counts().pieceWrites == pieceWrites + 1, "a write over two views is taken piece by piece");
+    Expect(protectionAt(base + 14 * PageBytes) == PAGE_NOACCESS && protectionAt(base + 15 * PageBytes) == PAGE_NOACCESS, "the pages of both views become GPU-owned");
+    const std::vector<std::byte> across(0x40, std::byte{0x01});
+    std::vector<std::byte> acrossAfter(0x40, std::byte{0x01});
+    acrossAfter[0x10] = std::byte{0xaa};
+    acrossAfter[0x30] = std::byte{0xbb};
+    std::memset(fake.shadow.data() + 15 * PageBytes - 0x20, 0x02, 0x40);
+    core.LandDiff(base + 15 * PageBytes - 0x20, across, acrossAfter, 13);
+    Expect(fake.shadow[15 * PageBytes - 0x10] == std::byte{0xaa} && fake.shadow[15 * PageBytes + 0x10] == std::byte{0xbb} && fake.shadow[15 * PageBytes] == std::byte{0x02}, "a diff over two views lands through both");
+
+    fake.hidden.store(true);
+    const auto unviewedBefore = core.Counts();
+    const auto unviewed = core.NoteGpuWrite(base + 14 * PageBytes, PageBytes, 14);
+    fake.hidden.store(false);
+    Expect(unviewed.owned.empty() && unviewed.open.empty() && core.Written().Any(base + 14 * PageBytes, PageBytes), "a write that finds no view keeps its note on a page the GPU already owns");
+    Expect(core.Counts().ownedUnviewedBytes == unviewedBefore.ownedUnviewedBytes + PageBytes && core.Counts().gpuOnlyBytes == unviewedBefore.gpuOnlyBytes, "such a write is not counted as lost");
+    fake.split.store(0);
+
     RemoveVectoredExceptionHandler(handler);
     core.SetHost(nullptr);
     core.Uninstall();
     core.Unregister(base, Pages * PageBytes);
     VirtualFree(reinterpret_cast<void*>(base), 0, MEM_RELEASE);
+}
+
+std::atomic<int> resolverCalls{0};
+std::atomic<int> resolverBusyCalls{0};
+std::atomic<std::uint8_t*> resolverView{nullptr};
+
+std::uint8_t* busyResolver(std::uintptr_t, std::size_t) {
+    return resolverCalls.fetch_add(1) < resolverBusyCalls.load() ? nullptr : resolverView.load();
+}
+
+void testAViewLookupWaitsOutABusyResolver() {
+    const HANDLE section = CreateFileMappingW(INVALID_HANDLE_VALUE, nullptr, PAGE_READWRITE, 0, static_cast<DWORD>(PageBytes), nullptr);
+    auto* guest = section != nullptr ? static_cast<std::uint8_t*>(MapViewOfFile(section, FILE_MAP_ALL_ACCESS, 0, 0, PageBytes)) : nullptr;
+    auto* alias = section != nullptr ? static_cast<std::uint8_t*>(MapViewOfFile(section, FILE_MAP_ALL_ACCESS, 0, 0, PageBytes)) : nullptr;
+    Expect(guest != nullptr && alias != nullptr, "a section is mapped twice");
+    if (guest == nullptr || alias == nullptr) return;
+    GuestArena::GuestArenaSetViewResolver_nid_no_patch(&busyResolver);
+    resolverView.store(alias);
+    resolverBusyCalls.store(5);
+    resolverCalls.store(0);
+    const auto before = Mirror::ViewWaits();
+    Expect(Mirror::PatientView(reinterpret_cast<std::uint64_t>(guest), 64) == reinterpret_cast<std::byte*>(alias), "a lookup that finds the resolver busy is repeated until the view is there");
+    const auto waited = Mirror::ViewWaits();
+    Expect(resolverCalls.load() == 7 && waited.waited == before.waited + 1 && waited.found == before.found + 1, "the repeated lookup is counted as one wait that found its view");
+    resolverBusyCalls.store(0);
+    resolverCalls.store(0);
+    Expect(Mirror::PatientView(reinterpret_cast<std::uint64_t>(guest), 64) == reinterpret_cast<std::byte*>(alias) && resolverCalls.load() == 1 && Mirror::ViewWaits().waited == waited.waited, "a lookup that answers at once does not wait");
+    const auto unmapped = reserve();
+    resolverView.store(nullptr);
+    resolverCalls.store(0);
+    Expect(Mirror::PatientView(unmapped, 64) == nullptr && resolverCalls.load() == 2 && Mirror::ViewWaits().waited == waited.waited, "memory that is not a mapped section is not waited for");
+    Expect(Mirror::PatientView(reinterpret_cast<std::uint64_t>(guest), 64) == nullptr && Mirror::ViewWaits().waited == waited.waited + 1 && Mirror::ViewWaits().found == waited.found, "a mapped section that never gets a view is waited for once");
+    resolverCalls.store(0);
+    Expect(Mirror::PatientView(reinterpret_cast<std::uint64_t>(guest), 64) == nullptr && resolverCalls.load() == 2 && Mirror::ViewWaits().waited == waited.waited + 1, "and is remembered, so the next lookup there returns at once");
+    GuestArena::GuestArenaSetViewResolver_nid_no_patch(nullptr);
+    VirtualFree(reinterpret_cast<void*>(unmapped), 0, MEM_RELEASE);
+    UnmapViewOfFile(alias);
+    UnmapViewOfFile(guest);
+    CloseHandle(section);
+}
+
+std::atomic<std::uint64_t> piecesBase{0};
+std::atomic<std::uint8_t*> piecesAlias{nullptr};
+
+std::uint8_t* twoMappingResolver(std::uintptr_t address, std::size_t bytes) {
+    const auto base = piecesBase.load();
+    if (address < base) return nullptr;
+    const auto offset = address - base;
+    for (const std::uint64_t first : {std::uint64_t{0}, 2 * PageBytes}) {
+        if (offset >= first && offset + bytes <= first + 2 * PageBytes) return piecesAlias.load() + offset;
+    }
+    return nullptr;
+}
+
+void testAWriteOverTwoMappingsIsSplitAtTheirBoundary() {
+    const HANDLE section = CreateFileMappingW(INVALID_HANDLE_VALUE, nullptr, PAGE_READWRITE, 0, static_cast<DWORD>(8 * PageBytes), nullptr);
+    auto* guest = section != nullptr ? static_cast<std::uint8_t*>(MapViewOfFile(section, FILE_MAP_ALL_ACCESS, 0, 0, 8 * PageBytes)) : nullptr;
+    auto* alias = section != nullptr ? static_cast<std::uint8_t*>(MapViewOfFile(section, FILE_MAP_ALL_ACCESS, 0, 0, 8 * PageBytes)) : nullptr;
+    Expect(guest != nullptr && alias != nullptr, "a section of eight pages is mapped twice");
+    if (guest == nullptr || alias == nullptr) return;
+    const auto base = reinterpret_cast<std::uint64_t>(guest);
+    piecesBase.store(base);
+    piecesAlias.store(alias);
+    GuestArena::GuestArenaSetViewResolver_nid_no_patch(&twoMappingResolver);
+    Expect(Mirror::PatientView(base + 0x800, 3 * PageBytes) == nullptr, "a range over two mappings has no single view");
+    const auto pieces = Mirror::ViewedPieces(base + 0x800, 3 * PageBytes);
+    Expect(pieces.size() == 2 && pieces[0].address == base + 0x800 && pieces[0].size == 2 * PageBytes - 0x800 && pieces[1].address == base + 2 * PageBytes && pieces[1].size == PageBytes + 0x800, "the range is split where the first mapping ends");
+    const auto inside = Mirror::ViewedPieces(base + 2 * PageBytes, 2 * PageBytes);
+    Expect(inside.size() == 1 && inside[0].address == base + 2 * PageBytes && inside[0].size == 2 * PageBytes, "a range inside one mapping is one piece");
+    const auto past = Mirror::ViewedPieces(base + 3 * PageBytes, 2 * PageBytes);
+    Expect(past.size() == 1 && past[0].address == base + 3 * PageBytes && past[0].size == PageBytes, "pages that never get a view are left out");
+    GuestArena::GuestArenaSetViewResolver_nid_no_patch(nullptr);
+    UnmapViewOfFile(alias);
+    UnmapViewOfFile(guest);
+    CloseHandle(section);
 }
 #endif
 
@@ -198,6 +322,8 @@ int main() {
     testTakeForGpuAfterCompletionLeavesDirtyPagesOpen();
 #ifdef _WIN32
     testOwnedPagesLandOnFault();
+    testAViewLookupWaitsOutABusyResolver();
+    testAWriteOverTwoMappingsIsSplitAtTheirBoundary();
 #endif
     if (failures != 0) {
         std::fprintf(stderr, "%d failure(s)\n", failures);

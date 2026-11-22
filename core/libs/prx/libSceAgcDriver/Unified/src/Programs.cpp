@@ -198,7 +198,7 @@ bool DecodePrograms(const ProgramInputs& inputs, DriverDetail::DrawDecode& decod
     DriverDetail::DecodeGraphicsPrograms(decode, queue, inputs.registry, false, true);
     auto& state = decode.state;
     if (state.stages.mesh || state.stages.tessellation || state.stages.tessellationGeometry) {
-        reason = "mesh or tessellation stages";
+        reason = state.stages.mesh ? "mesh or tessellation stages: mesh" : state.stages.tessellationGeometry ? "mesh or tessellation stages: tessellation with geometry" : "mesh or tessellation stages: tessellation";
         return false;
     }
     if (std::ranges::any_of(decode.roles, [](Role role) { return role == Role::GeometryBack; })) {

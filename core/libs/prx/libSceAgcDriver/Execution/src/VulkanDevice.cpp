@@ -810,6 +810,7 @@ struct VulkanDevice::State {
         VkCommandBuffer commands = VK_NULL_HANDLE;
         std::shared_ptr<void> kept;
         std::shared_ptr<void> keptPlane;
+        std::shared_ptr<void> keptRecord;
         std::unique_ptr<Graphics::Buffer> dumpBuffer;
         std::unique_ptr<PresentationScaler> dumpScaler;
         std::uint32_t dumpWidth = 0;
@@ -1091,6 +1092,7 @@ struct VulkanDevice::State {
         if (planePass) planePass->Release(static_cast<std::size_t>(&slot - presentSlots.data()));
         slot.kept.reset();
         slot.keptPlane.reset();
+        slot.keptRecord.reset();
         if (slot.dumpRecorded) {
             slot.dumpRecorded = false;
             WriteFrameDump(slot);
@@ -4106,9 +4108,18 @@ ResidentPresent ResidentPresentable(const Graphics::Context& context, const Grap
     return ResidentPresentPath(format, buffer.pixelFormat, blitSource);
 }
 
+ResidentPresent RecordPresentable(const Graphics::Context& context, VkFormat format, const Graphics::GuestTextureResource& resource, const DisplayBuffer& buffer, VkFilter& filter) {
+    if (resource.width != buffer.width || resource.height != buffer.height || resource.mipCount > 1u) return ResidentPresent::None;
+    VkFormatProperties properties{};
+    context.formatProperties(context.physical, format, &properties);
+    const bool blitSource = (properties.optimalTilingFeatures & VK_FORMAT_FEATURE_BLIT_SRC_BIT) != 0;
+    filter = (properties.optimalTilingFeatures & VK_FORMAT_FEATURE_SAMPLED_IMAGE_FILTER_LINEAR_BIT) != 0 ? VK_FILTER_LINEAR : VK_FILTER_NEAREST;
+    return ResidentPresentPath(format, buffer.pixelFormat, blitSource);
+}
+
 std::shared_ptr<Graphics::StorageTexture> PresentableResident(const Graphics::Context& context, const DisplayBuffer& buffer, VkFilter& filter, bool& pending, bool& convert, std::uint32_t& layer) {
 #if ANYPS5_UNIFIED
-    Unified::Record::PublishRecords(context, buffer.address, DisplayBufferSize(buffer));
+    Unified::Record::FlipSource(context, buffer.address, DisplayBufferSize(buffer));
 #endif
     auto resident = Graphics::StorageTexture::FindPendingSlice(buffer.address, DisplayBufferSize(buffer));
     pending = resident != nullptr;
@@ -4303,7 +4314,21 @@ bool VulkanDevice::PresentDisplayBuffer(const DisplayBuffer& buffer, const Displ
     VkFilter filter = VK_FILTER_LINEAR;
     bool convert = false;
     std::uint32_t layer = 0;
-    if (!NoResidentPresent()) {
+    VkImage recordImage = VK_NULL_HANDLE;
+    std::shared_ptr<void> recordOwner;
+#if ANYPS5_UNIFIED
+    if (!NoResidentPresent() && buffer.dccAddress == 0 && buffer.tilingMode != DisplayTilingGcn) {
+        if (auto source = Unified::Record::DisplayRecord(buffer.address, bytes)) {
+            const auto path = RecordPresentable(graphicsContext(), source->format, source->resource, buffer, filter);
+            if (path != ResidentPresent::None) {
+                recordImage = source->image;
+                recordOwner = std::move(source->owner);
+                convert = path == ResidentPresent::Convert;
+            }
+        }
+    }
+#endif
+    if (recordImage == VK_NULL_HANDLE && !NoResidentPresent()) {
         bool pending = false;
         resident = PresentableResident(graphicsContext(), buffer, filter, pending, convert, layer);
         if (resident != nullptr && buffer.dccAddress != 0 && !ResidentServesDisplay(*resident, buffer)) {
@@ -4319,11 +4344,11 @@ bool VulkanDevice::PresentDisplayBuffer(const DisplayBuffer& buffer, const Displ
             ++residentPresents;
         }
     }
-    const auto cleared = buffer.dccAddress != 0 && resident == nullptr ? CompressedClearPixel(buffer, bytes) : std::nullopt;
+    const auto cleared = buffer.dccAddress != 0 && (resident == nullptr && recordImage == VK_NULL_HANDLE) ? CompressedClearPixel(buffer, bytes) : std::nullopt;
     bool dumpFrame = false;
     std::optional<int> cpuDump;
     if (frameDumpOutput.Enabled_nid_no_patch() && dumps.dumped < dumps.limit && ++dumps.presents % static_cast<std::uint64_t>(dumps.every) == 0) {
-        if (dumps.cpu || (passthrough && resident == nullptr)) {
+        if (dumps.cpu || (passthrough && (resident == nullptr && recordImage == VK_NULL_HANDLE))) {
             cpuDump = dumps.dumped++;
         } else {
             state->nextDumpIndex = dumps.dumped++;
@@ -4337,10 +4362,10 @@ bool VulkanDevice::PresentDisplayBuffer(const DisplayBuffer& buffer, const Displ
     }
     const bool screenshot = takeScreenshot(dumpFrame);
     if (cpuDump) QueueFrameDump(state->dumpWriter, *cpuDump, buffer.width, buffer.height, DisplayPixels(buffer, cleared));
-    const bool cpuScreenshot = screenshot && passthrough && resident == nullptr;
+    const bool cpuScreenshot = screenshot && passthrough && (resident == nullptr && recordImage == VK_NULL_HANDLE);
     auto shot = cpuScreenshot ? DisplayPixels(buffer, cleared) : std::vector<std::byte>{};
-    CaptureTrace::Log("present dump=%d address=%llx width=%u height=%u resident=%d generation=%llu", dumpFrame ? state->nextDumpIndex : -1, static_cast<unsigned long long>(buffer.address), buffer.width, buffer.height, resident != nullptr, static_cast<unsigned long long>(resident ? resident->Generation() : 0));
-    if (passthrough && resident == nullptr) ensureHdrScaler(DisplayTexelFormat(buffer.pixelFormat));
+    CaptureTrace::Log("present dump=%d address=%llx width=%u height=%u resident=%d generation=%llu", dumpFrame ? state->nextDumpIndex : -1, static_cast<unsigned long long>(buffer.address), buffer.width, buffer.height, (resident != nullptr || recordImage != VK_NULL_HANDLE), static_cast<unsigned long long>(resident ? resident->Generation() : 0));
+    if (passthrough && (resident == nullptr && recordImage == VK_NULL_HANDLE)) ensureHdrScaler(DisplayTexelFormat(buffer.pixelFormat));
     VkClearColorValue uniform{};
     if (cleared && passthrough) {
         uniform = PqClearValue(buffer);
@@ -4348,8 +4373,8 @@ bool VulkanDevice::PresentDisplayBuffer(const DisplayBuffer& buffer, const Displ
         const auto channel = [&](std::size_t index) { return static_cast<float>(std::to_integer<unsigned>((*cleared)[index])) / 255.0f; };
         uniform = {{channel(2), channel(1), channel(0), channel(3)}};
     }
-    const auto decoded = buffer.tilingMode != DisplayTilingGcn || resident != nullptr ? std::vector<std::byte>{} : passthrough ? ReadDisplayBufferTexels(buffer) : ReadDisplayBuffer(buffer);
-    if (!present(buffer.width, buffer.height, true, decoded, cleared || !decoded.empty() ? nullptr : &buffer, resident, filter, dumpFrame || (screenshot && !cpuScreenshot), convert, cleared ? &uniform : nullptr, layer, passthrough, plane)) {
+    const auto decoded = buffer.tilingMode != DisplayTilingGcn || (resident != nullptr || recordImage != VK_NULL_HANDLE) ? std::vector<std::byte>{} : passthrough ? ReadDisplayBufferTexels(buffer) : ReadDisplayBuffer(buffer);
+    if (!present(buffer.width, buffer.height, true, decoded, cleared || !decoded.empty() ? nullptr : &buffer, resident, filter, dumpFrame || (screenshot && !cpuScreenshot), convert, cleared ? &uniform : nullptr, layer, passthrough, plane, recordImage, std::move(recordOwner))) {
         // A dropped frame (swapchain out of date) keeps the dump numbering contiguous.
         if (dumpFrame) --dumps.dumped;
         if (screenshot) Screenshot::Request();
@@ -4405,7 +4430,9 @@ bool VulkanDevice::AcquireImage() {
     return true;
 }
 
-bool VulkanDevice::present(std::uint32_t width, std::uint32_t height, bool opaque, std::span<const std::byte> pixels, const DisplayBuffer* display, const std::shared_ptr<Graphics::StorageTexture>& resident, VkFilter residentFilter, bool dumpFrame, bool residentConvert, const VkClearColorValue* uniform, std::uint32_t residentLayer, bool passthrough, const DisplayBuffer* plane) {
+bool VulkanDevice::present(std::uint32_t width, std::uint32_t height, bool opaque, std::span<const std::byte> pixels, const DisplayBuffer* display, const std::shared_ptr<Graphics::StorageTexture>& resident, VkFilter residentFilter, bool dumpFrame, bool residentConvert, const VkClearColorValue* uniform, std::uint32_t residentLayer, bool passthrough, const DisplayBuffer* plane, VkImage recordImage, std::shared_ptr<void> recordOwner) {
+    const bool sourced = resident != nullptr || recordImage != VK_NULL_HANDLE;
+    const VkImage sourceImage = recordImage != VK_NULL_HANDLE ? recordImage : resident != nullptr ? resident->Image() : VK_NULL_HANDLE;
     PerformanceTimer timing("Vulkan.Present");
     APS5_LOG_OUT_DEBUG("present begin width=%u height=%u opaque=%u pixels=%zu", width, height, static_cast<unsigned>(opaque), pixels.size());
     require(state->swapchain != VK_NULL_HANDLE, "device has no swapchain");
@@ -4420,10 +4447,10 @@ bool VulkanDevice::present(std::uint32_t width, std::uint32_t height, bool opaqu
     require(index < state->images.size() && index < state->rendered.size(), "acquired image index is out of range");
     auto& rendered = state->rendered[index];
     const bool clearOnly = pixels.empty() && display == nullptr && uniform == nullptr;
-    require(!residentConvert || (resident != nullptr && display != nullptr), "a converted resident presentation needs its image and display buffer");
-    require(uniform == nullptr || (pixels.empty() && display == nullptr && resident == nullptr), "a uniform presentation has no other source");
-    const bool direct = resident != nullptr && !residentConvert;
-    const bool drawn = resident != nullptr && residentConvert && !DisplayHalfFloat(display->pixelFormat);
+    require(!residentConvert || (sourced && display != nullptr), "a converted resident presentation needs its image and display buffer");
+    require(uniform == nullptr || (pixels.empty() && display == nullptr && !sourced), "a uniform presentation has no other source");
+    const bool direct = sourced && !residentConvert;
+    const bool drawn = sourced && residentConvert && !DisplayHalfFloat(display->pixelFormat);
     require(passthrough == (state->surfaceColorSpace == VK_COLOR_SPACE_HDR10_ST2084_EXT) || clearOnly, "a presentation's dynamic range differs from its swapchain's");
     require(!passthrough || drawn || clearOnly || (state->hdrScaler != nullptr && !dumpFrame), "an HDR10 presentation through the scaler needs the HDR10 scaler and dumps on the CPU");
     auto* scaler = passthrough && !drawn ? state->hdrScaler.get() : state->scaler.get();
@@ -4451,7 +4478,7 @@ bool VulkanDevice::present(std::uint32_t width, std::uint32_t height, bool opaqu
     const auto padStatusLines = PadStatusOverlayLines();
     const bool padStatusShown = PadStatusDrawn(padStatusLines.has_value(), keyboard);
     const bool drawsOver = overlay || keyboard || padStatusShown || plane != nullptr;
-    if (display != nullptr && resident == nullptr) {
+    if (display != nullptr && !sourced) {
         static_cast<void>(DisplayBufferSize(*display));
         state->colorTransfer->Upload(display->address, width, height, Graphics::ColorTileMode::RenderTarget, DisplayTexelBytes(display->pixelFormat));
     }
@@ -4540,7 +4567,7 @@ bool VulkanDevice::present(std::uint32_t width, std::uint32_t height, bool opaqu
         VkImageMemoryBarrier residentBarrier{VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER};
         const VkPipelineStageFlags residentStage = drawn ? VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT : VK_PIPELINE_STAGE_TRANSFER_BIT;
         const VkAccessFlags residentRead = drawn ? VK_ACCESS_SHADER_READ_BIT : VK_ACCESS_TRANSFER_READ_BIT;
-        if (resident != nullptr) {
+        if (sourced) {
             // The draws and dispatches that produced the image were submitted before this command
             // buffer; their writes become visible to the blit here. The layout stays GENERAL, the
             // one the storage image is tracked in.
@@ -4550,12 +4577,12 @@ bool VulkanDevice::present(std::uint32_t width, std::uint32_t height, bool opaqu
             residentBarrier.newLayout = VK_IMAGE_LAYOUT_GENERAL;
             residentBarrier.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
             residentBarrier.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
-            residentBarrier.image = resident->Image();
+            residentBarrier.image = sourceImage;
             residentBarrier.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, VK_REMAINING_MIP_LEVELS, 0, VK_REMAINING_ARRAY_LAYERS};
             pipelineBarrier(commands, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, residentStage, 0, 0, nullptr, 0, nullptr, 1, &residentBarrier);
             Graphics::Recorder::CountBarriers(CommandClass::PresentBlit);
             if (residentConvert && !drawn) {
-                state->colorTransfer->DetileImage(commands, resident->Image(), VK_IMAGE_LAYOUT_GENERAL, width, height, Graphics::ColorTileMode::RenderTarget, DisplayRedLow(display->pixelFormat), DisplayTenBit(display->pixelFormat), DisplayHalfFloat(display->pixelFormat), residentLayer);
+                state->colorTransfer->DetileImage(commands, sourceImage, VK_IMAGE_LAYOUT_GENERAL, width, height, Graphics::ColorTileMode::RenderTarget, DisplayRedLow(display->pixelFormat), DisplayTenBit(display->pixelFormat), DisplayHalfFloat(display->pixelFormat), residentLayer);
                 scaler->RecordUpload(commands, state->colorTransfer->LinearBuffer());
             }
         } else {
@@ -4572,22 +4599,22 @@ bool VulkanDevice::present(std::uint32_t width, std::uint32_t height, bool opaqu
             const auto stageExtent = PresentationUpscaler::StageExtent(width, height, state->extent);
             const auto stage = state->upscaler->Stage(slotIndex, state->surfaceFormat, stageExtent);
             if (drawn) {
-                state->presentation->Bind(slotIndex, resident->Image(), width, height, display->pixelFormat, whiteNits, residentLayer);
+                state->presentation->Bind(slotIndex, sourceImage, width, height, display->pixelFormat, whiteNits, residentLayer);
                 state->presentation->RecordStage(commands, slotIndex, stage, state->surfaceFormat, state->surfaceColorSpace, stageExtent, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL);
             } else {
                 const AspectFitRect whole{0, 0, stageExtent.width, stageExtent.height};
                 state->upscaler->RecordStageTransferDestination(commands, slotIndex);
-                if (direct) PresentationScaler::RecordStretchFrom(graphicsContext(), commands, resident->Image(), VK_IMAGE_LAYOUT_GENERAL, width, height, residentFilter, stage, whole, residentLayer);
+                if (direct) PresentationScaler::RecordStretchFrom(graphicsContext(), commands, sourceImage, VK_IMAGE_LAYOUT_GENERAL, width, height, residentFilter, stage, whole, residentLayer);
                 else scaler->RecordStretch(commands, stage, whole);
                 state->upscaler->RecordStageWritten(commands, slotIndex, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_ACCESS_TRANSFER_WRITE_BIT);
             }
             state->upscaler->RecordPresent(commands, slotIndex, width, height, barrier.image, state->extent, drawsOver ? VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL : VK_IMAGE_LAYOUT_PRESENT_SRC_KHR);
         } else if (drawn) {
-            state->presentation->Bind(slotIndex, resident->Image(), width, height, display->pixelFormat, whiteNits, residentLayer);
+            state->presentation->Bind(slotIndex, sourceImage, width, height, display->pixelFormat, whiteNits, residentLayer);
             state->presentation->RecordPresent(commands, slotIndex, barrier.image, state->surfaceFormat, state->surfaceColorSpace, state->extent, drawsOver ? VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL : VK_IMAGE_LAYOUT_PRESENT_SRC_KHR);
         } else {
             scaler->RecordLetterbox(commands, width, height, barrier.image, state->extent.width, state->extent.height);
-            if (direct) PresentationScaler::RecordBlitFrom(graphicsContext(), commands, resident->Image(), VK_IMAGE_LAYOUT_GENERAL, width, height, residentFilter, barrier.image, state->extent.width, state->extent.height, residentLayer);
+            if (direct) PresentationScaler::RecordBlitFrom(graphicsContext(), commands, sourceImage, VK_IMAGE_LAYOUT_GENERAL, width, height, residentFilter, barrier.image, state->extent.width, state->extent.height, residentLayer);
             else scaler->RecordBlit(commands, barrier.image, state->extent.width, state->extent.height);
         }
         if (dumpFrame) {
@@ -4611,7 +4638,7 @@ bool VulkanDevice::present(std::uint32_t width, std::uint32_t height, bool opaqu
             } else if (direct) {
                 if (!slot.dumpScaler) slot.dumpScaler = std::make_unique<PresentationScaler>(graphicsContext(), VK_FORMAT_B8G8R8A8_UNORM, VK_FORMAT_B8G8R8A8_UNORM);
                 slot.dumpScaler->EnsureSourceImage(slot.dumpWidth, slot.dumpHeight);
-                slot.dumpScaler->RecordBlitInto(commands, resident->Image(), VK_IMAGE_LAYOUT_GENERAL, VK_FILTER_NEAREST, width, height, residentLayer);
+                slot.dumpScaler->RecordBlitInto(commands, sourceImage, VK_IMAGE_LAYOUT_GENERAL, VK_FILTER_NEAREST, width, height, residentLayer);
                 blendPlaneInto(slot.dumpScaler->SourceImage(), VK_FORMAT_B8G8R8A8_UNORM, {slot.dumpWidth, slot.dumpHeight});
                 slot.dumpScaler->RecordReadback(commands, slot.dumpBuffer->Handle());
             } else {
@@ -4619,7 +4646,7 @@ bool VulkanDevice::present(std::uint32_t width, std::uint32_t height, bool opaqu
                 scaler->RecordReadback(commands, slot.dumpBuffer->Handle());
             }
         }
-        if (resident != nullptr) {
+        if (sourced) {
             residentBarrier.srcAccessMask = residentRead;
             residentBarrier.dstAccessMask = VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT | VK_ACCESS_SHADER_WRITE_BIT | VK_ACCESS_TRANSFER_WRITE_BIT;
             pipelineBarrier(commands, residentStage | VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, 0, 0, nullptr, 0, nullptr, 1, &residentBarrier);
@@ -4676,6 +4703,7 @@ bool VulkanDevice::present(std::uint32_t width, std::uint32_t height, bool opaqu
         // The image stays alive until the slot is retired (storage-cache eviction only drops the
         // cache's reference).
         slot.kept = resident;
+        slot.keptRecord = std::move(recordOwner);
         slot.keptPlane = planeSource.resident;
         slot.imageIndex = index;
         slot.inFlight = true;

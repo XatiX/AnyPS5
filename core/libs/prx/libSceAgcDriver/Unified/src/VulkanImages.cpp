@@ -251,7 +251,7 @@ VkImageView VulkanSurface::AttachmentView(VkFormat viewFormat, std::uint32_t lev
     return created;
 }
 
-VkImageView VulkanSurface::ShapedStorageView(std::uint32_t level, StorageShape shape, bool uintView, bool atomic, std::string& reason) {
+VkImageView VulkanSurface::ShapedStorageView(std::uint32_t level, StorageShape shape, bool uintView, bool atomic, std::string& reason, std::uint32_t layer) {
     if (compressed) {
         reason = "storage view of a compressed surface";
         return VK_NULL_HANDLE;
@@ -271,7 +271,12 @@ VkImageView VulkanSurface::ShapedStorageView(std::uint32_t level, StorageShape s
         reason = "atomic storage view of a format that is not 32-bit single-channel";
         return VK_NULL_HANDLE;
     }
-    const auto key = std::make_tuple(level, static_cast<std::uint32_t>(shape), uintView, atomic);
+    if (shape != StorageShape::Flat) layer = 0;
+    if (layer >= std::max(geometry.imageLayers, 1u)) {
+        reason = "storage view past the layers";
+        return VK_NULL_HANDLE;
+    }
+    const auto key = std::make_tuple(level, static_cast<std::uint32_t>(shape), uintView, atomic, layer);
     std::lock_guard lock(mutex);
     if (const auto found = shapedStorageViews.find(key); found != shapedStorageViews.end()) return found->second;
     VkImageViewUsageCreateInfo usage{VK_STRUCTURE_TYPE_IMAGE_VIEW_USAGE_CREATE_INFO};
@@ -283,7 +288,7 @@ VkImageView VulkanSurface::ShapedStorageView(std::uint32_t level, StorageShape s
     const auto packed = packedStorageView(storageFormat);
     const auto uintFormat = uintView ? uintStorageView(storageFormat) : VK_FORMAT_UNDEFINED;
     info.format = atomic ? VK_FORMAT_R32_UINT : packed != VK_FORMAT_UNDEFINED ? packed : uintFormat != VK_FORMAT_UNDEFINED ? uintFormat : storageFormat;
-    info.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, level, 1u, 0u, shape == StorageShape::Array ? std::max(geometry.imageLayers, 1u) : 1u};
+    info.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, level, 1u, layer, shape == StorageShape::Array ? std::max(geometry.imageLayers, 1u) : 1u};
     VkImageView created = VK_NULL_HANDLE;
     if (context.Function<PFN_vkCreateImageView>("vkCreateImageView")(context.device, &info, nullptr, &created) != VK_SUCCESS) {
         reason = "vkCreateImageView recode storage";

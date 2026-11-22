@@ -182,7 +182,7 @@ bool SurfaceDetiler::WriteBack(Graphics::Recorder& recorder, const std::shared_p
         reason = "record without a Vulkan image";
         return false;
     }
-    if (!vulkan->Initialized()) {
+    if (!vulkan->Initialized() && !surface->gpuNewer) {
         reason = "record never filled";
         return false;
     }
@@ -197,6 +197,8 @@ bool SurfaceDetiler::WriteBack(Graphics::Recorder& recorder, const std::shared_p
     const auto& key = surface->key;
     Shadow::OwnedSpan span;
     if (!Shadow::ServeOwned(context, key.address, key.bytes, &span) || span.handle == 0u || key.address < span.origin) {
+        static std::atomic<std::uint32_t> notes{0};
+        if (notes.fetch_add(1, std::memory_order_relaxed) < 8u) std::fprintf(stderr, "[recode-images] write-back refused, memory not served: record 0x%llx+0x%llx %ux%u format %u (span handle %llu origin 0x%llx)\n", static_cast<unsigned long long>(key.address), static_cast<unsigned long long>(key.bytes), key.width, key.height, key.format, static_cast<unsigned long long>(span.handle), static_cast<unsigned long long>(span.origin));
         reason = "record memory not resident";
         return false;
     }

@@ -92,6 +92,16 @@ const char* Protector::RegionKind(std::uint64_t address) {
 #endif
 }
 
+bool Protector::SectionBacked(std::uint64_t address) {
+#ifdef _WIN32
+    MEMORY_BASIC_INFORMATION memory{};
+    return VirtualQuery(reinterpret_cast<const void*>(address), &memory, sizeof(memory)) == sizeof(memory) && memory.State == MEM_COMMIT && memory.Type == MEM_MAPPED;
+#else
+    static_cast<void>(address);
+    return false;
+#endif
+}
+
 std::vector<DirtyRange> Protector::ReadableRanges(std::uint64_t address, std::uint64_t size) {
     std::vector<DirtyRange> readable;
 #ifdef _WIN32

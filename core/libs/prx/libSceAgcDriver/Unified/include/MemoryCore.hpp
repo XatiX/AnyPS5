@@ -48,6 +48,10 @@ struct MemoryCoreCounts {
     std::uint64_t smallReadBytes = 0;
     std::uint64_t imageFaults = 0;
     std::uint64_t imageWriteFaults = 0;
+    std::uint64_t pieceWrites = 0;
+    std::uint64_t ownedUnviewedBytes = 0;
+    std::uint64_t diffChainedBytes = 0;
+    std::uint64_t diffForeignBytes = 0;
 };
 
 struct GpuWriteMark {
@@ -63,6 +67,8 @@ public:
     virtual bool WaitFor(std::uint64_t serial) = 0;
     virtual bool ReadMirror(std::uint64_t address, std::span<std::byte> out) = 0;
     virtual std::byte* View(std::uint64_t address, std::size_t bytes) = 0;
+    virtual std::byte* PatientView(std::uint64_t address, std::size_t bytes) { return View(address, bytes); }
+    virtual std::vector<DirtyRange> ViewedPieces(std::uint64_t address, std::uint64_t size) { return View(address, static_cast<std::size_t>(size)) != nullptr ? std::vector<DirtyRange>{{address, size}} : std::vector<DirtyRange>{}; }
     virtual void Upload(std::uint64_t address, std::uint64_t size) = 0;
     virtual bool Bypass() = 0;
     virtual bool ImagePage(std::uint64_t) { return false; }
@@ -76,6 +82,8 @@ public:
     static constexpr std::uint64_t SmallReadBytes = 256;
     static constexpr int ResolveAttempts = 3;
     static constexpr std::uint64_t UnviewedReports = 8;
+    static constexpr std::uint64_t LandedDiffBudgetBytes = 32u * 1024u * 1024u;
+    static constexpr std::uint64_t DiffReports = 16;
 
     static MemoryCore& Get();
 
@@ -128,6 +136,9 @@ private:
     bool rehash(std::uint64_t page, bool proven);
     bool resolveOwnedFault(std::uint64_t address, bool write);
     bool resolvePage(std::uint64_t page, bool write);
+    void takeViewed(GpuWriteMark& mark, std::uint64_t address, std::uint64_t size, bool takeDirty);
+    void leaveUnviewed(GpuWriteMark& mark, std::uint64_t address, std::uint64_t size, MemoryHost* current);
+    void landDiffThrough(std::byte* view, std::uint64_t address, std::span<const std::byte> before, std::span<const std::byte> after, std::uint64_t serial, MemoryHost& current);
     void openWithPreImage(std::uint64_t page);
     std::uint64_t landOpenPieces(std::uint64_t page, std::uint64_t completed, std::uint64_t begin, std::uint64_t end);
     void noteHot(std::uint64_t page);
@@ -143,6 +154,8 @@ private:
     GpuWritten written;
     std::atomic<MemoryHost*> host{nullptr};
     std::unordered_map<std::uint64_t, std::vector<std::byte>> preImages;
+    std::unordered_map<std::uint64_t, std::vector<std::byte>> landedDiffs;
+    std::uint64_t landedDiffBytes = 0;
     std::vector<Hot> hot;
     std::mutex parkMutex;
     std::condition_variable parkSignal;
@@ -182,6 +195,11 @@ private:
     std::atomic<std::uint64_t> imageWriteFaults{0};
     std::atomic<std::uint64_t> smallReads{0};
     std::atomic<std::uint64_t> smallReadBytes{0};
+    std::atomic<std::uint64_t> pieceWrites{0};
+    std::atomic<std::uint64_t> ownedUnviewedBytes{0};
+    std::atomic<std::uint64_t> diffChainedBytes{0};
+    std::atomic<std::uint64_t> diffForeignBytes{0};
+    std::atomic<std::uint64_t> diffReports{0};
 };
 
 }

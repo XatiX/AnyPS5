@@ -32,6 +32,7 @@ public:
     [[nodiscard]] bool NeverArmed(std::uint64_t address) const;
     [[nodiscard]] static bool Readable(std::uint64_t address);
     [[nodiscard]] static const char* RegionKind(std::uint64_t address);
+    [[nodiscard]] static bool SectionBacked(std::uint64_t address);
     [[nodiscard]] static std::vector<DirtyRange> ReadableRanges(std::uint64_t address, std::uint64_t size);
     std::size_t Apply(std::span<const ProtectionChange> changes, bool* held = nullptr);
     void Defer(std::span<const ProtectionChange> changes);

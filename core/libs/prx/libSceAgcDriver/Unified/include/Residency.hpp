@@ -73,6 +73,7 @@ struct ResidencyCounts {
     std::uint64_t segments = 0;
     std::uint64_t removals = 0;
     std::uint64_t sharedChunks = 0;
+    std::uint64_t gapRanges = 0;
 };
 
 class GpuPageTable;
@@ -87,8 +88,10 @@ public:
     Residency& operator=(const Residency&) = delete;
 
     bool Add(std::uint64_t address, std::uint64_t size);
+    bool Cover(std::uint64_t address, std::uint64_t size, std::vector<GuestSpan>* gaps = nullptr);
     void Remove(std::uint64_t address);
     [[nodiscard]] bool Owns(std::uint64_t address, std::uint64_t size) const;
+    [[nodiscard]] std::vector<GuestSpan> Covering(std::uint64_t address, std::uint64_t size) const;
     std::vector<GuestSpan> MakeResident(std::uint64_t address, std::uint64_t size, std::uint64_t frame);
     [[nodiscard]] std::optional<DeviceSpan> Translate(std::uint64_t address, std::uint64_t size) const;
     [[nodiscard]] std::vector<ResidentPiece> ResidentPieces(std::uint64_t address, std::uint64_t size) const;
@@ -119,6 +122,7 @@ private:
 
     Ranges::iterator rangeOf(std::uint64_t address);
     Ranges::const_iterator rangeOf(std::uint64_t address) const;
+    bool add(std::uint64_t address, std::uint64_t size);
     const DeviceBuffer* segmentOf(std::uint64_t address) const;
     const DeviceBuffer* segmentFor(std::uint64_t address);
     std::optional<Chunk> take();
@@ -144,6 +148,7 @@ private:
     std::uint64_t refusedCount = 0;
     std::uint64_t removals = 0;
     std::uint64_t sharedChunks = 0;
+    std::uint64_t gapRanges = 0;
 };
 
 }

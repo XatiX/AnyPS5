@@ -62,16 +62,20 @@ void ResidentUploads::NoteDirty(std::span<const DirtyRange> ranges) {
 bool ResidentUploads::Prepare(std::uint64_t address, std::uint64_t size, std::uint64_t frame) {
     if (size == 0) return true;
     std::lock_guard lock(mutex);
-    if (!residency.Owns(address, size)) return false;
-    for (const auto& span : residency.MakeResident(address, size, frame)) snapshot(span.address, span.size, true);
+    const auto pieces = residency.Covering(address, size);
+    if (pieces.empty()) return false;
+    for (const auto& piece : pieces) {
+        for (const auto& span : residency.MakeResident(piece.address, piece.size, frame)) snapshot(span.address, span.size, true);
+    }
     return residency.Translate(address, size).has_value();
 }
 
 bool ResidentUploads::PrepareFilled(std::uint64_t address, std::uint64_t size, std::uint64_t frame) {
     if (size == 0) return true;
     std::lock_guard lock(mutex);
-    if (!residency.Owns(address, size)) return false;
-    static_cast<void>(residency.MakeResident(address, size, frame));
+    const auto pieces = residency.Covering(address, size);
+    if (pieces.empty()) return false;
+    for (const auto& piece : pieces) static_cast<void>(residency.MakeResident(piece.address, piece.size, frame));
     return residency.Translate(address, size).has_value();
 }
 

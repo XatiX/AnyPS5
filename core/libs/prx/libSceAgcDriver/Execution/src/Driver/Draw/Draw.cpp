@@ -443,6 +443,19 @@ DrawVerdict Driver::draw(QueueState& queue, std::span<const std::uint32_t> packe
             return drawn();
         }
         if (found.value == nullptr) Unified::Record::RefuseUnrecorded("draw", 0, {});
+        if (Unified::Record::DropsUnrecorded()) {
+            if (found.offered) resolvedDraws.Release(submission.queue, submission.serial, packetOffset);
+            const auto commitQueue = submission.queue;
+            DrawPipeline::Queue0().Enqueue(DrawPipeline::CommitKind::Draw, [this, localDevice, commitQueue] {
+                GuestMemory::TagGpuLockSite(GuestMemory::GpuLockSite::Draw);
+                std::lock_guard commitLock(GuestMemory::GpuMutex());
+                auto current = device.Load();
+                if (current == nullptr) current = localDevice;
+                recordLabelsForPacket(current.get(), commitQueue);
+                submitDueAfterCommit(current.get());
+            }, {}, 0, {}, {}, true);
+            return drawn();
+        }
     } else if (Unified::Record::RecordActive()) {
         Unified::Record::RefuseUnrecorded("draw", 0, "draw outside the draw pipeline");
     }

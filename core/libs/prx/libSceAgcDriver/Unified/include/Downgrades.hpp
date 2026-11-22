@@ -94,7 +94,7 @@ void Note(std::uint64_t codeAddress, Kind kind, std::uint32_t binding = 0, std::
 void NoteHashed(std::uint64_t hash, Kind kind, std::uint32_t binding = 0, std::string_view detail = {});
 void NoteCurrent(Kind kind, std::uint32_t binding = 0, std::string_view detail = {});
 void NotePipeline(std::uint64_t pipeline, std::uint64_t codeAddress, std::uint64_t module);
-enum class ExistingPath : std::uint8_t { Abort, Log, Allow };
+enum class ExistingPath : std::uint8_t { Abort, Log, Allow, Drop };
 [[nodiscard]] ExistingPath ExistingPathMode();
 void RefuseExistingPath(std::uint64_t codeAddress, std::string_view work, std::string_view reason);
 void NoteGuestWrite(const char* what, std::uint64_t address, std::uint64_t bytes);

@@ -36,7 +36,7 @@ std::optional<ImageKey> KeyOf(const Graphics::GuestTextureResource& resource, st
         reason = "multisampled image";
         return std::nullopt;
     }
-    if (resource.dccAddress != 0u) {
+    if (resource.dccAddress != 0u && !MetadataRecords()) {
         reason = "compressed image metadata";
         return std::nullopt;
     }
@@ -45,6 +45,14 @@ std::optional<ImageKey> KeyOf(const Graphics::GuestTextureResource& resource, st
     const auto swizzle = static_cast<std::uint32_t>(resource.dstSelX) | static_cast<std::uint32_t>(resource.dstSelY) << 4u | static_cast<std::uint32_t>(resource.dstSelZ) << 8u | static_cast<std::uint32_t>(resource.dstSelW) << 12u | static_cast<std::uint32_t>(resource.bcSwizzle) << 16u;
     key.view = {resource.baseLevel, resource.lastLevel, resource.baseArray, resource.depthOrLastArray, swizzle, resource.format};
     return key;
+}
+
+bool MetadataRecords() {
+    static const bool records = [] {
+        const char* value = std::getenv("APS5_RECODE_METADATA_RECORDS");
+        return value == nullptr || std::string_view(value) != "0";
+    }();
+    return records;
 }
 
 std::size_t SurfaceTable::KeyHash::operator()(const SurfaceKey& key) const {
@@ -285,7 +293,9 @@ std::vector<std::shared_ptr<Surface>> SurfaceTable::StaleOverlapping(std::uint64
 bool SurfaceTable::ChangedSinceWrite(const Surface& surface) const {
     std::lock_guard lock(mutex);
     const auto owner = OwnerOf(surface);
-    return shared.ChangedSince(surface.key.address, surface.key.bytes, surface.stamp, owner) || gpuWrites.ChangedSince(surface.key.address, surface.key.bytes, surface.imageStamp, owner);
+    if (shared.ChangedSince(surface.key.address, surface.key.bytes, surface.stamp, owner)) return true;
+    if (!gpuWrites.ChangedSince(surface.key.address, surface.key.bytes, surface.imageStamp, owner)) return false;
+    return gpuWrites.ChangedOwner(surface.key.address, surface.key.bytes, surface.imageStamp) != Events::TargetOwner;
 }
 
 void SurfaceTable::Touch(Surface& surface) {

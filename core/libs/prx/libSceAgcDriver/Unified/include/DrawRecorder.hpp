@@ -3,9 +3,12 @@
 
 #include "prx/libSceAgcDriver/Execution/include/Pm4.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/Context.hpp"
+#include "prx/libSceAgcDriver/Graphics/include/GuestTextureResource.hpp"
 #include "prx/libSceAgcDriver/Unified/include/Resolve.hpp"
 #include <array>
 #include <cstdint>
+#include <memory>
+#include <optional>
 #include <span>
 #include <string>
 #include <string_view>
@@ -18,10 +21,19 @@ class VulkanDevice;
 namespace AgcDriver::Unified::Record {
 
 [[nodiscard]] bool RecordActive();
+[[nodiscard]] bool DropsUnrecorded();
 [[nodiscard]] bool RecordsKernels(std::uint32_t queue);
 enum class Kernel : std::uint8_t { Fill, Copy };
 void NoteKernel(Kernel kernel);
 void PublishRecords(const Graphics::Context& context, std::uint64_t address, std::uint64_t bytes);
+void FlipSource(const Graphics::Context& context, std::uint64_t address, std::uint64_t bytes);
+struct DisplaySource {
+    VkImage image = VK_NULL_HANDLE;
+    VkFormat format = VK_FORMAT_UNDEFINED;
+    Graphics::GuestTextureResource resource;
+    std::shared_ptr<void> owner;
+};
+[[nodiscard]] std::optional<DisplaySource> DisplayRecord(std::uint64_t address, std::uint64_t bytes);
 [[nodiscard]] bool LandingsPending();
 [[nodiscard]] bool IdleStores();
 bool RecordPrecheck(const Resolve::ResolvedDraw& draw, const Pm4::DrawParameters& parameters, std::vector<std::pair<std::uint64_t, std::uint64_t>>& reads, std::string& reason);

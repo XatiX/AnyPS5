@@ -24,6 +24,7 @@
 #include <string>
 #include <utility>
 #if ANYPS5_UNIFIED
+#include "prx/libSceAgcDriver/Unified/include/Releases.hpp"
 #include "prx/libSceAgcDriver/Unified/include/Resolve.hpp"
 #include "prx/libSceAgcDriver/Unified/include/Shadow.hpp"
 #endif
@@ -496,6 +497,29 @@ void Driver::execute(Submission& submission) {
                 ~FlipReadying() { driver.endFlipReady(handle); }
             } readying(*this, submission.flipHandles.at(cursor));
             flipHold.Release();
+#if ANYPS5_UNIFIED
+            bool flipQueued = false;
+            if (Unified::Releases::FlipsFollowWork()) {
+                const auto flipHandle = submission.flipHandles.at(cursor);
+                beginFlipReady(flipHandle);
+                {
+                    GuestMemory::TagGpuLockSite(GuestMemory::GpuLockSite::Flush);
+                    std::lock_guard gpuLock(GuestMemory::GpuMutex());
+                    const auto localDevice = device.Load();
+                    flipQueued = localDevice != nullptr && localDevice->AfterRecordedWork([this, flip = submission.flips.at(cursor), frame, flipHandle] {
+                        Unified::Releases::Queue([this, flip, frame, flipHandle] {
+                            flip->GpuReady(frame);
+                            endFlipReady(flipHandle);
+                        });
+                    }, false);
+                }
+                if (!flipQueued) {
+                    endFlipReady(flipHandle);
+                    Unified::Releases::NoteDirect();
+                }
+            }
+            if (!flipQueued)
+#endif
             submission.flips.at(cursor)->GpuReady(frame);
         } else if (opcode == 0x15 || opcode == 0x16) {
             packetCounters.CountDispatch();

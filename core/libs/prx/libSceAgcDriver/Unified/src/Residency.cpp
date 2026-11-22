@@ -61,6 +61,46 @@ const DeviceBuffer* Residency::segmentFor(std::uint64_t address) {
 bool Residency::Add(std::uint64_t address, std::uint64_t size) {
     if (size == 0 || address > std::numeric_limits<std::uint64_t>::max() - size) return false;
     std::lock_guard lock(mutex);
+    return add(address, size);
+}
+
+bool Residency::Cover(std::uint64_t address, std::uint64_t size, std::vector<GuestSpan>* gaps) {
+    if (size == 0 || address > std::numeric_limits<std::uint64_t>::max() - size) return false;
+    std::lock_guard lock(mutex);
+    const auto end = address + size;
+    auto it = rangeOf(address);
+    if (it == ranges.end()) it = ranges.lower_bound(address);
+    for (auto cursor = address; cursor < end;) {
+        if (it != ranges.end() && it->first <= cursor) {
+            cursor = it->second.end;
+            ++it;
+            continue;
+        }
+        const auto stop = it != ranges.end() ? std::min(end, it->first) : end;
+        if (!add(cursor, stop - cursor)) return false;
+        if (gaps != nullptr) gaps->push_back({cursor, stop - cursor});
+        ++gapRanges;
+        cursor = stop;
+    }
+    return true;
+}
+
+std::vector<GuestSpan> Residency::Covering(std::uint64_t address, std::uint64_t size) const {
+    std::vector<GuestSpan> pieces;
+    if (size == 0 || address > std::numeric_limits<std::uint64_t>::max() - size) return pieces;
+    std::lock_guard lock(mutex);
+    const auto end = address + size;
+    auto it = rangeOf(address);
+    for (auto cursor = address; cursor < end; ++it) {
+        if (it == ranges.end() || it->first > cursor) return {};
+        const auto stop = std::min(end, it->second.end);
+        pieces.push_back({cursor, stop - cursor});
+        cursor = stop;
+    }
+    return pieces;
+}
+
+bool Residency::add(std::uint64_t address, std::uint64_t size) {
     const auto end = address + size;
     const auto next = ranges.lower_bound(address);
     if (next != ranges.end() && next->first < end) return false;
@@ -353,7 +393,7 @@ void Residency::SetPageTable(GpuPageTable* table) {
 
 ResidencyCounts Residency::Counts() const {
     std::lock_guard lock(mutex);
-    return {ranges.size(), pools, boundBytes, budget, boundCount, evictedCount, refusedCount, sharedPages, segments.size(), removals, sharedChunks};
+    return {ranges.size(), pools, boundBytes, budget, boundCount, evictedCount, refusedCount, sharedPages, segments.size(), removals, sharedChunks, gapRanges};
 }
 
 }

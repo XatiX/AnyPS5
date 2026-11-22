@@ -1,4 +1,5 @@
 #include "prx/libSceAgcDriver/Unified/include/Resolve.hpp"
+#include "prx/libSceAgcDriver/Unified/include/MemoryCore.hpp"
 #include "prx/libSceAgcDriver/Unified/include/Downgrades.hpp"
 #include "prx/libSceAgcDriver/Unified/include/DrawRecorder.hpp"
 #include "prx/libSceAgcDriver/Execution/include/GuestMemory.hpp"
@@ -40,7 +41,10 @@ constexpr std::uint32_t MultisampleArrayShape = 5u;
 constexpr std::uint32_t Image3DShape = 6u;
 
 bool storageShapeRecords() {
-    static const bool records = std::getenv("APS5_RECODE_STORAGE_SHAPE_RECORDS") != nullptr;
+    static const bool records = [] {
+        const char* value = std::getenv("APS5_RECODE_STORAGE_SHAPE_RECORDS");
+        return value == nullptr || std::string_view(value) != "0";
+    }();
     return records;
 }
 
@@ -91,6 +95,26 @@ bool imagesRouted() {
 }
 
 enum class SampledBind : std::uint8_t { Ahead, Record, RecordAll };
+
+}
+
+bool SampledRecordsAll() {
+    static const bool all = [] {
+        const char* value = std::getenv("APS5_RECODE_SAMPLED_RECORDS_ALL");
+        return value == nullptr || (std::string_view(value) != "gpu" && std::string_view(value) != "0");
+    }();
+    return all;
+}
+
+bool SampledRecordFor(std::uint64_t address, std::uint64_t bytes) {
+    static const bool gpu = [] {
+        const char* value = std::getenv("APS5_RECODE_SAMPLED_RECORDS_ALL");
+        return value != nullptr && std::string_view(value) == "gpu";
+    }();
+    return SampledRecordsAll() || (gpu && MemoryCore::Get().Pages().GpuWrittenIn(address, bytes));
+}
+
+namespace {
 
 SampledBind sampledBind() {
     static const SampledBind bind = [] {
@@ -358,7 +382,7 @@ public:
         return recordStorageShape((request.kind - Heap::LastSampledKind - 1u) % StorageShapes);
     }
 
-    std::shared_ptr<Images::Surface> BindRecordSlot(const Heap::SlotRequest& request, std::shared_ptr<Images::Surface> record, std::uint32_t& slot) {
+    std::shared_ptr<Images::Surface> BindRecordSlot(const Heap::SlotRequest& request, std::shared_ptr<Images::Surface> record, std::uint32_t& slot, std::uint32_t layer = 0) {
         if (table == nullptr || record == nullptr) return nullptr;
         auto* vulkan = dynamic_cast<Images::VulkanSurface*>(record->device.get());
         if (vulkan == nullptr) return noteRecordRefusal("storage surface without a Vulkan image");
@@ -367,7 +391,7 @@ public:
             const auto shape = (request.kind - Heap::LastSampledKind - 1u) % StorageShapes;
             const auto resource = Graphics::DecodeTextureResource(request.words);
             const auto mip = std::min(request.flags >> Heap::RequestFlag::MipShift, std::max(resource.mipCount, 1u) - 1u);
-            const auto view = vulkan->ShapedStorageView(mip, storageShapeOf(shape), (request.flags & Heap::RequestFlag::UintView) != 0u, (request.flags & Heap::RequestFlag::Atomic) != 0u, why);
+            const auto view = vulkan->ShapedStorageView(mip, storageShapeOf(shape), (request.flags & Heap::RequestFlag::UintView) != 0u, (request.flags & Heap::RequestFlag::Atomic) != 0u, why, layer + resource.baseArray);
             if (view == VK_NULL_HANDLE) return noteRecordRefusal(why);
             slot = table->ImageSlot(request.kind, {reinterpret_cast<std::uint64_t>(view), static_cast<std::uint32_t>(VK_IMAGE_LAYOUT_GENERAL), record});
             if (slot == Heap::NoSlot) return noteRecordRefusal("image heap full");
@@ -875,7 +899,8 @@ private:
         if (!Images::OwnersEnabled()) return false;
         try {
             const auto resource = Graphics::DecodeTextureResource(request.words);
-            return surfaces->OwnerOfRange(resource.baseAddress, Graphics::SurfaceGuestBytes(resource)) == Images::Side::Record;
+            const auto side = surfaces->OwnerOfRange(resource.baseAddress, Graphics::SurfaceGuestBytes(resource));
+            return side == Images::Side::Record || (side == Images::Side::None && SampledRecordFor(resource.baseAddress, Graphics::SurfaceGuestBytes(resource)));
         } catch (const std::exception&) {
             return false;
         }
@@ -1134,8 +1159,8 @@ std::shared_ptr<Images::Surface> BindDeferredRecord(const Heap::SlotRequest& req
     return shared().BindDeferredRecord(request, slot);
 }
 
-std::shared_ptr<Images::Surface> BindRecordSlot(const Heap::SlotRequest& request, std::shared_ptr<Images::Surface> record, std::uint32_t& slot) {
-    return shared().BindRecordSlot(request, std::move(record), slot);
+std::shared_ptr<Images::Surface> BindRecordSlot(const Heap::SlotRequest& request, std::shared_ptr<Images::Surface> record, std::uint32_t& slot, std::uint32_t layer) {
+    return shared().BindRecordSlot(request, std::move(record), slot, layer);
 }
 
 bool StorageRecordShape(const Heap::SlotRequest& request) {

@@ -273,6 +273,10 @@ MemoryCoreCounts MemoryCore::Counts() const {
     counts.imageFaults = imageFaults.load(std::memory_order_relaxed);
     counts.imageWriteFaults = imageWriteFaults.load(std::memory_order_relaxed);
     counts.smallReadBytes = smallReadBytes.load(std::memory_order_relaxed);
+    counts.pieceWrites = pieceWrites.load(std::memory_order_relaxed);
+    counts.ownedUnviewedBytes = ownedUnviewedBytes.load(std::memory_order_relaxed);
+    counts.diffChainedBytes = diffChainedBytes.load(std::memory_order_relaxed);
+    counts.diffForeignBytes = diffForeignBytes.load(std::memory_order_relaxed);
     return counts;
 }
 

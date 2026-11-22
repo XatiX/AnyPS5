@@ -95,6 +95,8 @@ struct OwnerCounts {
     std::uint64_t demoted = 0;
 };
 
+[[nodiscard]] bool MetadataRecords();
+
 [[nodiscard]] inline std::uintptr_t OwnerOf(const Surface& surface) {
     return Events::ResourceOwner(&surface);
 }
