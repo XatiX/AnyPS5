@@ -54,6 +54,37 @@ class RecipeTests(unittest.TestCase):
                     with self.assertRaises(ValueError):
                         performance_bisect.load_recipe(path)
 
+    def test_rejects_oversized_percentage_integers(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            recipe = self.make_recipe(root)
+            path = root / "recipe.json"
+            for name in ("regression_pct", "max_spread_pct"):
+                for value in (10 ** 400, -(10 ** 400), math.inf, -math.inf, math.nan):
+                    with self.subTest(name=name, value=value):
+                        path.write_text(json.dumps(dict(recipe, **{name: value})), encoding="utf-8")
+                        with self.assertRaisesRegex(ValueError, "recipe." + name):
+                            performance_bisect.load_recipe(path)
+
+    def test_cli_reports_oversized_percentages_before_bisection(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            recipe = self.make_recipe(root)
+            path = root / "recipe.json"
+            output = root / "report.json"
+            for name in ("regression_pct", "max_spread_pct"):
+                with self.subTest(name=name):
+                    path.write_text(json.dumps(dict(recipe, **{name: 10 ** 400})), encoding="utf-8")
+                    result = subprocess.run([sys.executable, performance_bisect.__file__, "--recipe", str(path),
+                                             "--repo", str(root / "not-a-repository"), "--good", "good", "--bad", "bad",
+                                             "--output", str(output)], capture_output=True, timeout=10)
+                    error = result.stderr.decode("utf-8")
+                    self.assertEqual(result.returncode, 2, error)
+                    self.assertIn("recipe." + name, error)
+                    self.assertNotIn("Traceback", error)
+                    self.assertEqual(result.stdout, b"")
+                    self.assertFalse(output.exists())
+
     def test_resolves_relative_paths_from_the_recipe_file(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
@@ -741,6 +772,23 @@ class FocusedInputEdgeTests(unittest.TestCase):
             path = self.write_summary(Path(directory), summary)
             with self.assertRaisesRegex(ValueError, "missing machine"):
                 performance_bisect.sample_summary(path, "PPSA00000", GOOD)
+
+    def test_sample_requires_content_version(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            summary = self.sample_fixture()
+            title = summary["titles"]["PPSA00000"]
+            path = self.write_summary(root, summary)
+            sample = performance_bisect.sample_summary(path, "PPSA00000", GOOD)
+            self.assertEqual(sample["identity"]["content_version"], "01.00")
+
+            del title["version"]
+            for fields in ({}, {"version": ""}, {"version": " \t"}, {"version": None}, {"version": 1}):
+                with self.subTest(fields=fields):
+                    summary["titles"]["PPSA00000"] = dict(title, **fields)
+                    path = self.write_summary(root, summary)
+                    with self.assertRaisesRegex(ValueError, "missing a valid content version"):
+                        performance_bisect.sample_summary(path, "PPSA00000", GOOD)
 
 
     def test_summary_uses_middle_pair_for_even_sample_count(self):
