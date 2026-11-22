@@ -1,0 +1,45 @@
+#version 450
+
+layout(local_size_x = 64) in;
+
+layout(set = 0, binding = 0, std430) readonly buffer Keys { uint words[]; } keys;
+layout(set = 0, binding = 1, std430) buffer Result { uint mixed; } result;
+layout(set = 0, binding = 2) writeonly uniform uimage2D target;
+
+layout(push_constant) uniform Push {
+    uint base;
+    uint count;
+    uint width;
+    uint height;
+    uint mode;
+    uint reserved0;
+    uint reserved1;
+    uint reserved2;
+    uvec4 patterns[5];
+} push;
+
+uint keyAt(uint index) {
+    uint byteAddress = push.base + index;
+    return (keys.words[byteAddress / 4u] >> ((byteAddress % 4u) * 8u)) & 0xffu;
+}
+
+int slotOf(uint code) {
+    if (code == 0x00u) return 0;
+    if (code == 0x40u) return 1;
+    if (code == 0x80u) return 2;
+    if (code == 0xc0u) return 3;
+    if (code == 0x20u) return 4;
+    return -1;
+}
+
+void main() {
+    uint index = gl_GlobalInvocationID.y * gl_NumWorkGroups.x * 64u + gl_GlobalInvocationID.x;
+    if (push.mode == 0u) {
+        if (index < push.count && keyAt(index) != keyAt(0u)) atomicOr(result.mixed, 1u);
+        return;
+    }
+    if (result.mixed != 0u) return;
+    int slot = slotOf(keyAt(0u));
+    if (slot < 0 || index >= push.width * push.height) return;
+    imageStore(target, ivec2(int(index % push.width), int(index / push.width)), push.patterns[slot]);
+}

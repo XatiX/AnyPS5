@@ -26,6 +26,7 @@
 #include "prx/libSceAgcDriver/Unified/include/Releases.hpp"
 #include "prx/libSceAgcDriver/Unified/include/UploadClash.hpp"
 #include "prx/libSceAgcDriver/Unified/include/MetadataWatch.hpp"
+#include "prx/libSceAgcDriver/Unified/include/MetadataClears.hpp"
 #include "prx/libSceAgcDriver/Unified/include/ResidencyService.hpp"
 #include "prx/libSceAgcDriver/Unified/include/SlotPatch.hpp"
 #include "prx/libSceAgcDriver/Unified/include/Shadow.hpp"
@@ -237,6 +238,7 @@ struct Totals {
     std::uint64_t depthSeedRefusals = 0;
     std::uint64_t depthHtileClears = 0;
     std::uint64_t depthHtileOther = 0;
+    std::uint64_t metadataClears = 0;
     std::uint64_t depthRecordsSampled = 0;
     std::uint64_t recordsRefreshed = 0;
     std::uint64_t layersAbsorbed = 0;
@@ -1264,6 +1266,10 @@ public:
         std::snprintf(text, sizeof(text), "; table maps %llu hits, %llu uploads (%.1f MiB), %llu retired, %zu held (%.1f MiB)", static_cast<unsigned long long>(totals.mapHits), static_cast<unsigned long long>(totals.mapUploads), static_cast<double>(totals.mapUploadBytes) / 1048576.0, static_cast<unsigned long long>(totals.mapRetired), maps.size(), static_cast<double>(mapBytes) / 1048576.0);
         line += text;
         line += "; record ranges noted GPU-written for the memory core " + std::to_string(totals.recordRangesNoted) + "; records made for a sampled shape after a hand-over " + std::to_string(totals.sampledRecordsCreated) + ", new storage records started from their memory " + std::to_string(totals.storageRecordsSeeded) + "; new chains zeroed " + std::to_string(totals.zeroedChains) + ", new records poisoned " + std::to_string(totals.poisonedRecords);
+        if (metadataClears != nullptr) {
+            const auto metadata = metadataClears->TakeCounts();
+            line += "; metadata clears: DCC writes " + std::to_string(metadata.pendingDcc) + ", CMASK writes " + std::to_string(metadata.pendingCmask) + ", applied to records " + std::to_string(totals.metadataClears) + " (DCC " + std::to_string(metadata.dccApplied) + ", CMASK " + std::to_string(metadata.cmaskApplied) + "), refused " + std::to_string(metadata.refused);
+        }
         line += "; records written back for buffer readers " + std::to_string(totals.readerWriteBacks) + " (" + std::to_string(totals.readerWriteBackBytes >> 20u) + " MiB, " + std::to_string(totals.readerWriteBackRefusals) + " refused, " + std::to_string(totals.readerStale) + " skipped: memory changed since their GPU write), handed over before a buffer writer " + std::to_string(totals.writerHandOvers);
         line += "; records handed to another shape " + std::to_string(totals.shapesHandedOver) + " (" + std::to_string(totals.writeBacks) + " written back into the mirror, " + std::to_string(totals.writeBackBytes >> 20u) + " MiB, " + std::to_string(totals.writeBackRefusals) + " refused, " + std::to_string(totals.staleShapes) + " not written back: memory changed since their GPU write, " + std::to_string(totals.writeBacksUnserved) + " retired unwritten: the write-back was refused); draws with a recode depth record " + std::to_string(totals.depthRecordDraws) + " (" + std::to_string(Images::Depths().Size()) + " records, " + std::to_string(Images::Depths().Counts().cleared) + " started from their clear value, " + std::to_string(Images::Depths().Counts().refused) + " refused, " + std::to_string(Images::Depths().Counts().superseded) + " superseded by a record over their memory, " + std::to_string(Images::Depths().Counts().htileWrites) + " driver writes over HTILE, " + std::to_string(totals.depthRecordsSampled) + " sampled reads of them, " + std::to_string(totals.depthBufferReads) + " buffer reads of their memory, " + std::to_string(totals.depthWriteBacks) + " depth write-backs into the mirror for them, " + std::to_string(totals.depthWriteBackRefusals) + " refused; " + std::to_string(totals.depthSeeds) + " started from memory (" + std::to_string(totals.depthSeedRefusals) + " refused), HTILE writes re-cleared " + std::to_string(totals.depthHtileClears) + ", HTILE writes without a clear " + std::to_string(totals.depthHtileOther) + "); targets and sampled views served as layers of a containing record " + std::to_string(totals.layerTargets) + ", records copied in as layers of a new record " + std::to_string(totals.layersAbsorbed) + " (" + std::to_string(totals.layersAbsorbedOverChanges) + " over a change note); CPU-content records detiled again after their memory changed " + std::to_string(totals.recordsRefreshed);
         line += "; images adopted from the existing cache " + std::to_string(totals.recordAdoptions) + " (" + std::to_string(totals.recordAdoptionRefusals) + " refused), published back " + std::to_string(publishedRecords.load(std::memory_order_relaxed)) + " (" + std::to_string(staleRecordsKept.load(std::memory_order_relaxed)) + " not published: guest memory changed since their GPU write, " + std::to_string(publishNoSurface.load(std::memory_order_relaxed)) + " without an existing surface, " + std::to_string(publishShape.load(std::memory_order_relaxed)) + " of another shape, " + std::to_string(publishCompressed.load(std::memory_order_relaxed)) + " compressed); flips from a GPU-written record " + std::to_string(flipsFromNewRecords.load(std::memory_order_relaxed)) + ", over a record not GPU-written " + std::to_string(flipsFromOldRecords.load(std::memory_order_relaxed)) + ", with no record " + std::to_string(flipsWithoutRecords.load(std::memory_order_relaxed)) + ", presented straight from the record " + std::to_string(flipsPresentedFromRecords.load(std::memory_order_relaxed));
@@ -3057,8 +3063,33 @@ private:
         }
     }
 
+    void noteMetadataWrites(const Resolve::ResolvedDraw& work) {
+        if (metadataClears == nullptr) return;
+        for (std::size_t index = 0; index < work.uses.size() && index < work.imageBegin; ++index) {
+            const auto& use = work.uses[index];
+            if (!use.write || use.size == 0u || (index >= work.targetBegin && index < work.targetEnd)) continue;
+            metadataClears->NoteWrite(use.address, use.size);
+        }
+    }
+
+    void applyMetadataClear(const Context& context, const std::shared_ptr<Images::Surface>& record) {
+        if (metadataClears == nullptr || record == nullptr || context.recorder == nullptr || !metadataClears->Pending(record->key.address)) return;
+        auto* vulkan = dynamic_cast<Images::VulkanSurface*>(record->device.get());
+        auto* table = Resolve::Surfaces();
+        if (vulkan == nullptr || table == nullptr) return;
+        drainSurfaces(context, *context.recorder);
+        std::string reason;
+        if (metadataClears->Apply(*context.recorder, record->key.address, *vulkan, reason)) {
+            markRecordWritten(*context.recorder, *table, *record);
+            totals.metadataClears++;
+            return;
+        }
+        if (!reason.empty() && seen.insert("metadata clear: " + reason).second) std::fprintf(stderr, "[recode-metadata] first refused clear: %s (record 0x%llx %ux%u format %u)\n", reason.c_str(), static_cast<unsigned long long>(record->key.address), record->key.width, record->key.height, record->key.format);
+    }
+
     void writeBackForReaders(const Context& context, const Resolve::ResolvedDraw& work) {
         noteClashWrites(work);
+        noteMetadataWrites(work);
         auto* table = Resolve::Surfaces();
         if (table == nullptr || context.recorder == nullptr || !ownsImages()) return;
         for (std::size_t index = 0; index < work.uses.size() && index < work.imageBegin; ++index) {
@@ -3211,6 +3242,10 @@ private:
                 std::vector<VkImageView> recordViews;
                 for (const auto& color : state.colors) {
                     MetadataWatch::NoteTarget(color);
+                    if (Images::MetadataClearsOn()) {
+                        if (metadataClears == nullptr) metadataClears = std::make_unique<Images::MetadataClears>(context);
+                        metadataClears->NoteTarget(color);
+                    }
                     VkImageView view = VK_NULL_HANDLE;
                     auto record = targetRecord(context, color, view);
                     if (record != nullptr && !targetTraceList().empty() && !draw.stages.empty() && tracedProgram(Downgrades::ProgramHash(draw.stages.back().program.codeAddress)) && targetTraceLines.fetch_add(1, std::memory_order_relaxed) < (targetTraceList() == "all" ? 20000u : 400u)) {
@@ -3675,6 +3710,7 @@ private:
                 absorbLayers(context, *table, owned, absorbed);
             }
             if (owned == nullptr) return refuse("target surface: " + ownedWhy);
+            applyMetadataClear(context, owned);
             auto* ownedVulkan = dynamic_cast<Images::VulkanSurface*>(owned->device.get());
             if (ownedVulkan == nullptr) return refuse("target surface without a Vulkan image");
             view = ownedVulkan->AttachmentView(color.format, color.mip, containingLayer + ownedResource.baseArray + color.arraySlice, std::max(color.layers, 1u), ownedWhy);
@@ -3898,6 +3934,7 @@ private:
                 totals.storageRecordsSeeded++;
             }
         }
+        applyMetadataClear(context, record);
         if (record != nullptr) record = Resolve::BindRecordSlot(request, std::move(record), slot, layer);
         if (record == nullptr) {
             claimUpstream(context, surface.address, surface.bytes, "storage: " + (why.empty() ? std::string("no view") : why));
@@ -3966,6 +4003,7 @@ private:
             }
         }
         if (Downgrades::Watching()) Downgrades::WatchProgramRead(stage.program.codeAddress, surface.address, surface.bytes);
+        applyMetadataClear(context, record);
         auto viewKey = key->view;
         viewKey.baseArray += layer;
         viewKey.lastArray += layer;
@@ -4073,6 +4111,7 @@ private:
     std::uint32_t censusDraws = 0;
     std::set<std::uint32_t> seenFaults;
     std::unique_ptr<Images::SurfaceDetiler> surfaceDetiler;
+    std::unique_ptr<Images::MetadataClears> metadataClears;
     std::map<std::vector<std::uint64_t>, std::shared_ptr<ComputePipeline>> computePipelines;
     std::vector<std::pair<std::uint64_t, std::uint64_t>> landing;
     std::vector<std::uint64_t> landingSerials;
