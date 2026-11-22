@@ -22,6 +22,7 @@ namespace AgcDriver::Unified::Record {
 enum class Kernel : std::uint8_t { Fill, Copy };
 void NoteKernel(Kernel kernel);
 void PublishRecords(const Graphics::Context& context, std::uint64_t address, std::uint64_t bytes);
+void FlipSource(const Graphics::Context& context, std::uint64_t address, std::uint64_t bytes);
 [[nodiscard]] bool LandingsPending();
 [[nodiscard]] bool IdleStores();
 bool RecordPrecheck(const Resolve::ResolvedDraw& draw, const Pm4::DrawParameters& parameters, std::vector<std::pair<std::uint64_t, std::uint64_t>>& reads, std::string& reason);

@@ -381,6 +381,13 @@ bool adoptsUpstream() {
 }
 
 std::atomic<std::uint64_t> publishedRecords{0};
+std::atomic<std::uint64_t> publishNoSurface{0};
+std::atomic<std::uint64_t> flipsFromNewRecords{0};
+std::atomic<std::uint64_t> flipsFromOldRecords{0};
+std::atomic<std::uint64_t> flipsWithoutRecords{0};
+std::atomic<std::uint32_t> flipNotes{0};
+std::atomic<std::uint64_t> publishShape{0};
+std::atomic<std::uint64_t> publishCompressed{0};
 std::atomic<std::uint64_t> staleRecordsKept{0};
 
 struct BatchLandings {
@@ -1134,7 +1141,7 @@ public:
         line += "; record ranges noted GPU-written for the memory core " + std::to_string(totals.recordRangesNoted) + "; records made for a sampled shape after a hand-over " + std::to_string(totals.sampledRecordsCreated) + "; new chains zeroed " + std::to_string(totals.zeroedChains);
         line += "; records written back for buffer readers " + std::to_string(totals.readerWriteBacks) + " (" + std::to_string(totals.readerWriteBackBytes >> 20u) + " MiB, " + std::to_string(totals.readerWriteBackRefusals) + " refused, " + std::to_string(totals.readerStale) + " skipped: memory changed since their GPU write)";
         line += "; records handed to another shape " + std::to_string(totals.shapesHandedOver) + " (" + std::to_string(totals.writeBacks) + " written back into the mirror, " + std::to_string(totals.writeBackBytes >> 20u) + " MiB, " + std::to_string(totals.writeBackRefusals) + " refused, " + std::to_string(totals.staleShapes) + " not written back: memory changed since their GPU write); targets and sampled views served as layers of a containing record " + std::to_string(totals.layerTargets) + ", records copied in as layers of a new record " + std::to_string(totals.layersAbsorbed) + " (" + std::to_string(totals.layersAbsorbedOverChanges) + " over a change note); CPU-content records detiled again after their memory changed " + std::to_string(totals.recordsRefreshed);
-        line += "; images adopted from the existing cache " + std::to_string(totals.recordAdoptions) + " (" + std::to_string(totals.recordAdoptionRefusals) + " refused), published back " + std::to_string(publishedRecords.load(std::memory_order_relaxed)) + " (" + std::to_string(staleRecordsKept.load(std::memory_order_relaxed)) + " not published: guest memory changed since their GPU write)";
+        line += "; images adopted from the existing cache " + std::to_string(totals.recordAdoptions) + " (" + std::to_string(totals.recordAdoptionRefusals) + " refused), published back " + std::to_string(publishedRecords.load(std::memory_order_relaxed)) + " (" + std::to_string(staleRecordsKept.load(std::memory_order_relaxed)) + " not published: guest memory changed since their GPU write, " + std::to_string(publishNoSurface.load(std::memory_order_relaxed)) + " without an existing surface, " + std::to_string(publishShape.load(std::memory_order_relaxed)) + " of another shape, " + std::to_string(publishCompressed.load(std::memory_order_relaxed)) + " compressed); flips from a GPU-written record " + std::to_string(flipsFromNewRecords.load(std::memory_order_relaxed)) + ", over a record not GPU-written " + std::to_string(flipsFromOldRecords.load(std::memory_order_relaxed)) + ", with no record " + std::to_string(flipsWithoutRecords.load(std::memory_order_relaxed));
         {
             auto& landings = batchLandings();
             line += "; landings after their batch " + std::to_string(landings.scheduled.load(std::memory_order_relaxed)) + " scheduled, " + std::to_string(landings.ran.load(std::memory_order_relaxed)) + " ran (" + std::to_string(landings.landedBytes.load(std::memory_order_relaxed) >> 10u) + " KiB), " + std::to_string(landings.pending.load(std::memory_order_relaxed)) + " pending, " + std::to_string(landings.retried.load(std::memory_order_relaxed)) + " retried later";
@@ -3763,17 +3770,27 @@ void PublishRecords(const Graphics::Context& context, std::uint64_t address, std
             continue;
         }
         auto* vulkan = dynamic_cast<Images::VulkanSurface*>(record->device.get());
-        if (vulkan == nullptr || vulkan->Compressed()) continue;
+        if (vulkan == nullptr || vulkan->Compressed()) {
+            publishCompressed.fetch_add(1, std::memory_order_relaxed);
+            continue;
+        }
         std::shared_ptr<Graphics::StorageTexture> upstream;
         try {
             upstream = Graphics::CachedStorageSurface(context, vulkan->Resource());
         } catch (const std::exception&) {
+            publishNoSurface.fetch_add(1, std::memory_order_relaxed);
             continue;
         }
-        if (upstream == nullptr) continue;
+        if (upstream == nullptr) {
+            publishNoSurface.fetch_add(1, std::memory_order_relaxed);
+            continue;
+        }
         const auto& resource = vulkan->Resource();
         const auto& descriptor = upstream->Descriptor();
-        if (resource.width != descriptor.width || resource.height != descriptor.height || Graphics::BytesPerElement(resource.format) != Graphics::BytesPerElement(descriptor.format)) continue;
+        if (resource.width != descriptor.width || resource.height != descriptor.height || Graphics::BytesPerElement(resource.format) != Graphics::BytesPerElement(descriptor.format)) {
+            publishShape.fetch_add(1, std::memory_order_relaxed);
+            continue;
+        }
         const auto commands = context.recorder->Commands();
         const auto levels = std::min(static_cast<std::uint32_t>(std::max<std::size_t>(vulkan->Geometry().mips.size(), 1u)), std::max(descriptor.mipCount, 1u));
         const auto layers = std::min(std::max(vulkan->Geometry().imageLayers, 1u), std::max(upstream->ImageLayers(), 1u));
@@ -3785,6 +3802,21 @@ void PublishRecords(const Graphics::Context& context, std::uint64_t address, std
         if (!ownsImages()) table->ClearGpuNewer(*record);
         publishedRecords.fetch_add(1, std::memory_order_relaxed);
     }
+}
+
+void FlipSource(const Graphics::Context& context, std::uint64_t address, std::uint64_t bytes) {
+    auto* table = Resolve::Surfaces();
+    if (table != nullptr && RecordActive()) {
+        const auto overlapping = table->Overlapping(address, bytes);
+        const bool newer = std::ranges::any_of(overlapping, [](const std::shared_ptr<Images::Surface>& record) { return record->gpuNewer; });
+        auto& counter = overlapping.empty() ? flipsWithoutRecords : newer ? flipsFromNewRecords : flipsFromOldRecords;
+        if (counter.fetch_add(1, std::memory_order_relaxed) == 0u && flipNotes.fetch_add(1, std::memory_order_relaxed) < 8u) {
+            std::fprintf(stderr, "[recode-flip] first flip of 0x%llx+0x%llx %s", static_cast<unsigned long long>(address), static_cast<unsigned long long>(bytes), overlapping.empty() ? "with no record" : newer ? "from a GPU-written record" : "over a record that is not GPU-written");
+            for (const auto& record : overlapping) std::fprintf(stderr, " [0x%llx+0x%llx %ux%u format %u]", static_cast<unsigned long long>(record->key.address), static_cast<unsigned long long>(record->key.bytes), record->key.width, record->key.height, record->key.format);
+            std::fputc(10, stderr);
+        }
+    }
+    PublishRecords(context, address, bytes);
 }
 
 void NoteKernel(Kernel kernel) {
