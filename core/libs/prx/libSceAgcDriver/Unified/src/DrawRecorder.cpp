@@ -583,6 +583,10 @@ const std::string& censusReads() {
     return list;
 }
 
+bool censusReadsOf(std::uint64_t program) {
+    return !censusReads().empty() && (censusReads() == "all" || Downgrades::ListedHash(censusReads(), program));
+}
+
 const NanCensus& nanCensus() {
     static const NanCensus census = [] {
         NanCensus parsed;
@@ -2419,7 +2423,7 @@ private:
             if (record != nullptr) {
                 stage.slots[deferred.index] = slot;
                 if (context.recorder != nullptr) context.recorder->Keep(record);
-                if (context.recorder != nullptr && nanCensus().draws != 0u && !censusReads().empty() && Downgrades::ListedHash(censusReads(), Downgrades::ProgramHash(stage.program.codeAddress))) censusRecord(context, *context.recorder, record, Downgrades::ProgramHash(stage.program.codeAddress), true);
+                if (context.recorder != nullptr && nanCensus().draws != 0u && censusReadsOf(Downgrades::ProgramHash(stage.program.codeAddress))) censusRecord(context, *context.recorder, record, Downgrades::ProgramHash(stage.program.codeAddress), true);
                 if (const auto* vulkan = dynamic_cast<const Images::VulkanSurface*>(record->device.get())) stageStorageImages.emplace_back(vulkan->Image(), storageWritten);
                 if (storageWritten) writtenRecords.push_back(std::move(record));
                 continue;
@@ -2532,8 +2536,14 @@ private:
                 for (std::size_t at = 0; at + 4u <= bytes.size(); at += 4u) {
                     std::uint32_t word = 0;
                     std::memcpy(&word, bytes.data() + at, 4u);
-                    if (((word >> 6u) & 0x1fu) == 0x1fu || ((word >> 17u) & 0x1fu) == 0x1fu || ((word >> 27u) & 0x1fu) == 0x1fu) ++bad;
-                    else if (((word >> 6u) & 0x1fu) == 0x1eu || ((word >> 17u) & 0x1fu) == 0x1eu || ((word >> 27u) & 0x1fu) == 0x1eu) ++huge;
+                    if (((word >> 6u) & 0x1fu) == 0x1fu || ((word >> 17u) & 0x1fu) == 0x1fu || ((word >> 27u) & 0x1fu) == 0x1fu) {
+                        ++bad;
+                        continue;
+                    }
+                    if (((word >> 6u) & 0x1fu) == 0x1eu || ((word >> 17u) & 0x1fu) == 0x1eu || ((word >> 27u) & 0x1fu) == 0x1eu) ++huge;
+                    const auto unpacked = [](std::uint32_t exponent, std::uint32_t mantissa, double steps) { return exponent == 0u ? mantissa / steps * std::ldexp(1.0, -14) : (1.0 + mantissa / steps) * std::ldexp(1.0, static_cast<int>(exponent) - 15); };
+                    sum += unpacked((word >> 6u) & 0x1fu, word & 0x3fu, 64.0) + unpacked((word >> 17u) & 0x1fu, (word >> 11u) & 0x3fu, 64.0) + unpacked((word >> 27u) & 0x1fu, (word >> 22u) & 0x1fu, 32.0);
+                    counted += 3u;
                 }
             } else if (format == VK_FORMAT_R32G32B32A32_SFLOAT || format == VK_FORMAT_R32G32_SFLOAT || format == VK_FORMAT_R32_SFLOAT) {
                 for (std::size_t at = 0; at + 4u <= bytes.size(); at += 4u) {
@@ -3815,7 +3825,7 @@ private:
         }
         stage.slots[deferred.index] = slot;
         if (context.recorder != nullptr) context.recorder->Keep(record);
-        if (context.recorder != nullptr && nanCensus().draws != 0u && !censusReads().empty() && Downgrades::ListedHash(censusReads(), Downgrades::ProgramHash(stage.program.codeAddress))) censusRecord(context, *context.recorder, record, Downgrades::ProgramHash(stage.program.codeAddress), true);
+        if (context.recorder != nullptr && nanCensus().draws != 0u && censusReadsOf(Downgrades::ProgramHash(stage.program.codeAddress))) censusRecord(context, *context.recorder, record, Downgrades::ProgramHash(stage.program.codeAddress), true);
         totals.recordSampled++;
         return true;
     }
