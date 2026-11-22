@@ -618,7 +618,7 @@ bool ResidencyService::claim(std::uint64_t address, std::uint64_t size, const ch
     ledger->RemoveUnboundInside(address, size);
     if (ledger->Add(address, size)) return true;
     static const char* const chosen = std::getenv("APS5_RECODE_COVER");
-    static const std::string covered = chosen != nullptr ? chosen : "mirror";
+    static const std::string covered = chosen != nullptr ? chosen : "all";
     if (covered != "all" && covered.find(user) == std::string::npos) return false;
     std::vector<GuestSpan> gaps;
     if (!ledger->Cover(address, size, &gaps)) return false;

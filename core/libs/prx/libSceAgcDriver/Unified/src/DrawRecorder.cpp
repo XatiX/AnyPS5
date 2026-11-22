@@ -525,6 +525,24 @@ struct NanCensus {
     std::uint32_t draws = 0;
 };
 
+struct CensusDump {
+    std::string directory;
+    std::uint32_t count = 0;
+};
+
+const CensusDump& censusDump() {
+    static const CensusDump dump = [] {
+        CensusDump parsed;
+        const char* count = std::getenv("APS5_RECODE_NAN_CENSUS_DUMP");
+        const char* directory = std::getenv("APS5_RECODE_DUMP_DIR");
+        if (count == nullptr || directory == nullptr) return parsed;
+        parsed.count = static_cast<std::uint32_t>(std::strtoul(count, nullptr, 10));
+        parsed.directory = directory;
+        return parsed;
+    }();
+    return dump;
+}
+
 const std::string& targetTraceList() {
     static const std::string list = [] {
         const char* value = std::getenv("APS5_RECODE_TRACE_TARGETS");
@@ -2459,7 +2477,7 @@ private:
         auto* vulkan = dynamic_cast<Images::VulkanSurface*>(record->device.get());
         if (vulkan == nullptr || vulkan->Compressed()) return;
         const auto format = vulkan->Format();
-        if (format != VK_FORMAT_R16G16B16A16_SFLOAT && format != VK_FORMAT_R32G32B32A32_SFLOAT && format != VK_FORMAT_R32_SFLOAT && format != VK_FORMAT_R16G16_SFLOAT && format != VK_FORMAT_R16_SFLOAT && format != VK_FORMAT_B10G11R11_UFLOAT_PACK32 && !read) return;
+        if (format != VK_FORMAT_R16G16B16A16_SFLOAT && format != VK_FORMAT_R32G32B32A32_SFLOAT && format != VK_FORMAT_R32_SFLOAT && format != VK_FORMAT_R16G16_SFLOAT && format != VK_FORMAT_R16_SFLOAT && format != VK_FORMAT_B10G11R11_UFLOAT_PACK32 && !read && censusDump().count == 0u) return;
         const auto sequence = censusDraws++;
         const auto width = record->key.width;
         const auto height = record->key.height;
@@ -2486,6 +2504,17 @@ private:
         recorder.OnComplete([buffer, sequence, program, address, width, height, mips, format, read, layers, layerBytes, guestNonzero] {
             buffer->Invalidate();
             const auto bytes = buffer->Bytes();
+            if (const auto& dump = censusDump(); sequence < dump.count) {
+                char name[160];
+                std::snprintf(name, sizeof(name), "\\census%04u-%s-p%016llx-record-%llx-L0-%ux%u-vk%u.raw", sequence, read ? "read" : "write", static_cast<unsigned long long>(program), static_cast<unsigned long long>(address), width, height, static_cast<unsigned>(format));
+                const auto file = dump.directory + name;
+                if (auto* out = std::fopen(file.c_str(), "wb")) {
+                    std::fwrite(bytes.data(), 1, std::min(layerBytes, bytes.size()), out);
+                    std::fclose(out);
+                } else {
+                    std::fprintf(stderr, "[recode-dump] cannot write %s\n", file.c_str());
+                }
+            }
             std::uint32_t filledLayers = 0;
             for (std::uint32_t layer = 0; layer < layers; ++layer) {
                 const auto chunk = bytes.subspan(layer * layerBytes, std::min(layerBytes, bytes.size() - std::min(bytes.size(), layer * layerBytes)));
