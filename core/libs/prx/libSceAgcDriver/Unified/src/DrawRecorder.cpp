@@ -389,6 +389,7 @@ std::atomic<std::uint64_t> flipsFromNewRecords{0};
 std::atomic<std::uint64_t> flipsFromOldRecords{0};
 std::atomic<std::uint64_t> flipsWithoutRecords{0};
 std::atomic<std::uint32_t> flipNotes{0};
+std::atomic<std::uint64_t> flipsPresentedFromRecords{0};
 std::atomic<std::uint64_t> publishShape{0};
 std::atomic<std::uint64_t> publishCompressed{0};
 std::atomic<std::uint64_t> staleRecordsKept{0};
@@ -572,6 +573,14 @@ bool refreshesRecords() {
         return value == nullptr || std::string_view(value) != "0";
     }();
     return refreshes;
+}
+
+bool presentsRecords() {
+    static const bool presents = [] {
+        const char* value = std::getenv("APS5_RECODE_PRESENT_RECORDS");
+        return value == nullptr || std::string_view(value) != "0";
+    }();
+    return presents;
 }
 
 bool zeroesNewChains() {
@@ -1147,7 +1156,7 @@ public:
         line += "; record ranges noted GPU-written for the memory core " + std::to_string(totals.recordRangesNoted) + "; records made for a sampled shape after a hand-over " + std::to_string(totals.sampledRecordsCreated) + "; new chains zeroed " + std::to_string(totals.zeroedChains);
         line += "; records written back for buffer readers " + std::to_string(totals.readerWriteBacks) + " (" + std::to_string(totals.readerWriteBackBytes >> 20u) + " MiB, " + std::to_string(totals.readerWriteBackRefusals) + " refused, " + std::to_string(totals.readerStale) + " skipped: memory changed since their GPU write)";
         line += "; records handed to another shape " + std::to_string(totals.shapesHandedOver) + " (" + std::to_string(totals.writeBacks) + " written back into the mirror, " + std::to_string(totals.writeBackBytes >> 20u) + " MiB, " + std::to_string(totals.writeBackRefusals) + " refused, " + std::to_string(totals.staleShapes) + " not written back: memory changed since their GPU write); draws with a recode depth record " + std::to_string(totals.depthRecordDraws) + " (" + std::to_string(Images::Depths().Size()) + " records, " + std::to_string(Images::Depths().Counts().cleared) + " started from their clear value, " + std::to_string(Images::Depths().Counts().refused) + " refused, " + std::to_string(totals.depthRecordsSampled) + " sampled reads of them); targets and sampled views served as layers of a containing record " + std::to_string(totals.layerTargets) + ", records copied in as layers of a new record " + std::to_string(totals.layersAbsorbed) + " (" + std::to_string(totals.layersAbsorbedOverChanges) + " over a change note); CPU-content records detiled again after their memory changed " + std::to_string(totals.recordsRefreshed);
-        line += "; images adopted from the existing cache " + std::to_string(totals.recordAdoptions) + " (" + std::to_string(totals.recordAdoptionRefusals) + " refused), published back " + std::to_string(publishedRecords.load(std::memory_order_relaxed)) + " (" + std::to_string(staleRecordsKept.load(std::memory_order_relaxed)) + " not published: guest memory changed since their GPU write, " + std::to_string(publishNoSurface.load(std::memory_order_relaxed)) + " without an existing surface, " + std::to_string(publishShape.load(std::memory_order_relaxed)) + " of another shape, " + std::to_string(publishCompressed.load(std::memory_order_relaxed)) + " compressed); flips from a GPU-written record " + std::to_string(flipsFromNewRecords.load(std::memory_order_relaxed)) + ", over a record not GPU-written " + std::to_string(flipsFromOldRecords.load(std::memory_order_relaxed)) + ", with no record " + std::to_string(flipsWithoutRecords.load(std::memory_order_relaxed));
+        line += "; images adopted from the existing cache " + std::to_string(totals.recordAdoptions) + " (" + std::to_string(totals.recordAdoptionRefusals) + " refused), published back " + std::to_string(publishedRecords.load(std::memory_order_relaxed)) + " (" + std::to_string(staleRecordsKept.load(std::memory_order_relaxed)) + " not published: guest memory changed since their GPU write, " + std::to_string(publishNoSurface.load(std::memory_order_relaxed)) + " without an existing surface, " + std::to_string(publishShape.load(std::memory_order_relaxed)) + " of another shape, " + std::to_string(publishCompressed.load(std::memory_order_relaxed)) + " compressed); flips from a GPU-written record " + std::to_string(flipsFromNewRecords.load(std::memory_order_relaxed)) + ", over a record not GPU-written " + std::to_string(flipsFromOldRecords.load(std::memory_order_relaxed)) + ", with no record " + std::to_string(flipsWithoutRecords.load(std::memory_order_relaxed)) + ", presented straight from the record " + std::to_string(flipsPresentedFromRecords.load(std::memory_order_relaxed));
         {
             auto& landings = batchLandings();
             line += "; landings after their batch " + std::to_string(landings.scheduled.load(std::memory_order_relaxed)) + " scheduled, " + std::to_string(landings.ran.load(std::memory_order_relaxed)) + " ran (" + std::to_string(landings.landedBytes.load(std::memory_order_relaxed) >> 10u) + " KiB), " + std::to_string(landings.pending.load(std::memory_order_relaxed)) + " pending, " + std::to_string(landings.retried.load(std::memory_order_relaxed)) + " retried later";
@@ -3836,6 +3845,19 @@ void PublishRecords(const Graphics::Context& context, std::uint64_t address, std
         if (!ownsImages()) table->ClearGpuNewer(*record);
         publishedRecords.fetch_add(1, std::memory_order_relaxed);
     }
+}
+
+std::optional<DisplaySource> DisplayRecord(std::uint64_t address, std::uint64_t bytes) {
+    auto* table = Resolve::Surfaces();
+    if (table == nullptr || !RecordActive() || !presentsRecords()) return std::nullopt;
+    for (const auto& record : table->Overlapping(address, bytes)) {
+        if (!record->gpuNewer || record->retired || record->key.address != address) continue;
+        auto* vulkan = dynamic_cast<Images::VulkanSurface*>(record->device.get());
+        if (vulkan == nullptr || vulkan->Compressed() || vulkan->Geometry().mips.size() > 1u || vulkan->Geometry().imageLayers > 1u) continue;
+        flipsPresentedFromRecords.fetch_add(1, std::memory_order_relaxed);
+        return DisplaySource{vulkan->Image(), vulkan->Format(), vulkan->Resource(), record};
+    }
+    return std::nullopt;
 }
 
 void FlipSource(const Graphics::Context& context, std::uint64_t address, std::uint64_t bytes) {
