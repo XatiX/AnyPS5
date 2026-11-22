@@ -221,6 +221,7 @@ struct Totals {
     std::uint64_t writeBackBytes = 0;
     std::uint64_t writeBackRefusals = 0;
     std::uint64_t shapesHandedOver = 0;
+    std::uint64_t layerTargets = 0;
     std::uint64_t staleShapes = 0;
     std::uint64_t readerWriteBacks = 0;
     std::uint64_t readerWriteBackBytes = 0;
@@ -311,7 +312,16 @@ bool copiesBackSmallWrites() {
     return copies;
 }
 
-std::atomic<std::uint32_t> shapeNotes{0};
+std::mutex shapeNoteMutex;
+std::set<std::string> shapeNotePairs;
+
+bool firstShapePair(const Images::SurfaceKey& asked, const Images::SurfaceKey& held) {
+    char pair[160];
+    std::snprintf(pair, sizeof(pair), "%ux%u/%u/%u/%u/%u-%ux%u/%u/%u/%u/%u", asked.width, asked.height, asked.depth, asked.mips, asked.format, asked.dimension, held.width, held.height, held.depth, held.mips, held.format, held.dimension);
+    std::lock_guard lock(shapeNoteMutex);
+    if (shapeNotePairs.size() >= 64u) return false;
+    return shapeNotePairs.insert(pair).second;
+}
 
 constexpr std::uint64_t OutputProbeLimitBytes = 4ull << 20u;
 constexpr std::uint32_t OutputProbePrints = 6;
@@ -1072,7 +1082,7 @@ public:
         line += text;
         line += "; record ranges noted GPU-written for the memory core " + std::to_string(totals.recordRangesNoted) + "; records made for a sampled shape after a hand-over " + std::to_string(totals.sampledRecordsCreated) + "; new chains zeroed " + std::to_string(totals.zeroedChains);
         line += "; records written back for buffer readers " + std::to_string(totals.readerWriteBacks) + " (" + std::to_string(totals.readerWriteBackBytes >> 20u) + " MiB, " + std::to_string(totals.readerWriteBackRefusals) + " refused, " + std::to_string(totals.readerStale) + " skipped: memory changed since their GPU write)";
-        line += "; records handed to another shape " + std::to_string(totals.shapesHandedOver) + " (" + std::to_string(totals.writeBacks) + " written back into the mirror, " + std::to_string(totals.writeBackBytes >> 20u) + " MiB, " + std::to_string(totals.writeBackRefusals) + " refused, " + std::to_string(totals.staleShapes) + " not written back: memory changed since their GPU write)";
+        line += "; records handed to another shape " + std::to_string(totals.shapesHandedOver) + " (" + std::to_string(totals.writeBacks) + " written back into the mirror, " + std::to_string(totals.writeBackBytes >> 20u) + " MiB, " + std::to_string(totals.writeBackRefusals) + " refused, " + std::to_string(totals.staleShapes) + " not written back: memory changed since their GPU write); targets and sampled views served as layers of a containing record " + std::to_string(totals.layerTargets);
         line += "; images adopted from the existing cache " + std::to_string(totals.recordAdoptions) + " (" + std::to_string(totals.recordAdoptionRefusals) + " refused), published back " + std::to_string(publishedRecords.load(std::memory_order_relaxed)) + " (" + std::to_string(staleRecordsKept.load(std::memory_order_relaxed)) + " not published: guest memory changed since their GPU write)";
         {
             auto& landings = batchLandings();
@@ -2447,6 +2457,7 @@ private:
     void markRecordWritten(Graphics::Recorder& recorder, Images::SurfaceTable& table, Images::Surface& record) {
         const bool wasStale = record.mirrorStale;
         table.MarkGpuWritten(record);
+        if (!wasStale && record.mirrorStale) Downgrades::WatchTouch("a record's first GPU write", record.key.address, record.key.bytes);
         if (wasStale || !record.mirrorStale || !Mirror::WritesEnabled() || !notesRecordRanges()) return;
         const auto mark = MemoryCore::Get().NoteGpuWrite(record.key.address, record.key.bytes, recorder.OpenBatchSerial());
         if (!mark.upload.empty()) ResidencyService::Get().NoteDirty(mark.upload);
@@ -2589,6 +2600,9 @@ private:
             writtenRanges.emplace_back(use.address, use.address + use.size);
         }
         writtenRecords.clear();
+        if (Downgrades::Watching()) {
+            for (const auto& [begin, end] : writtenRanges) Downgrades::WatchTouch("a dispatch write outside its records", begin, end - begin);
+        }
         if (!writtenRanges.empty()) Events::NoteRanges(writtenRanges);
         if (marksDispatchWrites()) {
             for (const auto& [begin, end] : writtenRanges) {
@@ -2699,6 +2713,9 @@ private:
             totals.drawStorageWrites += written.size() + writtenRecords.size();
         }
         writtenRecords.clear();
+        if (Downgrades::Watching()) {
+            for (const auto& [begin, end] : writtenRanges) Downgrades::WatchTouch("a draw storage write outside its records", begin, end - begin);
+        }
         if (!writtenRanges.empty()) Events::NoteRanges(writtenRanges);
         return true;
     }
@@ -3188,7 +3205,8 @@ private:
             if (!ownedKey.has_value()) return refuse("target key: " + ownedWhy);
             if (table->OwnerOfRange(ownedKey->surface.address, ownedKey->surface.bytes) == Images::Side::Upstream) return refuse("target owned by the existing cache");
             if ((ownedKey->surface.mips > 1u || color.mipTail) && (!recordsMipChains() || ownedKey->surface.width < mipChainMinWidth())) return refuse("target with a mip chain");
-            auto owned = ownedRecord(context, *table, ownedKey->surface, ownedWhy);
+            std::uint32_t containingLayer = 0;
+            auto owned = ownedRecord(context, *table, ownedKey->surface, ownedWhy, &containingLayer);
             if (owned == nullptr && ownedWhy.empty()) {
                 auto adopted = table->AdoptResource(ownedKey->surface, ownedResource, ownedWhy);
                 if (adopted != nullptr && (ownedKey->surface.mips > 1u || zeroesAllNewTargets()) && zeroesNewChains() && context.recorder != nullptr) zeroRecord(context, *context.recorder, *table, *adopted);
@@ -3197,7 +3215,7 @@ private:
             if (owned == nullptr) return refuse("target surface: " + ownedWhy);
             auto* ownedVulkan = dynamic_cast<Images::VulkanSurface*>(owned->device.get());
             if (ownedVulkan == nullptr) return refuse("target surface without a Vulkan image");
-            view = ownedVulkan->AttachmentView(color.format, color.mip, ownedResource.baseArray + color.arraySlice, std::max(color.layers, 1u), ownedWhy);
+            view = ownedVulkan->AttachmentView(color.format, color.mip, containingLayer + ownedResource.baseArray + color.arraySlice, std::max(color.layers, 1u), ownedWhy);
             if (view == VK_NULL_HANDLE) return refuse(ownedWhy);
             static_cast<void>(table->Claim(ownedKey->surface.address, ownedKey->surface.bytes, Images::Side::Record, "target"));
             return owned;
@@ -3225,14 +3243,45 @@ private:
         return record;
     }
 
-    std::shared_ptr<Images::Surface> ownedRecord(const Context& context, Images::SurfaceTable& table, const Images::SurfaceKey& key, std::string& why) {
+    static bool layered(std::uint32_t dimension) {
+        return dimension == static_cast<std::uint32_t>(Graphics::TextureDimension::k2D) || dimension == static_cast<std::uint32_t>(Graphics::TextureDimension::k2DArray) || dimension == static_cast<std::uint32_t>(Graphics::TextureDimension::kCube);
+    }
+
+    static std::shared_ptr<Images::Surface> layersOfRecord(std::span<const std::shared_ptr<Images::Surface>> overlapping, const Images::SurfaceKey& key, std::uint32_t& layer) {
+        if (!layered(key.dimension) || key.bytes == 0u) return nullptr;
+        for (const auto& record : overlapping) {
+            if (!record->seeded || record->retired) continue;
+            const auto& held = record->key;
+            if (!layered(held.dimension) || held.format != key.format || held.tileMode != key.tileMode || held.width != key.width || held.height != key.height || held.mips != key.mips || held.pipeBankXor != key.pipeBankXor || held.pitch != key.pitch) continue;
+            auto* vulkan = dynamic_cast<Images::VulkanSurface*>(record->device.get());
+            if (vulkan == nullptr) continue;
+            const auto layers = std::max(vulkan->Geometry().imageLayers, 1u);
+            if (layers < 2u || held.bytes % layers != 0u) continue;
+            const auto stride = held.bytes / layers;
+            if (key.address < held.address || (key.address - held.address) % stride != 0u) continue;
+            const auto first = (key.address - held.address) / stride;
+            const auto asked = (key.bytes + stride - 1u) / stride;
+            if (first + asked > layers) continue;
+            layer = static_cast<std::uint32_t>(first);
+            return record;
+        }
+        return nullptr;
+    }
+
+    std::shared_ptr<Images::Surface> ownedRecord(const Context& context, Images::SurfaceTable& table, const Images::SurfaceKey& key, std::string& why, std::uint32_t* layer = nullptr) {
         const auto overlapping = table.Overlapping(key.address, key.bytes);
         for (const auto& record : overlapping) {
             if (record->seeded && !record->retired && Images::SameBacking(record->key, key)) return record;
         }
+        if (layer != nullptr) {
+            if (auto containing = layersOfRecord(overlapping, key, *layer)) {
+                totals.layerTargets++;
+                return containing;
+            }
+        }
         for (const auto& record : overlapping) {
             if (!record->seeded || record->retired) continue;
-            if (Downgrades::Active() && shapeNotes.fetch_add(1, std::memory_order_relaxed) < 24u) {
+            if (Downgrades::Active() && firstShapePair(key, record->key)) {
                 const auto& held = record->key;
                 std::fprintf(stderr, "[recode-images] another shape: asked 0x%llx+0x%llx %ux%u depth %u mips %u format %u tile %u dimension %u; record 0x%llx+0x%llx %ux%u depth %u mips %u format %u tile %u dimension %u%s\n", static_cast<unsigned long long>(key.address), static_cast<unsigned long long>(key.bytes), key.width, key.height, key.depth, key.mips, key.format, key.tileMode, key.dimension, static_cast<unsigned long long>(held.address), static_cast<unsigned long long>(held.bytes), held.width, held.height, held.depth, held.mips, held.format, held.tileMode, held.dimension, record->gpuNewer ? " (GPU-written: written back)" : "");
             }
@@ -3243,6 +3292,10 @@ private:
 
     bool handOverShape(const Context& context, Images::SurfaceTable& table, const std::shared_ptr<Images::Surface>& record, std::string& why) {
         if (record->gpuNewer && table.ChangedSinceWrite(*record)) {
+            if (Downgrades::Active() && totals.staleShapes < 16u) {
+                const auto& held = record->key;
+                std::fprintf(stderr, "[recode-images] not written back: record 0x%llx+0x%llx %ux%u depth %u mips %u format %u dimension %u; %s\n", static_cast<unsigned long long>(held.address), static_cast<unsigned long long>(held.bytes), held.width, held.height, held.depth, held.mips, held.format, held.dimension, table.ChangeOf(*record).c_str());
+            }
             totals.staleShapes++;
         } else if (record->gpuNewer) {
             std::string reason = "no recorder";
@@ -3270,6 +3323,7 @@ private:
             const auto mark = MemoryCore::Get().NoteGpuWrite(address, bytes, recorder.OpenBatchSerial());
             if (!mark.upload.empty()) ResidencyService::Get().NoteDirty(mark.upload);
         }
+        Downgrades::WatchTouch("a record written back", address, bytes);
         const std::array written{std::pair{address, address + bytes}};
         Events::NoteRanges(written);
     }
@@ -3351,8 +3405,10 @@ private:
         }
         const auto& surface = key->surface;
         if (table->OwnerOfRange(surface.address, surface.bytes) != Images::Side::Record) return false;
-        auto record = ownedRecord(context, *table, surface, why);
+        std::uint32_t layer = 0;
+        auto record = ownedRecord(context, *table, surface, why, &layer);
         if (record == nullptr && why.empty()) {
+            layer = 0;
             record = table->Seed(table->Adopt(surface, deferred.request.words, why));
             if (record != nullptr) {
                 static_cast<void>(table->Claim(surface.address, surface.bytes, Images::Side::Record, "sampled"));
@@ -3360,7 +3416,10 @@ private:
                 totals.sampledRecordsCreated++;
             }
         }
-        const auto view = record != nullptr ? record->device->View(key->view, deferred.request.kind, why) : std::uint64_t{0};
+        auto viewKey = key->view;
+        viewKey.baseArray += layer;
+        viewKey.lastArray += layer;
+        const auto view = record != nullptr ? record->device->View(viewKey, deferred.request.kind, why) : std::uint64_t{0};
         std::uint32_t slot = 0;
         if (view == 0u || !Resolve::BindViewSlot(deferred.request, view, record->device->Layout(), record, slot)) {
             claimUpstream(context, surface.address, surface.bytes, "sampled: " + (why.empty() ? std::string("another shape of a recode record") : why));
