@@ -303,6 +303,25 @@ void testRangesKeepTheirFirstOwner() {
     Expect(table.OwnersLine().find("1 demoted") != std::string::npos, "the owners line counts the demotion");
 }
 
+void testCpuWrittenRecordIsDetiledAgain() {
+    FakeDevice device;
+    Events::ChangeLog shared;
+    Events::ChangeLog gpuWrites;
+    SurfaceTable table(device, shared, gpuWrites);
+    std::string reason;
+    const auto record = table.Seed(table.Adopt(Key(0xc00040000ull), words, reason));
+    Expect(record != nullptr && table.TakeWork().size() == 1u, "a new record is queued for its first content");
+    table.MarkReady(*record, shared.Serial(), gpuWrites.Serial());
+    Expect(!table.RefreshIfChanged(record), "an unchanged record is not detiled again");
+    static_cast<void>(shared.Note(0xc00041000ull, 0x100));
+    Expect(table.RefreshIfChanged(record) && table.TakeWork().size() == 1u, "a CPU write under the record queues it again");
+    Expect(!table.RefreshIfChanged(record), "a queued record is not queued twice");
+    table.MarkReady(*record, shared.Serial(), gpuWrites.Serial());
+    table.MarkGpuWritten(*record);
+    static_cast<void>(shared.Note(0xc00041000ull, 0x100));
+    Expect(!table.RefreshIfChanged(record), "a GPU-written record keeps its content");
+}
+
 void testArrayClaimOutlivesItsSlices() {
     FakeDevice device;
     Events::ChangeLog shared;
@@ -319,6 +338,7 @@ void testArrayClaimOutlivesItsSlices() {
 int main() {
     testBudgetDropsLeastRecentlyUsed();
     testArrayClaimOutlivesItsSlices();
+    testCpuWrittenRecordIsDetiledAgain();
     testGpuWrittenSurfacesAreLeftToTheExistingCache();
     testImageSetNotesAreNotGpuWrites();
     testSurfacesAreSharedAndQueued();

@@ -222,6 +222,7 @@ struct Totals {
     std::uint64_t writeBackRefusals = 0;
     std::uint64_t shapesHandedOver = 0;
     std::uint64_t layerTargets = 0;
+    std::uint64_t recordsRefreshed = 0;
     std::uint64_t layersAbsorbed = 0;
     std::uint64_t layersAbsorbedOverChanges = 0;
     std::uint64_t staleShapes = 0;
@@ -512,16 +513,26 @@ const std::string& targetTraceList() {
 
 std::atomic<std::uint32_t> targetTraceLines{0};
 
-const std::pair<std::uint32_t, std::uint32_t>& censusSize() {
-    static const std::pair<std::uint32_t, std::uint32_t> size = [] {
+bool tracedProgram(std::uint64_t hash) {
+    return targetTraceList() == "all" || Downgrades::ListedHash(targetTraceList(), hash);
+}
+
+const std::vector<std::pair<std::uint32_t, std::uint32_t>>& censusSizes() {
+    static const std::vector<std::pair<std::uint32_t, std::uint32_t>> sizes = [] {
+        std::vector<std::pair<std::uint32_t, std::uint32_t>> parsed;
         const char* value = std::getenv("APS5_RECODE_NAN_CENSUS_SIZE");
-        if (value == nullptr) return std::pair<std::uint32_t, std::uint32_t>{0u, 0u};
-        char* end = nullptr;
-        const auto width = static_cast<std::uint32_t>(std::strtoul(value, &end, 10));
-        const auto height = end != nullptr && *end == 0x78 ? static_cast<std::uint32_t>(std::strtoul(end + 1, nullptr, 10)) : 0u;
-        return std::pair<std::uint32_t, std::uint32_t>{width, height};
+        while (value != nullptr && *value != 0) {
+            char* end = nullptr;
+            const auto width = static_cast<std::uint32_t>(std::strtoul(value, &end, 10));
+            if (end == nullptr || *end != 0x78) break;
+            const auto height = static_cast<std::uint32_t>(std::strtoul(end + 1, &end, 10));
+            parsed.emplace_back(width, height);
+            if (end == nullptr || *end != 0x2c) break;
+            value = end + 1;
+        }
+        return parsed;
     }();
-    return size;
+    return sizes;
 }
 
 const std::string& censusReads() {
@@ -543,6 +554,11 @@ const NanCensus& nanCensus() {
         return parsed;
     }();
     return census;
+}
+
+bool refreshesRecords() {
+    static const bool refreshes = std::getenv("APS5_RECODE_RECORD_REFRESH") != nullptr;
+    return refreshes;
 }
 
 bool zeroesNewChains() {
@@ -1114,7 +1130,7 @@ public:
         line += text;
         line += "; record ranges noted GPU-written for the memory core " + std::to_string(totals.recordRangesNoted) + "; records made for a sampled shape after a hand-over " + std::to_string(totals.sampledRecordsCreated) + "; new chains zeroed " + std::to_string(totals.zeroedChains);
         line += "; records written back for buffer readers " + std::to_string(totals.readerWriteBacks) + " (" + std::to_string(totals.readerWriteBackBytes >> 20u) + " MiB, " + std::to_string(totals.readerWriteBackRefusals) + " refused, " + std::to_string(totals.readerStale) + " skipped: memory changed since their GPU write)";
-        line += "; records handed to another shape " + std::to_string(totals.shapesHandedOver) + " (" + std::to_string(totals.writeBacks) + " written back into the mirror, " + std::to_string(totals.writeBackBytes >> 20u) + " MiB, " + std::to_string(totals.writeBackRefusals) + " refused, " + std::to_string(totals.staleShapes) + " not written back: memory changed since their GPU write); targets and sampled views served as layers of a containing record " + std::to_string(totals.layerTargets) + ", records copied in as layers of a new record " + std::to_string(totals.layersAbsorbed) + " (" + std::to_string(totals.layersAbsorbedOverChanges) + " over a change note)";
+        line += "; records handed to another shape " + std::to_string(totals.shapesHandedOver) + " (" + std::to_string(totals.writeBacks) + " written back into the mirror, " + std::to_string(totals.writeBackBytes >> 20u) + " MiB, " + std::to_string(totals.writeBackRefusals) + " refused, " + std::to_string(totals.staleShapes) + " not written back: memory changed since their GPU write); targets and sampled views served as layers of a containing record " + std::to_string(totals.layerTargets) + ", records copied in as layers of a new record " + std::to_string(totals.layersAbsorbed) + " (" + std::to_string(totals.layersAbsorbedOverChanges) + " over a change note); CPU-content records detiled again after their memory changed " + std::to_string(totals.recordsRefreshed);
         line += "; images adopted from the existing cache " + std::to_string(totals.recordAdoptions) + " (" + std::to_string(totals.recordAdoptionRefusals) + " refused), published back " + std::to_string(publishedRecords.load(std::memory_order_relaxed)) + " (" + std::to_string(staleRecordsKept.load(std::memory_order_relaxed)) + " not published: guest memory changed since their GPU write)";
         {
             auto& landings = batchLandings();
@@ -2355,7 +2371,7 @@ private:
     void censusRecord(const Context& context, Graphics::Recorder& recorder, const std::shared_ptr<Images::Surface>& record, std::uint64_t program, bool read = false) {
         const auto& census = nanCensus();
         const auto now = std::chrono::steady_clock::now();
-        if (censusSize().first != 0u && (record->key.width != censusSize().first || record->key.height != censusSize().second)) return;
+        if (!censusSizes().empty() && std::ranges::find(censusSizes(), std::pair<std::uint32_t, std::uint32_t>{record->key.width, record->key.height}) == censusSizes().end()) return;
         if (now - censusClock < std::chrono::seconds(census.seconds) || censusDraws >= census.draws) return;
         auto* vulkan = dynamic_cast<Images::VulkanSurface*>(record->device.get());
         if (vulkan == nullptr || vulkan->Compressed()) return;
@@ -2424,7 +2440,7 @@ private:
             const double mean = counted == 0u ? 0.0 : sum / static_cast<double>(counted);
             if (read) std::fprintf(stderr, "[recode-nan-read] %u program %016llx reads record 0x%llx %ux%u mips %u vk%u: %llu non-finite values, %llu at or above 32768, mean %.4f", sequence, static_cast<unsigned long long>(program), static_cast<unsigned long long>(address), width, height, mips, static_cast<unsigned>(format), static_cast<unsigned long long>(bad), static_cast<unsigned long long>(huge), mean);
             if (read) std::fputc(10, stderr);
-            else if (censusSize().first != 0u) {
+            else if (!censusSizes().empty()) {
                 std::fprintf(stderr, "[recode-nan] %u program %016llx record 0x%llx %ux%u mips %u vk%u: %llu non-finite values, %llu at or above 32768, mean %.4f", sequence, static_cast<unsigned long long>(program), static_cast<unsigned long long>(address), width, height, mips, static_cast<unsigned>(format), static_cast<unsigned long long>(bad), static_cast<unsigned long long>(huge), mean);
                 std::fputc(10, stderr);
             } else if (bad != 0u || huge != 0u) std::fprintf(stderr, read ? "[recode-nan-read] %u program %016llx reads record 0x%llx %ux%u mips %u vk%u: %llu non-finite values, %llu at or above 32768\n" : "[recode-nan] %u program %016llx record 0x%llx %ux%u mips %u vk%u: %llu non-finite values, %llu at or above 32768\n", sequence, static_cast<unsigned long long>(program), static_cast<unsigned long long>(address), width, height, mips, static_cast<unsigned>(format), static_cast<unsigned long long>(bad), static_cast<unsigned long long>(huge));
@@ -2892,7 +2908,7 @@ private:
                 for (const auto& color : state.colors) {
                     VkImageView view = VK_NULL_HANDLE;
                     auto record = targetRecord(context, color, view);
-                    if (record != nullptr && !targetTraceList().empty() && !draw.stages.empty() && Downgrades::ListedHash(targetTraceList(), Downgrades::ProgramHash(draw.stages.back().program.codeAddress)) && targetTraceLines.fetch_add(1, std::memory_order_relaxed) < 400u) {
+                    if (record != nullptr && !targetTraceList().empty() && !draw.stages.empty() && tracedProgram(Downgrades::ProgramHash(draw.stages.back().program.codeAddress)) && targetTraceLines.fetch_add(1, std::memory_order_relaxed) < (targetTraceList() == "all" ? 20000u : 400u)) {
                         const auto resource = Graphics::SurfaceForTarget(color);
                         std::fprintf(stderr, "[recode-target] program %016llx color 0x%llx %ux%u mip %u tail %u slice %u extent %ux%u -> record 0x%llx+0x%llx %ux%u mips %u dimension %u\n", static_cast<unsigned long long>(Downgrades::ProgramHash(draw.stages.back().program.codeAddress)), static_cast<unsigned long long>(resource.baseAddress), resource.width, resource.height, color.mip, color.mipTail ? 1u : 0u, color.arraySlice, color.extent.width, color.extent.height, static_cast<unsigned long long>(record->key.address), static_cast<unsigned long long>(record->key.bytes), record->key.width, record->key.height, record->key.mips, record->key.dimension);
                     }
@@ -3424,7 +3440,12 @@ private:
     std::shared_ptr<Images::Surface> ownedRecord(const Context& context, Images::SurfaceTable& table, const Images::SurfaceKey& key, std::string& why, std::uint32_t* layer = nullptr, Absorbed* absorbed = nullptr) {
         const auto overlapping = table.Overlapping(key.address, key.bytes);
         for (const auto& record : overlapping) {
-            if (record->seeded && !record->retired && Images::SameBacking(record->key, key)) return record;
+            if (!record->seeded || record->retired || !Images::SameBacking(record->key, key)) continue;
+            if (refreshesRecords() && table.RefreshIfChanged(record)) {
+                totals.recordsRefreshed++;
+                if (context.recorder != nullptr) drainSurfaces(context, *context.recorder);
+            }
+            return record;
         }
         if (layer != nullptr) {
             if (auto containing = layersOfRecord(overlapping, key, *layer)) {
@@ -3579,7 +3600,7 @@ private:
         auto viewKey = key->view;
         viewKey.baseArray += layer;
         viewKey.lastArray += layer;
-        if (record != nullptr && !targetTraceList().empty() && Downgrades::ListedHash(targetTraceList(), Downgrades::ProgramHash(stage.program.codeAddress)) && targetTraceLines.fetch_add(1, std::memory_order_relaxed) < 400u) {
+        if (record != nullptr && !targetTraceList().empty() && tracedProgram(Downgrades::ProgramHash(stage.program.codeAddress)) && targetTraceLines.fetch_add(1, std::memory_order_relaxed) < (targetTraceList() == "all" ? 20000u : 400u)) {
             std::fprintf(stderr, "[recode-sampled] program %016llx slot %u kind %u 0x%llx %ux%u mips %u view levels %u-%u layers %u-%u format %u -> record 0x%llx mips %u\n", static_cast<unsigned long long>(Downgrades::ProgramHash(stage.program.codeAddress)), deferred.index, deferred.request.kind, static_cast<unsigned long long>(surface.address), surface.width, surface.height, surface.mips, viewKey.baseLevel, viewKey.lastLevel, viewKey.baseArray, viewKey.lastArray, viewKey.format, static_cast<unsigned long long>(record->key.address), record->key.mips);
         }
         const auto view = record != nullptr ? record->device->View(viewKey, deferred.request.kind, why) : std::uint64_t{0};

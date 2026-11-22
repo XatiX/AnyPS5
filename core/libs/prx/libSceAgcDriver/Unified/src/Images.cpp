@@ -284,6 +284,16 @@ bool SurfaceTable::ChangedSinceWrite(const Surface& surface) const {
     return shared.ChangedSince(surface.key.address, surface.key.bytes, surface.stamp, owner) || gpuWrites.ChangedSince(surface.key.address, surface.key.bytes, surface.imageStamp, owner);
 }
 
+bool SurfaceTable::RefreshIfChanged(const std::shared_ptr<Surface>& surface) {
+    std::lock_guard lock(mutex);
+    if (surface == nullptr || surface->retired || surface->gpuNewer || surface->state != State::Ready) return false;
+    if (!shared.ChangedSince(surface->key.address, surface->key.bytes, surface->stamp, OwnerOf(*surface))) return false;
+    surface->state = State::Pending;
+    work.push_back(surface);
+    counts.stale++;
+    return true;
+}
+
 std::string SurfaceTable::ChangeOf(const Surface& surface) const {
     std::lock_guard lock(mutex);
     const auto own = OwnerOf(surface);
