@@ -1,5 +1,6 @@
 #include "prx/libSceAgcDriver/Unified/include/Events.hpp"
 #include "prx/libSceAgcDriver/Execution/include/GuestMemory.hpp"
+#include "prx/libSceAgcDriver/Unified/include/Downgrades.hpp"
 #include "prx/libSceAgcDriver/Unified/include/Shadow.hpp"
 #include <algorithm>
 
@@ -168,6 +169,7 @@ namespace {
 thread_local std::uintptr_t storeOwner = 0;
 
 void noteStore(std::uint64_t address, std::uint64_t bytes) {
+    if (storeOwner == 0u) Downgrades::WatchTouch("a guest store", address, bytes);
     Shared().Note(address, bytes, storeOwner);
 }
 
@@ -201,6 +203,7 @@ ChangeLog& GpuWrites() {
 }
 
 void NoteImage(std::uint64_t address, std::uint64_t bytes, std::uintptr_t owner) {
+    if (owner == 0u) Downgrades::WatchTouch("an existing-cache image note", address, bytes);
     Shared().Note(address, bytes, owner);
     Images().Note(address, bytes, owner);
     if (owner != ImageSetOwner) GpuWrites().Note(address, bytes, owner);

@@ -46,6 +46,8 @@ struct MemoryCoreCounts {
     std::uint64_t bypassLanded = 0;
     std::uint64_t smallReads = 0;
     std::uint64_t smallReadBytes = 0;
+    std::uint64_t imageFaults = 0;
+    std::uint64_t imageWriteFaults = 0;
 };
 
 struct GpuWriteMark {
@@ -63,6 +65,7 @@ public:
     virtual std::byte* View(std::uint64_t address, std::size_t bytes) = 0;
     virtual void Upload(std::uint64_t address, std::uint64_t size) = 0;
     virtual bool Bypass() = 0;
+    virtual bool ImagePage(std::uint64_t) { return false; }
 };
 
 class MemoryCore {
@@ -175,6 +178,8 @@ private:
     std::atomic<std::uint64_t> gpuOnlyBytes{0};
     std::atomic<std::uint64_t> unviewedReports{0};
     std::atomic<std::uint64_t> bypassLanded{0};
+    std::atomic<std::uint64_t> imageFaults{0};
+    std::atomic<std::uint64_t> imageWriteFaults{0};
     std::atomic<std::uint64_t> smallReads{0};
     std::atomic<std::uint64_t> smallReadBytes{0};
 };

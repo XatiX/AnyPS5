@@ -28,6 +28,11 @@ void imageBarrier(const Graphics::Context& context, VkCommandBuffer commands, Vk
     context.Resolved(&Graphics::DeviceFunctions::cmdPipelineBarrier, "vkCmdPipelineBarrier")(commands, sourceStage, destinationStage, 0, 0, nullptr, 0, nullptr, 1, &barrier);
 }
 
+std::uint32_t copyLayers(const Graphics::SurfaceGeometry& geometry) {
+    if (geometry.imageDepth > 1u) return std::max(geometry.layers, geometry.imageDepth);
+    return std::min(geometry.layers, std::max(geometry.imageLayers, 1u));
+}
+
 }
 
 SurfaceDetiler::SurfaceDetiler(const Graphics::Context& context) : context(context), detiler(std::make_unique<Graphics::TextureDetiler>(context)) {}
@@ -100,8 +105,8 @@ void SurfaceDetiler::recordOne(Graphics::Recorder& recorder, VkCommandBuffer com
     const auto& resource = vulkan.Resource();
     const auto& geometry = vulkan.Geometry();
     const auto elementBytes = Graphics::BytesPerElement(resource.format);
-    const auto layers = std::min(geometry.layers, std::max(geometry.imageLayers, 1u));
-    if (vulkan.Compressed()) {
+    const auto layers = copyLayers(geometry);
+    if (vulkan.Compressed() || geometry.thick || geometry.imageDepth > 1u) {
         std::string reason;
         if (!recordThroughBuffer(recorder, commands, vulkan, buffer, base, layers, reason)) throw std::runtime_error(reason);
     } else {
@@ -147,7 +152,8 @@ bool SurfaceDetiler::recordThroughBuffer(Graphics::Recorder& recorder, VkCommand
             region.bufferOffset = static_cast<std::uint64_t>(layer) * layerBytes + mip.linearOffset;
             region.bufferRowLength = rowTexels;
             region.bufferImageHeight = 0u;
-            region.imageSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, level, layer, 1u};
+            region.imageSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, level, geometry.CopyLayer(layer), 1u};
+            region.imageOffset = {0, 0, geometry.CopyDepth(layer)};
             region.imageExtent = {std::max(resource.width >> level, 1u), std::max(resource.height >> level, 1u), 1u};
             regions.push_back(region);
         }
@@ -158,7 +164,7 @@ bool SurfaceDetiler::recordThroughBuffer(Graphics::Recorder& recorder, VkCommand
         const auto& mip = geometry.mips[level];
         for (std::uint32_t layer = 0; layer < layers; ++layer) {
             if (!geometry.HasLayer(level, layer)) continue;
-            detiler->Dispatch(commands, resource.tileMode, elementBytes, source, base + geometry.GuestOffset(layer, mip), scratch->Handle(), regions[index++].bufferOffset, mip, false, layer, false, window);
+            detiler->Dispatch(commands, resource.tileMode, elementBytes, source, base + geometry.GuestOffset(layer, mip), scratch->Handle(), regions[index++].bufferOffset, mip, false, layer, geometry.thick, window);
             counts.dispatches++;
         }
     }
@@ -167,6 +173,73 @@ bool SurfaceDetiler::recordThroughBuffer(Graphics::Recorder& recorder, VkCommand
     context.Resolved(&Graphics::DeviceFunctions::cmdCopyBufferToImage, "vkCmdCopyBufferToImage")(commands, scratch->Handle(), surface.Image(), VK_IMAGE_LAYOUT_GENERAL, static_cast<std::uint32_t>(regions.size()), regions.data());
     imageBarrier(context, commands, surface.Image(), VK_IMAGE_LAYOUT_GENERAL, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_ACCESS_TRANSFER_WRITE_BIT, VK_ACCESS_SHADER_READ_BIT);
     recorder.Keep(scratch);
+    return true;
+}
+
+bool SurfaceDetiler::WriteBack(Graphics::Recorder& recorder, const std::shared_ptr<Surface>& surface, std::string& reason) {
+    auto* vulkan = dynamic_cast<VulkanSurface*>(surface->device.get());
+    if (vulkan == nullptr) {
+        reason = "record without a Vulkan image";
+        return false;
+    }
+    if (!vulkan->Initialized()) {
+        reason = "record never filled";
+        return false;
+    }
+    if (vulkan->Compressed()) {
+        reason = "block-compressed record";
+        return false;
+    }
+    if (vulkan->Geometry().thick || vulkan->Geometry().imageDepth > 1u) {
+        reason = "thick or volume record";
+        return false;
+    }
+    const auto& key = surface->key;
+    Shadow::OwnedSpan span;
+    if (!Shadow::ServeOwned(context, key.address, key.bytes, &span) || span.handle == 0u || key.address < span.origin) {
+        reason = "record memory not resident";
+        return false;
+    }
+    const auto buffer = reinterpret_cast<VkBuffer>(static_cast<std::uintptr_t>(span.handle));
+    const auto base = key.address - span.origin;
+    const auto serial = recorder.OpenBatchSerial();
+    if (serial != batch) {
+        detiler->BeginBatch();
+        batch = serial;
+    }
+    const auto commands = recorder.Commands();
+    const auto timing = recorder.BeginGpuTiming(DetileTimingKey);
+    std::vector<std::shared_ptr<void>> kept;
+    if (Shadow::RecordOwnedUploads(commands, kept) != 0u) {
+        for (auto& object : kept) recorder.Keep(std::move(object));
+    }
+    imageBarrier(context, commands, vulkan->Image(), VK_IMAGE_LAYOUT_GENERAL, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_ACCESS_SHADER_WRITE_BIT | VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT | VK_ACCESS_TRANSFER_WRITE_BIT, VK_ACCESS_SHADER_READ_BIT);
+    Graphics::RecordMemoryBarrier(context, commands, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_ACCESS_TRANSFER_WRITE_BIT | VK_ACCESS_SHADER_WRITE_BIT | VK_ACCESS_SHADER_READ_BIT, VK_ACCESS_SHADER_WRITE_BIT);
+    const auto& resource = vulkan->Resource();
+    const auto& geometry = vulkan->Geometry();
+    const auto elementBytes = Graphics::BytesPerElement(resource.format);
+    const auto layers = std::min(geometry.layers, std::max(geometry.imageLayers, 1u));
+    Graphics::DetileWindow window;
+    window.pipeBankXor = resource.pipeBankXor;
+    try {
+        for (std::uint32_t level = 0; level < geometry.mips.size(); ++level) {
+            const auto& mip = geometry.mips[level];
+            for (std::uint32_t layer = 0; layer < layers; ++layer) {
+                if (!geometry.HasLayer(level, layer)) continue;
+                detiler->DispatchImage(commands, resource.tileMode, elementBytes, buffer, base + geometry.GuestOffset(layer, mip), vulkan->StorageView(level, layer, elementBytes), mip, true, layer, window);
+                counts.writeBackDispatches++;
+            }
+        }
+    } catch (const std::exception& error) {
+        recorder.EndGpuTiming(timing);
+        reason = std::string("write-back: ") + error.what();
+        return false;
+    }
+    Graphics::RecordMemoryBarrier(context, commands, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_ACCESS_SHADER_WRITE_BIT, VK_ACCESS_MEMORY_READ_BIT | VK_ACCESS_MEMORY_WRITE_BIT);
+    recorder.EndGpuTiming(timing);
+    recorder.Keep(surface);
+    counts.writeBacks++;
+    counts.writeBackBytes += key.bytes;
     return true;
 }
 

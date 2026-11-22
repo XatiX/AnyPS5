@@ -102,6 +102,8 @@ std::string_view KindName(Kind kind) {
         case Kind::ViewMismatch: return "view-mismatch";
         case Kind::ImageResultsDropped: return "image-results-dropped";
         case Kind::SamplerMode: return "sampler-mode";
+        case Kind::UpstreamDepth: return "upstream-depth";
+        case Kind::SampledStaleRecord: return "sampled-stale-record";
         default: return "unknown";
     }
 }
@@ -117,12 +119,14 @@ Severity SeverityOf(Kind kind) {
         case Kind::SampledAhead:
         case Kind::ViewMismatch:
         case Kind::ImageResultsDropped:
-        case Kind::SamplerMode: return Severity::Severe;
+        case Kind::SamplerMode:
+        case Kind::SampledStaleRecord: return Severity::Severe;
         case Kind::ExistingPath:
         case Kind::StorageRecordMissing:
         case Kind::UpstreamSampled:
         case Kind::UpstreamStorage:
-        case Kind::UpstreamTarget: return Severity::Fallback;
+        case Kind::UpstreamTarget:
+        case Kind::UpstreamDepth: return Severity::Fallback;
         case Kind::KnownNull:
         case Kind::KnownPrefix: return Severity::Warn;
         default: return Severity::Info;
@@ -426,6 +430,13 @@ WatchState& watchState() {
         auto* created = new WatchState;
         const char* offset = std::getenv("APS5_RECODE_WATCH_OFFSET");
         created->offset = offset != nullptr ? std::strtoull(offset, nullptr, 16) : 0xfff8u;
+        const auto& list = watchList();
+        for (auto at = list.find('@'); at != std::string::npos; at = list.find('@', at + 1u)) {
+            char* end = nullptr;
+            const auto address = std::strtoull(list.c_str() + at + 1u, &end, 16);
+            const auto bytes = end != nullptr && *end == '+' ? std::strtoull(end + 1, nullptr, 16) : 0ull;
+            if (bytes != 0u) created->ranges.push_back({address, address + bytes, 0u});
+        }
         return created;
     }();
     return *state;
@@ -464,6 +475,20 @@ void WatchProgramWrite(std::uint64_t codeAddress, std::uint64_t address, std::ui
     if (state.ranges.size() >= WatchedRanges) state.ranges.erase(state.ranges.begin());
     state.ranges.push_back({address, address + bytes, hash});
     std::fprintf(stderr, "[recode-watch] %lld ms: %016llx writes 0x%llx+0x%llx (sampling +0x%llx)\n", watchMs(state), static_cast<unsigned long long>(hash), static_cast<unsigned long long>(address), static_cast<unsigned long long>(bytes), static_cast<unsigned long long>(state.offset));
+}
+
+void WatchProgramRead(std::uint64_t codeAddress, std::uint64_t address, std::uint64_t bytes) {
+    if (!Watching() || bytes == 0u || bytes > 0x10000u) return;
+    const auto hash = ProgramHash(codeAddress);
+    if (!ListedHash(watchList(), hash)) return;
+    auto& state = watchState();
+    std::lock_guard lock(state.mutex);
+    for (const auto& range : state.ranges) {
+        if (range.begin == address && range.end == address + bytes) return;
+    }
+    if (state.ranges.size() >= WatchedRanges) state.ranges.erase(state.ranges.begin());
+    state.ranges.push_back({address, address + bytes, hash});
+    std::fprintf(stderr, "[recode-watch] %lld ms: %016llx reads 0x%llx+0x%llx (sampling +0x%llx)\n", watchMs(state), static_cast<unsigned long long>(hash), static_cast<unsigned long long>(address), static_cast<unsigned long long>(bytes), static_cast<unsigned long long>(state.offset));
 }
 
 void WatchTouch(const char* what, std::uint64_t address, std::uint64_t bytes) {

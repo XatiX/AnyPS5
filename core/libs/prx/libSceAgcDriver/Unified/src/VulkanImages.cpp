@@ -206,12 +206,12 @@ void VulkanSurface::EnsureGeneral(VkCommandBuffer commands) {
     initialized = true;
 }
 
-void CopyImageContent(const Graphics::Context& context, VkCommandBuffer commands, VkImage source, VkImage destination, std::uint32_t width, std::uint32_t height, std::uint32_t levels, std::uint32_t layers) {
+void CopyImageContent(const Graphics::Context& context, VkCommandBuffer commands, VkImage source, VkImage destination, std::uint32_t width, std::uint32_t height, std::uint32_t levels, std::uint32_t layers, std::uint32_t destinationLayer) {
     std::vector<VkImageCopy> regions;
     for (std::uint32_t level = 0; level < levels; ++level) {
         VkImageCopy region{};
         region.srcSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, level, 0u, layers};
-        region.dstSubresource = region.srcSubresource;
+        region.dstSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, level, destinationLayer, layers};
         region.extent = {std::max(width >> level, 1u), std::max(height >> level, 1u), 1u};
         regions.push_back(region);
     }
@@ -251,14 +251,14 @@ VkImageView VulkanSurface::AttachmentView(VkFormat viewFormat, std::uint32_t lev
     return created;
 }
 
-VkImageView VulkanSurface::ShapedStorageView(std::uint32_t level, bool array, bool uintView, std::string& reason) {
+VkImageView VulkanSurface::ShapedStorageView(std::uint32_t level, StorageShape shape, bool uintView, bool atomic, std::string& reason) {
     if (compressed) {
         reason = "storage view of a compressed surface";
         return VK_NULL_HANDLE;
     }
     const bool volume = resource.dimension == Graphics::TextureDimension::k3D;
-    if (volume) {
-        reason = "storage view of a volume";
+    if (volume != (shape == StorageShape::Volume)) {
+        reason = volume ? "flat storage view of a volume" : "volume storage view of a flat surface";
         return VK_NULL_HANDLE;
     }
     const auto levels = static_cast<std::uint32_t>(std::max<std::size_t>(geometry.mips.size(), 1u));
@@ -266,7 +266,12 @@ VkImageView VulkanSurface::ShapedStorageView(std::uint32_t level, bool array, bo
         reason = "storage view past the levels";
         return VK_NULL_HANDLE;
     }
-    const auto key = std::make_tuple(level, array, uintView);
+    const auto storageFormat = linearStorageFormat(Graphics::ResolveTextureFormat(resource.format));
+    if (atomic && storageFormat != VK_FORMAT_R32_UINT && storageFormat != VK_FORMAT_R32_SINT && storageFormat != VK_FORMAT_R32_SFLOAT) {
+        reason = "atomic storage view of a format that is not 32-bit single-channel";
+        return VK_NULL_HANDLE;
+    }
+    const auto key = std::make_tuple(level, static_cast<std::uint32_t>(shape), uintView, atomic);
     std::lock_guard lock(mutex);
     if (const auto found = shapedStorageViews.find(key); found != shapedStorageViews.end()) return found->second;
     VkImageViewUsageCreateInfo usage{VK_STRUCTURE_TYPE_IMAGE_VIEW_USAGE_CREATE_INFO};
@@ -274,12 +279,11 @@ VkImageView VulkanSurface::ShapedStorageView(std::uint32_t level, bool array, bo
     VkImageViewCreateInfo info{VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO};
     info.pNext = &usage;
     info.image = image;
-    info.viewType = array ? VK_IMAGE_VIEW_TYPE_2D_ARRAY : VK_IMAGE_VIEW_TYPE_2D;
-    const auto storageFormat = linearStorageFormat(Graphics::ResolveTextureFormat(resource.format));
+    info.viewType = shape == StorageShape::Volume ? VK_IMAGE_VIEW_TYPE_3D : shape == StorageShape::Array ? VK_IMAGE_VIEW_TYPE_2D_ARRAY : VK_IMAGE_VIEW_TYPE_2D;
     const auto packed = packedStorageView(storageFormat);
     const auto uintFormat = uintView ? uintStorageView(storageFormat) : VK_FORMAT_UNDEFINED;
-    info.format = packed != VK_FORMAT_UNDEFINED ? packed : uintFormat != VK_FORMAT_UNDEFINED ? uintFormat : storageFormat;
-    info.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, level, 1u, 0u, array ? std::max(geometry.imageLayers, 1u) : 1u};
+    info.format = atomic ? VK_FORMAT_R32_UINT : packed != VK_FORMAT_UNDEFINED ? packed : uintFormat != VK_FORMAT_UNDEFINED ? uintFormat : storageFormat;
+    info.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, level, 1u, 0u, shape == StorageShape::Array ? std::max(geometry.imageLayers, 1u) : 1u};
     VkImageView created = VK_NULL_HANDLE;
     if (context.Function<PFN_vkCreateImageView>("vkCreateImageView")(context.device, &info, nullptr, &created) != VK_SUCCESS) {
         reason = "vkCreateImageView recode storage";
@@ -309,10 +313,6 @@ std::shared_ptr<DeviceSurface> VulkanSurfaceDevice::CreateFromResource(const Sur
             return nullptr;
         }
         auto geometry = Graphics::DescribeSurface(resource);
-        if (geometry.thick) {
-            reason = "thick surface";
-            return nullptr;
-        }
         const auto format = Graphics::SampledTextureFormat(context, resource.format);
         if (format == VK_FORMAT_UNDEFINED) {
             reason = "surface format";

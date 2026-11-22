@@ -199,6 +199,47 @@ void testCpuReuseMakesARecordStale() {
     Expect(table.ChangedSinceWrite(*created->surface), "a CPU store into the record's memory after its GPU write makes it stale");
 }
 
+void testRetiredRecordLeavesTheTable() {
+    FakeDevice device;
+    Events::ChangeLog shared;
+    Events::ChangeLog gpuWrites;
+    SurfaceTable table(device, shared, gpuWrites);
+    std::string reason;
+    const auto key = Key(0xc00000000ull);
+    const auto created = table.Find(key, words, reason);
+    auto work = table.TakeWork();
+    table.MarkReady(*work.front(), shared.Serial(), gpuWrites.Serial());
+    table.MarkGpuWritten(*created->surface);
+    static_cast<void>(table.Claim(key.address, key.bytes, Side::Record, "target"));
+    table.Retire(created->surface);
+    Expect(created->surface->retired && !created->surface->gpuNewer, "a retired record is no longer newer than memory");
+    Expect(table.Overlapping(key.address, key.bytes).empty() && table.Size() == 0u, "a retired record leaves the table");
+    Expect(table.OwnerOfRange(key.address, key.bytes) == Side::None, "its claim goes with it, so another shape can claim the range");
+    Expect(table.TakeCounts().retired == 1u, "the retirement is counted");
+}
+
+void testStaleMirrorIndex() {
+    FakeDevice device;
+    Events::ChangeLog shared;
+    Events::ChangeLog gpuWrites;
+    SurfaceTable table(device, shared, gpuWrites);
+    std::string reason;
+    const auto key = Key(0xd00000000ull);
+    const auto created = table.Find(key, words, reason);
+    auto work = table.TakeWork();
+    table.MarkReady(*work.front(), shared.Serial(), gpuWrites.Serial());
+    Expect(table.StaleOverlapping(key.address, key.bytes).empty(), "a record no GPU work wrote leaves the mirror current");
+    table.MarkGpuWritten(*created->surface);
+    Expect(table.StaleOverlapping(key.address + 0x100u, 4u).size() == 1u, "a buffer read inside a GPU-written record finds it");
+    Expect(table.StaleOverlapping(key.address + key.bytes, 4u).empty() && table.StaleOverlapping(key.address - 4u, 4u).empty(), "reads next to it do not");
+    table.MarkWrittenBack(*created->surface);
+    Expect(table.StaleOverlapping(key.address, key.bytes).empty(), "a written-back record leaves the index");
+    table.MarkGpuWritten(*created->surface);
+    Expect(table.StaleOverlapping(key.address, 4u).size() == 1u, "the next GPU write makes it stale again");
+    table.Retire(created->surface);
+    Expect(table.StaleOverlapping(key.address, key.bytes).empty(), "a retired record leaves the index");
+}
+
 void testOverlapQuery() {
     FakeDevice device;
     Events::ChangeLog shared;
@@ -262,8 +303,42 @@ void testRangesKeepTheirFirstOwner() {
     Expect(table.OwnersLine().find("1 demoted") != std::string::npos, "the owners line counts the demotion");
 }
 
+void testCpuWrittenRecordIsDetiledAgain() {
+    FakeDevice device;
+    Events::ChangeLog shared;
+    Events::ChangeLog gpuWrites;
+    SurfaceTable table(device, shared, gpuWrites);
+    std::string reason;
+    const auto record = table.Seed(table.Adopt(Key(0xc00040000ull), words, reason));
+    Expect(record != nullptr && table.TakeWork().size() == 1u, "a new record is queued for its first content");
+    table.MarkReady(*record, shared.Serial(), gpuWrites.Serial());
+    Expect(!table.RefreshIfChanged(record), "an unchanged record is not detiled again");
+    static_cast<void>(shared.Note(0xc00041000ull, 0x100));
+    Expect(table.RefreshIfChanged(record) && table.TakeWork().size() == 1u, "a CPU write under the record queues it again");
+    Expect(!table.RefreshIfChanged(record), "a queued record is not queued twice");
+    table.MarkReady(*record, shared.Serial(), gpuWrites.Serial());
+    table.MarkGpuWritten(*record);
+    static_cast<void>(shared.Note(0xc00041000ull, 0x100));
+    Expect(!table.RefreshIfChanged(record), "a GPU-written record keeps its content");
+}
+
+void testArrayClaimOutlivesItsSlices() {
+    FakeDevice device;
+    Events::ChangeLog shared;
+    Events::ChangeLog gpuWrites;
+    SurfaceTable table(device, shared, gpuWrites);
+    std::string reason;
+    const auto slice = table.Seed(table.Adopt(Key(0xc00020000ull), words, reason));
+    Expect(slice != nullptr && table.Claim(0xc00020000ull, 0x10000, Side::Record, "target") == Side::Record, "a slice claims its own range");
+    Expect(table.Claim(0xc00000000ull, 0x40000, Side::Record, "sampled") == Side::Record, "an array over the slice is a record range too");
+    table.Retire(slice);
+    Expect(table.OwnerOfRange(0xc00000000ull, 0x40000) == Side::Record, "retiring the slice leaves the array's claim");
+}
+
 int main() {
     testBudgetDropsLeastRecentlyUsed();
+    testArrayClaimOutlivesItsSlices();
+    testCpuWrittenRecordIsDetiledAgain();
     testGpuWrittenSurfacesAreLeftToTheExistingCache();
     testImageSetNotesAreNotGpuWrites();
     testSurfacesAreSharedAndQueued();
@@ -272,6 +347,8 @@ int main() {
     testOwnGpuWritesKeepTheSurface();
     testForeignWritesHandTheSurfaceBack();
     testCpuReuseMakesARecordStale();
+    testRetiredRecordLeavesTheTable();
+    testStaleMirrorIndex();
     testOverlapQuery();
     testRangesKeepTheirFirstOwner();
     if (failures != 0) return 1;

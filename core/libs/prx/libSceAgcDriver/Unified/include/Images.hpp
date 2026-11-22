@@ -4,6 +4,7 @@
 #include "prx/libSceAgcDriver/Unified/include/Events.hpp"
 #include <array>
 #include <cstdint>
+#include <map>
 #include <memory>
 #include <mutex>
 #include <optional>
@@ -81,6 +82,7 @@ struct Surface {
     bool retired = false;
     bool gpuNewer = false;
     bool seeded = false;
+    bool mirrorStale = false;
 };
 
 enum class Side : std::uint8_t { None, Record, Upstream };
@@ -113,9 +115,11 @@ struct TableCounts {
     std::uint64_t detiled = 0;
     std::uint64_t gpuWritten = 0;
     std::uint64_t evicted = 0;
+    std::uint64_t evictionsKept = 0;
     std::uint64_t ownWrites = 0;
     std::uint64_t ownServed = 0;
     std::uint64_t aliasServed = 0;
+    std::uint64_t retired = 0;
 };
 
 class SurfaceTable {
@@ -130,12 +134,18 @@ public:
     [[nodiscard]] std::shared_ptr<Surface> AdoptResource(const SurfaceKey& key, const Graphics::GuestTextureResource& resource, std::string& reason);
     void MarkGpuWritten(Surface& surface);
     void ClearGpuNewer(Surface& surface);
+    void MarkWrittenBack(Surface& surface);
+    [[nodiscard]] std::vector<std::shared_ptr<Surface>> StaleOverlapping(std::uint64_t address, std::uint64_t bytes) const;
     [[nodiscard]] bool ChangedSinceWrite(const Surface& surface) const;
+    [[nodiscard]] std::string ChangeOf(const Surface& surface) const;
+    bool RefreshIfChanged(const std::shared_ptr<Surface>& surface);
+    void Touch(Surface& surface);
     [[nodiscard]] std::vector<std::shared_ptr<Surface>> Overlapping(std::uint64_t address, std::uint64_t bytes) const;
     void Requeue(const std::shared_ptr<Surface>& surface);
     [[nodiscard]] Side OwnerOfRange(std::uint64_t address, std::uint64_t bytes) const;
     Side Claim(std::uint64_t address, std::uint64_t bytes, Side side, std::string_view reason);
     void Demote(std::uint64_t address, std::uint64_t bytes, std::string_view reason);
+    void Retire(const std::shared_ptr<Surface>& surface);
     [[nodiscard]] std::shared_ptr<Surface> Seed(const std::shared_ptr<Surface>& surface);
     [[nodiscard]] std::string OwnersLine() const;
     [[nodiscard]] TableCounts TakeCounts();
@@ -148,6 +158,7 @@ private:
     };
 
     void evict();
+    void dropStale(Surface& surface);
     template<typename TCreate>
     std::optional<Found> findWith(const SurfaceKey& key, TCreate&& create, std::string& reason);
     template<typename TCreate>
@@ -167,6 +178,9 @@ private:
         std::string reason;
     };
     std::vector<Claimed> claims;
+    mutable std::mutex staleMutex;
+    std::map<std::uint64_t, std::shared_ptr<Surface>> stale;
+    std::uint64_t staleSpan = 0;
     OwnerCounts owners;
     TableCounts counts;
     std::uint64_t budget = 0;

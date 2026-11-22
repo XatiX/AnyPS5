@@ -3,6 +3,7 @@
 #include "prx/libSceAgcDriver/Graphics/include/TextureFormat.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/TextureTiling.hpp"
 #include <algorithm>
+#include <cstdio>
 #include <cstdlib>
 #include <exception>
 
@@ -173,7 +174,12 @@ void SurfaceTable::evict() {
     for (const auto& [used, key] : order) {
         if (heldBytes <= target || surfaces.size() <= 1u) break;
         const auto found = surfaces.find(key);
+        if (found->second->gpuNewer) {
+            counts.evictionsKept++;
+            continue;
+        }
         found->second->retired = true;
+        dropStale(*found->second);
         heldBytes -= key.bytes;
         surfaces.erase(found);
         counts.evicted++;
@@ -237,17 +243,82 @@ void SurfaceTable::MarkGpuWritten(Surface& surface) {
     surface.stamp = shared.Serial();
     surface.imageStamp = gpuWrites.Serial();
     counts.ownWrites++;
+    if (surface.mirrorStale) return;
+    if (const auto found = surfaces.find(surface.key); found != surfaces.end() && found->second.get() == &surface) {
+        surface.mirrorStale = true;
+        std::lock_guard staleLock(staleMutex);
+        stale[surface.key.address] = found->second;
+        staleSpan = std::max(staleSpan, surface.key.bytes);
+    }
 }
 
 void SurfaceTable::ClearGpuNewer(Surface& surface) {
     std::lock_guard lock(mutex);
     surface.gpuNewer = false;
+    dropStale(surface);
+}
+
+void SurfaceTable::MarkWrittenBack(Surface& surface) {
+    std::lock_guard lock(mutex);
+    dropStale(surface);
+}
+
+void SurfaceTable::dropStale(Surface& surface) {
+    if (!surface.mirrorStale) return;
+    surface.mirrorStale = false;
+    std::lock_guard staleLock(staleMutex);
+    if (const auto found = stale.find(surface.key.address); found != stale.end() && found->second.get() == &surface) stale.erase(found);
+}
+
+std::vector<std::shared_ptr<Surface>> SurfaceTable::StaleOverlapping(std::uint64_t address, std::uint64_t bytes) const {
+    std::vector<std::shared_ptr<Surface>> found;
+    std::lock_guard staleLock(staleMutex);
+    if (stale.empty() || bytes == 0u) return found;
+    const auto end = address + bytes;
+    for (auto at = stale.lower_bound(address > staleSpan ? address - staleSpan : 0u); at != stale.end() && at->first < end; ++at) {
+        const auto& surface = at->second;
+        if (surface->key.address + surface->key.bytes > address) found.push_back(surface);
+    }
+    return found;
 }
 
 bool SurfaceTable::ChangedSinceWrite(const Surface& surface) const {
     std::lock_guard lock(mutex);
     const auto owner = OwnerOf(surface);
     return shared.ChangedSince(surface.key.address, surface.key.bytes, surface.stamp, owner) || gpuWrites.ChangedSince(surface.key.address, surface.key.bytes, surface.imageStamp, owner);
+}
+
+void SurfaceTable::Touch(Surface& surface) {
+    std::lock_guard lock(mutex);
+    surface.used = ++clock;
+}
+
+bool SurfaceTable::RefreshIfChanged(const std::shared_ptr<Surface>& surface) {
+    std::lock_guard lock(mutex);
+    if (surface == nullptr || surface->retired || surface->gpuNewer || surface->state != State::Ready) return false;
+    if (!shared.ChangedSince(surface->key.address, surface->key.bytes, surface->stamp, OwnerOf(*surface))) return false;
+    surface->state = State::Pending;
+    work.push_back(surface);
+    counts.stale++;
+    return true;
+}
+
+std::string SurfaceTable::ChangeOf(const Surface& surface) const {
+    std::lock_guard lock(mutex);
+    const auto own = OwnerOf(surface);
+    const auto describe = [&](const char* log, std::uintptr_t owner) {
+        std::string text = std::string(log) + " owner " + (owner == 0u ? std::string("none (CPU or untracked)") : std::to_string(owner));
+        for (const auto& [key, other] : surfaces) {
+            if (OwnerOf(*other) != owner || owner == 0u) continue;
+            char held[160];
+            std::snprintf(held, sizeof(held), ": record 0x%llx+0x%llx %ux%u depth %u mips %u format %u dimension %u%s", static_cast<unsigned long long>(key.address), static_cast<unsigned long long>(key.bytes), key.width, key.height, key.depth, key.mips, key.format, key.dimension, other->retired ? " (retired)" : "");
+            return text + held;
+        }
+        return text + (owner == own ? ": itself" : ": not a live record");
+    };
+    if (shared.ChangedSince(surface.key.address, surface.key.bytes, surface.stamp, own)) return describe("shared", shared.ChangedOwner(surface.key.address, surface.key.bytes, surface.stamp));
+    if (gpuWrites.ChangedSince(surface.key.address, surface.key.bytes, surface.imageStamp, own)) return describe("gpu writes", gpuWrites.ChangedOwner(surface.key.address, surface.key.bytes, surface.imageStamp));
+    return "unchanged";
 }
 
 std::vector<std::shared_ptr<Surface>> SurfaceTable::Overlapping(std::uint64_t address, std::uint64_t bytes) const {
@@ -274,12 +345,14 @@ Side SurfaceTable::OwnerOfRange(std::uint64_t address, std::uint64_t bytes) cons
 Side SurfaceTable::Claim(std::uint64_t address, std::uint64_t bytes, Side side, std::string_view reason) {
     std::lock_guard lock(mutex);
     auto owner = Side::None;
+    bool covered = false;
     for (const auto& claim : claims) {
         if (claim.begin >= address + bytes || address >= claim.end) continue;
         if (claim.side == Side::Upstream) return Side::Upstream;
         owner = claim.side;
+        covered = covered || (claim.begin <= address && address + bytes <= claim.end);
     }
-    if (owner != Side::None) return owner;
+    if (owner != Side::None && (covered || side != Side::Record || owner != Side::Record)) return owner;
     claims.push_back({address, address + bytes, side, std::string(reason)});
     if (side == Side::Record) {
         owners.recordRanges++;
@@ -310,9 +383,34 @@ void SurfaceTable::Demote(std::uint64_t address, std::uint64_t bytes, std::strin
             continue;
         }
         at->second->retired = true;
+        dropStale(*at->second);
         heldBytes -= key.bytes;
         at = surfaces.erase(at);
     }
+}
+
+void SurfaceTable::Retire(const std::shared_ptr<Surface>& surface) {
+    std::lock_guard lock(mutex);
+    if (surface == nullptr || surface->retired) return;
+    surface->retired = true;
+    surface->gpuNewer = false;
+    dropStale(*surface);
+    const auto found = surfaces.find(surface->key);
+    if (found != surfaces.end() && found->second == surface) {
+        heldBytes -= surface->key.bytes;
+        surfaces.erase(found);
+    }
+    std::erase_if(newer, [&](const std::shared_ptr<Surface>& other) { return other == surface; });
+    for (auto at = claims.begin(); at != claims.end();) {
+        if (at->side != Side::Record || at->begin != surface->key.address || at->end != surface->key.address + surface->key.bytes) {
+            ++at;
+            continue;
+        }
+        owners.recordRanges--;
+        owners.recordBytes -= at->end - at->begin;
+        at = claims.erase(at);
+    }
+    counts.retired++;
 }
 
 std::shared_ptr<Surface> SurfaceTable::Seed(const std::shared_ptr<Surface>& surface) {
