@@ -20,6 +20,7 @@
 #include "prx/libSceAgcDriver/Unified/include/Downgrades.hpp"
 #include "prx/libSceAgcDriver/Unified/include/Events.hpp"
 #include "prx/libSceAgcDriver/Unified/include/ImageDetile.hpp"
+#include "prx/libSceAgcDriver/Unified/include/IndirectArguments.hpp"
 #include "prx/libSceAgcDriver/Unified/include/MemoryCore.hpp"
 #include "prx/libSceAgcDriver/Unified/include/MirrorHost.hpp"
 #include "prx/libSceAgcDriver/Unified/include/ResidencyService.hpp"
@@ -171,6 +172,7 @@ struct Totals {
     std::uint64_t openLandedBytes = 0;
     std::uint64_t mirrorWriteBytes = 0;
     std::uint64_t mirrorArguments = 0;
+    std::uint64_t patchedArguments = 0;
     std::uint64_t edgeSnapshotBytes = 0;
     std::uint64_t edgeDiffBytes = 0;
     std::uint64_t writtenOverflows = 0;
@@ -1177,6 +1179,8 @@ public:
             std::snprintf(text, sizeof(text), "; mirror writes %.1f MiB, pages left GPU-owned %.1f MiB, edges landed whole %.1f MiB, edges snapshot %.1f MiB and landed by diff %.1f MiB, indirect arguments from the mirror %llu", static_cast<double>(totals.mirrorWriteBytes) / 1048576.0, static_cast<double>(totals.ownedBytes) / 1048576.0, static_cast<double>(totals.openLandedBytes) / 1048576.0, static_cast<double>(totals.edgeSnapshotBytes) / 1048576.0, static_cast<double>(totals.edgeDiffBytes) / 1048576.0, static_cast<unsigned long long>(totals.mirrorArguments));
             line += text;
         }
+        std::snprintf(text, sizeof(text), "; indirect draw arguments patched on the GPU for a constant rule %llu", static_cast<unsigned long long>(totals.patchedArguments));
+        line += text;
         std::snprintf(text, sizeof(text), "; GPU-written chunks %llu switched to their import from the written bitmap (%.1f MiB copied over), %llu from other GPU writes, %llu refused, %llu written pieces already on an import", static_cast<unsigned long long>(totals.importSwitches), static_cast<double>(totals.switchBytes) / 1048576.0, static_cast<unsigned long long>(totals.writtenSwitches), static_cast<unsigned long long>(totals.switchRefused), static_cast<unsigned long long>(totals.writtenOnImports));
         line += text;
         for (const auto& [reasonCode, count] : faultReasons) line += "; fault reason " + std::to_string(reasonCode) + " " + std::to_string(count);
@@ -1241,7 +1245,7 @@ private:
         alignment = std::max<std::uint64_t>(context.limits.minStorageBufferOffsetAlignment, 16u);
         const auto ringMemory = ResidencyService::ShaderReadMemory(context, RingBytes);
         const VkBufferUsageFlags addressable = context.bufferDeviceAddress ? VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT : 0u;
-        ring = std::make_shared<Graphics::Buffer>(context, RingBytes + RingZeroBytes, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_INDIRECT_BUFFER_BIT | VK_BUFFER_USAGE_VERTEX_BUFFER_BIT | VK_BUFFER_USAGE_INDEX_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_SRC_BIT | addressable, ringMemory);
+        ring = std::make_shared<Graphics::Buffer>(context, RingBytes + RingZeroBytes, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_INDIRECT_BUFFER_BIT | VK_BUFFER_USAGE_VERTEX_BUFFER_BIT | VK_BUFFER_USAGE_INDEX_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_SRC_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT | addressable, ringMemory);
         std::memset(ring->Bytes().data() + RingBytes, 0, RingZeroBytes);
         ringAddress = addressable != 0u ? ring->DeviceAddress() : 0u;
         space.emplace(RingBytes, alignment);
@@ -2033,6 +2037,12 @@ private:
         std::uint64_t address = 0;
         std::uint64_t bytes = 0;
         VkDeviceSize offset = 0;
+    };
+
+    struct ArgumentPatch {
+        VkBuffer source = VK_NULL_HANDLE;
+        VkDeviceSize sourceOffset = 0;
+        VkDeviceSize ringOffset = 0;
     };
 
     std::optional<DrawInput> copiedInput(std::vector<CopiedSpan>& done, std::uint64_t address, std::uint64_t bytes, std::uint64_t serial, std::uint64_t completed) {
@@ -3080,6 +3090,7 @@ private:
         VkBuffer argumentBuffer = VK_NULL_HANDLE;
         VkDeviceSize argumentOffset = 0;
         std::optional<DrawInput> indirectCount;
+        std::optional<ArgumentPatch> argumentPatch;
         if (parameters.indirect) {
             using Rule = Pm4::DrawParameters::IndirectDraw::Rule;
             const auto& args = *parameters.indirect;
@@ -3102,8 +3113,8 @@ private:
                 argumentOffset = *offset;
                 totals.snapshotArguments++;
             } else {
-                if (rewritten) {
-                    reason = "constant rule on GPU-written arguments";
+                if (rewritten && !PatchableArguments(args)) {
+                    reason = "constant rule on GPU-written arguments the patch does not take";
                     return false;
                 }
                 const auto readInput = [&](std::uint64_t address, std::uint64_t size, bool& mirrored) -> std::optional<DrawInput> {
@@ -3140,6 +3151,16 @@ private:
                 else recorder->NotePendingRead(args.arguments, bytes, Graphics::Recorder::ReadKind::Indirect);
                 argumentBuffer = argumentInput->buffer;
                 argumentOffset = argumentInput->offset;
+                if (rewritten && bytes != 0u) {
+                    const auto placed = space->Allocate(bytes, serial, completed);
+                    if (!placed.has_value()) {
+                        reason = "ring full";
+                        return false;
+                    }
+                    argumentPatch = ArgumentPatch{argumentBuffer, argumentOffset, *placed};
+                    argumentBuffer = ring->Handle();
+                    argumentOffset = *placed;
+                }
             }
             totals.indirect++;
         }
@@ -3197,7 +3218,7 @@ private:
         access.anyWrites = pageTable != nullptr && std::ranges::any_of(draw.stages, [](const Resolve::ResolvedStage& stage) { return Graphics::ShaderStoresThroughAddresses(stage.program.result->spirv); });
         const bool feedback = recorder->RenderPassOpen() && overlaps(passReads, passTargets);
         if (feedback) totals.passFeedback++;
-        const bool snapshotArguments = parameters.indirect && ring != nullptr && argumentBuffer == ring->Handle();
+        const bool snapshotArguments = parameters.indirect && ring != nullptr && argumentBuffer == ring->Handle() && !argumentPatch.has_value();
         const bool forced = !mergesPasses() || !draw.complete || feedback || storesImages || (parameters.indirect && !snapshotArguments) || indirectCount.has_value();
         const bool fenced = state.depth.has_value();
         const auto start = recorder->StartDrawPass(key, forced, fenced, access);
@@ -3221,6 +3242,10 @@ private:
         if (start.continued) {
             pipeline->Continue(recording, state, maskedState);
         } else {
+            if (argumentPatch) {
+                PatchIndirectArguments(context, commands, *parameters.indirect, argumentPatch->source, argumentPatch->sourceOffset, ring->Handle(), argumentPatch->ringOffset);
+                totals.patchedArguments++;
+            }
             if (parameters.indirect) Graphics::RecordMemoryBarrier(context, commands, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT | VK_PIPELINE_STAGE_HOST_BIT, VK_PIPELINE_STAGE_DRAW_INDIRECT_BIT, VK_ACCESS_SHADER_WRITE_BIT | VK_ACCESS_TRANSFER_WRITE_BIT | VK_ACCESS_HOST_WRITE_BIT, VK_ACCESS_INDIRECT_COMMAND_READ_BIT);
             pipeline->Begin(recording, *framebuffer, state.renderExtent, state, maskedState);
         }
