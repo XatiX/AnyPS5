@@ -3,12 +3,14 @@
 #include "prx/libSceAgcDriver/Graphics/include/Context.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/State.hpp"
 
+#include <atomic>
 #include <cstdint>
 #include <map>
 #include <memory>
 #include <mutex>
 #include <string>
 #include <tuple>
+#include <vector>
 
 namespace AgcDriver::Unified::Images {
 
@@ -39,6 +41,19 @@ public:
     [[nodiscard]] bool Initialized() const { return initialized; }
     void Initialize(VkCommandBuffer commands, float clearDepth, std::uint8_t clearStencil);
     [[nodiscard]] VkImageView SampledView(bool stencil);
+    [[nodiscard]] VkImageAspectFlags Aspects() const { return aspects; }
+    void SetTiling(std::uint32_t swizzleMode, std::uint32_t xorBits) {
+        swizzle = swizzleMode;
+        pipeBankXor = xorBits;
+    }
+    [[nodiscard]] std::uint32_t Swizzle() const { return swizzle; }
+    [[nodiscard]] std::uint32_t PipeBankXor() const { return pipeBankXor; }
+    void MarkDrawn() { drawn.store(true, std::memory_order_relaxed); }
+    [[nodiscard]] bool TakeDrawn() { return drawn.exchange(false, std::memory_order_relaxed); }
+    void SetInitialized() { initialized = true; }
+    void NoteHtileWrite() { htileWritten.store(true, std::memory_order_release); }
+    [[nodiscard]] bool TakeHtileWrite() { return htileWritten.exchange(false, std::memory_order_acq_rel); }
+    [[nodiscard]] std::uint64_t HtileBytes() const { return static_cast<std::uint64_t>((key.width + 7u) / 8u) * ((key.height + 7u) / 8u) * 4u; }
 
 private:
     VkDevice device = VK_NULL_HANDLE;
@@ -56,13 +71,27 @@ private:
     VkImageView stencilView = VK_NULL_HANDLE;
     VkImageAspectFlags aspects = 0;
     bool initialized = false;
+    std::uint32_t swizzle = 0;
+    std::uint32_t pipeBankXor = 0;
+    std::atomic<bool> drawn{false};
+    std::atomic<bool> htileWritten{false};
 };
+
+enum class HtileState {
+    Cleared,
+    Written,
+    Unknown,
+};
+
+[[nodiscard]] HtileState ReadHtile(std::uint64_t address, std::uint64_t bytes, bool depthOnly, bool stencil, float clearDepth);
 
 struct DepthCounts {
     std::uint64_t created = 0;
     std::uint64_t found = 0;
     std::uint64_t refused = 0;
     std::uint64_t cleared = 0;
+    std::uint64_t htileWrites = 0;
+    std::uint64_t superseded = 0;
 };
 
 class DepthRecords {
@@ -70,7 +99,8 @@ public:
     [[nodiscard]] std::shared_ptr<DepthRecord> Find(const Graphics::Context& context, const Graphics::DepthTarget& target, std::string& reason);
     [[nodiscard]] std::shared_ptr<DepthRecord> At(std::uint64_t address, bool& stencil);
     [[nodiscard]] bool Overlaps(std::uint64_t address, std::uint64_t bytes) const;
-    void NoteCleared() {
+    [[nodiscard]] std::vector<std::shared_ptr<DepthRecord>> Overlapping(std::uint64_t address, std::uint64_t bytes) const;
+    std::size_t NoteHtileWrites(std::uint64_t address, std::uint64_t bytes);    void NoteCleared() {
         std::lock_guard lock(mutex);
         counts.cleared++;
     }

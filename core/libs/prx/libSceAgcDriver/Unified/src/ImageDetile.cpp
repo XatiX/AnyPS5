@@ -3,6 +3,8 @@
 #include "prx/libSceAgcDriver/Graphics/include/Resources.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/TextureDetiler.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/TextureFormat.hpp"
+#include "prx/libSceAgcDriver/Graphics/include/TextureTiling.hpp"
+#include "prx/libSceAgcDriver/Unified/include/DepthRecords.hpp"
 #include "prx/libSceAgcDriver/Unified/include/Events.hpp"
 #include "prx/libSceAgcDriver/Unified/include/Shadow.hpp"
 #include "prx/libSceAgcDriver/Unified/include/VulkanImages.hpp"
@@ -242,6 +244,176 @@ bool SurfaceDetiler::WriteBack(Graphics::Recorder& recorder, const std::shared_p
     recorder.Keep(surface);
     counts.writeBacks++;
     counts.writeBackBytes += key.bytes;
+    return true;
+}
+
+bool SurfaceDetiler::depthPlanes(const DepthRecord& record, std::vector<DepthPlane>& planes, std::uint64_t& stagingBytes, std::string& reason) {
+    const auto& key = record.Key();
+    if (key.format != VK_FORMAT_D32_SFLOAT && key.format != VK_FORMAT_D32_SFLOAT_S8_UINT) {
+        reason = "depth format other than D32";
+        return false;
+    }
+    if (record.Swizzle() != Graphics::XorSwizzleMode(Graphics::TextureTileMode::kZ64KBX)) {
+        reason = "depth plane outside the Z 64 KiB swizzle";
+        return false;
+    }
+    planes.push_back({key.address, 22u, 4u, VK_IMAGE_ASPECT_DEPTH_BIT});
+    if (key.stencilAddress != 0u && (record.Aspects() & VK_IMAGE_ASPECT_STENCIL_BIT) != 0u) planes.push_back({key.stencilAddress, 5u, 1u, VK_IMAGE_ASPECT_STENCIL_BIT});
+    stagingBytes = 0;
+    for (auto& plane : planes) {
+        Graphics::GuestTextureResource resource{};
+        resource.baseAddress = plane.address;
+        resource.width = key.width;
+        resource.height = key.height;
+        resource.mipCount = 1;
+        resource.allocatedMipCount = 1;
+        resource.tileMode = Graphics::TextureTileMode::kZ64KBX;
+        resource.dimension = Graphics::TextureDimension::k2D;
+        resource.format = plane.format;
+        resource.pipeBankXor = record.PipeBankXor();
+        resource.dstSelX = 4;
+        resource.dstSelY = 5;
+        resource.dstSelZ = 6;
+        resource.dstSelW = 7;
+        plane.geometry = Graphics::DescribeSurface(resource);
+        if (plane.geometry.mips.empty()) {
+            reason = "depth plane layout";
+            return false;
+        }
+        const auto& mip = plane.geometry.mips.front();
+        if (mip.pitchBytes == 0u || mip.pitchBytes % plane.elementBytes != 0u) {
+            reason = "depth plane pitch";
+            return false;
+        }
+        Shadow::OwnedSpan span;
+        if (!Shadow::ServeOwned(context, plane.address, plane.geometry.guestBytes, &span) || span.handle == 0u || plane.address < span.origin) {
+            reason = "depth plane memory not resident";
+            return false;
+        }
+        plane.buffer = reinterpret_cast<VkBuffer>(static_cast<std::uintptr_t>(span.handle));
+        plane.base = plane.address - span.origin;
+        plane.staged = stagingBytes;
+        stagingBytes += (mip.linearOffset + mip.linearSize + 255u) & ~std::uint64_t{255u};
+    }
+    return true;
+}
+
+VkCommandBuffer SurfaceDetiler::depthCommands(Graphics::Recorder& recorder) {
+    const auto serial = recorder.OpenBatchSerial();
+    if (serial != batch) {
+        detiler->BeginBatch();
+        batch = serial;
+    }
+    const auto commands = recorder.Commands();
+    std::vector<std::shared_ptr<void>> kept;
+    if (Shadow::RecordOwnedUploads(commands, kept) != 0u) {
+        for (auto& object : kept) recorder.Keep(std::move(object));
+    }
+    return commands;
+}
+
+bool SurfaceDetiler::SeedDepth(Graphics::Recorder& recorder, const std::shared_ptr<DepthRecord>& record, std::string& reason) {
+    const auto& key = record->Key();
+    std::vector<DepthPlane> planes;
+    std::uint64_t stagingBytes = 0;
+    if (!depthPlanes(*record, planes, stagingBytes, reason)) return false;
+    const auto commands = depthCommands(recorder);
+    const auto timing = recorder.BeginGpuTiming(DetileTimingKey);
+    auto staging = std::make_shared<Graphics::DeviceBuffer>(context, static_cast<std::size_t>(stagingBytes), VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_SRC_BIT);
+    Graphics::RecordMemoryBarrier(context, commands, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_ACCESS_TRANSFER_WRITE_BIT | VK_ACCESS_SHADER_WRITE_BIT, VK_ACCESS_SHADER_READ_BIT);
+    try {
+        for (const auto& plane : planes) {
+            const auto& mip = plane.geometry.mips.front();
+            Graphics::DetileWindow window;
+            window.pipeBankXor = record->PipeBankXor();
+            detiler->Dispatch(commands, Graphics::TextureTileMode::kZ64KBX, plane.elementBytes, plane.buffer, plane.base + plane.geometry.GuestOffset(0u, mip), staging->Handle(), plane.staged + mip.linearOffset, mip, false, 0u, false, window);
+            counts.dispatches++;
+        }
+    } catch (const std::exception& error) {
+        recorder.EndGpuTiming(timing);
+        reason = std::string("depth seed: ") + error.what();
+        return false;
+    }
+    Graphics::RecordMemoryBarrier(context, commands, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_ACCESS_SHADER_WRITE_BIT, VK_ACCESS_TRANSFER_READ_BIT);
+    VkImageMemoryBarrier barrier{VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER};
+    barrier.srcAccessMask = VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT | VK_ACCESS_SHADER_READ_BIT;
+    barrier.dstAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
+    barrier.oldLayout = record->Initialized() ? VK_IMAGE_LAYOUT_GENERAL : VK_IMAGE_LAYOUT_UNDEFINED;
+    barrier.newLayout = VK_IMAGE_LAYOUT_GENERAL;
+    barrier.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+    barrier.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+    barrier.image = record->Image();
+    barrier.subresourceRange = {record->Aspects(), 0u, 1u, 0u, 1u};
+    context.Resolved(&Graphics::DeviceFunctions::cmdPipelineBarrier, "vkCmdPipelineBarrier")(commands, VK_PIPELINE_STAGE_EARLY_FRAGMENT_TESTS_BIT | VK_PIPELINE_STAGE_LATE_FRAGMENT_TESTS_BIT | VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT | VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT | VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 0, nullptr, 0, nullptr, 1, &barrier);
+    for (const auto& plane : planes) {
+        const auto& mip = plane.geometry.mips.front();
+        VkBufferImageCopy copy{};
+        copy.bufferOffset = plane.staged + mip.linearOffset;
+        copy.bufferRowLength = mip.pitchBytes / plane.elementBytes;
+        copy.imageSubresource = {static_cast<VkImageAspectFlags>(plane.aspect), 0u, 0u, 1u};
+        copy.imageExtent = {std::max(key.width, 1u), std::max(key.height, 1u), 1u};
+        context.Function<PFN_vkCmdCopyBufferToImage>("vkCmdCopyBufferToImage")(commands, staging->Handle(), record->Image(), VK_IMAGE_LAYOUT_GENERAL, 1, &copy);
+    }
+    barrier.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
+    barrier.dstAccessMask = VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_READ_BIT | VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT | VK_ACCESS_SHADER_READ_BIT;
+    barrier.oldLayout = VK_IMAGE_LAYOUT_GENERAL;
+    context.Resolved(&Graphics::DeviceFunctions::cmdPipelineBarrier, "vkCmdPipelineBarrier")(commands, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_EARLY_FRAGMENT_TESTS_BIT | VK_PIPELINE_STAGE_LATE_FRAGMENT_TESTS_BIT | VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT | VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, 0, 0, nullptr, 0, nullptr, 1, &barrier);
+    recorder.EndGpuTiming(timing);
+    recorder.Keep(staging);
+    recorder.Keep(record);
+    record->SetInitialized();
+    counts.depthSeeds++;
+    return true;
+}
+
+bool SurfaceDetiler::WriteBackDepth(Graphics::Recorder& recorder, const std::shared_ptr<DepthRecord>& record, std::vector<std::pair<std::uint64_t, std::uint64_t>>& written, std::string& reason) {
+    const auto& key = record->Key();
+    std::vector<DepthPlane> planes;
+    std::uint64_t stagingBytes = 0;
+    if (!depthPlanes(*record, planes, stagingBytes, reason)) return false;
+    const auto commands = depthCommands(recorder);
+    const auto timing = recorder.BeginGpuTiming(DetileTimingKey);
+    auto staging = std::make_shared<Graphics::DeviceBuffer>(context, static_cast<std::size_t>(stagingBytes), VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT);
+    VkImageMemoryBarrier barrier{VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER};
+    barrier.srcAccessMask = VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT | VK_ACCESS_TRANSFER_WRITE_BIT;
+    barrier.dstAccessMask = VK_ACCESS_TRANSFER_READ_BIT;
+    barrier.oldLayout = VK_IMAGE_LAYOUT_GENERAL;
+    barrier.newLayout = VK_IMAGE_LAYOUT_GENERAL;
+    barrier.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+    barrier.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+    barrier.image = record->Image();
+    barrier.subresourceRange = {record->Aspects(), 0u, 1u, 0u, 1u};
+    context.Resolved(&Graphics::DeviceFunctions::cmdPipelineBarrier, "vkCmdPipelineBarrier")(commands, VK_PIPELINE_STAGE_EARLY_FRAGMENT_TESTS_BIT | VK_PIPELINE_STAGE_LATE_FRAGMENT_TESTS_BIT | VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 0, nullptr, 0, nullptr, 1, &barrier);
+    for (const auto& plane : planes) {
+        const auto& mip = plane.geometry.mips.front();
+        VkBufferImageCopy copy{};
+        copy.bufferOffset = plane.staged + mip.linearOffset;
+        copy.bufferRowLength = mip.pitchBytes / plane.elementBytes;
+        copy.imageSubresource = {static_cast<VkImageAspectFlags>(plane.aspect), 0u, 0u, 1u};
+        copy.imageExtent = {std::max(key.width, 1u), std::max(key.height, 1u), 1u};
+        context.Function<PFN_vkCmdCopyImageToBuffer>("vkCmdCopyImageToBuffer")(commands, record->Image(), VK_IMAGE_LAYOUT_GENERAL, staging->Handle(), 1, &copy);
+    }
+    Graphics::RecordMemoryBarrier(context, commands, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_ACCESS_TRANSFER_WRITE_BIT | VK_ACCESS_SHADER_WRITE_BIT | VK_ACCESS_SHADER_READ_BIT, VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT);
+    try {
+        for (const auto& plane : planes) {
+            const auto& mip = plane.geometry.mips.front();
+            Graphics::DetileWindow window;
+            window.pipeBankXor = record->PipeBankXor();
+            detiler->Dispatch(commands, Graphics::TextureTileMode::kZ64KBX, plane.elementBytes, staging->Handle(), plane.staged + mip.linearOffset, plane.buffer, plane.base + plane.geometry.GuestOffset(0u, mip), mip, true, 0u, false, window);
+            counts.writeBackDispatches++;
+            written.emplace_back(plane.address, plane.geometry.guestBytes);
+            counts.depthWriteBackBytes += plane.geometry.guestBytes;
+        }
+    } catch (const std::exception& error) {
+        recorder.EndGpuTiming(timing);
+        reason = std::string("depth write-back: ") + error.what();
+        return false;
+    }
+    Graphics::RecordMemoryBarrier(context, commands, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_ACCESS_SHADER_WRITE_BIT, VK_ACCESS_MEMORY_READ_BIT | VK_ACCESS_MEMORY_WRITE_BIT);
+    recorder.EndGpuTiming(timing);
+    recorder.Keep(staging);
+    recorder.Keep(record);
+    counts.depthWriteBacks++;
     return true;
 }
 

@@ -1,4 +1,6 @@
 #include "prx/libSceAgcDriver/Unified/include/DepthRecords.hpp"
+#include "prx/libSceAgcDriver/Unified/include/PageTable.hpp"
+#include "prx/libSceAgcDriver/Unified/include/Protector.hpp"
 
 #include <algorithm>
 #include <cstdio>
@@ -15,6 +17,15 @@ bool hasStencil(VkFormat format) {
 
 bool hasDepth(VkFormat format) {
     return format != VK_FORMAT_S8_UINT;
+}
+
+std::uint64_t planeBytes(const DepthKey& key) {
+    const std::uint64_t texel = key.format == VK_FORMAT_D16_UNORM || key.format == VK_FORMAT_D16_UNORM_S8_UINT ? 2u : 4u;
+    return static_cast<std::uint64_t>(key.width) * key.height * texel;
+}
+
+std::uint64_t stencilBytes(const DepthKey& key) {
+    return static_cast<std::uint64_t>(key.width) * key.height;
 }
 
 }
@@ -104,11 +115,53 @@ VkImageView DepthRecord::SampledView(bool stencil) {
 bool DepthRecords::Overlaps(std::uint64_t address, std::uint64_t bytes) const {
     std::lock_guard lock(mutex);
     for (const auto& [key, record] : records) {
-        const std::uint64_t plane = static_cast<std::uint64_t>(key.width) * key.height * 4u;
-        if (address < key.address + plane && key.address < address + bytes) return true;
-        if (key.stencilAddress != 0u && address < key.stencilAddress + plane / 4u && key.stencilAddress < address + bytes) return true;
+        if (address < key.address + planeBytes(key) && key.address < address + bytes) return true;
+        if (key.stencilAddress != 0u && address < key.stencilAddress + stencilBytes(key) && key.stencilAddress < address + bytes) return true;
     }
     return false;
+}
+
+HtileState ReadHtile(std::uint64_t address, std::uint64_t bytes, bool depthOnly, bool stencil, float clearDepth) {
+    if (address == 0u || bytes < 4u) return HtileState::Unknown;
+    for (auto page = address & ~(PageBytes - 1u); page < address + bytes; page += PageBytes) {
+        if (!Protector::Readable(page)) return HtileState::Unknown;
+    }
+    const auto* words = reinterpret_cast<const std::uint32_t*>(address);
+    const auto count = bytes / 4u;
+    for (std::uint64_t at = 0; at < count; ++at) {
+        const auto word = words[at];
+        if ((word & 15u) == 15u) return HtileState::Written;
+        const auto depth = depthOnly ? word : word & 0xfffff00fu;
+        const bool depthCleared = (depth == 0u && clearDepth == 0.0f) || (depth == (depthOnly ? 0xfffffff0u : 0xfffc0000u) && clearDepth == 1.0f);
+        if (!depthCleared) return HtileState::Written;
+        if (stencil && !depthOnly && ((word >> 8u) & 3u) != 0u) return HtileState::Written;
+    }
+    return HtileState::Cleared;
+}
+
+std::size_t DepthRecords::NoteHtileWrites(std::uint64_t address, std::uint64_t bytes) {
+    std::lock_guard lock(mutex);
+    std::size_t noted = 0;
+    for (const auto& [key, record] : records) {
+        if (key.htileAddress == 0u) continue;
+        if (address < key.htileAddress + record->HtileBytes() && key.htileAddress < address + bytes) {
+            record->NoteHtileWrite();
+            ++noted;
+        }
+    }
+    if (noted != 0u) counts.htileWrites++;
+    return noted;
+}
+
+std::vector<std::shared_ptr<DepthRecord>> DepthRecords::Overlapping(std::uint64_t address, std::uint64_t bytes) const {
+    std::lock_guard lock(mutex);
+    std::vector<std::shared_ptr<DepthRecord>> found;
+    for (const auto& [key, record] : records) {
+        const bool depth = address < key.address + planeBytes(key) && key.address < address + bytes;
+        const bool stencil = key.stencilAddress != 0u && address < key.stencilAddress + stencilBytes(key) && key.stencilAddress < address + bytes;
+        if (depth || stencil) found.push_back(record);
+    }
+    return found;
 }
 
 std::shared_ptr<DepthRecord> DepthRecords::At(std::uint64_t address, bool& stencil) {
@@ -141,7 +194,17 @@ std::shared_ptr<DepthRecord> DepthRecords::Find(const Graphics::Context& context
         counts.found++;
         return found->second;
     }
+    for (auto at = records.begin(); at != records.end();) {
+        const auto& held = at->first;
+        if (held.address != key.address && held.address < key.address + planeBytes(key) && key.address < held.address + planeBytes(held)) {
+            counts.superseded++;
+            at = records.erase(at);
+            continue;
+        }
+        ++at;
+    }
     auto created = std::make_shared<DepthRecord>(context, key);
+    created->SetTiling(target.depthSwizzle, target.pipeBankXor);
     records.emplace(key, created);
     counts.created++;
     if (counts.created <= 16u) std::fprintf(stderr, "[recode-depth] record 0x%llx stencil 0x%llx htile 0x%llx %ux%u format %d clear %g/%u\n", static_cast<unsigned long long>(key.address), static_cast<unsigned long long>(key.stencilAddress), static_cast<unsigned long long>(key.htileAddress), key.width, key.height, static_cast<int>(key.format), static_cast<double>(target.clearDepth), static_cast<unsigned>(target.clearStencil));
