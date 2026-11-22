@@ -224,6 +224,7 @@ struct Totals {
     std::uint64_t shapesHandedOver = 0;
     std::uint64_t layerTargets = 0;
     std::uint64_t depthRecordDraws = 0;
+    std::uint64_t depthRecordsSampled = 0;
     std::uint64_t recordsRefreshed = 0;
     std::uint64_t layersAbsorbed = 0;
     std::uint64_t layersAbsorbedOverChanges = 0;
@@ -1145,7 +1146,7 @@ public:
         line += text;
         line += "; record ranges noted GPU-written for the memory core " + std::to_string(totals.recordRangesNoted) + "; records made for a sampled shape after a hand-over " + std::to_string(totals.sampledRecordsCreated) + "; new chains zeroed " + std::to_string(totals.zeroedChains);
         line += "; records written back for buffer readers " + std::to_string(totals.readerWriteBacks) + " (" + std::to_string(totals.readerWriteBackBytes >> 20u) + " MiB, " + std::to_string(totals.readerWriteBackRefusals) + " refused, " + std::to_string(totals.readerStale) + " skipped: memory changed since their GPU write)";
-        line += "; records handed to another shape " + std::to_string(totals.shapesHandedOver) + " (" + std::to_string(totals.writeBacks) + " written back into the mirror, " + std::to_string(totals.writeBackBytes >> 20u) + " MiB, " + std::to_string(totals.writeBackRefusals) + " refused, " + std::to_string(totals.staleShapes) + " not written back: memory changed since their GPU write); draws with a recode depth record " + std::to_string(totals.depthRecordDraws) + " (" + std::to_string(Images::Depths().Size()) + " records, " + std::to_string(Images::Depths().Counts().cleared) + " started from their clear value, " + std::to_string(Images::Depths().Counts().refused) + " refused); targets and sampled views served as layers of a containing record " + std::to_string(totals.layerTargets) + ", records copied in as layers of a new record " + std::to_string(totals.layersAbsorbed) + " (" + std::to_string(totals.layersAbsorbedOverChanges) + " over a change note); CPU-content records detiled again after their memory changed " + std::to_string(totals.recordsRefreshed);
+        line += "; records handed to another shape " + std::to_string(totals.shapesHandedOver) + " (" + std::to_string(totals.writeBacks) + " written back into the mirror, " + std::to_string(totals.writeBackBytes >> 20u) + " MiB, " + std::to_string(totals.writeBackRefusals) + " refused, " + std::to_string(totals.staleShapes) + " not written back: memory changed since their GPU write); draws with a recode depth record " + std::to_string(totals.depthRecordDraws) + " (" + std::to_string(Images::Depths().Size()) + " records, " + std::to_string(Images::Depths().Counts().cleared) + " started from their clear value, " + std::to_string(Images::Depths().Counts().refused) + " refused, " + std::to_string(totals.depthRecordsSampled) + " sampled reads of them); targets and sampled views served as layers of a containing record " + std::to_string(totals.layerTargets) + ", records copied in as layers of a new record " + std::to_string(totals.layersAbsorbed) + " (" + std::to_string(totals.layersAbsorbedOverChanges) + " over a change note); CPU-content records detiled again after their memory changed " + std::to_string(totals.recordsRefreshed);
         line += "; images adopted from the existing cache " + std::to_string(totals.recordAdoptions) + " (" + std::to_string(totals.recordAdoptionRefusals) + " refused), published back " + std::to_string(publishedRecords.load(std::memory_order_relaxed)) + " (" + std::to_string(staleRecordsKept.load(std::memory_order_relaxed)) + " not published: guest memory changed since their GPU write, " + std::to_string(publishNoSurface.load(std::memory_order_relaxed)) + " without an existing surface, " + std::to_string(publishShape.load(std::memory_order_relaxed)) + " of another shape, " + std::to_string(publishCompressed.load(std::memory_order_relaxed)) + " compressed); flips from a GPU-written record " + std::to_string(flipsFromNewRecords.load(std::memory_order_relaxed)) + ", over a record not GPU-written " + std::to_string(flipsFromOldRecords.load(std::memory_order_relaxed)) + ", with no record " + std::to_string(flipsWithoutRecords.load(std::memory_order_relaxed));
         {
             auto& landings = batchLandings();
@@ -3615,6 +3616,19 @@ private:
         const auto& surface = key->surface;
         const auto side = table->OwnerOfRange(surface.address, surface.bytes);
         if (side != Images::Side::Record && !(side == Images::Side::None && Resolve::SampledRecordsAll())) return false;
+        if (Images::DepthRecordsOn()) {
+            bool stencilPlane = false;
+            if (auto depth = Images::Depths().At(surface.address, stencilPlane)) {
+                const auto depthView = depth->SampledView(stencilPlane);
+                std::uint32_t depthSlot = 0;
+                if (depthView != VK_NULL_HANDLE && Resolve::BindViewSlot(deferred.request, reinterpret_cast<std::uint64_t>(depthView), VK_IMAGE_LAYOUT_GENERAL, depth, depthSlot)) {
+                    stage.slots[deferred.index] = depthSlot;
+                    if (context.recorder != nullptr) context.recorder->Keep(depth);
+                    totals.depthRecordsSampled++;
+                    return true;
+                }
+            }
+        }
         std::uint32_t layer = 0;
         Absorbed absorbed;
         auto record = ownedRecord(context, *table, surface, why, &layer, &absorbed);

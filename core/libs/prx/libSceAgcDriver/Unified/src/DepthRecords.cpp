@@ -1,6 +1,7 @@
 #include "prx/libSceAgcDriver/Unified/include/DepthRecords.hpp"
 
 #include <algorithm>
+#include <cstdio>
 #include <cstdlib>
 #include <string_view>
 
@@ -18,7 +19,13 @@ bool hasDepth(VkFormat format) {
 
 }
 
-DepthRecord::DepthRecord(const Graphics::Context& context, const DepthKey& key) : context(context), key(key) {
+DepthRecord::DepthRecord(const Graphics::Context& context, const DepthKey& key) : device(context.device), key(key) {
+    createView = context.Function<PFN_vkCreateImageView>("vkCreateImageView");
+    destroyView = context.Function<PFN_vkDestroyImageView>("vkDestroyImageView");
+    destroyImage = context.Function<PFN_vkDestroyImage>("vkDestroyImage");
+    freeMemory = context.Function<PFN_vkFreeMemory>("vkFreeMemory");
+    pipelineBarrier = context.Function<PFN_vkCmdPipelineBarrier>("vkCmdPipelineBarrier");
+    clearImage = context.Function<PFN_vkCmdClearDepthStencilImage>("vkCmdClearDepthStencilImage");
     aspects = (hasDepth(key.format) ? VK_IMAGE_ASPECT_DEPTH_BIT : 0u) | (hasStencil(key.format) ? VK_IMAGE_ASPECT_STENCIL_BIT : 0u);
     VkImageCreateInfo info{VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO};
     info.imageType = VK_IMAGE_TYPE_2D;
@@ -49,13 +56,15 @@ DepthRecord::DepthRecord(const Graphics::Context& context, const DepthKey& key) 
     viewInfo.viewType = VK_IMAGE_VIEW_TYPE_2D;
     viewInfo.format = key.format;
     viewInfo.subresourceRange = {aspects, 0u, 1u, 0u, 1u};
-    Graphics::Check(context.Function<PFN_vkCreateImageView>("vkCreateImageView")(context.device, &viewInfo, nullptr, &view), "vkCreateImageView recode depth record");
+    Graphics::Check(createView(device, &viewInfo, nullptr, &view), "vkCreateImageView recode depth record");
 }
 
 DepthRecord::~DepthRecord() {
-    if (view != VK_NULL_HANDLE) context.Function<PFN_vkDestroyImageView>("vkDestroyImageView")(context.device, view, nullptr);
-    if (image != VK_NULL_HANDLE) context.Function<PFN_vkDestroyImage>("vkDestroyImage")(context.device, image, nullptr);
-    if (memory != VK_NULL_HANDLE) context.Function<PFN_vkFreeMemory>("vkFreeMemory")(context.device, memory, nullptr);
+    if (depthView != VK_NULL_HANDLE) destroyView(device, depthView, nullptr);
+    if (stencilView != VK_NULL_HANDLE) destroyView(device, stencilView, nullptr);
+    if (view != VK_NULL_HANDLE) destroyView(device, view, nullptr);
+    if (image != VK_NULL_HANDLE) destroyImage(device, image, nullptr);
+    if (memory != VK_NULL_HANDLE) freeMemory(device, memory, nullptr);
 }
 
 void DepthRecord::Initialize(VkCommandBuffer commands, float clearDepth, std::uint8_t clearStencil) {
@@ -68,15 +77,39 @@ void DepthRecord::Initialize(VkCommandBuffer commands, float clearDepth, std::ui
     barrier.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
     barrier.image = image;
     barrier.subresourceRange = {aspects, 0u, 1u, 0u, 1u};
-    context.Function<PFN_vkCmdPipelineBarrier>("vkCmdPipelineBarrier")(commands, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 0, nullptr, 0, nullptr, 1, &barrier);
+    pipelineBarrier(commands, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 0, nullptr, 0, nullptr, 1, &barrier);
     const VkClearDepthStencilValue value{clearDepth, clearStencil};
     const VkImageSubresourceRange range{aspects, 0u, 1u, 0u, 1u};
-    context.Function<PFN_vkCmdClearDepthStencilImage>("vkCmdClearDepthStencilImage")(commands, image, VK_IMAGE_LAYOUT_GENERAL, &value, 1, &range);
+    clearImage(commands, image, VK_IMAGE_LAYOUT_GENERAL, &value, 1, &range);
     barrier.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
     barrier.dstAccessMask = VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_READ_BIT | VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT | VK_ACCESS_SHADER_READ_BIT;
     barrier.oldLayout = VK_IMAGE_LAYOUT_GENERAL;
-    context.Function<PFN_vkCmdPipelineBarrier>("vkCmdPipelineBarrier")(commands, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_EARLY_FRAGMENT_TESTS_BIT | VK_PIPELINE_STAGE_LATE_FRAGMENT_TESTS_BIT | VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT, 0, 0, nullptr, 0, nullptr, 1, &barrier);
+    pipelineBarrier(commands, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_EARLY_FRAGMENT_TESTS_BIT | VK_PIPELINE_STAGE_LATE_FRAGMENT_TESTS_BIT | VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT, 0, 0, nullptr, 0, nullptr, 1, &barrier);
     initialized = true;
+}
+
+VkImageView DepthRecord::SampledView(bool stencil) {
+    auto& made = stencil ? stencilView : depthView;
+    const VkImageAspectFlags aspect = stencil ? VK_IMAGE_ASPECT_STENCIL_BIT : VK_IMAGE_ASPECT_DEPTH_BIT;
+    if (made != VK_NULL_HANDLE || (aspects & aspect) == 0u) return made;
+    VkImageViewCreateInfo viewInfo{VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO};
+    viewInfo.image = image;
+    viewInfo.viewType = VK_IMAGE_VIEW_TYPE_2D;
+    viewInfo.format = key.format;
+    viewInfo.subresourceRange = {aspect, 0u, 1u, 0u, 1u};
+    Graphics::Check(createView(device, &viewInfo, nullptr, &made), "vkCreateImageView recode depth record sampled view");
+    return made;
+}
+
+std::shared_ptr<DepthRecord> DepthRecords::At(std::uint64_t address, bool& stencil) {
+    std::lock_guard lock(mutex);
+    for (const auto& [key, record] : records) {
+        if (key.address == address || (key.stencilAddress != 0u && key.stencilAddress == address)) {
+            stencil = key.address != address;
+            return record->Initialized() ? record : nullptr;
+        }
+    }
+    return nullptr;
 }
 
 std::shared_ptr<DepthRecord> DepthRecords::Find(const Graphics::Context& context, const Graphics::DepthTarget& target, std::string& reason) {
@@ -101,6 +134,7 @@ std::shared_ptr<DepthRecord> DepthRecords::Find(const Graphics::Context& context
     auto created = std::make_shared<DepthRecord>(context, key);
     records.emplace(key, created);
     counts.created++;
+    if (counts.created <= 16u) std::fprintf(stderr, "[recode-depth] record 0x%llx stencil 0x%llx htile 0x%llx %ux%u format %d clear %g/%u\n", static_cast<unsigned long long>(key.address), static_cast<unsigned long long>(key.stencilAddress), static_cast<unsigned long long>(key.htileAddress), key.width, key.height, static_cast<int>(key.format), static_cast<double>(target.clearDepth), static_cast<unsigned>(target.clearStencil));
     return created;
 }
 

@@ -37,13 +37,22 @@ public:
     [[nodiscard]] VkImageView View() const { return view; }
     [[nodiscard]] bool Initialized() const { return initialized; }
     void Initialize(VkCommandBuffer commands, float clearDepth, std::uint8_t clearStencil);
+    [[nodiscard]] VkImageView SampledView(bool stencil);
 
 private:
-    const Graphics::Context& context;
+    VkDevice device = VK_NULL_HANDLE;
+    PFN_vkCreateImageView createView = nullptr;
+    PFN_vkDestroyImageView destroyView = nullptr;
+    PFN_vkDestroyImage destroyImage = nullptr;
+    PFN_vkFreeMemory freeMemory = nullptr;
+    PFN_vkCmdPipelineBarrier pipelineBarrier = nullptr;
+    PFN_vkCmdClearDepthStencilImage clearImage = nullptr;
     DepthKey key;
     VkImage image = VK_NULL_HANDLE;
     VkDeviceMemory memory = VK_NULL_HANDLE;
     VkImageView view = VK_NULL_HANDLE;
+    VkImageView depthView = VK_NULL_HANDLE;
+    VkImageView stencilView = VK_NULL_HANDLE;
     VkImageAspectFlags aspects = 0;
     bool initialized = false;
 };
@@ -58,6 +67,7 @@ struct DepthCounts {
 class DepthRecords {
 public:
     [[nodiscard]] std::shared_ptr<DepthRecord> Find(const Graphics::Context& context, const Graphics::DepthTarget& target, std::string& reason);
+    [[nodiscard]] std::shared_ptr<DepthRecord> At(std::uint64_t address, bool& stencil);
     void NoteCleared() {
         std::lock_guard lock(mutex);
         counts.cleared++;
