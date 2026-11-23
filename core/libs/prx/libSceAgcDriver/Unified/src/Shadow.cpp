@@ -147,6 +147,9 @@ void consumeMemory() {
     if (Mirror::WritesEnabled()) {
         const auto upload = MemoryCore::Get().WithoutGpuWritten(ranges);
         UploadClash::CheckUploads(upload);
+        if (Images::DepthRecordsOn()) {
+            for (const auto& range : upload) Images::Depths().NoteCpuWrites(range.address, range.size);
+        }
         ResidencyService::Get().NoteDirty(upload);
         MemoryCore::Get().LandAhead();
         MemoryCore::Get().LandOpened();

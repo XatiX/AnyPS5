@@ -167,6 +167,20 @@ std::size_t DepthRecords::NoteGpuHtileWrites(std::uint64_t address, std::uint64_
     return noted;
 }
 
+std::size_t DepthRecords::NoteCpuWrites(std::uint64_t address, std::uint64_t bytes) {
+    std::lock_guard lock(mutex);
+    std::size_t noted = 0;
+    for (const auto& [key, record] : records) {
+        const bool depth = address < key.address + planeBytes(key) && key.address < address + bytes;
+        const bool stencil = key.stencilAddress != 0u && address < key.stencilAddress + stencilBytes(key) && key.stencilAddress < address + bytes;
+        if (!depth && !stencil) continue;
+        record->NotePlaneWrite();
+        ++noted;
+    }
+    if (noted != 0u) counts.cpuPlaneWrites++;
+    return noted;
+}
+
 std::vector<std::shared_ptr<DepthRecord>> DepthRecords::Overlapping(std::uint64_t address, std::uint64_t bytes) const {
     std::lock_guard lock(mutex);
     std::vector<std::shared_ptr<DepthRecord>> found;

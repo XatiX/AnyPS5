@@ -59,6 +59,8 @@ public:
     [[nodiscard]] bool TakeHtileWrite() { return htileWritten.exchange(false, std::memory_order_acq_rel); }
     void NoteGpuHtileWrite() { htileGpuWritten.store(true, std::memory_order_release); }
     [[nodiscard]] bool TakeGpuHtileWrite() { return htileGpuWritten.exchange(false, std::memory_order_acq_rel); }
+    void NotePlaneWrite() { planeWritten.store(true, std::memory_order_release); }
+    [[nodiscard]] bool TakePlaneWrite() { return planeWritten.exchange(false, std::memory_order_acq_rel); }
     void SetHtileSaysCleared(bool cleared) { htileSaysCleared = cleared; }
     [[nodiscard]] bool HtileSaysCleared() const { return htileSaysCleared; }
     [[nodiscard]] std::uint64_t HtileBytes() const { return HtileBlockBytes(key.width, key.height); }
@@ -84,6 +86,7 @@ private:
     std::atomic<bool> drawn{false};
     std::atomic<bool> htileWritten{false};
     std::atomic<bool> htileGpuWritten{false};
+    std::atomic<bool> planeWritten{false};
     bool htileSaysCleared = false;
 };
 
@@ -102,6 +105,7 @@ struct DepthCounts {
     std::uint64_t cleared = 0;
     std::uint64_t htileWrites = 0;
     std::uint64_t gpuHtileWrites = 0;
+    std::uint64_t cpuPlaneWrites = 0;
     std::uint64_t superseded = 0;
 };
 
@@ -113,6 +117,7 @@ public:
     [[nodiscard]] std::vector<std::shared_ptr<DepthRecord>> Overlapping(std::uint64_t address, std::uint64_t bytes) const;
     std::size_t NoteHtileWrites(std::uint64_t address, std::uint64_t bytes);
     std::size_t NoteGpuHtileWrites(std::uint64_t address, std::uint64_t bytes);
+    std::size_t NoteCpuWrites(std::uint64_t address, std::uint64_t bytes);
     void NoteCleared() {
         std::lock_guard lock(mutex);
         counts.cleared++;
