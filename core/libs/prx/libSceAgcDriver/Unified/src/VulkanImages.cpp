@@ -4,6 +4,7 @@
 #include "prx/libSceAgcDriver/Graphics/include/TextureFormat.hpp"
 #include "RuntimeAbi.hpp"
 #include <algorithm>
+#include <cstdlib>
 #include <exception>
 #include <vector>
 
@@ -51,6 +52,11 @@ VkFormat uintStorageView(VkFormat format) {
     }
 }
 
+bool volumeTargets() {
+    static const bool targets = std::getenv("APS5_RECODE_NO_VOLUME_TARGETS") == nullptr;
+    return targets;
+}
+
 std::optional<VkComponentSwizzle> swizzleOf(std::uint32_t select) {
     switch (select) {
         case 0: return VK_COMPONENT_SWIZZLE_ZERO;
@@ -70,7 +76,7 @@ VulkanSurface::VulkanSurface(const Graphics::Context& context, const Graphics::G
     compressed = Graphics::BlockWidth(resource.format) != 1u;
     identity = Graphics::IsConvertedTextureFormat(resource.format) && format != VK_FORMAT_B10G11R11_UFLOAT_PACK32;
     VkImageCreateInfo info{VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO};
-    info.flags = compressed ? 0u : VK_IMAGE_CREATE_MUTABLE_FORMAT_BIT | VK_IMAGE_CREATE_EXTENDED_USAGE_BIT;
+    info.flags = compressed ? 0u : VK_IMAGE_CREATE_MUTABLE_FORMAT_BIT | VK_IMAGE_CREATE_EXTENDED_USAGE_BIT | (volume && volumeTargets() ? VK_IMAGE_CREATE_2D_ARRAY_COMPATIBLE_BIT : 0u);
     info.imageType = volume ? VK_IMAGE_TYPE_3D : VK_IMAGE_TYPE_2D;
     info.format = format;
     info.extent = {std::max(resource.width, 1u), std::max(resource.height, 1u), volume ? std::max(this->geometry.imageDepth, 1u) : 1u};
@@ -78,7 +84,7 @@ VulkanSurface::VulkanSurface(const Graphics::Context& context, const Graphics::G
     info.arrayLayers = volume ? 1u : std::max(this->geometry.imageLayers, 1u);
     info.samples = VK_SAMPLE_COUNT_1_BIT;
     info.tiling = VK_IMAGE_TILING_OPTIMAL;
-    attachable = !compressed && !volume;
+    attachable = !compressed && (!volume || volumeTargets());
     info.usage = VK_IMAGE_USAGE_SAMPLED_BIT | (compressed ? 0u : VK_IMAGE_USAGE_STORAGE_BIT) | (attachable ? VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT : 0u) | VK_IMAGE_USAGE_TRANSFER_DST_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT;
     info.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
     info.initialLayout = VK_IMAGE_LAYOUT_UNDEFINED;
@@ -225,8 +231,9 @@ VkImageView VulkanSurface::AttachmentView(VkFormat viewFormat, std::uint32_t lev
         reason = "surface is not attachable";
         return VK_NULL_HANDLE;
     }
+    const bool volume = resource.dimension == Graphics::TextureDimension::k3D;
     const auto levels = static_cast<std::uint32_t>(std::max<std::size_t>(geometry.mips.size(), 1u));
-    const auto imageLayers = std::max(geometry.imageLayers, 1u);
+    const auto imageLayers = volume ? std::max(std::max(geometry.imageDepth, 1u) >> level, 1u) : std::max(geometry.imageLayers, 1u);
     if (level >= levels || layers == 0u || layer + layers > imageLayers) {
         reason = "attachment outside the surface";
         return VK_NULL_HANDLE;
@@ -239,7 +246,7 @@ VkImageView VulkanSurface::AttachmentView(VkFormat viewFormat, std::uint32_t lev
     VkImageViewCreateInfo info{VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO};
     info.pNext = &usage;
     info.image = image;
-    info.viewType = layers > 1u ? VK_IMAGE_VIEW_TYPE_2D_ARRAY : VK_IMAGE_VIEW_TYPE_2D;
+    info.viewType = layers > 1u || volume ? VK_IMAGE_VIEW_TYPE_2D_ARRAY : VK_IMAGE_VIEW_TYPE_2D;
     info.format = viewFormat;
     info.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, level, 1u, layer, layers};
     VkImageView created = VK_NULL_HANDLE;

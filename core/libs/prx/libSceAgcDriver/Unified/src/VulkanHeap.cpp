@@ -37,7 +37,7 @@ VulkanHeapDevice::VulkanHeapDevice(const Graphics::Context& context) : context(c
     sampledSlots = limited(SampledSlots, limits.maxDescriptorSetUpdateAfterBindSampledImages, SampledKinds);
     samplerSlots = limited(SamplerSlots, limits.maxDescriptorSetUpdateAfterBindSamplers, 1u);
     storageSlots = context.storageImageUpdateAfterBind ? limited(StorageSlots, limits.maxDescriptorSetUpdateAfterBindStorageImages, StorageKinds) : 0u;
-    constexpr VkShaderStageFlags stages = VK_SHADER_STAGE_ALL_GRAPHICS | VK_SHADER_STAGE_COMPUTE_BIT;
+    const VkShaderStageFlags stages = VK_SHADER_STAGE_ALL_GRAPHICS | VK_SHADER_STAGE_COMPUTE_BIT | (context.meshShader ? VkShaderStageFlags{VK_SHADER_STAGE_MESH_BIT_EXT} : VkShaderStageFlags{0});
     constexpr VkDescriptorBindingFlags bindingFlags = VK_DESCRIPTOR_BINDING_PARTIALLY_BOUND_BIT | VK_DESCRIPTOR_BINDING_UPDATE_AFTER_BIND_BIT;
     std::vector<VkDescriptorSetLayoutBinding> bindings;
     for (auto kind = FirstImageKind; kind <= LastStorageKind; ++kind) {

@@ -178,6 +178,8 @@ struct Totals {
     std::uint64_t mirrorWriteBytes = 0;
     std::uint64_t mirrorArguments = 0;
     std::uint64_t patchedArguments = 0;
+    std::uint64_t meshDraws = 0;
+    std::uint64_t meshEmpty = 0;
     std::uint64_t edgeSnapshotBytes = 0;
     std::uint64_t edgeDiffBytes = 0;
     std::uint64_t writtenOverflows = 0;
@@ -581,6 +583,14 @@ bool targetDetailOn() {
 }
 
 std::atomic<std::uint32_t> targetDetailLines{0};
+std::atomic<std::uint32_t> meshTraceLines{0};
+std::atomic<std::uint32_t> layeredTraceLines{0};
+std::atomic<std::uint32_t> inputRefusalLines{0};
+
+bool meshDrawsSkipped() {
+    static const bool skipped = std::getenv("APS5_RECODE_MESH_SKIP_DRAW") != nullptr;
+    return skipped;
+}
 
 std::uint64_t sourcesOfProgram() {
     static const std::uint64_t program = [] {
@@ -752,6 +762,11 @@ std::uint32_t mipChainMinWidth() {
         return static_cast<std::uint32_t>(std::strtoul(value + 4, nullptr, 10));
     }();
     return width;
+}
+
+bool recordsLayeredTargets() {
+    static const bool records = std::getenv("APS5_RECODE_NO_LAYERED_TARGETS") == nullptr;
+    return records;
 }
 
 bool recordsMipTailTargets() {
@@ -958,9 +973,32 @@ bool precheck(const Resolve::ResolvedDraw& draw, const Pm4::DrawParameters& para
         return false;
     }
     const auto& state = *draw.state;
-    if (state.stages.mesh || state.stages.tessellation || state.tessellationCapture != nullptr) {
-        reason = "mesh or tessellation";
+    if (state.stages.tessellation || state.tessellationCapture != nullptr) {
+        reason = "tessellation";
         return false;
+    }
+    if (state.stages.mesh) {
+        const auto& mesh = *state.stages.mesh;
+        if (parameters.indirect) {
+            reason = "mesh: indirect draw";
+            return false;
+        }
+        if (mesh.primitivesPerGroup == 0u) {
+            reason = "mesh: no primitives per group";
+            return false;
+        }
+        if (parameters.indexed && ((state.stages.registerValue >> 19u) & 3u) != 0u) {
+            reason = "mesh: indexed fast launch";
+            return false;
+        }
+        if (parameters.indexed && state.primitiveRestart && (mesh.inputPrimitive == 5u || mesh.inputPrimitive == 6u)) {
+            reason = "mesh: strip with primitive restart";
+            return false;
+        }
+        if (std::ranges::any_of(draw.stages, [](const Resolve::ResolvedStage& stage) { return stage.program.result->barycentricEmulation.active; })) {
+            reason = "mesh: emulated barycentrics";
+            return false;
+        }
     }
     for (const auto& stage : draw.stages) {
         if (stage.program.result->readsDepthRemapPush) {
@@ -977,8 +1015,8 @@ bool precheck(const Resolve::ResolvedDraw& draw, const Pm4::DrawParameters& para
             reason = "color target in a mip tail";
             return false;
         }
-        if (color.layers != 1u) {
-            reason = "layered color target";
+        if (color.layers == 0u || (color.layers != 1u && !recordsLayeredTargets())) {
+            reason = color.layers == 0u ? "colour target without layers" : "layered color target";
             return false;
         }
     }
@@ -1343,7 +1381,7 @@ public:
             std::snprintf(text, sizeof(text), "; mirror writes %.1f MiB, pages left GPU-owned %.1f MiB, edges landed whole %.1f MiB, edges snapshot %.1f MiB and landed by diff %.1f MiB, indirect arguments from the mirror %llu", static_cast<double>(totals.mirrorWriteBytes) / 1048576.0, static_cast<double>(totals.ownedBytes) / 1048576.0, static_cast<double>(totals.openLandedBytes) / 1048576.0, static_cast<double>(totals.edgeSnapshotBytes) / 1048576.0, static_cast<double>(totals.edgeDiffBytes) / 1048576.0, static_cast<unsigned long long>(totals.mirrorArguments));
             line += text;
         }
-        std::snprintf(text, sizeof(text), "; indirect draw arguments patched on the GPU for a constant rule %llu", static_cast<unsigned long long>(totals.patchedArguments));
+        std::snprintf(text, sizeof(text), "; indirect draw arguments patched on the GPU for a constant rule %llu; mesh draws %llu (%llu empty)", static_cast<unsigned long long>(totals.patchedArguments), static_cast<unsigned long long>(totals.meshDraws), static_cast<unsigned long long>(totals.meshEmpty));
         line += text;
         std::snprintf(text, sizeof(text), "; GPU-written chunks %llu switched to their import from the written bitmap (%.1f MiB copied over), %llu from other GPU writes, %llu refused, %llu written pieces already on an import", static_cast<unsigned long long>(totals.importSwitches), static_cast<double>(totals.switchBytes) / 1048576.0, static_cast<unsigned long long>(totals.writtenSwitches), static_cast<unsigned long long>(totals.switchRefused), static_cast<unsigned long long>(totals.writtenOnImports));
         line += text;
@@ -3339,10 +3377,35 @@ private:
             return false;
         }
         if (!attach(context, reason) || !precheck(draw, parameters, nullptr, reason)) return false;
+        const auto& state = *draw.state;
+        std::optional<Graphics::MeshGrid> meshGrid;
+        if (state.stages.mesh) {
+            const auto& mesh = *state.stages.mesh;
+            const auto inputSize = mesh.inputPrimitive == 1u ? 1u : mesh.inputPrimitive == 2u ? 2u : 3u;
+            if (parameters.indexCount < inputSize || parameters.instanceCount == 0u) {
+                totals.meshEmpty++;
+                return true;
+            }
+            const auto step = mesh.inputPrimitive == 5u || mesh.inputPrimitive == 6u ? 1u : inputSize;
+            const auto primitives = (parameters.indexCount - inputSize) / step + 1u;
+            meshGrid = Graphics::MeshGridFor(context, (primitives - 1u) / mesh.primitivesPerGroup + 1u, parameters.instanceCount);
+            if (!meshGrid) {
+                reason = "mesh: workgroup count past the device limits";
+                return false;
+            }
+        }
+        if (Downgrades::Active() && std::ranges::any_of(state.colors, [](const Graphics::ColorTarget& color) { return color.layers > 1u; }) && layeredTraceLines.fetch_add(1, std::memory_order_relaxed) < 8u) {
+            std::string targets;
+            for (const auto& color : state.colors) {
+                char text[160];
+                std::snprintf(text, sizeof(text), " [0x%llx %ux%u slice %u layers %u format %d]", static_cast<unsigned long long>(color.address), color.extent.width, color.extent.height, color.arraySlice, color.layers, static_cast<int>(color.format));
+                targets += text;
+            }
+            std::fprintf(stderr, "[recode-layered] program %016llx render layers %u layer exports 0x%x depth %d:%s\n", static_cast<unsigned long long>(Downgrades::ProgramHash(draw.stages.back().program.codeAddress)), state.renderLayers, state.layerExports, state.depth ? 1 : 0, targets.c_str());
+        }
         auto phase = std::chrono::steady_clock::now();
         drainSurfaces(context, *recorder);
         totals.surfaceNanoseconds += elapsed(phase);
-        const auto& state = *draw.state;
         std::vector<Graphics::CompiledShader> shaders;
         for (const auto& stage : draw.stages) shaders.push_back({stage.program.stage, stage.program.result.get(), stage.program.pushOffset});
         const auto& attributes = draw.stages.front().program.vertexAttributes;
@@ -3371,6 +3434,7 @@ private:
                 const auto input = drawInput(context, begin, end - begin, source);
                 if (!input) {
                     reason = "vertex buffer not imported";
+                    if (Downgrades::Active() && inputRefusalLines.fetch_add(1, std::memory_order_relaxed) < 16u) std::fprintf(stderr, "[recode-input] vertex buffer 0x%llx+0x%llx not imported: source %d, gpu pending %d, GPU-owned pages %zu, aliased %d, program %016llx\n", static_cast<unsigned long long>(begin), static_cast<unsigned long long>(end - begin), static_cast<int>(source), gpuPending(begin, end - begin) ? 1 : 0, MemoryCore::Get().Pages().GpuOwnedIn(begin, end - begin).size(), DirectMemoryAliased_nid_postfix(static_cast<std::uintptr_t>(begin), static_cast<std::size_t>(end - begin)) ? 1 : 0, static_cast<unsigned long long>(Downgrades::ProgramHash(draw.stages.back().program.codeAddress)));
                     return false;
                 }
                 if (source == InputSource::Written && copiesInputs() && end - begin <= InputCopyLimitBytes) inputCopies.push_back({begin, end - begin, index});
@@ -3493,6 +3557,8 @@ private:
             reason = "no pipeline";
             return false;
         }
+        const bool meshWindow = Graphics::UsesMeshWindow(shaders);
+        if (meshWindow) Graphics::PrepareMeshWindow(context);
         auto framebuffer = pipeline->AcquireFramebuffer(views, owners, state.renderExtent, state.renderLayers);
         const auto masked = maskedOutputs(state, fragmentOutputs(shaders));
 
@@ -3527,6 +3593,20 @@ private:
             }
             std::memcpy(block.data() + shaders[index].pushConstantOffset, push.data(), push.size());
             servePushKnownBuffers(context, draw.stages[index], std::span(block).subspan(shaders[index].pushConstantOffset), serial, completed);
+        }
+        VkShaderStageFlags pushStages = Graphics::PushConstantStages(shaders);
+        if (meshGrid) {
+            for (const auto& shader : shaders) {
+                const auto bytes = shader.program->pushConstants.size();
+                if (bytes != 0u && shader.pushConstantOffset < Graphics::PipelinePushSlotBytes && shader.pushConstantOffset + bytes > ShaderRecompiler::MeshDrawPushOffsetBytes) {
+                    reason = "mesh: stage push data overlaps the mesh draw words";
+                    return false;
+                }
+            }
+            const std::array<std::uint32_t, ShaderRecompiler::MeshDrawPushBytes / 4> words{parameters.indexCount, parameters.firstVertex, parameters.firstInstance, (parameters.indexed ? parameters.indexSize : 0u) | meshGrid->layerStride << ShaderRecompiler::MeshLayerStrideShift, 0u, 0u};
+            std::memcpy(block.data() + ShaderRecompiler::MeshDrawPushOffsetBytes, words.data(), sizeof(words));
+            pushStages |= VK_SHADER_STAGE_MESH_BIT_EXT;
+            totals.meshDraws++;
         }
 
         VkBuffer argumentBuffer = VK_NULL_HANDLE;
@@ -3607,12 +3687,13 @@ private:
             totals.indirect++;
         }
         std::optional<DrawInput> indexInput;
-        if (parameters.indexed) {
+        if (parameters.indexed && !meshGrid) {
             const auto bytes = static_cast<std::size_t>(parameters.indexCount) * parameters.indexSize;
             InputSource source = InputSource::Imported;
             if (bytes != 0u) indexInput = drawInput(context, parameters.indexAddress, bytes, source);
             if (!indexInput) {
-                reason = "indices not imported";
+                reason = bytes == 0u ? "indexed draw without indices" : "indices not imported";
+                if (Downgrades::Active() && inputRefusalLines.fetch_add(1, std::memory_order_relaxed) < 16u) std::fprintf(stderr, "[recode-input] indices 0x%llx+0x%zx (%u of %u bytes) not imported: source %d, gpu pending %d, GPU-owned pages %zu, aliased %d, program %016llx\n", static_cast<unsigned long long>(parameters.indexAddress), bytes, parameters.indexCount, parameters.indexSize, static_cast<int>(source), bytes != 0u && gpuPending(parameters.indexAddress, bytes) ? 1 : 0, bytes != 0u ? MemoryCore::Get().Pages().GpuOwnedIn(parameters.indexAddress, bytes).size() : 0u, bytes != 0u && DirectMemoryAliased_nid_postfix(static_cast<std::uintptr_t>(parameters.indexAddress), bytes) ? 1 : 0, static_cast<unsigned long long>(Downgrades::ProgramHash(draw.stages.back().program.codeAddress)));
                 return false;
             }
             countInput(totals, source);
@@ -3697,7 +3778,8 @@ private:
         if (sets.split) bind(commands, VK_PIPELINE_BIND_POINT_GRAPHICS, pipeline->Layout(), ShaderRecompiler::RuntimeAbi::FragmentDescriptorSet, 1, &descriptorSets[1], 0, nullptr);
         const VkDescriptorSet heapSet = heap->Set();
         bind(commands, VK_PIPELINE_BIND_POINT_GRAPHICS, pipeline->Layout(), ShaderRecompiler::RuntimeAbi::DirectHeapSet, 1, &heapSet, 0, nullptr);
-        pipeline->PushConstants(commands, Graphics::PushConstantStages(shaders), block);
+        if (meshWindow) Graphics::BindMeshWindow(context, commands, pipeline->Layout());
+        pipeline->PushConstants(commands, pushStages, block);
 
         if (!vertexBuffers.empty()) context.Resolved(&Graphics::DeviceFunctions::cmdBindVertexBuffers, "vkCmdBindVertexBuffers")(commands, 0, static_cast<std::uint32_t>(vertexBuffers.size()), vertexBuffers.data(), vertexOffsets.data());
         if (indexInput) context.Resolved(&Graphics::DeviceFunctions::cmdBindIndexBuffer, "vkCmdBindIndexBuffer")(commands, indexInput->buffer, indexInput->offset, parameters.indexSize == 2u ? VK_INDEX_TYPE_UINT16 : VK_INDEX_TYPE_UINT32);
@@ -3707,7 +3789,21 @@ private:
             if (timedProgram == 0 || one.program.stage == ShaderRecompiler::ShaderStage::Fragment) timedProgram = one.program.codeAddress;
         }
         const auto drawTiming = recorder->BeginInPassGpuTiming(DrawTimingKey | (std::uint64_t{0x7ec} << 48u) | (timedProgram & 0xffffffffffffull));
-        if (parameters.indirect) {
+        if (meshGrid) {
+            if (Downgrades::Active() && meshTraceLines.fetch_add(1, std::memory_order_relaxed) < 40u) {
+                std::string stagesText;
+                for (std::size_t index = 0; index < draw.stages.size(); ++index) {
+                    const auto& stage = draw.stages[index];
+                    char text[200];
+                    std::snprintf(text, sizeof(text), " [%016llx stage %d push %u+%zu attributes %zu known %zu window %d]", static_cast<unsigned long long>(Downgrades::ProgramHash(stage.program.codeAddress)), static_cast<int>(stage.program.stage), shaders[index].pushConstantOffset, stage.program.result->pushConstants.size(), stage.program.vertexAttributes.size(), stage.program.variant != nullptr ? stage.program.variant->info.info.knownBuffers.size() : 0u, stage.program.result->meshWindowBuffer ? 1 : 0);
+                    stagesText += text;
+                }
+                std::size_t meshBindings = 0;
+                for (const auto& binding : draw.layout.bindings) meshBindings += binding.stage == 0u ? 1u : 0u;
+                std::fprintf(stderr, "[recode-mesh] groups %u layers %u stride %u instances %u indices %u size %u indexed %d at 0x%llx first vertex %u input %u per group %u; bindings %zu (%zu mesh), uses %zu; push stages 0x%x;%s\n", meshGrid->groups, meshGrid->layers, meshGrid->layerStride, parameters.instanceCount, parameters.indexCount, parameters.indexSize, parameters.indexed ? 1 : 0, static_cast<unsigned long long>(parameters.indexAddress), parameters.firstVertex, state.stages.mesh->inputPrimitive, state.stages.mesh->primitivesPerGroup, draw.layout.bindings.size(), meshBindings, draw.uses.size(), static_cast<unsigned>(pushStages), stagesText.c_str());
+            }
+            if (!meshDrawsSkipped()) context.Function<PFN_vkCmdDrawMeshTasksEXT>("vkCmdDrawMeshTasksEXT")(commands, meshGrid->groups, parameters.instanceCount, meshGrid->layers);
+        } else if (parameters.indirect) {
             const auto& args = *parameters.indirect;
             if (indirectCount) {
                 if (parameters.indexed) context.Function<PFN_vkCmdDrawIndexedIndirectCountKHR>("vkCmdDrawIndexedIndirectCountKHR")(commands, argumentBuffer, argumentOffset, indirectCount->buffer, indirectCount->offset, args.count, args.stride);

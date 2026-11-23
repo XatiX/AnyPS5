@@ -5,6 +5,7 @@
 #include "prx/libSceAgcDriver/Execution/include/Driver/Shaders/ShaderRegistry.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Pm4.hpp"
 #include "prx/libSceAgcDriver/Execution/include/ShaderMemory.hpp"
+#include "prx/libSceAgcDriver/Graphics/include/Draw.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/ShaderInputState.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/Shaders.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/State.hpp"
@@ -278,8 +279,10 @@ bool DecodePrograms(const ProgramInputs& inputs, DriverDetail::DrawDecode& decod
             std::fprintf(stderr, "[recode-depth-state] program %016llx depth control %08llx z info %08llx clear %08llx render control %08llx depth 0x%llx colours %llu; z read %08x write %08x stencil read %08x write %08x depth view %08x size %08x bounds %08x %08x\n", static_cast<unsigned long long>(key[6]), static_cast<unsigned long long>(key[0]), static_cast<unsigned long long>(key[1]), static_cast<unsigned long long>(key[2]), static_cast<unsigned long long>(key[3]), static_cast<unsigned long long>(key[4]), static_cast<unsigned long long>(key[5]), DriverDetail::readRegister(queue.context, 0x012), DriverDetail::readRegister(queue.context, 0x014), DriverDetail::readRegister(queue.context, 0x013), DriverDetail::readRegister(queue.context, 0x015), DriverDetail::readRegister(queue.context, 0x002), DriverDetail::readRegister(queue.context, 0x007), DriverDetail::readRegister(queue.context, 0x008), DriverDetail::readRegister(queue.context, 0x009));
         }
     }
-    if (state.stages.mesh || state.stages.tessellation || state.stages.tessellationGeometry) {
-        reason = state.stages.mesh ? "mesh or tessellation stages: mesh" : state.stages.tessellationGeometry ? "mesh or tessellation stages: tessellation with geometry" : "mesh or tessellation stages: tessellation";
+    const bool meshOnly = state.stages.mesh && !state.stages.tessellation && !state.stages.tessellationGeometry && inputs.context.meshShader;
+    if (static std::atomic<std::uint32_t> lines{0}; (state.stages.mesh || state.stages.tessellation) && Downgrades::Active() && lines.fetch_add(1, std::memory_order_relaxed) < 4u) std::fprintf(stderr, "[recode-mesh] decoded: mesh %d tessellation %d with geometry %d, device mesh %d, path %d, roles %zu\n", state.stages.mesh ? 1 : 0, state.stages.tessellation ? 1 : 0, state.stages.tessellationGeometry ? 1 : 0, inputs.context.meshShader ? 1 : 0, static_cast<int>(state.stages.path), decode.roles.size());
+    if (!meshOnly && (state.stages.mesh || state.stages.tessellation || state.stages.tessellationGeometry)) {
+        reason = state.stages.tessellationGeometry ? "mesh or tessellation stages: tessellation with geometry" : state.stages.tessellation ? "mesh or tessellation stages: tessellation" : "mesh or tessellation stages: mesh without device support";
         if (Downgrades::Active()) {
             static std::mutex mutex;
             static std::vector<std::uint64_t> seen;
@@ -350,6 +353,17 @@ bool BuildPrograms(const ProgramInputs& inputs, const DrawFacts& facts, ProgramS
     const bool decoded = DecodePrograms(inputs, out.decode, reason);
     lap(PhaseDecode);
     if (!decoded) return false;
+    if (out.decode.state.stages.mesh) {
+        if (static std::atomic<std::uint32_t> lines{0}; Downgrades::Active() && lines.fetch_add(1, std::memory_order_relaxed) < 4u) std::fprintf(stderr, "[recode-mesh] program set decoded: %zu programs, first user sgpr %u, %zu user words, indices %u size %u indexed %d indirect %d\n", out.decode.programs.size(), out.decode.programs.front().firstUserSgpr, out.decode.programs.front().userData.size(), facts.indexCount, facts.indexSize, facts.indexed ? 1 : 0, facts.indirect ? 1 : 0);
+        auto& words = out.decode.programs.front().userData;
+        if (out.decode.programs.front().firstUserSgpr != 0u || words.size() < ShaderRecompiler::MeshIndexBufferUserWord + 4u) {
+            reason = "mesh program lacks the hidden user words";
+            return false;
+        }
+        const Pm4::DrawParameters parameters{facts.indexAddress, facts.indirect ? std::max(facts.indexCount, 1u) : facts.indexCount, facts.indexSize, facts.indirect ? 1u : facts.instanceCount, 0u, facts.indexed};
+        const auto descriptor = Graphics::MeshIndexBufferDescriptor(parameters);
+        std::copy(descriptor.begin(), descriptor.end(), words.begin() + ShaderRecompiler::MeshIndexBufferUserWord);
+    }
     const auto& decode = out.decode;
     const auto& programs = decode.programs;
     const auto& state = decode.state;
@@ -419,6 +433,7 @@ bool BuildPrograms(const ProgramInputs& inputs, const DrawFacts& facts, ProgramS
         out.stages.push_back(std::move(built));
         pushCursor += static_cast<std::uint32_t>(out.stages.back().result->pushConstants.size());
     }
+    if (static std::atomic<std::uint32_t> lines{0}; state.stages.mesh && Downgrades::Active() && lines.fetch_add(1, std::memory_order_relaxed) < 4u) std::fprintf(stderr, "[recode-mesh] program set built: mesh %016llx\n", static_cast<unsigned long long>(Downgrades::ProgramHash(out.stages.front().codeAddress)));
     return true;
 } catch (const std::exception& error) {
     reason = error.what();
