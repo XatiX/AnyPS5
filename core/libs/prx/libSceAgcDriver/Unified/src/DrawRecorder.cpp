@@ -2632,7 +2632,10 @@ private:
             return;
         }
         auto* vulkan = dynamic_cast<Images::VulkanSurface*>(record->device.get());
-        if (vulkan == nullptr || vulkan->Compressed()) return;
+        if (vulkan == nullptr || vulkan->Compressed()) {
+            if (seen.insert("dump skipped").second) std::fprintf(stderr, "[recode-dump] record 0x%llx skipped: %s\n", static_cast<unsigned long long>(record->key.address), vulkan == nullptr ? "not a Vulkan surface" : "block-compressed format");
+            return;
+        }
         dumpedRecords.insert(record->key.address);
         const auto elementBytes = Graphics::BytesPerElement(vulkan->Resource().format);
         const auto levels = static_cast<std::uint32_t>(std::max<std::size_t>(vulkan->Geometry().mips.size(), 1u));
