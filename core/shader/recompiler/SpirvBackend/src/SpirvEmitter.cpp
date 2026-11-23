@@ -356,7 +356,9 @@ std::vector<std::uint32_t> SpirvEmitter::Emit(const IrProgram& program, const Sh
         static const bool snapshotLoads = SpannedSnapshotLoadsEnabled(std::getenv("APS5_NO_SPANNED_SNAPSHOT_LOADS"));
         const std::uint32_t snapshotVariables[] = {state.flattenedSrtVariable};
         const auto snapshots = snapshotLoads && state.flattenedSrtVariable != 0u ? std::span<const std::uint32_t>(snapshotVariables) : std::span<const std::uint32_t>();
-        if (auto reason = SpannedBarrierInDivergentFlow(words, snapshots)) throw SpannedWaveUnsupported(*reason);
+        const std::uint32_t privateVariables[] = {state.faultBufferVariable};
+        const auto privates = state.program.Metadata().directResources && state.faultBufferVariable != 0u ? std::span<const std::uint32_t>(privateVariables) : std::span<const std::uint32_t>();
+        if (auto reason = SpannedBarrierInDivergentFlow(words, snapshots, privates)) throw SpannedWaveUnsupported(*reason);
     }
     if (info != nullptr) {
         info->fullSubgroups = state.spannedWave;

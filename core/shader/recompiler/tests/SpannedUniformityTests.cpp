@@ -94,8 +94,8 @@ public:
 
 bool failed = false;
 
-void expect(const char* name, const Module& module, bool rejected, std::span<const std::uint32_t> snapshots = {}) {
-    const auto reason = ShaderRecompiler::SpannedBarrierInDivergentFlow(module.words, snapshots);
+void expect(const char* name, const Module& module, bool rejected, std::span<const std::uint32_t> snapshots = {}, std::span<const std::uint32_t> privates = {}) {
+    const auto reason = ShaderRecompiler::SpannedBarrierInDivergentFlow(module.words, snapshots, privates);
     if (reason.has_value() == rejected) return;
     std::fprintf(stderr, "%s: expected %s, got %s\n", name, rejected ? "a rejection" : "no rejection", reason ? reason->c_str() : "none");
     failed = true;
@@ -342,5 +342,17 @@ int main() {
     };
     expect("a barrier under a snapshot word read at a uniform index with the default", joined(snapshotRead(Snapshot)), false, snapshotsFor(nullptr));
     expect("a barrier under a snapshot word read at a uniform index with the opt-out set", joined(snapshotRead(Snapshot)), true, snapshotsFor("1"));
+    const std::uint32_t listedPrivate[] = {Writable};
+    const auto privateWrite = [](std::uint32_t read) {
+        return [read](Module& module) {
+            module.emit(spv::OpAccessChain, {StoragePointer, First + 5u, Writable, Two});
+            module.emit(spv::OpAtomicIAdd, {Uint, First + 6u, First + 5u, Two, Semantics, Three});
+            module.emit(spv::OpLoad, {Uint, First + 7u + 4u, read});
+            module.emit(spv::OpIEqual, {Bool, First + 8u, First + 11u, Two});
+        };
+    };
+    expect("a barrier under a buffer word read after an atomic on a listed private buffer", joined(privateWrite(Storage)), false, {}, listedPrivate);
+    expect("a barrier under a buffer word read after an atomic on an unlisted buffer", joined(privateWrite(Storage)), true);
+    expect("a barrier under a word of the listed private buffer it writes", joined(privateWrite(Writable)), true, {}, listedPrivate);
     return failed ? EXIT_FAILURE : EXIT_SUCCESS;
 }
