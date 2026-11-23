@@ -10,6 +10,7 @@
 #include <mutex>
 #include <string>
 #include <tuple>
+#include <utility>
 #include <vector>
 
 namespace AgcDriver::Unified::Images {
@@ -64,8 +65,11 @@ public:
     void SetHtileSaysCleared(bool cleared) { htileSaysCleared = cleared; }
     [[nodiscard]] bool HtileSaysCleared() const { return htileSaysCleared; }
     [[nodiscard]] std::uint64_t HtileBytes() const { return HtileBlockBytes(key.width, key.height); }
+    void SetPredecessors(std::vector<std::shared_ptr<DepthRecord>> records) { predecessors = std::move(records); }
+    [[nodiscard]] std::vector<std::shared_ptr<DepthRecord>> TakePredecessors() { return std::exchange(predecessors, {}); }
 
 private:
+    std::vector<std::shared_ptr<DepthRecord>> predecessors;
     VkDevice device = VK_NULL_HANDLE;
     PFN_vkCreateImageView createView = nullptr;
     PFN_vkDestroyImageView destroyView = nullptr;

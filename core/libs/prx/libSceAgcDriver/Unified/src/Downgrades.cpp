@@ -490,7 +490,8 @@ void WatchProgramWrite(std::uint64_t codeAddress, std::uint64_t address, std::ui
 }
 
 void WatchProgramRead(std::uint64_t codeAddress, std::uint64_t address, std::uint64_t bytes) {
-    if (!Watching() || bytes == 0u || bytes > 0x10000u) return;
+    static const bool large = std::getenv("APS5_RECODE_WATCH_LARGE") != nullptr;
+    if (!Watching() || bytes == 0u || (bytes > 0x10000u && !large)) return;
     const auto hash = ProgramHash(codeAddress);
     if (!ListedHash(watchList(), hash)) return;
     auto& state = watchState();

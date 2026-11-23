@@ -222,16 +222,19 @@ std::shared_ptr<DepthRecord> DepthRecords::Find(const Graphics::Context& context
         counts.found++;
         return found->second;
     }
+    std::vector<std::shared_ptr<DepthRecord>> superseded;
     for (auto at = records.begin(); at != records.end();) {
         const auto& held = at->first;
         if (held.address != key.address && held.address < key.address + planeBytes(key) && key.address < held.address + planeBytes(held)) {
             counts.superseded++;
+            if (at->second->Initialized()) superseded.push_back(at->second);
             at = records.erase(at);
             continue;
         }
         ++at;
     }
     auto created = std::make_shared<DepthRecord>(context, key);
+    created->SetPredecessors(std::move(superseded));
     created->SetTiling(target.depthSwizzle, target.pipeBankXor);
     records.emplace(key, created);
     counts.created++;

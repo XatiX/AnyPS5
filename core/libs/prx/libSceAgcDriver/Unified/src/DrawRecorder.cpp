@@ -238,6 +238,7 @@ struct Totals {
     std::uint64_t depthHtileClears = 0;
     std::uint64_t depthHtileOther = 0;
     std::uint64_t depthReseeds = 0;
+    std::uint64_t depthSupersedeSeeds = 0;
     std::uint64_t depthGpuHtileClears = 0;
     std::uint64_t depthGpuHtileRefusals = 0;
     std::uint64_t depthHtileExpanded = 0;
@@ -509,6 +510,11 @@ struct RecordDumpRequest {
     std::string program;
     std::uint32_t every = 1;
 };
+
+std::chrono::steady_clock::time_point processStart() {
+    static const auto start = std::chrono::steady_clock::now();
+    return start;
+}
 
 const RecordDumpRequest& recordDumpRequest() {
     static const RecordDumpRequest request = [] {
@@ -1257,6 +1263,7 @@ public:
     }
 
     void noteUses(const Resolve::ResolvedDraw& work, const char* what) {
+        traceSourceWrites(work);
         if (!Downgrades::Active() || work.stages.empty()) return;
         const auto code = work.stages.back().program.codeAddress;
         if (!usesNoted.insert(code).second) return;
@@ -1314,7 +1321,7 @@ public:
             line += "; HTILE checks finished: every tile cleared " + std::to_string(outcomes.cleared) + ", no tile cleared " + std::to_string(outcomes.untouched) + ", tiles disagree (not applied) " + std::to_string(outcomes.mixed);
         }
         line += "; records written back for buffer readers " + std::to_string(totals.readerWriteBacks) + " (" + std::to_string(totals.readerWriteBackBytes >> 20u) + " MiB, " + std::to_string(totals.readerWriteBackRefusals) + " refused, " + std::to_string(totals.readerStale) + " skipped: memory changed since their GPU write), handed over before a buffer writer " + std::to_string(totals.writerHandOvers);
-        line += "; records handed to another shape " + std::to_string(totals.shapesHandedOver) + " (" + std::to_string(totals.writeBacks) + " written back into the mirror, " + std::to_string(totals.writeBackBytes >> 20u) + " MiB, " + std::to_string(totals.writeBackRefusals) + " refused, " + std::to_string(totals.staleShapes) + " not written back: memory changed since their GPU write, " + std::to_string(totals.writeBacksUnserved) + " retired unwritten: the write-back was refused); draws with a recode depth record " + std::to_string(totals.depthRecordDraws) + " (" + std::to_string(Images::Depths().Size()) + " records, " + std::to_string(Images::Depths().Counts().cleared) + " started from their clear value, " + std::to_string(Images::Depths().Counts().refused) + " refused, " + std::to_string(Images::Depths().Counts().superseded) + " superseded by a record over their memory, " + std::to_string(Images::Depths().Counts().htileWrites) + " driver writes over HTILE, " + std::to_string(totals.depthRecordsSampled) + " sampled reads of them, " + std::to_string(totals.depthBufferReads) + " buffer reads of their memory, " + std::to_string(totals.depthWriteBacks) + " depth write-backs into the mirror for them, " + std::to_string(totals.depthWriteBackRefusals) + " refused; " + std::to_string(totals.depthSeeds) + " started from memory (" + std::to_string(totals.depthSeedRefusals) + " refused), HTILE writes re-cleared " + std::to_string(totals.depthHtileClears) + ", HTILE writes without a clear " + std::to_string(totals.depthHtileOther) + "; CPU writes over their planes " + std::to_string(Images::Depths().Counts().cpuPlaneWrites) + ", seeded again from memory " + std::to_string(totals.depthReseeds) + "; GPU writes over HTILE " + std::to_string(Images::Depths().Counts().gpuHtileWrites) +", checked for a clear on the GPU " + std::to_string(totals.depthGpuHtileClears) + " (" + std::to_string(totals.depthGpuHtileRefusals) + " refused), HTILE set to expanded after a clear " + std::to_string(totals.depthHtileExpanded) + " (" + std::to_string(totals.depthHtileExpandRefusals) + " refused)); targets and sampled views served as layers of a containing record " + std::to_string(totals.layerTargets) + ", records copied in as layers of a new record " + std::to_string(totals.layersAbsorbed) + " (" + std::to_string(totals.layersAbsorbedOverChanges) + " over a change note); CPU-content records detiled again after their memory changed " + std::to_string(totals.recordsRefreshed);
+        line += "; records handed to another shape " + std::to_string(totals.shapesHandedOver) + " (" + std::to_string(totals.writeBacks) + " written back into the mirror, " + std::to_string(totals.writeBackBytes >> 20u) + " MiB, " + std::to_string(totals.writeBackRefusals) + " refused, " + std::to_string(totals.staleShapes) + " not written back: memory changed since their GPU write, " + std::to_string(totals.writeBacksUnserved) + " retired unwritten: the write-back was refused); draws with a recode depth record " + std::to_string(totals.depthRecordDraws) + " (" + std::to_string(Images::Depths().Size()) + " records, " + std::to_string(Images::Depths().Counts().cleared) + " started from their clear value, " + std::to_string(Images::Depths().Counts().refused) + " refused, " + std::to_string(Images::Depths().Counts().superseded) + " superseded by a record over their memory, " + std::to_string(Images::Depths().Counts().htileWrites) + " driver writes over HTILE, " + std::to_string(totals.depthRecordsSampled) + " sampled reads of them, " + std::to_string(totals.depthBufferReads) + " buffer reads of their memory, " + std::to_string(totals.depthWriteBacks) + " depth write-backs into the mirror for them, " + std::to_string(totals.depthWriteBackRefusals) + " refused; " + std::to_string(totals.depthSeeds) + " started from memory (" + std::to_string(totals.depthSeedRefusals) + " refused), HTILE writes re-cleared " + std::to_string(totals.depthHtileClears) + ", HTILE writes without a clear " + std::to_string(totals.depthHtileOther) + "; CPU writes over their planes " + std::to_string(Images::Depths().Counts().cpuPlaneWrites) + ", seeded again from memory " + std::to_string(totals.depthReseeds) + ", seeded from a superseded record " + std::to_string(totals.depthSupersedeSeeds) + "; GPU writes over HTILE " + std::to_string(Images::Depths().Counts().gpuHtileWrites) +", checked for a clear on the GPU " + std::to_string(totals.depthGpuHtileClears) + " (" + std::to_string(totals.depthGpuHtileRefusals) + " refused), HTILE set to expanded after a clear " + std::to_string(totals.depthHtileExpanded) + " (" + std::to_string(totals.depthHtileExpandRefusals) + " refused)); targets and sampled views served as layers of a containing record " + std::to_string(totals.layerTargets) + ", records copied in as layers of a new record " + std::to_string(totals.layersAbsorbed) + " (" + std::to_string(totals.layersAbsorbedOverChanges) + " over a change note); CPU-content records detiled again after their memory changed " + std::to_string(totals.recordsRefreshed);
         line += "; flips from a GPU-written record " + std::to_string(flipsFromNewRecords.load(std::memory_order_relaxed)) + ", over a record not GPU-written " + std::to_string(flipsFromOldRecords.load(std::memory_order_relaxed)) + ", with no record " + std::to_string(flipsWithoutRecords.load(std::memory_order_relaxed)) + ", presented straight from the record " + std::to_string(flipsPresentedFromRecords.load(std::memory_order_relaxed));
         {
             auto& landings = batchLandings();
@@ -1933,7 +1940,14 @@ private:
             const auto zero = ringAddress != 0u ? ringAddress + RingBytes : 0u;
             if (address == 0u || bytes == 0u) {
                 totals.knownSkipped++;
-                noteKnown(stage, Downgrades::Kind::KnownNull, index, address, bytes, 0u);
+                if (Downgrades::Active()) {
+                    char detail[160] = "not captured";
+                    if (index < known.size()) {
+                        const auto& value = known[index];
+                        std::snprintf(detail, sizeof(detail), "%s %u words, available mask %02x, words %08x %08x %08x %08x", index < infos.size() && infos[index].Pointer() ? "pointer" : "descriptor", value.dwordCount, static_cast<unsigned>(value.availableDwordMask), value.dwords[0], value.dwords[1], value.dwords[2], value.dwords[3]);
+                    }
+                    Downgrades::Note(stage.program.codeAddress, Downgrades::Kind::KnownNull, index, detail);
+                }
                 write(zero, 0u);
                 continue;
             }
@@ -2384,7 +2398,45 @@ private:
         return count;
     }
 
+    static void traceSourceWrites(const Resolve::ResolvedDraw& work) {
+        if (sourcesOfProgram() == 0 || work.stages.empty()) return;
+        static const long long after = [] {
+            const char* value = std::getenv("APS5_RECODE_TRACE_SOURCES_AFTER");
+            return value == nullptr ? 0ll : std::strtoll(value, nullptr, 10);
+        }();
+        if (std::chrono::steady_clock::now() - processStart() < std::chrono::seconds(after)) return;
+        const auto program = Downgrades::ProgramHash(work.stages.back().program.codeAddress);
+        for (std::size_t index = 0; index < work.uses.size(); ++index) {
+            const auto& use = work.uses[index];
+            static std::atomic<std::uint32_t> lines{0};
+            if (!use.write || !sourceTarget(use.address, use.size) || lines.fetch_add(1, std::memory_order_relaxed) >= 3000u) continue;
+            const char* kind = index >= work.imageBegin ? "image" : index >= work.targetBegin && index < work.targetEnd ? "target" : "memory";
+            std::fprintf(stderr, "[recode-source-write] %lld s: program %016llx writes %s 0x%llx+0x%llx\n", static_cast<long long>(std::chrono::duration_cast<std::chrono::seconds>(std::chrono::steady_clock::now() - processStart()).count()), static_cast<unsigned long long>(program), kind, static_cast<unsigned long long>(use.address), static_cast<unsigned long long>(use.size));
+        }
+    }
+
+    void dumpImageReads(const Context& context, const Resolve::ResolvedDraw& work) {
+        static const bool on = std::getenv("APS5_RECODE_DUMP_SAMPLED_BY") != nullptr;
+        auto* table = Resolve::Surfaces();
+        if (!on || table == nullptr || context.recorder == nullptr || work.stages.empty()) return;
+        const auto program = Downgrades::ProgramHash(work.stages.back().program.codeAddress);
+        std::size_t reads = 0;
+        std::size_t matched = 0;
+        for (std::size_t index = work.imageBegin; index < work.uses.size(); ++index) {
+            const auto& use = work.uses[index];
+            if (use.write) continue;
+            ++reads;
+            for (const auto& record : table->Overlapping(use.address, use.size)) {
+                if (record->key.address != use.address) continue;
+                ++matched;
+                maybeDumpSampled(context, *context.recorder, record, program);
+            }
+        }
+        if (seen.insert("image reads " + std::to_string(program)).second && program == std::strtoull(std::getenv("APS5_RECODE_DUMP_SAMPLED_BY"), nullptr, 16)) std::fprintf(stderr, "[recode-dump] dispatch %016llx: %zu image reads, %zu with a record at their address\n", static_cast<unsigned long long>(program), reads, matched);
+    }
+
     bool recordDispatch(const Context& context, const Resolve::ResolvedDraw& dispatch, const std::array<std::uint32_t, 3>& groups, std::string& reason) {
+        dumpImageReads(context, dispatch);
         writtenRecords.clear();
         stageStorageImages.clear();
         writeBackForReaders(context, dispatch);
@@ -2610,18 +2662,19 @@ private:
 
     void maybeDumpRecord(const Context& context, Graphics::Recorder& recorder, const std::shared_ptr<Images::Surface>& record, std::uint64_t program, std::uint32_t writtenLevel = 0) {
         const auto& request = recordDumpRequest();
-        if (record->key.width < request.width || record->key.mips <= 1u || (request.trace && record->key.width != request.width)) return;
+        static const bool single = std::getenv("APS5_RECODE_DUMP_SINGLE") != nullptr;
+        if (record->key.width < request.width || (record->key.mips <= 1u && !single) || (request.trace && record->key.width != request.width)) return;
         const auto now = std::chrono::steady_clock::now();
         if (now - dumpClock < std::chrono::seconds(request.seconds)) return;
         std::string prefix;
         if (request.trace) {
-            if (traceAddress == 0u) traceAddress = record->key.address;
-            if (record->key.address != traceAddress || traceDumps >= 40u) return;
             if (!request.program.empty()) {
                 char hash[20];
                 std::snprintf(hash, sizeof(hash), "%016llx", static_cast<unsigned long long>(program));
                 if (std::string_view(hash).rfind(request.program, 0) != 0) return;
             }
+            if (traceAddress == 0u) traceAddress = record->key.address;
+            if (record->key.address != traceAddress || traceDumps >= 40u) return;
             if (request.every > 1u && traceSeen++ % request.every != 0u) return;
             char tag[48];
             std::snprintf(tag, sizeof(tag), "trace%02u-p%016llx-", traceDumps++, static_cast<unsigned long long>(program));
@@ -2630,7 +2683,10 @@ private:
             return;
         }
         auto* vulkan = dynamic_cast<Images::VulkanSurface*>(record->device.get());
-        if (vulkan == nullptr || vulkan->Compressed()) return;
+        if (vulkan == nullptr || vulkan->Compressed()) {
+            if (seen.insert("dump skipped").second) std::fprintf(stderr, "[recode-dump] record 0x%llx skipped: %s\n", static_cast<unsigned long long>(record->key.address), vulkan == nullptr ? "not a Vulkan surface" : "block-compressed format");
+            return;
+        }
         dumpedRecords.insert(record->key.address);
         const auto elementBytes = Graphics::BytesPerElement(vulkan->Resource().format);
         const auto levels = static_cast<std::uint32_t>(std::max<std::size_t>(vulkan->Geometry().mips.size(), 1u));
@@ -2664,6 +2720,77 @@ private:
         }
         Graphics::RecordMemoryBarrier(context, commands, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT | VK_PIPELINE_STAGE_HOST_BIT, VK_ACCESS_TRANSFER_READ_BIT | VK_ACCESS_TRANSFER_WRITE_BIT, VK_ACCESS_HOST_READ_BIT | VK_ACCESS_MEMORY_WRITE_BIT);
         std::fprintf(stderr, "[recode-dump] record 0x%llx %ux%u %u levels format %u written at %lld s\n", static_cast<unsigned long long>(record->key.address), record->key.width, record->key.height, levels, record->key.format, static_cast<long long>(std::chrono::duration_cast<std::chrono::seconds>(now - dumpClock).count()));
+    }
+
+    void maybeDumpDepth(const Context& context, Graphics::Recorder& recorder, const std::shared_ptr<Images::DepthRecord>& record, std::uint64_t program) {
+        static const std::uint64_t wanted = [] {
+            const char* value = std::getenv("APS5_RECODE_DUMP_DEPTH_BEFORE");
+            return value == nullptr ? std::uint64_t{0} : static_cast<std::uint64_t>(std::strtoull(value, nullptr, 16));
+        }();
+        const auto& request = recordDumpRequest();
+        if (wanted == 0 || program != wanted || request.directory.empty() || !record->Initialized()) return;
+        if (std::chrono::steady_clock::now() - dumpClock < std::chrono::seconds(request.seconds)) return;
+        if (depthDumps >= 6u || depthSeen++ % std::max<std::uint32_t>(request.every, 1u) != 0u) return;
+        const auto& key = record->Key();
+        const auto commands = recorder.Commands();
+        Graphics::RecordMemoryBarrier(context, commands, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT | VK_ACCESS_SHADER_WRITE_BIT | VK_ACCESS_TRANSFER_WRITE_BIT, VK_ACCESS_TRANSFER_READ_BIT);
+        auto buffer = std::make_shared<Graphics::Buffer>(context, static_cast<std::size_t>(key.width) * key.height * 4u, VK_BUFFER_USAGE_TRANSFER_DST_BIT);
+        VkBufferImageCopy region{};
+        region.imageSubresource = {VK_IMAGE_ASPECT_DEPTH_BIT, 0u, 0u, 1u};
+        region.imageExtent = {key.width, key.height, 1u};
+        context.Resolved(&Graphics::DeviceFunctions::cmdCopyImageToBuffer, "vkCmdCopyImageToBuffer")(commands, record->Image(), VK_IMAGE_LAYOUT_GENERAL, buffer->Handle(), 1, &region);
+        Graphics::RecordMemoryBarrier(context, commands, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT | VK_PIPELINE_STAGE_HOST_BIT, VK_ACCESS_TRANSFER_READ_BIT | VK_ACCESS_TRANSFER_WRITE_BIT, VK_ACCESS_HOST_READ_BIT | VK_ACCESS_MEMORY_WRITE_BIT);
+        recorder.Keep(buffer);
+        char name[192];
+        std::snprintf(name, sizeof(name), "depth%02u-p%016llx-record-%llx-%ux%u.f32", depthDumps++, static_cast<unsigned long long>(program), static_cast<unsigned long long>(key.address), key.width, key.height);
+        recorder.OnComplete([buffer, file = request.directory + "/" + name] {
+            auto* out = std::fopen(file.c_str(), "wb");
+            if (out == nullptr) return;
+            buffer->Invalidate();
+            const auto bytes = buffer->Bytes();
+            std::fwrite(bytes.data(), 1, bytes.size(), out);
+            std::fclose(out);
+        });
+    }
+
+    void maybeDumpSampled(const Context& context, Graphics::Recorder& recorder, const std::shared_ptr<Images::Surface>& record, std::uint64_t program) {
+        static const std::uint64_t wanted = [] {
+            const char* value = std::getenv("APS5_RECODE_DUMP_SAMPLED_BY");
+            return value == nullptr ? std::uint64_t{0} : static_cast<std::uint64_t>(std::strtoull(value, nullptr, 16));
+        }();
+        const auto& request = recordDumpRequest();
+        if (wanted == 0 || program != wanted || request.directory.empty()) return;
+        if (std::chrono::steady_clock::now() - dumpClock < std::chrono::seconds(request.seconds)) return;
+        if (sampledDumps.contains(record->key.address) || sampledDumps.size() >= 16u) return;
+        sampledDumps.insert(record->key.address);
+        auto* vulkan = dynamic_cast<Images::VulkanSurface*>(record->device.get());
+        if (vulkan == nullptr || vulkan->Compressed()) {
+            std::fprintf(stderr, "[recode-dump] sampled record 0x%llx skipped: %s\n", static_cast<unsigned long long>(record->key.address), vulkan == nullptr ? "not a Vulkan surface" : "block-compressed format");
+            return;
+        }
+        const auto elementBytes = Graphics::BytesPerElement(vulkan->Resource().format);
+        const auto width = record->key.width;
+        const auto height = record->key.height;
+        const auto commands = recorder.Commands();
+        Graphics::RecordMemoryBarrier(context, commands, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT | VK_ACCESS_SHADER_WRITE_BIT | VK_ACCESS_TRANSFER_WRITE_BIT, VK_ACCESS_TRANSFER_READ_BIT);
+        auto buffer = std::make_shared<Graphics::Buffer>(context, static_cast<std::size_t>(width) * height * elementBytes, VK_BUFFER_USAGE_TRANSFER_DST_BIT);
+        VkBufferImageCopy region{};
+        region.imageSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0u, 0u, 1u};
+        region.imageExtent = {width, height, 1u};
+        context.Resolved(&Graphics::DeviceFunctions::cmdCopyImageToBuffer, "vkCmdCopyImageToBuffer")(commands, vulkan->Image(), VK_IMAGE_LAYOUT_GENERAL, buffer->Handle(), 1, &region);
+        Graphics::RecordMemoryBarrier(context, commands, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT | VK_PIPELINE_STAGE_HOST_BIT, VK_ACCESS_TRANSFER_READ_BIT | VK_ACCESS_TRANSFER_WRITE_BIT, VK_ACCESS_HOST_READ_BIT | VK_ACCESS_MEMORY_WRITE_BIT);
+        recorder.Keep(buffer);
+        char name[192];
+        std::snprintf(name, sizeof(name), "sampled-p%016llx-record-%llx-L0-%ux%u-vk%u.raw", static_cast<unsigned long long>(program), static_cast<unsigned long long>(record->key.address), width, height, static_cast<unsigned>(vulkan->Format()));
+        recorder.OnComplete([buffer, file = request.directory + "/" + name] {
+            auto* out = std::fopen(file.c_str(), "wb");
+            if (out == nullptr) return;
+            buffer->Invalidate();
+            const auto bytes = buffer->Bytes();
+            std::fwrite(bytes.data(), 1, bytes.size(), out);
+            std::fclose(out);
+        });
+        std::fprintf(stderr, "[recode-dump] sampled record 0x%llx %ux%u format %u by %016llx\n", static_cast<unsigned long long>(record->key.address), width, height, record->key.format, static_cast<unsigned long long>(program));
     }
 
     void maybeDumpUpstream(const Context& context, Graphics::Recorder& recorder, const std::shared_ptr<Graphics::StorageTexture>& resident, std::uint64_t program, std::uint32_t level) {
@@ -2926,6 +3053,8 @@ private:
             if (htileClears == nullptr) htileClears = std::make_unique<Images::HtileClears>(context);
             const Images::HtileClear clear{buffer, target.htileAddress - span.origin, bytes, target.htileStencil, target.clearDepth, target.clearStencil};
             if (htileClears->Apply(recorder, record, clear, reason)) {
+                static const bool traced = std::getenv("APS5_RECODE_TRACE_HTILE_CHECKS") != nullptr;
+                if (traced && totals.depthGpuHtileClears < 60u) std::fprintf(stderr, "[recode-htile-check] %llu: before program %016llx on record 0x%llx\n", static_cast<unsigned long long>(totals.depthGpuHtileClears), static_cast<unsigned long long>(Downgrades::ProgramHash(program)), static_cast<unsigned long long>(record->Key().address));
                 totals.depthGpuHtileClears++;
                 if (seen.insert("htile clear checked").second) std::fprintf(stderr, "[recode-depth] first GPU write over HTILE checked for a clear: record 0x%llx htile 0x%llx+0x%llx stencil in tiles %d clear %g/%u\n", static_cast<unsigned long long>(record->Key().address), static_cast<unsigned long long>(target.htileAddress), static_cast<unsigned long long>(bytes), target.htileStencil ? 1 : 0, static_cast<double>(target.clearDepth), static_cast<unsigned>(target.clearStencil));
                 record->SetHtileSaysCleared(true);
@@ -2950,8 +3079,34 @@ private:
         totals.depthHtileExpanded++;
     }
 
+    bool seedFromPredecessors(const Context& context, Graphics::Recorder& recorder, const std::shared_ptr<Images::DepthRecord>& record) {
+        const auto predecessors = record->TakePredecessors();
+        if (predecessors.empty() || !seedsDepth() || !writesBackDepth()) return false;
+        if (surfaceDetiler == nullptr) surfaceDetiler = std::make_unique<Images::SurfaceDetiler>(context);
+        std::string reason;
+        for (const auto& previous : predecessors) {
+            std::vector<std::pair<std::uint64_t, std::uint64_t>> written;
+            if (!surfaceDetiler->WriteBackDepth(recorder, previous, written, reason)) {
+                reason = "writing back the superseded record: " + reason;
+                break;
+            }
+            for (const auto& [begin, size] : written) noteWrittenBack(recorder, begin, size);
+        }
+        if (reason.empty() && surfaceDetiler->SeedDepth(recorder, record, reason)) {
+            if (totals.depthSupersedeSeeds++ == 0u) std::fprintf(stderr, "[recode-depth] first record seeded from the record it superseded: 0x%llx from %zu records\n", static_cast<unsigned long long>(record->Key().address), predecessors.size());
+            static_cast<void>(record->TakeHtileWrite());
+            static_cast<void>(record->TakePlaneWrite());
+            record->SetHtileSaysCleared(false);
+            return true;
+        }
+        totals.depthSeedRefusals++;
+        if (seen.insert("supersede seed: " + reason).second) std::fprintf(stderr, "[recode-depth] first refused seed from a superseded record: %s (record 0x%llx)\n", reason.c_str(), static_cast<unsigned long long>(record->Key().address));
+        return false;
+    }
+
     void startDepth(const Context& context, Graphics::Recorder& recorder, const std::shared_ptr<Images::DepthRecord>& record, const Graphics::DepthTarget& target, std::uint64_t program) {
         const bool fresh = !record->Initialized();
+        if (fresh && seedFromPredecessors(context, recorder, record)) return;
         const bool htileWritten = record->TakeHtileWrite();
         const bool planeWritten = record->TakePlaneWrite();
         if (!fresh && !htileWritten && !planeWritten) return;
@@ -3047,7 +3202,11 @@ private:
             const auto& use = work.uses[index];
             if (!use.write || use.size == 0u || (index >= work.targetBegin && index < work.targetEnd)) continue;
             if (metadataClears != nullptr) metadataClears->NoteWrite(use.address, use.size);
-            if (depth) Images::Depths().NoteGpuHtileWrites(use.address, use.size);
+            if (depth && Images::Depths().NoteGpuHtileWrites(use.address, use.size) != 0u) {
+                static const bool traced = std::getenv("APS5_RECODE_TRACE_HTILE_CHECKS") != nullptr;
+                static std::atomic<std::uint32_t> lines{0};
+                if (traced && !work.stages.empty() && lines.fetch_add(1, std::memory_order_relaxed) < 60u) std::fprintf(stderr, "[recode-htile-write] program %016llx writes 0x%llx+0x%llx over a depth record's HTILE\n", static_cast<unsigned long long>(Downgrades::ProgramHash(work.stages.back().program.codeAddress)), static_cast<unsigned long long>(use.address), static_cast<unsigned long long>(use.size));
+            }
         }
     }
 
@@ -3286,6 +3445,7 @@ private:
                 depthRecord = Images::Depths().Find(context, *state.depth, why);
                 if (depthRecord == nullptr && seen.insert("depth: " + why).second) std::fprintf(stderr, "[recode-depth] first refusal: %s (0x%llx %ux%u format %d samples %u slices %u-%u)", why.c_str(), static_cast<unsigned long long>(state.depth->address), state.depth->extent.width, state.depth->extent.height, static_cast<int>(state.depth->format), state.depth->samples, state.depth->firstSlice, state.depth->lastSlice), std::fputc(10, stderr);
                 if (depthRecord != nullptr) prepareDepth(context, *recorder, depthRecord, *state.depth, recordingProgram);
+                if (depthRecord != nullptr) maybeDumpDepth(context, *recorder, depthRecord, Downgrades::ProgramHash(recordingProgram));
             }
             if (depthRecord != nullptr) {
                 depthRecord->MarkDrawn();
@@ -3903,6 +4063,7 @@ private:
         viewKey.baseArray += layer;
         viewKey.lastArray += layer;
         if (record != nullptr) noteSampledSource(Downgrades::ProgramHash(stage.program.codeAddress), record->key.address, record->key.bytes);
+        if (record != nullptr && context.recorder != nullptr) maybeDumpSampled(context, *context.recorder, record, Downgrades::ProgramHash(stage.program.codeAddress));
         if (record != nullptr && sourcesOfProgram() == 0 && !targetTraceList().empty() && tracedProgram(Downgrades::ProgramHash(stage.program.codeAddress)) && targetTraceLines.fetch_add(1, std::memory_order_relaxed) < (targetTraceList() == "all" ? 20000u : 400u)) {
             std::fprintf(stderr, "[recode-sampled] program %016llx slot %u kind %u 0x%llx %ux%u mips %u view levels %u-%u layers %u-%u format %u -> record 0x%llx mips %u\n", static_cast<unsigned long long>(Downgrades::ProgramHash(stage.program.codeAddress)), deferred.index, deferred.request.kind, static_cast<unsigned long long>(surface.address), surface.width, surface.height, surface.mips, viewKey.baseLevel, viewKey.lastLevel, viewKey.baseArray, viewKey.lastArray, viewKey.format, static_cast<unsigned long long>(record->key.address), record->key.mips);
         }
@@ -3997,8 +4158,11 @@ private:
     std::map<std::uint64_t, MapBuffer> maps;
     std::uint64_t mapBytes = 0;
     std::set<std::string> seen;
-    std::chrono::steady_clock::time_point dumpClock = std::chrono::steady_clock::now();
+    std::chrono::steady_clock::time_point dumpClock = processStart();
     std::set<std::uint64_t> dumpedRecords;
+    std::set<std::uint64_t> sampledDumps;
+    std::uint32_t depthDumps = 0;
+    std::uint32_t depthSeen = 0;
     std::uint64_t traceAddress = 0;
     std::uint32_t traceDumps = 0;
     std::uint32_t traceSeen = 0;
