@@ -76,6 +76,7 @@ void MetadataClears::NoteTarget(const Graphics::ColorTarget& color) {
     if (color.dccAddress == 0u && (color.cmaskAddress == 0u || !color.cmaskFastClear)) return;
     std::lock_guard lock(mutex);
     auto& target = targets[color.address];
+    target.bytes = color.bytes;
     target.dcc = color.dccAddress;
     target.dccKeys = color.dccAddress != 0u ? Graphics::DccKeyBytes(color.bytes) : 0u;
     target.cmask = color.cmaskFastClear ? color.cmaskAddress : 0u;
@@ -101,10 +102,10 @@ void MetadataClears::NoteWrite(std::uint64_t address, std::uint64_t size) {
     }
 }
 
-bool MetadataClears::Pending(std::uint64_t target) const {
+bool MetadataClears::Pending(std::uint64_t target, std::uint64_t bytes) const {
     std::lock_guard lock(mutex);
     const auto found = targets.find(target);
-    return found != targets.end() && (found->second.dccPending || found->second.cmaskPending);
+    return found != targets.end() && found->second.bytes == bytes && (found->second.dccPending || found->second.cmaskPending);
 }
 
 bool MetadataClears::Apply(Graphics::Recorder& recorder, std::uint64_t address, VulkanSurface& surface, std::string& reason) {

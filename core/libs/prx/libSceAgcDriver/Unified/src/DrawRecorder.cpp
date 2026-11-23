@@ -3078,7 +3078,7 @@ private:
     }
 
     void applyMetadataClear(const Context& context, const std::shared_ptr<Images::Surface>& record, std::uint64_t program) {
-        if (metadataClears == nullptr || record == nullptr || context.recorder == nullptr || !metadataClears->Pending(record->key.address)) return;
+        if (metadataClears == nullptr || record == nullptr || context.recorder == nullptr || !metadataClears->Pending(record->key.address, record->key.bytes)) return;
         auto* vulkan = dynamic_cast<Images::VulkanSurface*>(record->device.get());
         auto* table = Resolve::Surfaces();
         if (vulkan == nullptr || table == nullptr) return;
@@ -3114,6 +3114,7 @@ private:
                     totals.readerStale++;
                     continue;
                 }
+                applyMetadataClear(context, record, 0u);
                 if (surfaceDetiler == nullptr) surfaceDetiler = std::make_unique<Images::SurfaceDetiler>(context);
                 std::string reason;
                 if (!surfaceDetiler->WriteBack(*context.recorder, record, reason)) {
@@ -3856,6 +3857,7 @@ private:
     }
 
     bool handOverShape(const Context& context, Images::SurfaceTable& table, const std::shared_ptr<Images::Surface>& record, std::string& why) {
+        applyMetadataClear(context, record, recordingProgram);
         if (record->gpuNewer && table.ChangedSinceWrite(*record)) {
             if (Downgrades::Active() && totals.staleShapes < 16u) {
                 const auto& held = record->key;

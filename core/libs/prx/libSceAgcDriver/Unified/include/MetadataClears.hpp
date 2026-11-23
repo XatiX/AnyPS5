@@ -36,12 +36,13 @@ public:
 
     void NoteTarget(const Graphics::ColorTarget& color);
     void NoteWrite(std::uint64_t address, std::uint64_t size);
-    [[nodiscard]] bool Pending(std::uint64_t target) const;
+    [[nodiscard]] bool Pending(std::uint64_t target, std::uint64_t bytes) const;
     bool Apply(Graphics::Recorder& recorder, std::uint64_t target, VulkanSurface& surface, std::string& reason);
     [[nodiscard]] MetadataCounts TakeCounts();
 
 private:
     struct Target {
+        std::uint64_t bytes = 0;
         std::uint64_t dcc = 0;
         std::uint64_t dccKeys = 0;
         std::uint64_t cmask = 0;
