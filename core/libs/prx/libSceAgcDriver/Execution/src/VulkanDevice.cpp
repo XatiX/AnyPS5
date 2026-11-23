@@ -4331,8 +4331,11 @@ bool VulkanDevice::PresentDisplayBuffer(const DisplayBuffer& buffer, const Displ
             }
         }
     }
+    const bool existingResidents = Unified::Record::PresentsExistingResidents();
+#else
+    const bool existingResidents = true;
 #endif
-    if (recordImage == VK_NULL_HANDLE && !NoResidentPresent()) {
+    if (recordImage == VK_NULL_HANDLE && !NoResidentPresent() && existingResidents) {
         bool pending = false;
         resident = PresentableResident(graphicsContext(), buffer, filter, pending, convert, layer);
         if (resident != nullptr && buffer.dccAddress != 0 && !ResidentServesDisplay(*resident, buffer)) {

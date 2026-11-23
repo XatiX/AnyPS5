@@ -38,6 +38,7 @@ struct DisplaySource {
     std::shared_ptr<void> owner;
 };
 [[nodiscard]] std::optional<DisplaySource> DisplayRecord(std::uint64_t address, std::uint64_t bytes);
+[[nodiscard]] bool PresentsExistingResidents();
 [[nodiscard]] bool LandingsPending();
 [[nodiscard]] bool RecordsHtileClears();
 void LandAfterBatch(Graphics::Recorder& recorder, std::function<void()> landing);

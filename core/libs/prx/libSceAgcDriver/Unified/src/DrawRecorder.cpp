@@ -4376,6 +4376,11 @@ std::optional<DisplaySource> DisplayRecord(std::uint64_t address, std::uint64_t 
     return std::nullopt;
 }
 
+bool PresentsExistingResidents() {
+    static const bool presents = !RecordActive() || std::getenv("APS5_RECODE_EXISTING_PRESENT") != nullptr;
+    return presents;
+}
+
 void FlipSource(const Graphics::Context& context, std::uint64_t address, std::uint64_t bytes) {
     auto* table = Resolve::Surfaces();
     if (table != nullptr && RecordActive()) {
