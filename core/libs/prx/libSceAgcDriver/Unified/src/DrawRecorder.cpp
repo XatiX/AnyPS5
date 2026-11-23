@@ -585,26 +585,26 @@ std::uint64_t sourcesOfProgram() {
 }
 
 std::mutex sourcesMutex;
-std::vector<std::uint64_t> sourceRecords;
+std::vector<std::pair<std::uint64_t, std::uint64_t>> sourceRecords;
 std::atomic<std::uint32_t> sourceTargetLines{0};
 
-void noteSampledSource(std::uint64_t program, std::uint64_t record) {
+void noteSampledSource(std::uint64_t program, std::uint64_t record, std::uint64_t bytes) {
     if (sourcesOfProgram() == 0 || program != sourcesOfProgram()) return;
     std::lock_guard lock(sourcesMutex);
-    if (std::ranges::find(sourceRecords, record) == sourceRecords.end() && sourceRecords.size() < 64u) {
-        sourceRecords.push_back(record);
-        std::fprintf(stderr, "[recode-source] program %016llx samples record 0x%llx\n", static_cast<unsigned long long>(program), static_cast<unsigned long long>(record));
+    if (std::ranges::find(sourceRecords, std::pair{record, bytes}) == sourceRecords.end() && sourceRecords.size() < 64u) {
+        sourceRecords.emplace_back(record, bytes);
+        std::fprintf(stderr, "[recode-source] program %016llx samples record 0x%llx+0x%llx\n", static_cast<unsigned long long>(program), static_cast<unsigned long long>(record), static_cast<unsigned long long>(bytes));
     }
 }
 
-bool sourceTarget(std::uint64_t record) {
+bool sourceTarget(std::uint64_t record, std::uint64_t bytes) {
     if (sourcesOfProgram() == 0) return false;
     std::lock_guard lock(sourcesMutex);
-    return std::ranges::find(sourceRecords, record) != sourceRecords.end() && sourceTargetLines.fetch_add(1, std::memory_order_relaxed) < 2000u;
+    return std::ranges::any_of(sourceRecords, [&](const auto& source) { return record < source.first + source.second && source.first < record + bytes; }) && sourceTargetLines.fetch_add(1, std::memory_order_relaxed) < 4000u;
 }
 
 bool traceTargetRecord(std::uint64_t address, std::uint64_t bytes) {
-    if (sourcesOfProgram() != 0) return sourceTarget(address);
+    if (sourcesOfProgram() != 0) return sourceTarget(address, bytes);
     const auto wanted = targetTraceAddress();
     if (wanted == 0) return targetTraceLines.fetch_add(1, std::memory_order_relaxed) < (targetTraceList() == "all" ? 20000u : 400u);
     return wanted >= address && wanted < address + bytes;
@@ -2408,6 +2408,7 @@ private:
             auto record = ownsImages() ? ownedStorage(context, deferred.request, slot, stage.program.codeAddress) : Resolve::BindDeferredRecord(deferred.request, slot);
             if (record == nullptr && Downgrades::Active() && Resolve::StorageRecordShape(deferred.request)) Downgrades::Note(stage.program.codeAddress, Downgrades::Kind::StorageRecordMissing, deferred.index, "bound from the existing cache");
             const bool storageWritten = (deferred.request.flags & Heap::RequestFlag::Written) != 0u;
+            if (record != nullptr && storageWritten && sourceTarget(record->key.address, record->key.bytes)) std::fprintf(stderr, "[recode-target] program %016llx storage -> record 0x%llx+0x%llx %ux%u mips %u dimension %u\n", static_cast<unsigned long long>(Downgrades::ProgramHash(stage.program.codeAddress)), static_cast<unsigned long long>(record->key.address), static_cast<unsigned long long>(record->key.bytes), record->key.width, record->key.height, record->key.mips, record->key.dimension);
             if (record != nullptr) {
                 stage.slots[deferred.index] = slot;
                 if (context.recorder != nullptr) context.recorder->Keep(record);
@@ -3901,7 +3902,7 @@ private:
         auto viewKey = key->view;
         viewKey.baseArray += layer;
         viewKey.lastArray += layer;
-        if (record != nullptr) noteSampledSource(Downgrades::ProgramHash(stage.program.codeAddress), record->key.address);
+        if (record != nullptr) noteSampledSource(Downgrades::ProgramHash(stage.program.codeAddress), record->key.address, record->key.bytes);
         if (record != nullptr && sourcesOfProgram() == 0 && !targetTraceList().empty() && tracedProgram(Downgrades::ProgramHash(stage.program.codeAddress)) && targetTraceLines.fetch_add(1, std::memory_order_relaxed) < (targetTraceList() == "all" ? 20000u : 400u)) {
             std::fprintf(stderr, "[recode-sampled] program %016llx slot %u kind %u 0x%llx %ux%u mips %u view levels %u-%u layers %u-%u format %u -> record 0x%llx mips %u\n", static_cast<unsigned long long>(Downgrades::ProgramHash(stage.program.codeAddress)), deferred.index, deferred.request.kind, static_cast<unsigned long long>(surface.address), surface.width, surface.height, surface.mips, viewKey.baseLevel, viewKey.lastLevel, viewKey.baseArray, viewKey.lastArray, viewKey.format, static_cast<unsigned long long>(record->key.address), record->key.mips);
         }
