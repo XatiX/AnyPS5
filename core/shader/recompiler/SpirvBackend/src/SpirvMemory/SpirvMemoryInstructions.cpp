@@ -214,7 +214,7 @@ std::uint32_t GuestAddressLow(SpirvValueEmitContext& ctx, const IrValue& inst, c
 
 std::array<std::uint32_t, 4> ReadBdaDwords(SpirvValueEmitContext& ctx, const IrValue& inst, const MemoryInfo& mem, std::uint32_t dwords, std::uint32_t used) {
     const auto lookup = [&] { return EmitBdaDwordReads(ctx, inst, GuestAddressBase(ctx, inst, mem), mem.offset, dwords, false, used); };
-    if (const auto known = KnownBdaAnchor(ctx.state, mem)) return EmitBoundedBdaRead(ctx.state, inst, *known, GuestAddressLow(ctx, inst, mem), static_cast<std::int32_t>(mem.offset), 32u, dwords, used);
+    if (const auto known = KnownBdaAnchor(ctx.state, mem)) return EmitKnownOrLookup(ctx.state, inst, *known, GuestAddressLow(ctx, inst, mem), static_cast<std::int32_t>(mem.offset), 32u, dwords, used, lookup);
     const auto* anchor = FindBdaAnchor(ctx.state, inst);
     if (anchor == nullptr) return lookup();
     return EmitAnchoredBdaRead(ctx.state, inst, *anchor, GuestAddressLow(ctx, inst, mem), static_cast<std::int32_t>(mem.offset), 32u, dwords, used, lookup);
@@ -224,7 +224,7 @@ std::uint32_t ReadBda(SpirvValueEmitContext& ctx, const IrValue& inst, const Mem
     const auto lookup = [&] { return std::array<std::uint32_t, 4>{EmitBdaRead(ctx, inst, GuestAddress(ctx, inst, mem), bits)}; };
     auto immediate = mem.offset;
     if (mem.kind == ResourceKind::ScalarAddress) immediate &= ~3u;
-    if (const auto known = KnownBdaAnchor(ctx.state, mem)) return EmitBoundedBdaRead(ctx.state, inst, *known, GuestAddressLow(ctx, inst, mem), static_cast<std::int32_t>(immediate), bits, 1u, 1u)[0];
+    if (const auto known = KnownBdaAnchor(ctx.state, mem)) return EmitKnownOrLookup(ctx.state, inst, *known, GuestAddressLow(ctx, inst, mem), static_cast<std::int32_t>(immediate), bits, 1u, 1u, lookup)[0];
     const auto* anchor = FindBdaAnchor(ctx.state, inst);
     if (anchor == nullptr) return lookup()[0];
     return EmitAnchoredBdaRead(ctx.state, inst, *anchor, GuestAddressLow(ctx, inst, mem), static_cast<std::int32_t>(immediate), bits, 1u, 1u, lookup)[0];

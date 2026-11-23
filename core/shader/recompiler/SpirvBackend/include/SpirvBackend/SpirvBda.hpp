@@ -61,6 +61,7 @@ struct KnownBdaTarget {
 std::optional<KnownBdaTarget> KnownBdaTargetOf(SpirvValueEmitContext& ctx, const IrValue& inst, std::uint32_t base, std::uint32_t address, std::uint32_t bytes);
 void EmitKnownBdaWrite(SpirvValueEmitContext& ctx, const IrValue& inst, std::uint32_t base, std::uint32_t address, std::uint32_t value, std::uint32_t bits);
 std::array<std::uint32_t, 4> EmitBoundedBdaRead(SpirvEmitterState& state, const IrValue& inst, const SpirvEmitterState::BdaAnchor& anchor, std::uint32_t low, std::int32_t immediate, std::uint32_t bits, std::uint32_t dwords, std::uint32_t usedDwords);
+std::array<std::uint32_t, 4> EmitKnownOrLookup(SpirvEmitterState& state, const IrValue& inst, const SpirvEmitterState::BdaAnchor& anchor, std::uint32_t low, std::int32_t immediate, std::uint32_t bits, std::uint32_t dwords, std::uint32_t usedDwords, const std::function<std::array<std::uint32_t, 4>()>& lookup);
 std::uint32_t AddBdaImmediate(SpirvValueEmitContext& ctx, const IrValue& inst, std::uint32_t address, std::int32_t immediate);
 
 }

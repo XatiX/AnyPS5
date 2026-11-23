@@ -703,6 +703,37 @@ std::optional<SpirvEmitterState::BdaAnchor> KnownBdaAnchor(SpirvEmitterState& st
     return anchor;
 }
 
+bool KnownLookupFallback(const SpirvEmitterState& state) {
+    static const bool off = std::getenv("APS5_RECODE_NO_KNOWN_FALLBACK") != nullptr;
+    return !off && state.program.Metadata().directResources;
+}
+
+std::array<std::uint32_t, 4> EmitKnownOrLookup(SpirvEmitterState& state, const IrValue& inst, const SpirvEmitterState::BdaAnchor& anchor, std::uint32_t low, std::int32_t immediate, std::uint32_t bits, std::uint32_t dwords, std::uint32_t usedDwords, const std::function<std::array<std::uint32_t, 4>()>& lookup) {
+    if (!KnownLookupFallback(state)) return EmitBoundedBdaRead(state, inst, anchor, low, immediate, bits, dwords, usedDwords);
+    const auto u32 = TypeU32(state);
+    const auto captured = Binary(state, spv::OpINotEqual, TypeBool(state), anchor.device, BdaConstant(state, 0u));
+    const auto knownLabel = state.module.AllocateId();
+    const auto lookupLabel = state.module.AllocateId();
+    const auto merge = state.module.AllocateId();
+    state.module.AddFunction(spv::OpSelectionMerge, merge, spv::SelectionControlMaskNone);
+    state.module.AddFunction(spv::OpBranchConditional, captured, knownLabel, lookupLabel);
+    EmitLabel(state, knownLabel);
+    const auto knownValues = EmitBoundedBdaRead(state, inst, anchor, low, immediate, bits, dwords, usedDwords);
+    const auto knownExit = state.currentLabel;
+    state.module.AddFunction(spv::OpBranch, merge);
+    EmitLabel(state, lookupLabel);
+    const auto lookupValues = lookup();
+    const auto lookupExit = state.currentLabel;
+    state.module.AddFunction(spv::OpBranch, merge);
+    EmitLabel(state, merge);
+    std::array<std::uint32_t, 4> values{};
+    for (std::size_t index = 0; index < values.size(); ++index) {
+        values[index] = state.module.AllocateId();
+        state.module.AddFunction(spv::OpPhi, u32, values[index], knownValues[index], knownExit, lookupValues[index] != 0u ? lookupValues[index] : ConstantU32(state, 0u), lookupExit);
+    }
+    return values;
+}
+
 std::array<std::uint32_t, 4> EmitBoundedBdaRead(SpirvEmitterState& state, const IrValue& inst, const SpirvEmitterState::BdaAnchor& anchor, std::uint32_t low, std::int32_t immediate, std::uint32_t bits, std::uint32_t dwords, std::uint32_t usedDwords) {
     if (bits != 8u && bits != 16u && bits != 32u) throw std::runtime_error("unsupported bounded BDA read width");
     if (bits == 32u && (dwords == 0u || dwords > 4u)) throw std::runtime_error("unsupported bounded BDA read dword count");
