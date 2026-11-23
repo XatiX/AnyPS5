@@ -2671,6 +2671,37 @@ private:
         std::fprintf(stderr, "[recode-dump] record 0x%llx %ux%u %u levels format %u written at %lld s\n", static_cast<unsigned long long>(record->key.address), record->key.width, record->key.height, levels, record->key.format, static_cast<long long>(std::chrono::duration_cast<std::chrono::seconds>(now - dumpClock).count()));
     }
 
+    void maybeDumpDepth(const Context& context, Graphics::Recorder& recorder, const std::shared_ptr<Images::DepthRecord>& record, std::uint64_t program) {
+        static const std::uint64_t wanted = [] {
+            const char* value = std::getenv("APS5_RECODE_DUMP_DEPTH_BEFORE");
+            return value == nullptr ? std::uint64_t{0} : static_cast<std::uint64_t>(std::strtoull(value, nullptr, 16));
+        }();
+        const auto& request = recordDumpRequest();
+        if (wanted == 0 || program != wanted || request.directory.empty() || !record->Initialized()) return;
+        if (std::chrono::steady_clock::now() - dumpClock < std::chrono::seconds(request.seconds)) return;
+        if (depthDumps >= 6u || depthSeen++ % std::max<std::uint32_t>(request.every, 1u) != 0u) return;
+        const auto& key = record->Key();
+        const auto commands = recorder.Commands();
+        Graphics::RecordMemoryBarrier(context, commands, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT | VK_ACCESS_SHADER_WRITE_BIT | VK_ACCESS_TRANSFER_WRITE_BIT, VK_ACCESS_TRANSFER_READ_BIT);
+        auto buffer = std::make_shared<Graphics::Buffer>(context, static_cast<std::size_t>(key.width) * key.height * 4u, VK_BUFFER_USAGE_TRANSFER_DST_BIT);
+        VkBufferImageCopy region{};
+        region.imageSubresource = {VK_IMAGE_ASPECT_DEPTH_BIT, 0u, 0u, 1u};
+        region.imageExtent = {key.width, key.height, 1u};
+        context.Resolved(&Graphics::DeviceFunctions::cmdCopyImageToBuffer, "vkCmdCopyImageToBuffer")(commands, record->Image(), VK_IMAGE_LAYOUT_GENERAL, buffer->Handle(), 1, &region);
+        Graphics::RecordMemoryBarrier(context, commands, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT | VK_PIPELINE_STAGE_HOST_BIT, VK_ACCESS_TRANSFER_READ_BIT | VK_ACCESS_TRANSFER_WRITE_BIT, VK_ACCESS_HOST_READ_BIT | VK_ACCESS_MEMORY_WRITE_BIT);
+        recorder.Keep(buffer);
+        char name[192];
+        std::snprintf(name, sizeof(name), "depth%02u-p%016llx-record-%llx-%ux%u.f32", depthDumps++, static_cast<unsigned long long>(program), static_cast<unsigned long long>(key.address), key.width, key.height);
+        recorder.OnComplete([buffer, file = request.directory + "/" + name] {
+            auto* out = std::fopen(file.c_str(), "wb");
+            if (out == nullptr) return;
+            buffer->Invalidate();
+            const auto bytes = buffer->Bytes();
+            std::fwrite(bytes.data(), 1, bytes.size(), out);
+            std::fclose(out);
+        });
+    }
+
     void maybeDumpSampled(const Context& context, Graphics::Recorder& recorder, const std::shared_ptr<Images::Surface>& record, std::uint64_t program) {
         static const std::uint64_t wanted = [] {
             const char* value = std::getenv("APS5_RECODE_DUMP_SAMPLED_BY");
@@ -3359,6 +3390,7 @@ private:
                 depthRecord = Images::Depths().Find(context, *state.depth, why);
                 if (depthRecord == nullptr && seen.insert("depth: " + why).second) std::fprintf(stderr, "[recode-depth] first refusal: %s (0x%llx %ux%u format %d samples %u slices %u-%u)", why.c_str(), static_cast<unsigned long long>(state.depth->address), state.depth->extent.width, state.depth->extent.height, static_cast<int>(state.depth->format), state.depth->samples, state.depth->firstSlice, state.depth->lastSlice), std::fputc(10, stderr);
                 if (depthRecord != nullptr) prepareDepth(context, *recorder, depthRecord, *state.depth, recordingProgram);
+                if (depthRecord != nullptr) maybeDumpDepth(context, *recorder, depthRecord, Downgrades::ProgramHash(recordingProgram));
             }
             if (depthRecord != nullptr) {
                 depthRecord->MarkDrawn();
@@ -4074,6 +4106,8 @@ private:
     std::chrono::steady_clock::time_point dumpClock = std::chrono::steady_clock::now();
     std::set<std::uint64_t> dumpedRecords;
     std::set<std::uint64_t> sampledDumps;
+    std::uint32_t depthDumps = 0;
+    std::uint32_t depthSeen = 0;
     std::uint64_t traceAddress = 0;
     std::uint32_t traceDumps = 0;
     std::uint32_t traceSeen = 0;
