@@ -2,12 +2,15 @@
 #define CORE_LIBS_PRX_LIBSCEAGCDRIVER_UNIFIED_INCLUDE_PAGETABLE_HPP
 
 #include <array>
+#include <atomic>
 #include <cstddef>
 #include <cstdint>
 #include <functional>
 #include <memory>
 #include <mutex>
+#include <span>
 #include <unordered_map>
+#include <utility>
 #include <vector>
 
 namespace AgcDriver::Unified {
@@ -45,6 +48,18 @@ struct PageTableCounts {
     std::uint64_t unchangedBusy = 0;
     std::uint64_t gpuOwnedPages = 0;
     std::uint64_t gpuWrittenPages = 0;
+    std::uint64_t adjacentFaults = 0;
+    std::uint64_t chunkFirstFaults = 0;
+    std::uint64_t grownFaults = 0;
+    std::uint64_t grownPages = 0;
+    std::uint64_t wholeFaults = 0;
+    std::uint64_t unprovenUnchanged = 0;
+    std::uint64_t unprovenChanged = 0;
+};
+
+struct UnprovenPage {
+    std::uint64_t page = 0;
+    std::uint64_t hash = 0;
 };
 
 struct GpuTake {
@@ -86,10 +101,30 @@ public:
     [[nodiscard]] bool RegionDirty(std::uint64_t address) const;
     [[nodiscard]] std::size_t DirtyPages() const;
     [[nodiscard]] PageTableCounts Counts() const;
+    [[nodiscard]] bool BeginWriteFault(std::uint64_t address);
+    void EndWriteFault(std::uint64_t address);
+    using Hasher = bool (*)(std::uint64_t page, std::uint64_t& hash);
+    void SetHasher(Hasher next) { hasher = next; }
+    [[nodiscard]] std::vector<DirtyRange> GrowWriteFault(std::uint64_t address);
+    void EndGrow(std::span<const DirtyRange> runs);
+    void OpenWhole(std::uint64_t address, std::uint64_t size);
+    [[nodiscard]] std::vector<UnprovenPage> TakeRearmedUnproven();
+    static constexpr std::size_t GrowChunkPages = 16;
+    static constexpr std::size_t WholeLimitPages = 256;
 
 private:
+    static constexpr std::size_t LeafBits = 13;
+    static constexpr std::size_t LeafRegions = std::size_t{1} << LeafBits;
+    static constexpr std::size_t LeafCount = std::size_t{1} << 13;
+
     struct Region {
-        std::array<PageState, RegionPages> states{};
+        std::array<std::atomic<PageState>, RegionPages> states{};
+        std::array<std::atomic<std::uint64_t>, RegionPages / 64> faulted{};
+        std::array<std::atomic<std::uint64_t>, RegionPages / 64> opening{};
+        std::atomic<bool> hasFaults{false};
+        std::array<std::atomic<std::uint64_t>, RegionPages / 64> unproven{};
+        std::array<std::atomic<std::uint64_t>, RegionPages / 64> whole{};
+        std::array<std::uint64_t, RegionPages> openHash{};
         std::array<std::uint8_t, RegionPages> streak{};
         std::array<std::uint32_t, RegionPages> busyUntil{};
         std::array<std::uint32_t, RegionPages> lastConsume{};
@@ -104,16 +139,35 @@ private:
         std::uint32_t unreportedPages = 0;
     };
 
+    struct Leaf {
+        std::array<std::atomic<Region*>, LeafRegions> regions{};
+    };
+
     Region* regionOf(std::uint64_t page, bool create);
     const Region* regionOf(std::uint64_t page) const;
-    void setState(std::uint64_t page, PageState next);
+    Region* tracked(std::uint64_t page) const;
+    PageState setState(std::uint64_t page, PageState next);
+    void account(Region& region, std::size_t slot, PageState state, PageState next);
+    void settle(Region& region, std::uint64_t page, bool listed);
+    void drainFaults();
     void list(std::uint64_t page);
     void unlist(std::uint64_t page);
     static Protection protectionOf(PageState state);
     static void appendChange(std::vector<ProtectionChange>& changes, std::uint64_t page, Protection protection);
 
     mutable std::mutex mutex;
-    std::unordered_map<std::uint64_t, std::unique_ptr<Region>> regions;
+    std::array<std::atomic<Leaf*>, LeafCount> leaves{};
+    std::vector<std::unique_ptr<Leaf>> ownedLeaves;
+    std::vector<std::pair<std::uint64_t, std::unique_ptr<Region>>> regions;
+    std::unordered_map<std::uint64_t, Region*> farRegions;
+    std::atomic<std::uint64_t> pendingFaults{0};
+    Hasher hasher = nullptr;
+    std::atomic<std::uint64_t> grownFaults{0};
+    std::atomic<std::uint64_t> grownPages{0};
+    std::atomic<std::uint64_t> wholeFaults{0};
+    std::vector<UnprovenPage> rearmedUnproven;
+    std::atomic<std::uint64_t> adjacentFaults{0};
+    std::atomic<std::uint64_t> chunkFirstFaults{0};
     std::vector<std::uint64_t> dirty;
     std::uint32_t consumeEpoch = 0;
     std::uint32_t frameEpoch = 0;

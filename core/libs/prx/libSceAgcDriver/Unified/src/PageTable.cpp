@@ -1,5 +1,8 @@
 #include "prx/libSceAgcDriver/Unified/include/PageTable.hpp"
 #include <algorithm>
+#include <bit>
+#include <thread>
+#include <utility>
 
 namespace AgcDriver::Unified {
 
@@ -19,17 +22,41 @@ std::size_t slotOf(std::uint64_t page) {
 
 }
 
+PageTable::Region* PageTable::tracked(std::uint64_t page) const {
+    const auto index = page / RegionPages;
+    if (index >= LeafCount * LeafRegions) return nullptr;
+    const auto* leaf = leaves[index >> LeafBits].load(std::memory_order_acquire);
+    return leaf == nullptr ? nullptr : leaf->regions[index & (LeafRegions - 1)].load(std::memory_order_acquire);
+}
+
 PageTable::Region* PageTable::regionOf(std::uint64_t page, bool create) {
     const auto index = page / RegionPages;
-    const auto found = regions.find(index);
-    if (found != regions.end()) return found->second.get();
+    const bool far = index >= LeafCount * LeafRegions;
+    if (far) {
+        if (const auto found = farRegions.find(index); found != farRegions.end()) return found->second;
+    } else if (auto* found = tracked(page)) {
+        return found;
+    }
     if (!create) return nullptr;
-    return regions.emplace(index, std::make_unique<Region>()).first->second.get();
+    auto* region = regions.emplace_back(index, std::make_unique<Region>()).second.get();
+    if (far) {
+        farRegions.emplace(index, region);
+        return region;
+    }
+    auto* leaf = leaves[index >> LeafBits].load(std::memory_order_acquire);
+    if (leaf == nullptr) {
+        leaf = ownedLeaves.emplace_back(std::make_unique<Leaf>()).get();
+        leaves[index >> LeafBits].store(leaf, std::memory_order_release);
+    }
+    leaf->regions[index & (LeafRegions - 1)].store(region, std::memory_order_release);
+    return region;
 }
 
 const PageTable::Region* PageTable::regionOf(std::uint64_t page) const {
-    const auto found = regions.find(page / RegionPages);
-    return found == regions.end() ? nullptr : found->second.get();
+    const auto index = page / RegionPages;
+    if (index < LeafCount * LeafRegions) return tracked(page);
+    const auto found = farRegions.find(index);
+    return found == farRegions.end() ? nullptr : found->second;
 }
 
 Protection PageTable::protectionOf(PageState state) {
@@ -74,28 +101,170 @@ void PageTable::unlist(std::uint64_t page) {
     --region->dirtyPages;
 }
 
-void PageTable::setState(std::uint64_t page, PageState next) {
-    auto* region = regionOf(page, true);
-    auto& state = region->states[slotOf(page)];
+void PageTable::account(Region& region, std::size_t slot, PageState state, PageState next) {
     if (state == PageState::GpuOwned && next != PageState::GpuOwned) --counts.gpuOwnedPages;
     if (state != PageState::GpuOwned && next == PageState::GpuOwned) ++counts.gpuOwnedPages;
-    const auto tracked = [](PageState value) { return value == PageState::CpuClean || value == PageState::CpuDirty; };
-    if (tracked(state) != tracked(next)) tracked(next) ? ++region->trackedPages : --region->trackedPages;
+    const auto followed = [](PageState value) { return value == PageState::CpuClean || value == PageState::CpuDirty; };
+    if (followed(state) != followed(next)) followed(next) ? ++region.trackedPages : --region.trackedPages;
     const bool dirtyChanged = (state == PageState::CpuDirty) != (next == PageState::CpuDirty);
-    if (dirtyChanged) next == PageState::CpuDirty ? ++region->writablePages : --region->writablePages;
-    if (dirtyChanged || (!tracked(state) && tracked(next))) {
-        const auto slot = slotOf(page);
-        auto& word = region->unreported[slot / 64];
-        const auto bit = std::uint64_t{1} << (slot % 64);
+    if (dirtyChanged) next == PageState::CpuDirty ? ++region.writablePages : --region.writablePages;
+    const auto bit = std::uint64_t{1} << (slot % 64);
+    if (dirtyChanged || (!followed(state) && followed(next))) {
+        auto& word = region.unreported[slot / 64];
         if ((word & bit) == 0) {
             word |= bit;
-            ++region->unreportedPages;
+            ++region.unreportedPages;
         }
-        if (next == PageState::CpuDirty && (state == PageState::Reserved || state == PageState::Untracked)) region->written[slot / 64] &= ~bit;
-        else if (next == PageState::CpuDirty) region->written[slot / 64] |= bit;
+        if (next == PageState::CpuDirty && (state == PageState::Reserved || state == PageState::Untracked)) region.written[slot / 64] &= ~bit;
+        else if (next == PageState::CpuDirty) region.written[slot / 64] |= bit;
     }
-    if (!tracked(next) || next == PageState::CpuDirty) region->device[slotOf(page) / 64] &= ~(std::uint64_t{1} << (slotOf(page) % 64));
-    state = next;
+    if (!followed(next) || next == PageState::CpuDirty) region.device[slot / 64] &= ~bit;
+}
+
+void PageTable::settle(Region& region, std::uint64_t page, bool listed) {
+    const auto slot = slotOf(page);
+    const auto bit = std::uint64_t{1} << (slot % 64);
+    while ((region.opening[slot / 64].load(std::memory_order_acquire) & bit) != 0) std::this_thread::yield();
+    if ((region.faulted[slot / 64].load(std::memory_order_acquire) & bit) == 0) return;
+    region.faulted[slot / 64].fetch_and(~bit, std::memory_order_acq_rel);
+    pendingFaults.fetch_sub(1, std::memory_order_acq_rel);
+    ++counts.writeFaults;
+    account(region, slot, PageState::CpuClean, PageState::CpuDirty);
+    if (listed && region.states[slot].load(std::memory_order_acquire) == PageState::CpuDirty) list(page);
+}
+
+void PageTable::drainFaults() {
+    if (pendingFaults.load(std::memory_order_acquire) == 0) return;
+    for (std::size_t at = 0; at < regions.size(); ++at) {
+        auto& region = *regions[at].second;
+        if (!region.hasFaults.exchange(false, std::memory_order_acq_rel)) continue;
+        for (std::size_t word = 0; word < region.faulted.size(); ++word) {
+            auto bits = region.faulted[word].load(std::memory_order_acquire);
+            while (bits != 0) {
+                const auto slot = word * 64 + static_cast<std::size_t>(std::countr_zero(bits));
+                bits &= bits - 1;
+                settle(region, regions[at].first * RegionPages + slot, true);
+            }
+        }
+    }
+}
+
+bool PageTable::BeginWriteFault(std::uint64_t address) {
+    const auto page = firstPage(address);
+    auto* region = tracked(page);
+    if (region == nullptr) return false;
+    const auto slot = slotOf(page);
+    const auto bit = std::uint64_t{1} << (slot % 64);
+    region->opening[slot / 64].fetch_or(bit, std::memory_order_acq_rel);
+    auto expected = PageState::CpuClean;
+    if (!region->states[slot].compare_exchange_strong(expected, PageState::CpuDirty, std::memory_order_acq_rel)) {
+        region->opening[slot / 64].fetch_and(~bit, std::memory_order_acq_rel);
+        return false;
+    }
+    const auto pendingAt = [&](std::size_t other) { return (region->faulted[other / 64].load(std::memory_order_relaxed) & (std::uint64_t{1} << (other % 64))) != 0; };
+    if ((slot > 0 && pendingAt(slot - 1)) || (slot + 1 < RegionPages && pendingAt(slot + 1))) adjacentFaults.fetch_add(1, std::memory_order_relaxed);
+    const auto chunk = slot & ~std::size_t{15};
+    bool first = true;
+    for (std::size_t other = chunk; other < chunk + 16 && first; ++other) first = !pendingAt(other);
+    if (first) chunkFirstFaults.fetch_add(1, std::memory_order_relaxed);
+    region->faulted[slot / 64].fetch_or(bit, std::memory_order_acq_rel);
+    region->hasFaults.store(true, std::memory_order_release);
+    pendingFaults.fetch_add(1, std::memory_order_acq_rel);
+    return true;
+}
+
+void PageTable::EndWriteFault(std::uint64_t address) {
+    const auto page = firstPage(address);
+    auto* region = tracked(page);
+    if (region == nullptr) return;
+    const auto slot = slotOf(page);
+    region->opening[slot / 64].fetch_and(~(std::uint64_t{1} << (slot % 64)), std::memory_order_acq_rel);
+}
+
+std::vector<DirtyRange> PageTable::GrowWriteFault(std::uint64_t address) {
+    std::vector<DirtyRange> runs;
+    if (hasher == nullptr) return runs;
+    const auto page = firstPage(address);
+    auto* region = tracked(page);
+    if (region == nullptr) return runs;
+    const auto slot = slotOf(page);
+    const auto test = [&](const std::array<std::atomic<std::uint64_t>, RegionPages / 64>& bits, std::size_t at) { return (bits[at / 64].load(std::memory_order_acquire) & (std::uint64_t{1} << (at % 64))) != 0; };
+    std::size_t first = slot;
+    std::size_t last = slot;
+    if (test(region->whole, slot)) {
+        while (first > 0 && slot - (first - 1) < WholeLimitPages && test(region->whole, first - 1)) --first;
+        while (last + 1 < RegionPages && last + 1 - first < WholeLimitPages && test(region->whole, last + 1)) ++last;
+        wholeFaults.fetch_add(1, std::memory_order_relaxed);
+    } else if ((slot > 0 && test(region->faulted, slot - 1)) || (slot + 1 < RegionPages && test(region->faulted, slot + 1))) {
+        first = slot & ~(GrowChunkPages - 1);
+        last = first + GrowChunkPages - 1;
+    } else {
+        return runs;
+    }
+    const auto base = page - slot;
+    for (auto at = first; at <= last; ++at) {
+        if (at == slot) continue;
+        const auto bit = std::uint64_t{1} << (at % 64);
+        if (region->states[at].load(std::memory_order_acquire) != PageState::CpuClean) continue;
+        region->opening[at / 64].fetch_or(bit, std::memory_order_acq_rel);
+        std::uint64_t hash = 0;
+        auto expected = PageState::CpuClean;
+        if (!hasher(base + at, hash) || !region->states[at].compare_exchange_strong(expected, PageState::CpuDirty, std::memory_order_acq_rel)) {
+            region->opening[at / 64].fetch_and(~bit, std::memory_order_acq_rel);
+            continue;
+        }
+        region->openHash[at] = hash;
+        region->unproven[at / 64].fetch_or(bit, std::memory_order_acq_rel);
+        region->faulted[at / 64].fetch_or(bit, std::memory_order_acq_rel);
+        pendingFaults.fetch_add(1, std::memory_order_acq_rel);
+        const auto address = (base + at) * PageBytes;
+        if (!runs.empty() && runs.back().address + runs.back().size == address) runs.back().size += PageBytes;
+        else runs.push_back({address, PageBytes});
+        grownPages.fetch_add(1, std::memory_order_relaxed);
+    }
+    if (!runs.empty()) {
+        region->hasFaults.store(true, std::memory_order_release);
+        grownFaults.fetch_add(1, std::memory_order_relaxed);
+    }
+    return runs;
+}
+
+void PageTable::EndGrow(std::span<const DirtyRange> runs) {
+    for (const auto& run : runs) {
+        for (auto at = run.address; at < run.address + run.size; at += PageBytes) EndWriteFault(at);
+    }
+}
+
+void PageTable::OpenWhole(std::uint64_t address, std::uint64_t size) {
+    if (size == 0) return;
+    std::lock_guard lock(mutex);
+    for (auto page = firstPage(address); page < endPage(address, size); ++page) {
+        auto* region = regionOf(page, false);
+        if (region == nullptr) continue;
+        const auto slot = slotOf(page);
+        region->whole[slot / 64].fetch_or(std::uint64_t{1} << (slot % 64), std::memory_order_acq_rel);
+    }
+}
+
+std::vector<UnprovenPage> PageTable::TakeRearmedUnproven() {
+    std::lock_guard lock(mutex);
+    return std::exchange(rearmedUnproven, {});
+}
+
+PageState PageTable::setState(std::uint64_t page, PageState next) {
+    auto* region = regionOf(page, true);
+    const auto slot = slotOf(page);
+    auto& cell = region->states[slot];
+    auto state = cell.load(std::memory_order_acquire);
+    if (state == PageState::CpuClean && next == PageState::CpuClean) return state;
+    if (state == PageState::CpuClean && cell.compare_exchange_strong(state, next, std::memory_order_acq_rel)) {
+        account(*region, slot, PageState::CpuClean, next);
+        return PageState::CpuClean;
+    }
+    settle(*region, page, false);
+    state = cell.exchange(next, std::memory_order_acq_rel);
+    account(*region, slot, state, next);
+    return state;
 }
 
 std::vector<ProtectionChange> PageTable::Register(std::uint64_t address, std::uint64_t size) {
@@ -154,7 +323,7 @@ std::vector<ProtectionChange> PageTable::Unregister(std::uint64_t address, std::
     for (auto page = firstPage(address); page < endPage(address, size); ++page) {
         auto* region = regionOf(page, false);
         if (region == nullptr) continue;
-        const auto state = region->states[slotOf(page)];
+        const auto state = region->states[slotOf(page)].load(std::memory_order_acquire);
         if (state == PageState::Untracked) continue;
         if (protectionOf(state) != Protection::ReadWrite) appendChange(changes, page, Protection::ReadWrite);
         unlist(page);
@@ -168,10 +337,9 @@ bool PageTable::HandleWrite(std::uint64_t address, std::vector<ProtectionChange>
     const auto page = firstPage(address);
     auto* region = regionOf(page, false);
     if (region == nullptr) return false;
-    switch (region->states[slotOf(page)]) {
+    switch (region->states[slotOf(page)].load(std::memory_order_acquire)) {
         case PageState::CpuClean:
-            ++counts.writeFaults;
-            setState(page, PageState::CpuDirty);
+            if (setState(page, PageState::CpuDirty) == PageState::CpuClean) ++counts.writeFaults;
             list(page);
             appendChange(changes, page, Protection::ReadWrite);
             return true;
@@ -188,6 +356,7 @@ void PageTable::AdvanceFrame() {
 
 std::vector<DirtyRange> PageTable::ConsumeDirty(std::vector<ProtectionChange>& changes, const WriteCheck& written) {
     std::lock_guard lock(mutex);
+    drainFaults();
     ++consumeEpoch;
     ++counts.consumes;
     std::vector<std::uint64_t> pages;
@@ -203,6 +372,19 @@ std::vector<DirtyRange> PageTable::ConsumeDirty(std::vector<ProtectionChange>& c
         if ((region->listed[slot / 64] & (std::uint64_t{1} << (slot % 64))) == 0) continue;
         unlist(page);
         if (region->states[slot] != PageState::CpuDirty) continue;
+        if (const auto bit = std::uint64_t{1} << (slot % 64); (region->unproven[slot / 64].load(std::memory_order_acquire) & bit) != 0) {
+            region->unproven[slot / 64].fetch_and(~bit, std::memory_order_acq_rel);
+            std::uint64_t now = 0;
+            if (hasher != nullptr && hasher(page, now) && now == region->openHash[slot]) {
+                ++counts.unprovenUnchanged;
+                region->streak[slot] = 0;
+                setState(page, PageState::CpuClean);
+                appendChange(changes, page, Protection::ReadOnly);
+                rearmedUnproven.push_back({page, region->openHash[slot]});
+                continue;
+            }
+            ++counts.unprovenChanged;
+        }
         if (region->busyUntil[slot] != 0 && written && !written(page, false)) {
             ++counts.unchangedBusy;
             const auto epoch = framePaced ? frameEpoch : consumeEpoch;
@@ -222,7 +404,7 @@ std::vector<DirtyRange> PageTable::ConsumeDirty(std::vector<ProtectionChange>& c
         const auto gapSafe = [&] {
             for (auto gap = (ranges.back().address + ranges.back().size) / PageBytes; gap < page; ++gap) {
                 const auto* holder = regionOf(gap);
-                const auto state = holder == nullptr ? PageState::Untracked : holder->states[slotOf(gap)];
+                const auto state = holder == nullptr ? PageState::Untracked : holder->states[slotOf(gap)].load(std::memory_order_acquire);
                 if (state != PageState::CpuClean && state != PageState::CpuDirty) return false;
             }
             return true;
@@ -266,7 +448,7 @@ std::vector<ProtectionChange> PageTable::MarkGpuOwned(std::uint64_t address, std
         auto* region = regionOf(page, false);
         if (region == nullptr) continue;
         const auto slot = slotOf(page);
-        const auto state = region->states[slot];
+        const auto state = region->states[slot].load(std::memory_order_acquire);
         if (state == PageState::Untracked || state == PageState::GpuOwned || state == PageState::Reserved) continue;
         unlist(page);
         region->busyUntil[slot] = 0;
@@ -298,20 +480,27 @@ GpuTake PageTable::TakeForGpu(std::uint64_t address, std::uint64_t size, bool ta
         const auto at = page * PageBytes;
         auto* region = regionOf(page, false);
         const auto slot = slotOf(page);
-        const auto state = region == nullptr ? PageState::Untracked : region->states[slot];
+        if (region != nullptr) settle(*region, page, true);
+        const auto state = region == nullptr ? PageState::Untracked : region->states[slot].load(std::memory_order_acquire);
         if (state == PageState::GpuOwned) {
             append(take.owned, at, at + PageBytes);
             continue;
         }
-        const bool tracked = state == PageState::CpuClean || state == PageState::CpuDirty;
-        if (!tracked || region->busyUntil[slot] != 0 || (!takeDirty && state == PageState::CpuDirty)) {
+        const bool followed = state == PageState::CpuClean || state == PageState::CpuDirty;
+        if (!followed || region->busyUntil[slot] != 0 || (!takeDirty && state == PageState::CpuDirty)) {
             append(take.open, at, at + PageBytes);
             continue;
         }
-        if (state == PageState::CpuDirty) append(take.dirty, at, at + PageBytes);
         unlist(page);
         region->streak[slot] = 0;
-        setState(page, PageState::GpuOwned);
+        const bool dirty = setState(page, PageState::GpuOwned) == PageState::CpuDirty;
+        if (dirty && !takeDirty) {
+            setState(page, PageState::CpuDirty);
+            list(page);
+            append(take.open, at, at + PageBytes);
+            continue;
+        }
+        if (dirty) append(take.dirty, at, at + PageBytes);
         appendChange(take.changes, page, Protection::NoAccess);
         append(take.owned, at, at + PageBytes);
     }
@@ -326,7 +515,8 @@ std::vector<ProtectionChange> PageTable::MarkDeviceWritten(std::uint64_t address
         auto* region = regionOf(page, false);
         if (region == nullptr) continue;
         const auto slot = slotOf(page);
-        const auto state = region->states[slot];
+        settle(*region, page, true);
+        const auto state = region->states[slot].load(std::memory_order_acquire);
         if (state != PageState::CpuClean && state != PageState::CpuDirty) continue;
         if (state == PageState::CpuDirty) {
             unlist(page);
@@ -416,10 +606,14 @@ std::vector<ProtectionChange> PageTable::Reclaim(std::uint64_t address, std::uin
 }
 
 PageState PageTable::StateOf(std::uint64_t address) const {
-    std::lock_guard lock(mutex);
     const auto page = firstPage(address);
+    if (page / RegionPages < LeafCount * LeafRegions) {
+        const auto* region = tracked(page);
+        return region == nullptr ? PageState::Untracked : region->states[slotOf(page)].load(std::memory_order_acquire);
+    }
+    std::lock_guard lock(mutex);
     const auto* region = regionOf(page);
-    return region == nullptr ? PageState::Untracked : region->states[slotOf(page)];
+    return region == nullptr ? PageState::Untracked : region->states[slotOf(page)].load(std::memory_order_acquire);
 }
 
 bool PageTable::Covers(std::uint64_t address, std::uint64_t size) const {
@@ -435,7 +629,7 @@ bool PageTable::Covers(std::uint64_t address, std::uint64_t size) const {
             continue;
         }
         for (; page < std::min(end, regionEnd); ++page) {
-            const auto state = region->states[slotOf(page)];
+            const auto state = region->states[slotOf(page)].load(std::memory_order_acquire);
             if (state != PageState::CpuClean && state != PageState::CpuDirty) return false;
         }
     }
@@ -445,6 +639,7 @@ bool PageTable::Covers(std::uint64_t address, std::uint64_t size) const {
 void PageTable::Collect(std::uint64_t address, std::uint64_t size, WrittenRun written, void* context, const WriteCheck& changed) {
     if (size == 0) return;
     std::lock_guard lock(mutex);
+    drainFaults();
     const auto end = endPage(address, size);
     std::uint64_t runBegin = 0;
     std::uint64_t runEnd = 0;
@@ -490,12 +685,14 @@ void PageTable::Collect(std::uint64_t address, std::uint64_t size, WrittenRun wr
 
 bool PageTable::RegionDirty(std::uint64_t address) const {
     std::lock_guard lock(mutex);
+    const_cast<PageTable*>(this)->drainFaults();
     const auto* region = regionOf(firstPage(address));
     return region != nullptr && region->dirtyPages != 0;
 }
 
 std::size_t PageTable::DirtyPages() const {
     std::lock_guard lock(mutex);
+    const_cast<PageTable*>(this)->drainFaults();
     std::size_t total = 0;
     for (const auto& [index, region] : regions) total += region->dirtyPages;
     return total;
@@ -503,7 +700,14 @@ std::size_t PageTable::DirtyPages() const {
 
 PageTableCounts PageTable::Counts() const {
     std::lock_guard lock(mutex);
-    return counts;
+    const_cast<PageTable*>(this)->drainFaults();
+    auto total = counts;
+    total.adjacentFaults = adjacentFaults.load(std::memory_order_relaxed);
+    total.grownFaults = grownFaults.load(std::memory_order_relaxed);
+    total.grownPages = grownPages.load(std::memory_order_relaxed);
+    total.wholeFaults = wholeFaults.load(std::memory_order_relaxed);
+    total.chunkFirstFaults = chunkFirstFaults.load(std::memory_order_relaxed);
+    return total;
 }
 
 }

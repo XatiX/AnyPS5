@@ -3,9 +3,6 @@
 #include "IntermediateRepresentation/IrMetadata/ShaderStage.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/BdaResources.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/Resources.hpp"
-#ifdef ANYPS5_UNIFIED
-#include "prx/libSceAgcDriver/Unified/include/GpuPageTable.hpp"
-#endif
 #include <algorithm>
 #include <array>
 #include <cstdio>
@@ -550,79 +547,47 @@ void RunBdaExecutionTests(const Context& context) {
     RunBdaAnchorTests(context);
 }
 
-void RunBdaPageTableExecutionTests(const Context& context) {
-#ifdef ANYPS5_UNIFIED
+void RunBdaMirrorExecutionTests(const Context& context) {
     namespace Abi = ShaderRecompiler::BdaAbi;
-    namespace Unified = AgcDriver::Unified;
-    static_assert(Unified::GpuPageBits == Abi::PageTablePageBits && Unified::GpuLeafBits == Abi::PageTableLeafBits && Unified::GpuRootBits == Abi::PageTableRootBits);
-    static_assert(Unified::GpuPageRead == Abi::Read && Unified::GpuPageWrite == Abi::Write);
-    constexpr std::uint64_t page = Unified::GpuPageBytes;
-    constexpr std::uint64_t guest = 0x3e0400000ULL;
-    Buffer near(context, 2 * page, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT);
-    Buffer far(context, page, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT);
+    constexpr std::uint64_t window = 0x10000;
+    Buffer mirror(context, window, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT);
     const std::array<std::uint8_t, 4> head{0x11, 0x22, 0x33, 0x44};
-    const std::array<std::uint8_t, 4> seam{0xa1, 0xa2, 0xa3, 0xa4};
-    std::memcpy(near.Bytes().data(), head.data(), head.size());
-    std::memcpy(near.Bytes().data() + page - 2, seam.data(), seam.size());
-    std::memcpy(far.Bytes().data(), seam.data() + 2, 2);
+    const std::array<std::uint8_t, 4> tail{0xa1, 0xa2, 0xa3, 0xa4};
+    std::memcpy(mirror.Bytes().data() + 0x100, head.data(), head.size());
+    std::memcpy(mirror.Bytes().data() + window - 4, tail.data(), tail.size());
     Buffer fault(context, Abi::FaultBufferBytes, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT);
-    std::vector<std::uint64_t> faultPages;
     Buffer output(context, 4, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT);
-    const auto run = [&](const Unified::GpuPageTable& pages, std::uint64_t address, std::uint32_t bits, std::uint32_t expected, Abi::FaultReason reason) {
-        Buffer table(context, Abi::PageTableBytes(pages.Leaves()), VK_BUFFER_USAGE_STORAGE_BUFFER_BIT);
-        const Abi::Header header{Abi::PageTableVersion, pages.Leaves(), sizeof(std::uint64_t), 0};
+    const auto run = [&](std::uint64_t base, std::uint64_t address, std::uint32_t bits, std::uint32_t expected, Abi::FaultReason reason) {
+        Buffer table(context, Abi::MirrorTableWords * sizeof(std::uint32_t), VK_BUFFER_USAGE_STORAGE_BUFFER_BIT);
+        const Abi::Header header{Abi::MirrorVersion, 0, sizeof(std::uint64_t), 0};
         auto* bytes = table.Bytes().data();
         std::memcpy(bytes, &header, sizeof(header));
-        std::memcpy(bytes + Abi::PageTableHeaderWords * sizeof(std::uint32_t), pages.Root().data(), pages.Root().size_bytes());
-        for (std::uint32_t leaf = 0; leaf < pages.Leaves(); ++leaf) {
-            const auto entries = pages.Leaf(leaf);
-            std::memcpy(bytes + (Abi::PageTableLeavesWord + leaf * Abi::PageTableLeafEntries * 2u) * sizeof(std::uint32_t), entries.data(), entries.size_bytes());
-        }
+        std::memcpy(bytes + Abi::MirrorBaseWord * sizeof(std::uint32_t), &base, sizeof(base));
+        std::memcpy(bytes + Abi::MirrorLimitWord * sizeof(std::uint32_t), &window, sizeof(window));
         std::memset(fault.Bytes().data(), 0, fault.Bytes().size());
         const std::uint32_t sentinel = 0xdeadbeef;
         std::memcpy(output.Bytes().data(), &sentinel, sizeof(sentinel));
-        Pipeline pipeline(context, MakeBdaTestShader(address, bits, 0, Abi::PageTableVersion), {&table, &fault, &output});
+        Pipeline pipeline(context, MakeBdaTestShader(address, bits, 0, Abi::MirrorVersion), {&table, &fault, &output});
         pipeline.Run(1);
         Abi::Fault report{};
         std::uint32_t result = 0;
         std::memcpy(&report, fault.Bytes().data(), sizeof(report));
         std::memcpy(&result, output.Bytes().data(), sizeof(result));
-        faultPages.clear();
-        const auto* words = reinterpret_cast<const std::uint32_t*>(fault.Bytes().data());
-        Require(words[Abi::FaultPageOverflowWord] == 0 && Abi::ForEachFaultPage(words, [&](std::uint64_t page) { faultPages.push_back(page); }), "page-table BDA fault pages are invalid at " + Hex(address));
-        std::sort(faultPages.begin(), faultPages.end());
         if (static_cast<std::uint32_t>(reason) == 0) {
-            Require(faultPages.empty(), "a mapped page-table BDA read listed fault pages at " + Hex(address));
-            Require(report.state == Abi::FaultState::Empty && result == expected, "page-table BDA read produced incorrect data or a fault at " + Hex(address));
+            Require(report.state == Abi::FaultState::Empty && result == expected, "mirror BDA read produced incorrect data or a fault at " + Hex(address));
         } else {
-            Require(report.state == Abi::FaultState::Ready && report.reason == reason && report.instruction == 0x1234, "page-table BDA fault was not published correctly at " + Hex(address));
-            Require(result == sentinel, "faulting page-table BDA shader continued to output a substitute value");
+            Require(report.state == Abi::FaultState::Ready && report.reason == reason && report.instruction == 0x1234, "mirror BDA fault was not published correctly at " + Hex(address));
+            Require(result == sentinel, "faulting mirror BDA shader continued to output a substitute value");
         }
     };
-    Unified::GpuPageTable linear;
-    Require(linear.Map(guest, 2 * page, near.DeviceAddress(), Unified::GpuPageRead), "the test pages map");
-    run(linear, guest, 8, 0x11, static_cast<Abi::FaultReason>(0));
-    run(linear, guest + 1, 16, 0x3322, static_cast<Abi::FaultReason>(0));
-    run(linear, guest, 32, 0x44332211, static_cast<Abi::FaultReason>(0));
-    run(linear, guest + page - 2, 32, 0xa4a3a2a1, static_cast<Abi::FaultReason>(0));
-    run(linear, guest + 2 * page, 8, 0, Abi::FaultReason::Unmapped);
-    Require(faultPages == std::vector<std::uint64_t>{guest + 2 * page}, "an unmapped page-table BDA read did not list its page");
-    run(linear, guest + 2 * page - 2, 32, 0, Abi::FaultReason::Unmapped);
-    Require(faultPages == std::vector<std::uint64_t>{guest + 2 * page}, "a read running into an unmapped page did not list only that page");
-    run(linear, guest - 1, 8, 0, Abi::FaultReason::Unmapped);
-    Require(faultPages == std::vector<std::uint64_t>{guest - page}, "an unmapped page before the span was not listed");
-    run(linear, Abi::PageTableAddressSpace, 8, 0, Abi::FaultReason::Unmapped);
-    Require(faultPages.empty(), "an address past the page table was listed as a fault page");
-    Unified::GpuPageTable split;
-    Require(split.Map(guest, page, near.DeviceAddress(), Unified::GpuPageRead) && split.Map(guest + page, page, far.DeviceAddress(), Unified::GpuPageRead), "the split pages map");
-    run(split, guest + page, 16, 0xa4a3, static_cast<Abi::FaultReason>(0));
-    run(split, guest + page - 2, 32, 0xa4a3a2a1, static_cast<Abi::FaultReason>(0));
-    Unified::GpuPageTable writable;
-    Require(writable.Map(guest, page, near.DeviceAddress(), Unified::GpuPageWrite), "a write-only page maps");
-    run(writable, guest, 8, 0, Abi::FaultReason::Permission);
-#else
-    static_cast<void>(context);
-#endif
+    const auto base = mirror.DeviceAddress();
+    run(base, 0x100, 8, 0x11, static_cast<Abi::FaultReason>(0));
+    run(base, 0x101, 16, 0x3322, static_cast<Abi::FaultReason>(0));
+    run(base, 0x100, 32, 0x44332211, static_cast<Abi::FaultReason>(0));
+    run(base, window - 4, 32, 0xa4a3a2a1, static_cast<Abi::FaultReason>(0));
+    run(base, window - 2, 32, 0, Abi::FaultReason::Unmapped);
+    run(base, window, 8, 0, Abi::FaultReason::Unmapped);
+    run(0, 0x100, 8, 0, Abi::FaultReason::InvalidTable);
 }
 
 void RunBdaStoreExecutionTests(const Context& context) {

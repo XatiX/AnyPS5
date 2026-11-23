@@ -308,6 +308,35 @@ private:
     std::byte* stagingBytes = nullptr;
 };
 
+bool SparseFits(const Context& context, std::uint64_t bytes, int count) {
+    std::vector<VkBuffer> made;
+    bool all = true;
+    for (int index = 0; index < count && all; ++index) {
+        VkBufferCreateInfo info{VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO};
+        info.flags = VK_BUFFER_CREATE_SPARSE_BINDING_BIT | VK_BUFFER_CREATE_SPARSE_RESIDENCY_BIT;
+        info.size = bytes;
+        info.usage = VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT | VK_BUFFER_USAGE_TRANSFER_SRC_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT;
+        VkBuffer buffer = VK_NULL_HANDLE;
+        all = context.Function<PFN_vkCreateBuffer>("vkCreateBuffer")(context.device, &info, nullptr, &buffer) == VK_SUCCESS;
+        if (all) made.push_back(buffer);
+    }
+    for (const auto buffer : made) context.Function<PFN_vkDestroyBuffer>("vkDestroyBuffer")(context.device, buffer, nullptr);
+    return all;
+}
+
+void LargestSparse(const Context& context) {
+    constexpr std::uint64_t Step = std::uint64_t{1} << 30;
+    std::uint64_t low = 0;
+    std::uint64_t high = std::uint64_t{1} << 40;
+    while (high - low > Step) {
+        const auto middle = (low + (high - low) / 2) & ~(Step - 1);
+        (SparseFits(context, middle, 1) ? low : high) = middle;
+    }
+    std::uint32_t segments = 0;
+    while (segments < 32 && SparseFits(context, std::uint64_t{1} << 36, static_cast<int>(segments) + 1)) ++segments;
+    std::printf("largest single sparse buffer: %llu GiB; 64 GiB sparse buffers that fit at once: %u%s\n", static_cast<unsigned long long>(low >> 30), segments, segments == 32 ? " or more" : "");
+}
+
 }
 
 int main() {
@@ -319,6 +348,7 @@ int main() {
             std::puts("skipped, the device has no sparse residency buffers or device addresses");
             return VulkanTestSkipped;
         }
+        LargestSparse(context);
         Check check(context);
         check.Run();
         std::puts("mirror machine check finished");

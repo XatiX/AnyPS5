@@ -264,8 +264,8 @@ int main(int argc, char** argv) {
             std::cout << "CPU Vulkan device: BDA read and multi-dword write execution not tested\n";
         } else {
             RunBdaExecutionTests(device->GetContext());
-            RunBdaPageTableExecutionTests(device->GetContext());
-            std::cout << "BDA page-table execution tests passed\n";
+            RunBdaMirrorExecutionTests(device->GetContext());
+            std::cout << "BDA mirror execution tests passed\n";
         }
         RunBdaStoreExecutionTests(device->GetContext());
         std::cout << "BDA store boundary tests passed\n";

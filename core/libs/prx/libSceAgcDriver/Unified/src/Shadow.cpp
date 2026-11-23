@@ -1,5 +1,6 @@
 #include "prx/libSceAgcDriver/Unified/include/Shadow.hpp"
 #include "prx/libSceAgcDriver/Unified/include/Downgrades.hpp"
+#include "prx/libSceAgcDriver/Unified/include/FaultSites.hpp"
 #include "prx/libSceAgcDriver/Unified/include/Front.hpp"
 #include "prx/libSceAgcDriver/Unified/include/MemoryCore.hpp"
 #include "prx/libSceAgcDriver/Unified/include/MirrorHost.hpp"
@@ -176,12 +177,16 @@ std::string frameLine() {
     struct Sample {
         std::uint64_t frames = 0;
         std::uint64_t writeFaults = 0;
+        std::uint64_t lockFreeWrites = 0;
         std::uint64_t ownedFaults = 0;
         std::uint64_t parked = 0;
         std::uint64_t bypassed = 0;
         std::uint64_t protectCalls = 0;
         std::uint64_t faultCalls = 0;
         std::uint64_t faultNanoseconds = 0;
+        std::uint64_t lockNanoseconds = 0;
+        std::uint64_t tableNanoseconds = 0;
+        std::uint64_t protectNanoseconds = 0;
         std::uint64_t readBackBytes = 0;
         std::uint64_t landedBytes = 0;
     };
@@ -191,23 +196,33 @@ std::string frameLine() {
     Sample now;
     now.frames = memoryTotals().frames.load(std::memory_order_relaxed);
     now.writeFaults = core.writesOpened;
+    now.lockFreeWrites = core.lockFreeWrites;
     now.ownedFaults = core.gpuOwnedFaults;
     now.parked = core.faultsParked;
     now.bypassed = core.faultsBypassed;
     now.protectCalls = MemoryCore::Get().Protection().Counts().calls;
     now.faultCalls = core.faultCalls;
     now.faultNanoseconds = core.faultNanoseconds;
+    now.lockNanoseconds = core.faultLockNanoseconds;
+    now.tableNanoseconds = core.faultTableNanoseconds;
+    now.protectNanoseconds = core.faultProtectNanoseconds;
     now.readBackBytes = ResidencyService::Get().ReadBackBytes();
     now.landedBytes = core.ownedLandedBytes + core.diffLandedBytes + core.landedBytes;
     std::lock_guard lock(sampleMutex);
     const auto frames = now.frames - last.frames;
     const auto each = [&](std::uint64_t current, std::uint64_t before) { return frames == 0u ? 0.0 : static_cast<double>(current - before) / static_cast<double>(frames); };
-    char line[640];
-    std::snprintf(line, sizeof(line), "[recode-frame] %llu frames; per frame: write faults %.1f, faults on GPU-owned pages %.2f (parked %.2f, bypassed %.2f), protect calls %.1f, fault handler %.1f us in %.1f calls, read back %.1f KiB, landed %.1f KiB\n",
-        static_cast<unsigned long long>(frames), each(now.writeFaults, last.writeFaults), each(now.ownedFaults, last.ownedFaults), each(now.parked, last.parked), each(now.bypassed, last.bypassed), each(now.protectCalls, last.protectCalls),
-        each(now.faultNanoseconds, last.faultNanoseconds) / 1000.0, each(now.faultCalls, last.faultCalls), each(now.readBackBytes, last.readBackBytes) / 1024.0, each(now.landedBytes, last.landedBytes) / 1024.0);
+    char line[896];
+    std::snprintf(line, sizeof(line), "[recode-frame] %llu frames; per frame: write faults %.1f (%.1f without the core's lock), faults on GPU-owned pages %.2f (parked %.2f, bypassed %.2f), protect calls %.1f, fault handler %.1f us in %.1f calls (waiting for the core's lock %.1f us, page table and change note %.1f us, protection call %.1f us), read back %.1f KiB, landed %.1f KiB\n",
+        static_cast<unsigned long long>(frames), each(now.writeFaults, last.writeFaults), each(now.lockFreeWrites, last.lockFreeWrites), each(now.ownedFaults, last.ownedFaults), each(now.parked, last.parked), each(now.bypassed, last.bypassed), each(now.protectCalls, last.protectCalls),
+        each(now.faultNanoseconds, last.faultNanoseconds) / 1000.0, each(now.faultCalls, last.faultCalls), each(now.lockNanoseconds, last.lockNanoseconds) / 1000.0, each(now.tableNanoseconds, last.tableNanoseconds) / 1000.0, each(now.protectNanoseconds, last.protectNanoseconds) / 1000.0, each(now.readBackBytes, last.readBackBytes) / 1024.0, each(now.landedBytes, last.landedBytes) / 1024.0);
+    static PageTableCounts lastTable;
+    const auto table = MemoryCore::Get().Pages().Counts();
+    char clusters[448];
+    std::snprintf(clusters, sizeof(clusters), "[recode-frame] write faults next to a page opened since the last consume %.1f per frame, first in their 64 KiB chunk %.1f per frame; faults that opened more pages %.1f (%.1f of them over an image source), pages opened without their own fault %.1f, found unchanged at consume %.1f, changed %.1f\n",
+        each(table.adjacentFaults, lastTable.adjacentFaults), each(table.chunkFirstFaults, lastTable.chunkFirstFaults), each(table.grownFaults, lastTable.grownFaults), each(table.wholeFaults, lastTable.wholeFaults), each(table.grownPages, lastTable.grownPages), each(table.unprovenUnchanged, lastTable.unprovenUnchanged), each(table.unprovenChanged, lastTable.unprovenChanged));
+    lastTable = table;
     last = now;
-    return line;
+    return std::string(line) + clusters;
 }
 
 std::string footprintLine() {
@@ -264,7 +279,7 @@ std::string memoryLine() {
         owned += gpuOwnedLine;
         owned += "[recode-gpu-owned] landing uploads skipped over later GPU writes: " + std::to_string(Mirror::SkippedUploadBytes() >> 10) + " KiB; CPU faults on records not yet written back: " + std::to_string(core.imageFaults) + " reads, " + std::to_string(core.imageWriteFaults) + " writes; view lookups that waited: " + std::to_string(Mirror::ViewWaits().waited) + " (" + std::to_string(Mirror::ViewWaits().found) + " found, " + std::to_string(Mirror::ViewWaits().microseconds / 1000u) + " ms); writes taken in pieces: " + std::to_string(core.pieceWrites) + ", outside the second view on pages already GPU-owned: " + std::to_string(core.ownedUnviewedBytes >> 10) + " KiB; diff landings: " + std::to_string(core.diffChainedBytes) + " bytes behind an older landing, " + std::to_string(core.diffForeignBytes) + " bytes left unlike the mirror\n";
     }
-    return std::string(line) + eventLine + ResidencyService::Get().Line() + owned + UploadClash::Line() + MetadataWatch::Line() + frameLine() + footprintLine();
+    return std::string(line) + eventLine + ResidencyService::Get().Line() + owned + UploadClash::Line() + MetadataWatch::Line() + frameLine() + footprintLine() + FaultSites::Line();
 }
 
 void report() {
@@ -532,8 +547,8 @@ bool ServeOwned(const Graphics::Context& context, std::uint64_t address, std::ui
     if (!GuestArena::GuestArenaContains_nid_postfix(reinterpret_cast<const void*>(first), static_cast<std::size_t>(last - first))) return false;
     const auto start = std::chrono::steady_clock::now();
     const auto [owner, ownerEnd] = allocationAround(first, last);
-    const auto from = std::max(owner, first & ~(GpuPageBytes - 1));
-    const auto to = std::min(ownerEnd, (last + GpuPageBytes - 1) & ~(GpuPageBytes - 1));
+    const auto from = std::max(owner, first & ~(ChunkBytes - 1));
+    const auto to = std::min(ownerEnd, (last + ChunkBytes - 1) & ~(ChunkBytes - 1));
     const auto committed = GuestMemory::CommittedRanges(from, static_cast<std::size_t>(to - from));
     auto& core = MemoryCore::Get();
     core.Reserve(from, to - from);
@@ -566,14 +581,14 @@ void ServeFaultPages(std::span<const std::uint64_t> pages) {
     {
         const auto lease = GuestAllocations::GuestAllocationsAcquire_nid_postfix();
         for (const auto address : pages) {
-            const auto page = address & ~(GpuPageBytes - 1);
-            FaultPage entry{page, page, page + GpuPageBytes};
+            const auto page = address & ~(ChunkBytes - 1);
+            FaultPage entry{page, page, page + ChunkBytes};
             auto range = std::upper_bound(lease.begin(), lease.end(), page, [](std::uint64_t at, const auto& candidate) { return at < candidate->address; });
             if (range != lease.begin()) {
                 const auto& allocation = *--range;
                 const auto first = allocation->address & ~(PageBytes - 1);
                 const auto last = (allocation->address + allocation->bytes + PageBytes - 1) & ~(PageBytes - 1);
-                if (allocation->bytes != 0 && first <= page && page + GpuPageBytes <= last) {
+                if (allocation->bytes != 0 && first <= page && page + ChunkBytes <= last) {
                     entry.first = first;
                     entry.last = last;
                 }
@@ -583,11 +598,11 @@ void ServeFaultPages(std::span<const std::uint64_t> pages) {
     }
     auto& core = MemoryCore::Get();
     for (const auto& [page, first, last] : found) {
-        if (!GuestArena::GuestArenaContains_nid_postfix(reinterpret_cast<const void*>(page), static_cast<std::size_t>(GpuPageBytes))) continue;
+        if (!GuestArena::GuestArenaContains_nid_postfix(reinterpret_cast<const void*>(page), static_cast<std::size_t>(ChunkBytes))) continue;
         const bool whole = registerRange(first, last);
-        if (!whole && first != page) registerRange(page, page + GpuPageBytes);
-        const auto committed = GuestMemory::CommittedRanges(page, static_cast<std::size_t>(GpuPageBytes));
-        core.Reserve(page, GpuPageBytes);
+        if (!whole && first != page) registerRange(page, page + ChunkBytes);
+        const auto committed = GuestMemory::CommittedRanges(page, static_cast<std::size_t>(ChunkBytes));
+        core.Reserve(page, ChunkBytes);
         for (const auto& [from, to] : committed) core.MakeResident(from, to - from);
         if (whole) service.ServeFaultPage(page, first, last - first, committed);
         else service.ServeFaultPage(page, 0, 0, committed);
@@ -617,49 +632,6 @@ bool ResidentDrawInputs() {
     return resident;
 }
 
-namespace {
-
-constexpr std::size_t WrittenChunksPendingBound = std::size_t{1} << 16u;
-
-struct WrittenChunks {
-    std::mutex mutex;
-    std::set<std::uint64_t> queued;
-    std::vector<std::uint64_t> pending;
-};
-
-WrittenChunks& writtenChunks() {
-    static auto& chunks = *new WrittenChunks();
-    return chunks;
-}
-
-void queueWrittenChunks(std::uint64_t begin, std::uint64_t end) {
-    auto& chunks = writtenChunks();
-    std::lock_guard lock(chunks.mutex);
-    for (auto chunk = begin & ~(ChunkBytes - 1); chunk < end; chunk += ChunkBytes) {
-        if (chunks.pending.size() < WrittenChunksPendingBound && chunks.queued.insert(chunk).second) chunks.pending.push_back(chunk);
-    }
-}
-
-}
-
-std::vector<std::uint64_t> TakeGpuWrittenChunks() {
-    auto& chunks = writtenChunks();
-    std::lock_guard lock(chunks.mutex);
-    std::vector<std::uint64_t> taken;
-    taken.swap(chunks.pending);
-    return taken;
-}
-
-void ForgetImport(std::uint64_t base, std::uint64_t bytes, std::uint64_t deviceBegin, std::uint64_t deviceEnd) {
-    const auto forgotten = ResidencyService::Get().ForgetImport(base, bytes, deviceBegin, deviceEnd);
-    if (forgotten.empty()) return;
-    auto& chunks = writtenChunks();
-    std::lock_guard lock(chunks.mutex);
-    for (const auto chunk : forgotten) {
-        if (chunks.pending.size() < WrittenChunksPendingBound) chunks.pending.push_back(chunk);
-    }
-}
-
 void NoteGpuWrites(GuestRanges ranges) {
     if (Downgrades::Watching()) {
         for (const auto& [begin, end] : ranges) {
@@ -674,7 +646,6 @@ void NoteGpuWrites(GuestRanges ranges) {
         if (end <= begin) continue;
         begin &= ~(PageBytes - 1);
         end = (end + PageBytes - 1) & ~(PageBytes - 1);
-        queueWrittenChunks(begin, end);
         auto next = marked.upper_bound(begin);
         if (next != marked.begin()) {
             const auto previous = std::prev(next);

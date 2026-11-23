@@ -1,6 +1,10 @@
 #include "prx/libSceAgcDriver/Unified/include/PageTable.hpp"
+#include <atomic>
+#include <chrono>
 #include <cstdint>
 #include <cstdio>
+#include <map>
+#include <thread>
 #include <vector>
 
 using namespace AgcDriver::Unified;
@@ -320,7 +324,190 @@ void testDeviceWrittenPagesReportOnlyCpuWrites() {
     Expect(collect() == std::vector<DirtyRange>{{Base + PageBytes, PageBytes}}, "a page reopened by the CPU is content-checked again");
 }
 
+void armed(PageTable& table, std::uint64_t pages) {
+    static_cast<void>(table.Register(Base, pages * PageBytes));
+    std::vector<ProtectionChange> changes;
+    static_cast<void>(table.ConsumeDirty(changes));
+}
+
+void testLockFreeWriteFaultIsReportedAtTheNextConsume() {
+    PageTable table;
+    armed(table, 4);
+    const auto page = Base + PageBytes;
+    Expect(table.BeginWriteFault(page + 12), "a write fault on a clean page opens it without the table's lock");
+    Expect(table.StateOf(page) == PageState::CpuDirty, "the page is dirty at once");
+    table.EndWriteFault(page + 12);
+    Expect(!table.BeginWriteFault(page), "a second fault on the open page is not a new opening");
+    Expect(!table.BeginWriteFault(Base + 64 * PageBytes), "a fault on a page the table does not follow is refused");
+    Expect(table.DirtyPages() == 1 && table.RegionDirty(Base) && table.Counts().writeFaults == 1, "the opening is counted and listed once a lock holder looks");
+    std::vector<ProtectionChange> changes;
+    const auto ranges = table.ConsumeDirty(changes);
+    Expect(ranges.size() == 1 && ranges[0] == DirtyRange{page, PageBytes}, "the next consume reports the page");
+    Expect(changes.size() == 1 && changes[0] == ProtectionChange{page, PageBytes, Protection::ReadOnly}, "and arms it again");
+    Expect(table.StateOf(page) == PageState::CpuClean && table.DirtyPages() == 0, "the page is clean again");
+}
+
+void testGpuTakeSeesAnUndrainedFaultAsDirty() {
+    PageTable table;
+    armed(table, 4);
+    Expect(table.BeginWriteFault(Base + PageBytes), "a clean page opens");
+    table.EndWriteFault(Base + PageBytes);
+    const auto take = table.TakeForGpu(Base, 4 * PageBytes);
+    Expect(take.dirty.size() == 1 && take.dirty[0] == DirtyRange{Base + PageBytes, PageBytes}, "a page opened since the last consume is taken as dirty");
+    Expect(take.owned.size() == 1 && take.owned[0] == DirtyRange{Base, 4 * PageBytes} && table.StateOf(Base + PageBytes) == PageState::GpuOwned, "every page of the range is GPU-owned");
+    Expect(table.DirtyPages() == 0, "no taken page stays listed");
+    PageTable kept;
+    armed(kept, 4);
+    Expect(kept.BeginWriteFault(Base + PageBytes), "a clean page opens");
+    kept.EndWriteFault(Base + PageBytes);
+    const auto clean = kept.TakeForGpu(Base, 4 * PageBytes, false);
+    Expect(clean.dirty.empty() && kept.StateOf(Base + PageBytes) == PageState::CpuDirty && kept.StateOf(Base) == PageState::GpuOwned, "a take of clean pages only leaves the opened page with the CPU");
+    Expect(kept.DirtyPages() == 1, "and it stays listed");
+}
+
+void testLockHolderWaitsForAnOpeningPage() {
+    PageTable table;
+    armed(table, 2);
+    Expect(table.BeginWriteFault(Base), "a clean page starts opening");
+    std::atomic<bool> marked{false};
+    std::thread holder([&] {
+        static_cast<void>(table.MarkGpuOwned(Base, PageBytes));
+        marked.store(true, std::memory_order_release);
+    });
+    std::this_thread::sleep_for(std::chrono::milliseconds(50));
+    Expect(!marked.load(std::memory_order_acquire), "a lock holder does not change a page whose protection is still being opened");
+    table.EndWriteFault(Base);
+    holder.join();
+    Expect(marked.load() && table.StateOf(Base) == PageState::GpuOwned && table.DirtyPages() == 0, "it takes the page once the opening is finished");
+    Expect(table.Counts().writeFaults == 1 && table.Counts().gpuOwnedPages == 1, "both changes are counted");
+}
+
+void testWritersAgainstAConsumer() {
+    constexpr std::uint64_t Pages = 512;
+    constexpr int Writers = 4;
+    PageTable table;
+    armed(table, Pages);
+    std::vector<std::atomic<int>> pending(Pages);
+    std::atomic<bool> stop{false};
+    std::atomic<std::uint64_t> opened{0};
+    std::vector<std::thread> writers;
+    for (int writer = 0; writer < Writers; ++writer) {
+        writers.emplace_back([&, writer] {
+            std::uint64_t seed = 0x9e3779b97f4a7c15ull * static_cast<std::uint64_t>(writer + 1);
+            for (int turn = 0; turn < 20000; ++turn) {
+                seed = seed * 6364136223846793005ull + 1442695040888963407ull;
+                const auto index = (seed >> 33) % Pages;
+                pending[index].store(1, std::memory_order_release);
+                if (table.BeginWriteFault(Base + index * PageBytes)) {
+                    opened.fetch_add(1, std::memory_order_relaxed);
+                    table.EndWriteFault(Base + index * PageBytes);
+                }
+            }
+        });
+    }
+    const auto consume = [&] {
+        std::vector<ProtectionChange> changes;
+        for (const auto& range : table.ConsumeDirty(changes)) {
+            for (auto at = range.address; at < range.address + range.size; at += PageBytes) pending[(at - Base) / PageBytes].store(0, std::memory_order_release);
+        }
+    };
+    std::thread consumer([&] {
+        while (!stop.load(std::memory_order_acquire)) consume();
+    });
+    for (auto& writer : writers) writer.join();
+    stop.store(true, std::memory_order_release);
+    consumer.join();
+    for (int turn = 0; turn < 400 && table.DirtyPages() != 0; ++turn) consume();
+    bool reported = true;
+    bool clean = true;
+    for (std::uint64_t index = 0; index < Pages; ++index) {
+        reported = reported && pending[index].load() == 0;
+        clean = clean && table.StateOf(Base + index * PageBytes) == PageState::CpuClean;
+    }
+    Expect(reported, "every page a writer opened was reported by a consume after it");
+    Expect(clean && table.DirtyPages() == 0, "every page ends clean and unlisted");
+    Expect(table.Counts().writeFaults == opened.load(), "every opening is counted exactly once");
+}
+
+std::uint64_t& unreadablePage() {
+    static std::uint64_t page = 0;
+    return page;
+}
+
+std::map<std::uint64_t, std::uint64_t>& fakeHashes() {
+    static std::map<std::uint64_t, std::uint64_t> hashes;
+    return hashes;
+}
+
+bool fakeHash(std::uint64_t page, std::uint64_t& hash) {
+    if (page == unreadablePage()) return false;
+    hash = fakeHashes()[page];
+    return true;
+}
+
+std::uint64_t pageOf(std::uint64_t index) {
+    return Base / PageBytes + index;
+}
+
+void testAdjacentFaultOpensItsChunk() {
+    PageTable table;
+    table.SetHasher(fakeHash);
+    armed(table, 32);
+    Expect(table.BeginWriteFault(Base + 3 * PageBytes) && table.GrowWriteFault(Base + 3 * PageBytes).empty(), "a lone fault opens only its page");
+    table.EndWriteFault(Base + 3 * PageBytes);
+    Expect(table.BeginWriteFault(Base + 4 * PageBytes), "the neighbouring page opens");
+    const auto runs = table.GrowWriteFault(Base + 4 * PageBytes);
+    table.EndWriteFault(Base + 4 * PageBytes);
+    table.EndGrow(runs);
+    Expect(runs.size() == 2 && runs[0] == DirtyRange{Base, 3 * PageBytes} && runs[1] == DirtyRange{Base + 5 * PageBytes, 11 * PageBytes}, "a fault next to an open page opens the rest of its 64 KiB chunk");
+    Expect(table.StateOf(Base + 15 * PageBytes) == PageState::CpuDirty && table.StateOf(Base + 16 * PageBytes) == PageState::CpuClean, "the next chunk stays armed");
+    fakeHashes()[pageOf(7)] = 0x77;
+    std::vector<ProtectionChange> changes;
+    const auto ranges = table.ConsumeDirty(changes);
+    const auto rearmed = table.TakeRearmedUnproven();
+    Expect(ranges.size() == 1 && ranges[0] == DirtyRange{Base + 3 * PageBytes, 5 * PageBytes}, "the faulted pages and the changed unproven page are reported (merged across the short gap), the unchanged ones are not");
+    Expect(rearmed.size() == 13 && table.Counts().unprovenUnchanged == 13 && table.Counts().unprovenChanged == 1, "thirteen unproven pages were unchanged and are armed again");
+    Expect(table.StateOf(Base) == PageState::CpuClean && table.DirtyPages() == 0, "every page is clean again");
+    fakeHashes().clear();
+}
+
+void testImageSourceOpensWhole() {
+    PageTable table;
+    table.SetHasher(fakeHash);
+    armed(table, 64);
+    table.OpenWhole(Base + 8 * PageBytes, 40 * PageBytes);
+    Expect(table.BeginWriteFault(Base + 20 * PageBytes), "a page of the source opens");
+    const auto runs = table.GrowWriteFault(Base + 20 * PageBytes);
+    table.EndWriteFault(Base + 20 * PageBytes);
+    table.EndGrow(runs);
+    Expect(runs.size() == 2 && runs[0] == DirtyRange{Base + 8 * PageBytes, 12 * PageBytes} && runs[1] == DirtyRange{Base + 21 * PageBytes, 27 * PageBytes}, "its first write opens the whole source range");
+    Expect(table.StateOf(Base + 7 * PageBytes) == PageState::CpuClean && table.StateOf(Base + 48 * PageBytes) == PageState::CpuClean, "pages outside it stay armed");
+    Expect(table.Counts().wholeFaults == 1, "the fault is counted as a whole opening");
+}
+
+void testUnreadablePagesDoNotGrow() {
+    PageTable table;
+    table.SetHasher(fakeHash);
+    armed(table, 16);
+    unreadablePage() = pageOf(9);
+    Expect(table.BeginWriteFault(Base + 2 * PageBytes), "a page opens");
+    table.EndWriteFault(Base + 2 * PageBytes);
+    Expect(table.BeginWriteFault(Base + 3 * PageBytes), "its neighbour opens");
+    const auto runs = table.GrowWriteFault(Base + 3 * PageBytes);
+    table.EndWriteFault(Base + 3 * PageBytes);
+    table.EndGrow(runs);
+    Expect(table.StateOf(Base + 9 * PageBytes) == PageState::CpuClean && table.StateOf(Base + 8 * PageBytes) == PageState::CpuDirty, "a page that cannot be read is not opened without its own fault");
+    unreadablePage() = 0;
+}
+
 int main() {
+    testAdjacentFaultOpensItsChunk();
+    testImageSourceOpensWhole();
+    testUnreadablePagesDoNotGrow();
+    testLockFreeWriteFaultIsReportedAtTheNextConsume();
+    testGpuTakeSeesAnUndrainedFaultAsDirty();
+    testLockHolderWaitsForAnOpeningPage();
+    testWritersAgainstAConsumer();
     testDeviceWrittenPagesReportOnlyCpuWrites();
     testCollectReportsWritesOnce();
     testCollectChecksOpenPages();

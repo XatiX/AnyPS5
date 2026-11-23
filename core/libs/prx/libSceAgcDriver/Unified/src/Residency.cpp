@@ -1,6 +1,6 @@
 #include "prx/libSceAgcDriver/Unified/include/Residency.hpp"
-#include "prx/libSceAgcDriver/Unified/include/GpuPageTable.hpp"
 #include <algorithm>
+#include <atomic>
 #include <cstdio>
 #include <iterator>
 #include <limits>
@@ -9,14 +9,30 @@ namespace AgcDriver::Unified {
 
 namespace {
 
-constexpr std::uint64_t segmentBase(std::uint64_t address) {
-    return address & ~(MirrorSegmentBytes - 1);
+std::atomic<std::uint64_t> mirrorWindow{MirrorWindowBytes};
+
+std::uint64_t segmentBase(std::uint64_t address) {
+    return MirrorSegmentBase(address);
 }
 
 constexpr std::uint64_t chunkBase(std::uint64_t address) {
     return address & ~(ChunkBytes - 1);
 }
 
+}
+
+std::uint64_t Residency::OpenWindow() {
+    std::lock_guard lock(mutex);
+    const auto* window = segments.empty() ? segmentFor(0) : segmentOf(0);
+    return window != nullptr ? window->address : 0u;
+}
+
+std::uint64_t MirrorWindow() {
+    return mirrorWindow.load(std::memory_order_acquire);
+}
+
+void SetMirrorWindow(std::uint64_t bytes) {
+    mirrorWindow.store(bytes, std::memory_order_release);
 }
 
 Residency::Residency(ResidencyDevice& device, std::uint64_t budget) : device(device), budget(budget) {}
@@ -52,9 +68,13 @@ const DeviceBuffer* Residency::segmentOf(std::uint64_t address) const {
 const DeviceBuffer* Residency::segmentFor(std::uint64_t address) {
     const auto base = segmentBase(address);
     if (const auto found = segments.find(base); found != segments.end()) return &found->second;
-    const auto buffer = device.CreateBuffer(MirrorSegmentBytes);
+    auto buffer = device.CreateBuffer(MirrorSegmentSize(base));
+    while (!buffer && base == 0u && segments.empty() && MirrorWindow() > MirrorWindowStep) {
+        SetMirrorWindow(MirrorWindow() - MirrorWindowStep);
+        buffer = device.CreateBuffer(MirrorWindow());
+    }
     if (!buffer) return nullptr;
-    std::fprintf(stderr, "[recode-residency] mirror segment for guest 0x%llx+0x%llx at device 0x%llx\n", static_cast<unsigned long long>(base), static_cast<unsigned long long>(MirrorSegmentBytes), static_cast<unsigned long long>(buffer->address));
+    std::fprintf(stderr, "[recode-residency] mirror segment for guest 0x%llx+0x%llx at device 0x%llx\n", static_cast<unsigned long long>(base), static_cast<unsigned long long>(MirrorSegmentSize(base)), static_cast<unsigned long long>(buffer->address));
     return &segments.emplace(base, *buffer).first->second;
 }
 
@@ -168,7 +188,6 @@ std::uint64_t Residency::release(Range& range) {
         if (found == bound.end()) continue;
         if (--found->second.holders != 0) continue;
         binds.push_back({chunk - segmentBase(chunk), found->second.chunk, false});
-        if (segment != nullptr) unmapChunk(chunk, segment->address + (chunk - segmentBase(chunk)));
         put(found->second.chunk);
         bound.erase(found);
     }
@@ -224,7 +243,6 @@ std::vector<GuestSpan> Residency::MakeResident(std::uint64_t address, std::uint6
         const auto chunk = range.origin + fresh[at] * ChunkBytes;
         bound.emplace(chunk, Held{binds[at].chunk, 1u});
         range.held[fresh[at]] = true;
-        mapChunk(chunk, segment->address + (chunk - segmentBase(chunk)));
     }
     for (const auto index : joined) {
         ++bound.find(range.origin + index * ChunkBytes)->second.holders;
@@ -366,29 +384,6 @@ void Residency::SetBudget(std::uint64_t bytes) {
 void Residency::SetKeep(Keep next) {
     std::lock_guard lock(mutex);
     keep = next;
-}
-
-void Residency::mapChunk(std::uint64_t chunk, std::uint64_t deviceAddress) {
-    if (pageTable == nullptr) return;
-    if (const auto mapped = pageTable->Lookup(chunk); mapped != 0 && mapped != deviceAddress) {
-        ++sharedPages;
-        return;
-    }
-    pageTable->Map(chunk, ChunkBytes, deviceAddress, GpuPagePermissions);
-}
-
-void Residency::unmapChunk(std::uint64_t chunk, std::uint64_t deviceAddress) {
-    if (pageTable == nullptr) return;
-    if (pageTable->Lookup(chunk) == deviceAddress) pageTable->Unmap(chunk, ChunkBytes);
-}
-
-void Residency::SetPageTable(GpuPageTable* table) {
-    std::lock_guard lock(mutex);
-    pageTable = table;
-    if (pageTable == nullptr) return;
-    for (const auto& [chunk, held] : bound) {
-        if (const auto* segment = segmentOf(chunk)) mapChunk(chunk, segment->address + (chunk - segmentBase(chunk)));
-    }
 }
 
 ResidencyCounts Residency::Counts() const {

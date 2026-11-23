@@ -645,9 +645,6 @@ void retireImport(VkDevice device, HostImports& state, std::map<std::uint64_t, H
     auto* reading = forgetSettle(state, it->first);
 #endif
     state.pendingImports.erase(it->first);
-#if ANYPS5_UNIFIED
-    Unified::Shadow::ForgetImport(it->second.base, it->second.bytes, it->second.address, it->second.address + it->second.lead + it->second.bytes);
-#endif
     // Results shadowed for the import reach its (old) buffer first where the memory is still a
     // readable registered range (the import retires because its registration vanished or changed
     // size); the holder below outlives the batch that copies them.

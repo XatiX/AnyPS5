@@ -126,16 +126,39 @@ std::vector<DirtyRange> Protector::ReadableRanges(std::uint64_t address, std::ui
 
 void Protector::Track(Tracker next) {
     std::lock_guard lock(mutex);
-    tracker = next;
+    tracker.store(next, std::memory_order_release);
+}
+
+bool Protector::Open(std::uint64_t address, std::uint64_t size, bool* held) {
+    openCalls.fetch_add(1, std::memory_order_relaxed);
+    openBytes.fetch_add(size, std::memory_order_relaxed);
+    bool done = false;
+    if (const auto track = tracker.load(std::memory_order_acquire); track != nullptr) {
+        bool kept = false;
+        done = track(static_cast<std::uintptr_t>(address), static_cast<std::size_t>(size), static_cast<std::uint32_t>(Protection::ReadWrite), &kept);
+        if (kept) {
+            openHeld.fetch_add(1, std::memory_order_relaxed);
+            if (held != nullptr) *held = true;
+        }
+    } else {
+#ifdef _WIN32
+        DWORD previous = 0;
+        done = VirtualProtect(reinterpret_cast<void*>(address), static_cast<SIZE_T>(size), PAGE_READWRITE, &previous) != 0;
+#else
+        done = mprotect(reinterpret_cast<void*>(address), static_cast<std::size_t>(size), PROT_READ | PROT_WRITE) == 0;
+#endif
+    }
+    if (!done) openFailures.fetch_add(1, std::memory_order_relaxed);
+    return done;
 }
 
 bool Protector::protect(std::uint64_t address, std::uint64_t size, Protection protection, bool* held) {
     ++counts.calls;
     counts.bytes += size;
-    if (tracker != nullptr) {
+    if (const auto track = tracker.load(std::memory_order_acquire); track != nullptr) {
         ++counts.tracked;
         bool kept = false;
-        const bool done = tracker(static_cast<std::uintptr_t>(address), static_cast<std::size_t>(size), static_cast<std::uint32_t>(protection), &kept);
+        const bool done = track(static_cast<std::uintptr_t>(address), static_cast<std::size_t>(size), static_cast<std::uint32_t>(protection), &kept);
         if (!done) ++counts.failures;
         if (kept) {
             ++counts.held;
@@ -230,7 +253,14 @@ std::size_t Protector::Flush() {
 
 ProtectorCounts Protector::Counts() const {
     std::lock_guard lock(mutex);
-    return counts;
+    auto total = counts;
+    const auto opened = openCalls.load(std::memory_order_relaxed);
+    total.calls += opened;
+    total.bytes += openBytes.load(std::memory_order_relaxed);
+    total.failures += openFailures.load(std::memory_order_relaxed);
+    total.held += openHeld.load(std::memory_order_relaxed);
+    if (tracker.load(std::memory_order_acquire) != nullptr) total.tracked += opened;
+    return total;
 }
 
 }

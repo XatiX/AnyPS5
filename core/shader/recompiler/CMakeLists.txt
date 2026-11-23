@@ -257,7 +257,6 @@ function(add_shader_recompiler target runtimeTarget)
     set(shaderCacheReviewedNames
             BdaAbi::Known
             BdaAbi::OtherFaults
-            BdaAbi::PageTableBytes
             BdaAbi::ForEachFaultPage
             BdaAbi::RangesOrdered
             BuildBarycentricGeometryShader

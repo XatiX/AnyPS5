@@ -2,6 +2,7 @@
 #include "prx/libSceAgcDriver/Graphics/include/MemoryAccounting.hpp"
 #include "prx/libSceAgcDriver/Execution/include/GuestMemory.hpp"
 #include <algorithm>
+#include <cstdio>
 #include <array>
 #include <chrono>
 
@@ -65,7 +66,10 @@ std::optional<DeviceBuffer> VulkanResidency::CreateBuffer(std::uint64_t bytes) {
         info.pQueueFamilyIndices = families.data();
     }
     VkBuffer buffer = VK_NULL_HANDLE;
-    if (context.Function<PFN_vkCreateBuffer>("vkCreateBuffer")(context.device, &info, nullptr, &buffer) != VK_SUCCESS) return std::nullopt;
+    if (const auto created = context.Function<PFN_vkCreateBuffer>("vkCreateBuffer")(context.device, &info, nullptr, &buffer); created != VK_SUCCESS) {
+        std::fprintf(stderr, "[recode-residency] mirror buffer of 0x%llx bytes not created: vkCreateBuffer result %d\n", static_cast<unsigned long long>(bytes), static_cast<int>(created));
+        return std::nullopt;
+    }
     VkMemoryRequirements requirements{};
     context.Function<PFN_vkGetBufferMemoryRequirements>("vkGetBufferMemoryRequirements")(context.device, buffer, &requirements);
     const bool aligned = requirements.alignment != 0 && requirements.alignment <= ChunkBytes && ChunkBytes % requirements.alignment == 0;
@@ -73,6 +77,7 @@ std::optional<DeviceBuffer> VulkanResidency::CreateBuffer(std::uint64_t bytes) {
         std::lock_guard lock(mutex);
         if (aligned && !type) type = context.DeviceMemoryType(requirements.memoryTypeBits, PoolBytes, "a recode residency pool");
         if (!aligned || (requirements.memoryTypeBits & (1u << *type)) == 0) {
+            std::fprintf(stderr, "[recode-residency] mirror buffer of 0x%llx bytes refused: alignment 0x%llx, memory types 0x%x\n", static_cast<unsigned long long>(bytes), static_cast<unsigned long long>(requirements.alignment), requirements.memoryTypeBits);
             context.Function<PFN_vkDestroyBuffer>("vkDestroyBuffer")(context.device, buffer, nullptr);
             return std::nullopt;
         }
@@ -80,6 +85,7 @@ std::optional<DeviceBuffer> VulkanResidency::CreateBuffer(std::uint64_t bytes) {
     const VkBufferDeviceAddressInfo addressInfo{VK_STRUCTURE_TYPE_BUFFER_DEVICE_ADDRESS_INFO, nullptr, buffer};
     const auto address = context.Function<PFN_vkGetBufferDeviceAddressKHR>("vkGetBufferDeviceAddressKHR")(context.device, &addressInfo);
     if (address == 0) {
+        std::fprintf(stderr, "[recode-residency] mirror buffer of 0x%llx bytes has no device address\n", static_cast<unsigned long long>(bytes));
         context.Function<PFN_vkDestroyBuffer>("vkDestroyBuffer")(context.device, buffer, nullptr);
         return std::nullopt;
     }

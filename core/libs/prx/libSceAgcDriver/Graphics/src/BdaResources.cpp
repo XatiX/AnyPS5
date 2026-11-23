@@ -329,12 +329,12 @@ bool BdaResources::TakeFaultSlot(const Context& context) {
 
 BdaResources::BdaResources(const Context& context, const GuestBufferMemory& memory, bool reportOnly) : BdaResources(context, reportOnly) {
 #if ANYPS5_UNIFIED
-    if (Unified::ResidencyService::PageTableEnabled()) {
+    if (Unified::ResidencyService::MirrorAddressing()) {
         auto& service = Unified::ResidencyService::Get();
-        Require(service.Attach(context), "GPU page table: the residency service did not attach (no sparse residency buffers or device addresses)");
-        table = service.PageTableBuffer();
-        Require(table != nullptr, "GPU page table: the residency service has no page table");
-        tableBytes = ShaderRecompiler::BdaAbi::PageTableBytes(Unified::PageTableLeafCapacity);
+        Require(service.Attach(context), "mirror: the residency service did not attach (no sparse residency buffers or device addresses)");
+        table = service.MirrorTable();
+        Require(table != nullptr, "mirror: the residency service has no mirror table");
+        tableBytes = ShaderRecompiler::BdaAbi::MirrorTableWords * sizeof(std::uint32_t);
         Require(tableBytes <= context.limits.maxStorageBufferRange && ShaderRecompiler::BdaAbi::FaultBufferBytes <= context.limits.maxStorageBufferRange, "BDA descriptors exceed storage buffer range limit");
         tableGuardSerial = MultisampleTargetRangeGeneration();
         pageTable = true;

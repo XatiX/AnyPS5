@@ -2,6 +2,7 @@
 #include "SpirvBackend/SpirvSpannedUniformity.hpp"
 #include <algorithm>
 #include <stdexcept>
+#include <string>
 #include <unordered_map>
 #include <unordered_set>
 #include <vector>
@@ -31,6 +32,7 @@ struct Module {
     std::unordered_map<std::uint32_t, std::uint32_t> pointerClasses;
     std::unordered_map<std::uint32_t, std::uint32_t> constants;
     std::unordered_set<std::uint32_t> nonWritable;
+    std::unordered_map<std::uint32_t, std::string> names;
     std::vector<Function> functions;
 };
 
@@ -48,6 +50,9 @@ Module Parse(std::span<const std::uint32_t> words) {
         case spv::OpDecorate:
             if (instruction.size() >= 4u && instruction[2] == spv::DecorationBuiltIn) module.builtins[instruction[1]] = instruction[3];
             if (instruction.size() >= 3u && instruction[2] == spv::DecorationNonWritable) module.nonWritable.insert(instruction[1]);
+            break;
+        case spv::OpName:
+            if (instruction.size() >= 3u) module.names[instruction[1]] = std::string(reinterpret_cast<const char*>(&instruction[2]));
             break;
         case spv::OpTypePointer:
             if (instruction.size() >= 4u) module.pointerClasses[instruction[1]] = instruction[2];
@@ -150,7 +155,7 @@ bool ImageRead(spv::Op op) {
 
 class Analysis {
 public:
-    Analysis(const Module& module, std::span<const std::uint32_t> snapshotVariables) : module(module) {
+    Analysis(const Module& module, std::span<const std::uint32_t> snapshotVariables, std::span<const std::uint32_t> privateVariables) : module(module), privates(privateVariables.begin(), privateVariables.end()) {
         for (const auto variable : snapshotVariables) {
             if (module.nonWritable.contains(variable)) snapshots.insert(variable);
         }
@@ -163,6 +168,7 @@ public:
                     bool hasType = false;
                     spv::HasResultAndType(op, &hasResult, &hasType);
                     if (hasResult && hasType && instruction.size() > 2u) types[instruction[2]] = instruction[1];
+                    if ((op == spv::OpAccessChain || op == spv::OpInBoundsAccessChain || op == spv::OpPtrAccessChain) && instruction.size() > 3u) accessBases[instruction[2]] = instruction[3];
                 }
             }
         }
@@ -170,7 +176,10 @@ public:
             for (const auto& block : function.blocks) {
                 for (const auto& instruction : block.body) {
                     const auto pointer = WrittenPointer(instruction);
-                    if (pointer != 0u) written.insert(ClassOf(pointer));
+                    const auto base = pointer != 0u ? BaseOf(pointer) : 0u;
+                    if (pointer != 0u && privates.contains(base)) privateWritten.insert(base);
+                    else if (pointer != 0u) written.insert(ClassOf(pointer));
+                    if (pointer != 0u && ClassOf(pointer) == spv::StorageClassStorageBuffer && writtenVariables.size() < 8u && std::find(writtenVariables.begin(), writtenVariables.end(), base) == writtenVariables.end()) writtenVariables.push_back(base);
                     if (Opcode(instruction) == spv::OpImageWrite) written.insert(spv::StorageClassImage);
                 }
             }
@@ -246,7 +255,17 @@ private:
         return fenced && storageClass != spv::StorageClassWorkgroup && storageClass != UnknownClass;
     }
 
+    std::uint32_t BaseOf(std::uint32_t pointer) const {
+        for (std::size_t depth = 0u; depth < 64u; ++depth) {
+            const auto found = accessBases.find(pointer);
+            if (found == accessBases.end()) break;
+            pointer = found->second;
+        }
+        return pointer;
+    }
+
     bool Racy(std::uint32_t pointer, bool fenced) const {
+        if (const auto base = BaseOf(pointer); privates.contains(base)) return privateWritten.contains(base);
         const auto storageClass = ClassOf(pointer);
         if (storageClass != UnknownClass && (PrivateStorage(storageClass) || storageClass == spv::StorageClassInput)) return false;
         if (!Written(storageClass)) return false;
@@ -455,6 +474,23 @@ private:
                 }
             }
             if (!split) continue;
+            const auto cause = (terminatorOp == spv::OpBranchConditional || terminatorOp == spv::OpSwitch) ? reasons.find(terminator.at(1)) : reasons.end();
+            std::uint32_t inner = NoCause;
+            if (cause == reasons.end()) {
+                for (const auto node : construct) {
+                    const auto& nodeBody = blocks.at(node)->body;
+                    if (nodeBody.empty()) continue;
+                    const auto& exit = nodeBody.back();
+                    const auto exitOp = Opcode(exit);
+                    if ((exitOp != spv::OpBranchConditional && exitOp != spv::OpSwitch) || !NonUniform(exit.at(1))) continue;
+                    if (const auto found = reasons.find(exit.at(1)); found != reasons.end()) {
+                        inner = found->second;
+                        break;
+                    }
+                }
+            }
+            const auto constructCause = cause != reasons.end() ? cause->second : inner != NoCause ? CauseOf("exit of the construct: " + causes[inner]) : CauseOf("a loop exit or branch inside the construct");
+            for (const auto node : construct) divergentCause.try_emplace(node, constructCause);
             divergent.insert(construct.begin(), construct.end());
             if (mergeOp == spv::OpLoopMerge) divergent.insert(header);
             divergentMerges.insert(merge);
@@ -484,42 +520,72 @@ private:
                 if (op == spv::OpStore && instruction.size() >= 3u) {
                     const auto variable = BaseVariable(instruction[1], chains);
                     const auto storage = module.storageClasses.find(variable);
-                    if (storage != module.storageClasses.end() && PrivateStorage(storage->second) && (inDivergentFlow || NonUniform(instruction[1]) || NonUniform(instruction[2]))) storedNonUniform.insert(variable);
+                    if (storage != module.storageClasses.end() && PrivateStorage(storage->second) && (inDivergentFlow || NonUniform(instruction[1]) || NonUniform(instruction[2]))) {
+                        storedNonUniform.insert(variable);
+                        if (!storedCause.contains(variable)) {
+                            const auto value = reasons.find(NonUniform(instruction[2]) ? instruction[2] : instruction[1]);
+                            const auto flowCause = divergentCause.find(label);
+                            if ((NonUniform(instruction[2]) || NonUniform(instruction[1])) && value != reasons.end()) storedCause.emplace(variable, value->second);
+                            else if (inDivergentFlow && flowCause != divergentCause.end()) storedCause.emplace(variable, CauseOf("stored in divergent flow: " + causes[flowCause->second]));
+                            else if (inDivergentFlow) storedCause.emplace(variable, CauseOf("stored in flow after a divergent construct exits or escapes"));
+                        }
+                    }
                     continue;
                 }
                 if (inDivergentFlow && !report && (op == spv::OpControlBarrier || (op == spv::OpFunctionCall && instruction.size() > 3u && barriers.contains(instruction[3])))) {
                     report = std::string(op == spv::OpControlBarrier ? "an OpControlBarrier" : "a call reaching an OpControlBarrier") + " in block %" + std::to_string(label) + " of function %" + std::to_string(function.id) + " sits in control flow a per-invocation value decides";
+                    if (const auto cause = divergentCause.find(label); cause != divergentCause.end()) *report += " (" + causes[cause->second] + ")";
                 }
                 const auto result = Result(instruction);
                 if (result == 0u || NonUniform(result)) continue;
                 bool varying = false;
+                std::uint32_t cause = NoCause;
+                const auto inherit = [&](std::uint32_t id) {
+                    if (!NonUniform(id)) return false;
+                    if (const auto found = reasons.find(id); found != reasons.end()) cause = found->second;
+                    return true;
+                };
+                const auto seed = [&](const std::string& text) {
+                    varying = true;
+                    cause = CauseOf(text);
+                };
                 switch (op) {
                 case spv::OpLoad: {
                     const auto variable = BaseVariable(instruction.at(3), chains);
                     const auto builtin = module.builtins.find(variable);
                     const auto storage = module.storageClasses.find(variable);
-                    varying = NonUniform(instruction[3]) || (builtin != module.builtins.end() && VaryingBuiltin(builtin->second)) || storedNonUniform.contains(variable) ||
-                        (storage != module.storageClasses.end() && storage->second == spv::StorageClassInput && builtin == module.builtins.end()) || (!snapshots.contains(variable) && Racy(instruction[3], fencedBefore));
+                    if (inherit(instruction[3])) varying = true;
+                    else if (builtin != module.builtins.end() && VaryingBuiltin(builtin->second)) seed("built-in " + std::to_string(builtin->second));
+                    else if (storedNonUniform.contains(variable)) {
+                        varying = true;
+                        const auto stored = storedCause.find(variable);
+                        cause = stored != storedCause.end() ? stored->second : CauseOf("private variable stored with a per-invocation value of unknown cause");
+                    }
+                    else if (storage != module.storageClasses.end() && storage->second == spv::StorageClassInput && builtin == module.builtins.end()) seed("a stage input");
+                    else if (!snapshots.contains(variable) && Racy(instruction[3], fencedBefore)) seed("a load of storage class " + std::to_string(ClassOf(instruction[3])) + " the program also writes, variable " + (module.names.contains(variable) ? module.names.at(variable) : "%" + std::to_string(variable)) + WrittenNames());
                     break;
                 }
                 case spv::OpAtomicLoad:
-                    varying = NonUniform(instruction.at(3)) || Racy(instruction[3], fencedBefore);
+                    if (inherit(instruction.at(3))) varying = true;
+                    else if (Racy(instruction[3], fencedBefore)) seed("an atomic load of storage class " + std::to_string(ClassOf(instruction[3])));
                     break;
                 case spv::OpPhi:
-                    varying = inDivergentFlow || divergentMerges.contains(label);
-                    for (std::size_t operand = 3u; !varying && operand < instruction.size(); operand += 2u) varying = NonUniform(instruction[operand]);
+                    if (inDivergentFlow || divergentMerges.contains(label)) seed("a phi at the merge of divergent flow");
+                    for (std::size_t operand = 3u; !varying && operand < instruction.size(); operand += 2u) varying = inherit(instruction[operand]);
                     break;
                 case spv::OpFunctionCall:
-                    varying = instruction.size() > 3u && varyingFunctions.contains(instruction[3]);
-                    for (std::size_t operand = 4u; !varying && operand < instruction.size(); ++operand) varying = NonUniform(instruction[operand]);
+                    if (instruction.size() > 3u && varyingFunctions.contains(instruction[3])) seed("the result of function %" + std::to_string(instruction[3]));
+                    for (std::size_t operand = 4u; !varying && operand < instruction.size(); ++operand) varying = inherit(instruction[operand]);
                     break;
                 default:
-                    varying = PerInvocationResult(op) || (ImageRead(op) && Written(spv::StorageClassImage));
-                    if (!varying) VisitIdOperands(instruction, 1u, [&](std::size_t operand) { varying = varying || NonUniform(instruction[operand]); });
+                    if (PerInvocationResult(op)) seed("opcode " + std::to_string(static_cast<std::uint32_t>(op)));
+                    else if (ImageRead(op) && Written(spv::StorageClassImage)) seed("an image read of an image the program writes");
+                    if (!varying) VisitIdOperands(instruction, 1u, [&](std::size_t operand) { varying = varying || inherit(instruction[operand]); });
                     break;
                 }
                 if (!varying) continue;
                 nonUniform.insert(result);
+                if (cause != NoCause) reasons.emplace(result, cause);
                 if (op != spv::OpFunctionCall) varyingFunctions.insert(function.id);
             }
         }
@@ -535,6 +601,29 @@ private:
     std::unordered_set<std::uint32_t> storedNonUniform;
     std::unordered_set<std::uint32_t> snapshots;
     std::unordered_set<std::uint32_t> varyingFunctions;
+    std::string WrittenNames() const {
+        std::string text = "; written:";
+        for (const auto variable : writtenVariables) text += " " + (module.names.contains(variable) ? module.names.at(variable) : "%" + std::to_string(variable));
+        return text;
+    }
+
+    std::unordered_set<std::uint32_t> privates;
+    std::unordered_set<std::uint32_t> privateWritten;
+    std::vector<std::uint32_t> writtenVariables;
+    std::unordered_map<std::uint32_t, std::uint32_t> accessBases;
+
+    std::uint32_t CauseOf(const std::string& text) {
+        const auto [found, added] = causeIndex.try_emplace(text, static_cast<std::uint32_t>(causes.size()));
+        if (added) causes.push_back(text);
+        return found->second;
+    }
+
+    static constexpr std::uint32_t NoCause = 0xffffffffu;
+    std::vector<std::string> causes;
+    std::unordered_map<std::string, std::uint32_t> causeIndex;
+    std::unordered_map<std::uint32_t, std::uint32_t> reasons;
+    std::unordered_map<std::uint32_t, std::uint32_t> divergentCause;
+    std::unordered_map<std::uint32_t, std::uint32_t> storedCause;
     std::optional<std::string> report;
 };
 
@@ -544,12 +633,12 @@ bool SpannedSnapshotLoadsEnabled(const char* optOut) {
     return optOut == nullptr;
 }
 
-std::optional<std::string> SpannedBarrierInDivergentFlow(std::span<const std::uint32_t> words, std::span<const std::uint32_t> snapshotVariables) {
+std::optional<std::string> SpannedBarrierInDivergentFlow(std::span<const std::uint32_t> words, std::span<const std::uint32_t> snapshotVariables, std::span<const std::uint32_t> privateVariables) {
     bool barrier = false;
     for (std::size_t cursor = 5u; !barrier && cursor < words.size(); cursor += std::max(words[cursor] >> 16u, 1u)) barrier = (words[cursor] & 0xffffu) == spv::OpControlBarrier;
     if (!barrier) return std::nullopt;
     const auto module = Parse(words);
-    return Analysis(module, snapshotVariables).Run();
+    return Analysis(module, snapshotVariables, privateVariables).Run();
 }
 
 }

@@ -1,11 +1,13 @@
 #include "prx/libSceAgcDriver/Unified/include/MemoryCore.hpp"
 #include "prx/libSceAgcDriver/Unified/include/Downgrades.hpp"
 #include "prx/libSceAgcDriver/Unified/include/Events.hpp"
+#include "prx/libSceAgcDriver/Unified/include/FaultSites.hpp"
 #include <array>
 #include <atomic>
 #include <chrono>
 #include <cstdlib>
 #include <cstring>
+#include <string_view>
 #include "prx/libc/include/GuestArena.hpp"
 
 namespace AgcDriver::Unified {
@@ -16,11 +18,37 @@ thread_local volatile bool landing = false;
 
 std::atomic<std::uint64_t> faultCalls{0};
 std::atomic<std::uint64_t> faultNanoseconds{0};
+std::atomic<std::uint64_t> faultLockNanoseconds{0};
+std::atomic<std::uint64_t> faultTableNanoseconds{0};
+std::atomic<std::uint64_t> faultProtectNanoseconds{0};
+
+std::atomic<std::uint64_t> lockFreeWrites{0};
+
+bool lockFreeFaults() {
+    static const bool on = [] {
+        const char* value = std::getenv("APS5_RECODE_LOCKED_FAULTS");
+        return value == nullptr || std::string_view(value) == "0";
+    }();
+    return on;
+}
+
+bool growsFaults() {
+    static const bool on = [] {
+        const char* value = std::getenv("APS5_RECODE_GROW_FAULTS");
+        return value != nullptr && std::string_view(value) != "0";
+    }();
+    return on;
+}
+
+std::uint64_t since(std::chrono::steady_clock::time_point start) {
+    return static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - start).count());
+}
 
 bool handleGuestFault(std::uintptr_t address, bool write) {
     if (landing) return false;
     const auto start = std::chrono::steady_clock::now();
     const bool handled = MemoryCore::Get().HandleFault(address, write);
+    if (handled && write && FaultSites::Enabled()) FaultSites::Note();
     faultCalls.fetch_add(1, std::memory_order_relaxed);
     faultNanoseconds.fetch_add(static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - start).count()), std::memory_order_relaxed);
     return handled;
@@ -38,6 +66,8 @@ MemoryCore& MemoryCore::Get() {
 }
 
 bool MemoryCore::Install() {
+    pages.SetHasher(&MemoryCore::readableHash);
+    FaultSites::Install();
 #ifdef _WIN32
     if (!GuestArena::GuestArenaSetGpuFaultHandler_nid_no_patch(handleGuestFault)) return false;
     GuestArena::GuestArenaSetGpuHostWriteHook_nid_no_patch(prepareGuestHostWrite);
@@ -86,6 +116,12 @@ std::uint64_t MemoryCore::PageHash(std::uint64_t page) {
     return lanes[0] ^ (lanes[1] * 31u) ^ (lanes[2] * 131u) ^ (lanes[3] * 1031u);
 }
 
+bool MemoryCore::readableHash(std::uint64_t page, std::uint64_t& hash) {
+    if (!Protector::Readable(page * PageBytes)) return false;
+    hash = PageHash(page);
+    return true;
+}
+
 bool MemoryCore::rehash(std::uint64_t page, bool proven) {
     if (!Protector::Readable(page * PageBytes)) {
         unreadableHashes.fetch_add(1, std::memory_order_relaxed);
@@ -120,6 +156,11 @@ std::vector<DirtyRange> MemoryCore::ConsumeDirty() {
     };
     auto ranges = hashBusy ? pages.ConsumeDirty(changes, written) : pages.ConsumeDirty(changes);
     protector.Apply(changes);
+    for (const auto& [page, hash] : pages.TakeRearmedUnproven()) {
+        if (pages.StateOf(page * PageBytes) != PageState::CpuClean || PageHash(page) == hash) continue;
+        ranges.push_back({page * PageBytes, PageBytes});
+        rearmedChanged.fetch_add(1, std::memory_order_relaxed);
+    }
     for (const auto page : unchanged) {
         if (pages.StateOf(page * PageBytes) != PageState::CpuClean || !rehash(page, false)) continue;
         ranges.push_back({page * PageBytes, PageBytes});
@@ -138,7 +179,26 @@ void MemoryCore::MarkGpuOwned(std::uint64_t address, std::uint64_t size) {
 }
 
 bool MemoryCore::HandleFault(std::uint64_t address, bool write) {
+    const auto entered = std::chrono::steady_clock::now();
+    if (write && lockFreeFaults() && pages.BeginWriteFault(address)) {
+        const auto page = address & ~(PageBytes - 1);
+        Downgrades::WatchTouch("a CPU write fault", page, PageBytes);
+        Events::Shared().Note(page, PageBytes);
+        faultTableNanoseconds.fetch_add(since(entered), std::memory_order_relaxed);
+        const auto grown = growsFaults() ? pages.GrowWriteFault(address) : std::vector<DirtyRange>{};
+        bool held = false;
+        const auto protectStart = std::chrono::steady_clock::now();
+        protector.Open(page, PageBytes, &held);
+        pages.EndWriteFault(address);
+        for (const auto& run : grown) protector.Open(run.address, run.size);
+        pages.EndGrow(grown);
+        faultProtectNanoseconds.fetch_add(since(protectStart), std::memory_order_relaxed);
+        writesOpened.fetch_add(1, std::memory_order_relaxed);
+        lockFreeWrites.fetch_add(1, std::memory_order_relaxed);
+        return !held;
+    }
     std::unique_lock lock(mutex);
+    faultLockNanoseconds.fetch_add(since(entered), std::memory_order_relaxed);
     const auto state = pages.StateOf(address);
     if (state == PageState::Untracked || state == PageState::Reserved) {
         foreignFaults.fetch_add(1, std::memory_order_relaxed);
@@ -162,11 +222,15 @@ bool MemoryCore::HandleFault(std::uint64_t address, bool write) {
         return protector.Apply(std::span(&reopen, 1), &held) == 1 && !held;
     }
     std::vector<ProtectionChange> changes;
+    const auto tableStart = std::chrono::steady_clock::now();
     if (!pages.HandleWrite(address, changes)) return false;
     Downgrades::WatchTouch("a CPU write fault", address & ~(PageBytes - 1), PageBytes);
     Events::Shared().Note(address & ~(PageBytes - 1), PageBytes);
+    faultTableNanoseconds.fetch_add(since(tableStart), std::memory_order_relaxed);
     bool held = false;
+    const auto protectStart = std::chrono::steady_clock::now();
     protector.Apply(changes, &held);
+    faultProtectNanoseconds.fetch_add(since(protectStart), std::memory_order_relaxed);
     writesOpened.fetch_add(1, std::memory_order_relaxed);
     return !held;
 }
@@ -258,6 +322,10 @@ MemoryCoreCounts MemoryCore::Counts() const {
     counts.staleFaults = staleFaults.load(std::memory_order_relaxed);
     counts.faultCalls = faultCalls.load(std::memory_order_relaxed);
     counts.faultNanoseconds = faultNanoseconds.load(std::memory_order_relaxed);
+    counts.faultLockNanoseconds = faultLockNanoseconds.load(std::memory_order_relaxed);
+    counts.faultTableNanoseconds = faultTableNanoseconds.load(std::memory_order_relaxed);
+    counts.faultProtectNanoseconds = faultProtectNanoseconds.load(std::memory_order_relaxed);
+    counts.lockFreeWrites = lockFreeWrites.load(std::memory_order_relaxed);
     counts.landedBytes = landedBytes.load(std::memory_order_relaxed);
     counts.driverPagesSettled = driverPagesSettled.load(std::memory_order_relaxed);
     counts.rearmedChanged = rearmedChanged.load(std::memory_order_relaxed);

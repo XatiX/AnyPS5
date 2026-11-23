@@ -4944,7 +4944,7 @@ namespace {
 
 std::uint32_t bdaAbiVersion() {
 #if ANYPS5_UNIFIED
-    if (Unified::ResidencyService::PageTableEnabled()) return ShaderRecompiler::BdaAbi::PageTableVersion;
+    if (Unified::ResidencyService::MirrorAddressing()) return ShaderRecompiler::BdaAbi::MirrorVersion;
 #endif
     return ShaderRecompiler::BdaAbi::Version;
 }
