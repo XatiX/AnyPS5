@@ -2671,6 +2671,42 @@ private:
         std::fprintf(stderr, "[recode-dump] record 0x%llx %ux%u %u levels format %u written at %lld s\n", static_cast<unsigned long long>(record->key.address), record->key.width, record->key.height, levels, record->key.format, static_cast<long long>(std::chrono::duration_cast<std::chrono::seconds>(now - dumpClock).count()));
     }
 
+    void maybeDumpSampled(const Context& context, Graphics::Recorder& recorder, const std::shared_ptr<Images::Surface>& record, std::uint64_t program) {
+        static const std::uint64_t wanted = [] {
+            const char* value = std::getenv("APS5_RECODE_DUMP_SAMPLED_BY");
+            return value == nullptr ? std::uint64_t{0} : static_cast<std::uint64_t>(std::strtoull(value, nullptr, 16));
+        }();
+        const auto& request = recordDumpRequest();
+        if (wanted == 0 || program != wanted || request.directory.empty()) return;
+        if (std::chrono::steady_clock::now() - dumpClock < std::chrono::seconds(request.seconds)) return;
+        if (!sampledDumps.insert(record->key.address).second || sampledDumps.size() > 16u) return;
+        auto* vulkan = dynamic_cast<Images::VulkanSurface*>(record->device.get());
+        if (vulkan == nullptr || vulkan->Compressed()) return;
+        const auto elementBytes = Graphics::BytesPerElement(vulkan->Resource().format);
+        const auto width = record->key.width;
+        const auto height = record->key.height;
+        const auto commands = recorder.Commands();
+        Graphics::RecordMemoryBarrier(context, commands, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT | VK_ACCESS_SHADER_WRITE_BIT | VK_ACCESS_TRANSFER_WRITE_BIT, VK_ACCESS_TRANSFER_READ_BIT);
+        auto buffer = std::make_shared<Graphics::Buffer>(context, static_cast<std::size_t>(width) * height * elementBytes, VK_BUFFER_USAGE_TRANSFER_DST_BIT);
+        VkBufferImageCopy region{};
+        region.imageSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0u, 0u, 1u};
+        region.imageExtent = {width, height, 1u};
+        context.Resolved(&Graphics::DeviceFunctions::cmdCopyImageToBuffer, "vkCmdCopyImageToBuffer")(commands, vulkan->Image(), VK_IMAGE_LAYOUT_GENERAL, buffer->Handle(), 1, &region);
+        Graphics::RecordMemoryBarrier(context, commands, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT | VK_PIPELINE_STAGE_HOST_BIT, VK_ACCESS_TRANSFER_READ_BIT | VK_ACCESS_TRANSFER_WRITE_BIT, VK_ACCESS_HOST_READ_BIT | VK_ACCESS_MEMORY_WRITE_BIT);
+        recorder.Keep(buffer);
+        char name[192];
+        std::snprintf(name, sizeof(name), "sampled-p%016llx-record-%llx-L0-%ux%u-vk%u.raw", static_cast<unsigned long long>(program), static_cast<unsigned long long>(record->key.address), width, height, static_cast<unsigned>(vulkan->Format()));
+        recorder.OnComplete([buffer, file = request.directory + "/" + name] {
+            auto* out = std::fopen(file.c_str(), "wb");
+            if (out == nullptr) return;
+            buffer->Invalidate();
+            const auto bytes = buffer->Bytes();
+            std::fwrite(bytes.data(), 1, bytes.size(), out);
+            std::fclose(out);
+        });
+        std::fprintf(stderr, "[recode-dump] sampled record 0x%llx %ux%u format %u by %016llx\n", static_cast<unsigned long long>(record->key.address), width, height, record->key.format, static_cast<unsigned long long>(program));
+    }
+
     void maybeDumpUpstream(const Context& context, Graphics::Recorder& recorder, const std::shared_ptr<Graphics::StorageTexture>& resident, std::uint64_t program, std::uint32_t level) {
         const auto& request = recordDumpRequest();
         const auto& descriptor = resident->Descriptor();
@@ -3940,6 +3976,7 @@ private:
         viewKey.baseArray += layer;
         viewKey.lastArray += layer;
         if (record != nullptr) noteSampledSource(Downgrades::ProgramHash(stage.program.codeAddress), record->key.address, record->key.bytes);
+        if (record != nullptr && context.recorder != nullptr) maybeDumpSampled(context, *context.recorder, record, Downgrades::ProgramHash(stage.program.codeAddress));
         if (record != nullptr && sourcesOfProgram() == 0 && !targetTraceList().empty() && tracedProgram(Downgrades::ProgramHash(stage.program.codeAddress)) && targetTraceLines.fetch_add(1, std::memory_order_relaxed) < (targetTraceList() == "all" ? 20000u : 400u)) {
             std::fprintf(stderr, "[recode-sampled] program %016llx slot %u kind %u 0x%llx %ux%u mips %u view levels %u-%u layers %u-%u format %u -> record 0x%llx mips %u\n", static_cast<unsigned long long>(Downgrades::ProgramHash(stage.program.codeAddress)), deferred.index, deferred.request.kind, static_cast<unsigned long long>(surface.address), surface.width, surface.height, surface.mips, viewKey.baseLevel, viewKey.lastLevel, viewKey.baseArray, viewKey.lastArray, viewKey.format, static_cast<unsigned long long>(record->key.address), record->key.mips);
         }
@@ -4036,6 +4073,7 @@ private:
     std::set<std::string> seen;
     std::chrono::steady_clock::time_point dumpClock = std::chrono::steady_clock::now();
     std::set<std::uint64_t> dumpedRecords;
+    std::set<std::uint64_t> sampledDumps;
     std::uint64_t traceAddress = 0;
     std::uint32_t traceDumps = 0;
     std::uint32_t traceSeen = 0;
