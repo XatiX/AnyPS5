@@ -405,6 +405,7 @@ std::atomic<std::uint64_t> flipsFromNewRecords{0};
 std::atomic<std::uint64_t> flipsFromOldRecords{0};
 std::atomic<std::uint64_t> flipsWithoutRecords{0};
 std::atomic<std::uint32_t> flipNotes{0};
+std::atomic<std::uint32_t> flipMemoryNotes{0};
 std::atomic<std::uint64_t> flipsPresentedFromRecords{0};
 
 struct BatchLandings {
@@ -2824,16 +2825,18 @@ private:
         if (sampledDumps.contains(record->key.address) || sampledDumps.size() >= 16u) return;
         sampledDumps.insert(record->key.address);
         auto* vulkan = dynamic_cast<Images::VulkanSurface*>(record->device.get());
-        if (vulkan == nullptr || vulkan->Compressed()) {
-            std::fprintf(stderr, "[recode-dump] sampled record 0x%llx skipped: %s\n", static_cast<unsigned long long>(record->key.address), vulkan == nullptr ? "not a Vulkan surface" : "block-compressed format");
+        if (vulkan == nullptr) {
+            std::fprintf(stderr, "[recode-dump] sampled record 0x%llx skipped: not a Vulkan surface\n", static_cast<unsigned long long>(record->key.address));
             return;
         }
         const auto elementBytes = Graphics::BytesPerElement(vulkan->Resource().format);
+        const auto block = std::max(Graphics::BlockWidth(vulkan->Resource().format), 1u);
         const auto width = record->key.width;
         const auto height = record->key.height;
+        if (Downgrades::Active()) std::fprintf(stderr, "[recode-dump] sampled record 0x%llx %ux%u guest format %u vk %u, %u bytes per element, block %u, by %016llx\n", static_cast<unsigned long long>(record->key.address), width, height, static_cast<unsigned>(vulkan->Resource().format), static_cast<unsigned>(vulkan->Format()), elementBytes, block, static_cast<unsigned long long>(program));
         const auto commands = recorder.Commands();
         Graphics::RecordMemoryBarrier(context, commands, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT | VK_ACCESS_SHADER_WRITE_BIT | VK_ACCESS_TRANSFER_WRITE_BIT, VK_ACCESS_TRANSFER_READ_BIT);
-        auto buffer = std::make_shared<Graphics::Buffer>(context, static_cast<std::size_t>(width) * height * elementBytes, VK_BUFFER_USAGE_TRANSFER_DST_BIT);
+        auto buffer = std::make_shared<Graphics::Buffer>(context, static_cast<std::size_t>((width + block - 1u) / block) * ((height + block - 1u) / block) * elementBytes, VK_BUFFER_USAGE_TRANSFER_DST_BIT);
         VkBufferImageCopy region{};
         region.imageSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0u, 0u, 1u};
         region.imageExtent = {width, height, 1u};
@@ -4367,7 +4370,7 @@ std::optional<DisplaySource> DisplayRecord(std::uint64_t address, std::uint64_t 
         if (!record->gpuNewer || record->retired || record->key.address != address) continue;
         auto* vulkan = dynamic_cast<Images::VulkanSurface*>(record->device.get());
         if (vulkan == nullptr || vulkan->Compressed() || vulkan->Geometry().mips.size() > 1u || vulkan->Geometry().imageLayers > 1u) continue;
-        flipsPresentedFromRecords.fetch_add(1, std::memory_order_relaxed);
+        if (flipsPresentedFromRecords.fetch_add(1, std::memory_order_relaxed) < 6u && Downgrades::Active()) std::fprintf(stderr, "[recode-flip] presented from record 0x%llx+0x%llx %ux%u format %u at %.2f s\n", static_cast<unsigned long long>(record->key.address), static_cast<unsigned long long>(record->key.bytes), record->key.width, record->key.height, record->key.format, static_cast<double>(elapsed(processStart())) / 1e9);
         return DisplaySource{vulkan->Image(), vulkan->Format(), vulkan->Resource(), record};
     }
     return std::nullopt;
@@ -4384,6 +4387,18 @@ void FlipSource(const Graphics::Context& context, std::uint64_t address, std::ui
             for (const auto& record : overlapping) std::fprintf(stderr, " [0x%llx+0x%llx %ux%u format %u]", static_cast<unsigned long long>(record->key.address), static_cast<unsigned long long>(record->key.bytes), record->key.width, record->key.height, record->key.format);
             std::fputc(10, stderr);
             if (newer) std::fprintf(stderr, "[recode-flip] SEVERE: this flip is not presented from its GPU-written record; the existing presenter shows guest memory\n");
+        }
+        if (overlapping.empty() && Downgrades::Active() && flipMemoryNotes.fetch_add(1, std::memory_order_relaxed) < 6u) {
+            std::array<std::uint32_t, 4> head{};
+            std::array<std::uint32_t, 4> middle{};
+            const auto* base = reinterpret_cast<const std::byte*>(static_cast<std::uintptr_t>(address));
+            const bool readable = GuestMemory::Accessible(base, sizeof(head), false) && GuestMemory::Accessible(base + bytes / 2u, sizeof(middle), false);
+            if (readable) {
+                std::memcpy(head.data(), base, sizeof(head));
+                std::memcpy(middle.data(), base + bytes / 2u, sizeof(middle));
+            }
+            auto& pages = MemoryCore::Get().Pages();
+            std::fprintf(stderr, "[recode-flip] flip without a record at %.1f s: memory %s head %08x %08x %08x %08x middle %08x %08x %08x %08x; GPU-written %d, GPU-owned pages %zu\n", static_cast<double>(elapsed(processStart())) / 1e9, readable ? "readable" : "unreadable", head[0], head[1], head[2], head[3], middle[0], middle[1], middle[2], middle[3], pages.GpuWrittenIn(address, bytes) ? 1 : 0, pages.GpuOwnedIn(address, bytes).size());
         }
     }
     static_cast<void>(context);
