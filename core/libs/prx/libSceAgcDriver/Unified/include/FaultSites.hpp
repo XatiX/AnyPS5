@@ -13,6 +13,8 @@ inline constexpr std::size_t Shown = 8;
 [[nodiscard]] bool Enabled();
 void Install();
 void Note();
+[[nodiscard]] std::uintptr_t PendingSite();
+[[nodiscard]] std::string Describe(std::uintptr_t site);
 [[nodiscard]] std::string Line();
 
 }

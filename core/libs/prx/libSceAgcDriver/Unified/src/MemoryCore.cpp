@@ -48,7 +48,7 @@ bool handleGuestFault(std::uintptr_t address, bool write) {
     if (landing) return false;
     const auto start = std::chrono::steady_clock::now();
     const bool handled = MemoryCore::Get().HandleFault(address, write);
-    if (handled && write && FaultSites::Enabled()) FaultSites::Note();
+    if (FaultSites::Enabled() && handled && write) FaultSites::Note();
     faultCalls.fetch_add(1, std::memory_order_relaxed);
     faultNanoseconds.fetch_add(static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - start).count()), std::memory_order_relaxed);
     return handled;

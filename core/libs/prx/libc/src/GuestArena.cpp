@@ -765,12 +765,12 @@ bool GuestArenaSetGpuFaultHandler_nid_no_patch(bool (*handler)(std::uintptr_t ad
 
 bool GuestArenaHandleGpuFault_nid_no_patch(EXCEPTION_POINTERS* exception) {
     const auto handler = gpuFaultHandler().load(std::memory_order_acquire);
-    if (handler == nullptr) return false;
+    if (handler == nullptr || WindowsMappings::LockHeld()) return false;
     const auto* record = exception->ExceptionRecord;
     if (record->ExceptionCode != EXCEPTION_ACCESS_VIOLATION || record->NumberParameters < 2) return false;
     const auto kind = record->ExceptionInformation[0];
     if (kind != 0 && kind != 1) return false;
-    if (const auto site = gpuFaultSiteHook.load(std::memory_order_acquire); site != nullptr && kind == 1) site(reinterpret_cast<std::uintptr_t>(record->ExceptionAddress));
+    if (const auto site = gpuFaultSiteHook.load(std::memory_order_acquire); site != nullptr) site(reinterpret_cast<std::uintptr_t>(record->ExceptionAddress));
     return handler(static_cast<std::uintptr_t>(record->ExceptionInformation[1]), kind == 1);
 }
 

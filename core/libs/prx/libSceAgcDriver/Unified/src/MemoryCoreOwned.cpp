@@ -1,7 +1,9 @@
 #include "prx/libSceAgcDriver/Unified/include/MemoryCore.hpp"
 #include "prx/libSceAgcDriver/Unified/include/Downgrades.hpp"
 #include "prx/libSceAgcDriver/Unified/include/Events.hpp"
+#include "prx/libSceAgcDriver/Unified/include/FaultSites.hpp"
 #include <algorithm>
+#include <chrono>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -330,7 +332,10 @@ bool MemoryCore::resolveOwnedFault(std::uint64_t address, bool write) {
     parked.push_back(&request);
     faultsParked.fetch_add(1, std::memory_order_relaxed);
     parkSignal.notify_all();
-    parkSignal.wait(lock, [&] { return request.done; });
+    const auto site = FaultSites::PendingSite();
+    for (int waited = 0; !parkSignal.wait_for(lock, std::chrono::seconds(2), [&] { return request.done; }); waited += 2) {
+        if (waited == 0) std::fprintf(stderr, "[recode-park] %s fault on page 0x%llx from %s has waited 2 s for the fault resolver; %zu faults parked\n", write ? "write" : "read", static_cast<unsigned long long>(page), FaultSites::Describe(site).c_str(), parked.size());
+    }
     return true;
 }
 

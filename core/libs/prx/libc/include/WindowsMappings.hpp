@@ -24,6 +24,7 @@ namespace GuestArena {
 
 class WindowsMappings {
 public:
+    static bool LockHeld();
     enum class Collection { All, Armed, Fresh };
     static constexpr std::uint8_t CapNone = 0;
     static constexpr std::uint8_t CapReadOnly = 1;
@@ -879,13 +880,21 @@ private:
         void lock() {
             if (pthread) fallback.lock();
             else AcquireSRWLockExclusive(&native);
+            ++held();
         }
         bool try_lock() {
-            return pthread ? fallback.try_lock() : TryAcquireSRWLockExclusive(&native) != 0;
+            const bool taken = pthread ? fallback.try_lock() : TryAcquireSRWLockExclusive(&native) != 0;
+            if (taken) ++held();
+            return taken;
         }
         void unlock() {
+            --held();
             if (pthread) fallback.unlock();
             else ReleaseSRWLockExclusive(&native);
+        }
+        static int& held() {
+            thread_local int depth = 0;
+            return depth;
         }
 
     private:
@@ -1338,6 +1347,11 @@ private:
         if (!map(section, GetCurrentProcess(), reinterpret_cast<void*>(base), offset, bytes, MEM_REPLACE_PLACEHOLDER, PAGE_EXECUTE_READWRITE, nullptr, 0)) fail("map a run of shared guest pages");
     }
 
+    static bool readGuarded(std::uintptr_t address, unsigned char* destination, std::size_t bytes) {
+        SIZE_T copied = 0;
+        return ReadProcessMemory(GetCurrentProcess(), reinterpret_cast<const void*>(address), destination, bytes, &copied) != 0 && copied == bytes;
+    }
+
     void breakView(std::uintptr_t at) {
         const auto memory = query(at);
         if (memory.State == MEM_FREE || memory.Type != MEM_MAPPED) return;
@@ -1363,10 +1377,12 @@ private:
         const auto section = first->second.section;
         const auto offset = first->second.offset;
         std::vector<unsigned char> saved;
+        std::vector<bool> readable;
         for (auto it = views.lower_bound(start); it != views.end() && it->first < stop; ++it) {
             for (std::size_t sub = 0; sub < subpages; ++sub) {
-                const auto* bytes = reinterpret_cast<const unsigned char*>(it->first + sub * subpageBytes);
-                if ((it->second.armed & (1u << sub)) != 0) saved.insert(saved.end(), bytes, bytes + subpageBytes);
+                if ((it->second.armed & (1u << sub)) == 0) continue;
+                saved.resize(saved.size() + subpageBytes);
+                readable.push_back(readGuarded(it->first + sub * subpageBytes, saved.data() + saved.size() - subpageBytes, subpageBytes));
             }
         }
         if (!unmap(GetCurrentProcess(), reinterpret_cast<void*>(start), MEM_PRESERVE_PLACEHOLDER)) fail("unmap a run of shared guest pages to split it");
@@ -1380,11 +1396,13 @@ private:
             }
         }
         const auto* before = saved.data();
+        std::size_t index = 0;
+        std::vector<unsigned char> now(subpageBytes);
         for (auto it = views.lower_bound(start); it != views.end() && it->first < stop; ++it) {
             std::uint8_t written = 0;
             for (std::size_t sub = 0; sub < subpages; ++sub) {
                 if ((it->second.armed & (1u << sub)) == 0) continue;
-                if (std::memcmp(reinterpret_cast<const void*>(it->first + sub * subpageBytes), before, subpageBytes) != 0) written |= static_cast<std::uint8_t>(1u << sub);
+                if (readable[index++] && readGuarded(it->first + sub * subpageBytes, now.data(), subpageBytes) && std::memcmp(now.data(), before, subpageBytes) != 0) written |= static_cast<std::uint8_t>(1u << sub);
                 before += subpageBytes;
             }
             if (written != 0) invalidate(*it->second.page, written);
@@ -1867,6 +1885,10 @@ private:
     UnmapFunction unmap = nullptr;
     CompareFunction compare = nullptr;
 };
+
+inline bool WindowsMappings::LockHeld() {
+    return Lock::held() != 0;
+}
 
 }
 #endif

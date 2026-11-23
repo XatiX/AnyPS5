@@ -63,8 +63,16 @@ bool Enabled() {
 
 void Install() {
 #ifdef _WIN32
-    if (Enabled()) GuestArena::GuestArenaSetGpuFaultSiteHook_nid_no_patch(noteSite);
+    GuestArena::GuestArenaSetGpuFaultSiteHook_nid_no_patch(noteSite);
 #endif
+}
+
+std::uintptr_t PendingSite() {
+    return pendingSite;
+}
+
+std::string Describe(std::uintptr_t site) {
+    return moduleOf(site);
 }
 
 void Note() {
