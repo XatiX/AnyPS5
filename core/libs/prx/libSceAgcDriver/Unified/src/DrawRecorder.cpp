@@ -832,6 +832,13 @@ std::optional<DrawInput> mirrorInput(std::uint64_t address, std::uint64_t bytes)
     return DrawInput{reinterpret_cast<VkBuffer>(static_cast<std::uintptr_t>(span->handle)), static_cast<VkDeviceSize>(span->offset)};
 }
 
+constexpr std::uint64_t InputCopyLimitBytes = 64ull << 10u;
+
+bool copiesInputs() {
+    static const bool copies = std::getenv("APS5_RECODE_NO_INPUT_COPIES") == nullptr;
+    return copies;
+}
+
 std::optional<DrawInput> drawInput(const Context& context, std::uint64_t address, std::uint64_t bytes, InputSource& source) {
     source = InputSource::Imported;
     auto& pages = MemoryCore::Get().Pages();
@@ -846,14 +853,18 @@ std::optional<DrawInput> drawInput(const Context& context, std::uint64_t address
         }
     } else if (DirectMemoryAliased_nid_postfix(static_cast<std::uintptr_t>(address), static_cast<std::size_t>(bytes))) {
         source = InputSource::Aliased;
-    } else {
+    }
+    std::optional<DrawInput> written;
+    if (source == InputSource::Imported) {
         Shadow::OwnedSpan span;
         if (Shadow::ServeOwned(context, address, bytes, &span) && span.handle != 0u) {
+            const DrawInput resident{reinterpret_cast<VkBuffer>(static_cast<std::uintptr_t>(span.handle)), static_cast<VkDeviceSize>(address - span.origin)};
             if (pages.CleanIn(address, bytes)) {
                 source = InputSource::Resident;
-                return DrawInput{reinterpret_cast<VkBuffer>(static_cast<std::uintptr_t>(span.handle)), static_cast<VkDeviceSize>(address - span.origin)};
+                return resident;
             }
             source = InputSource::Written;
+            if (copiesInputs() && bytes <= InputCopyLimitBytes) written = resident;
         }
     }
     if (mirrorPart("inputs") && source != InputSource::Aliased) {
@@ -867,6 +878,10 @@ std::optional<DrawInput> drawInput(const Context& context, std::uint64_t address
             source = InputSource::Mirrored;
             return input;
         }
+    }
+    if (!imported && written) {
+        source = InputSource::Written;
+        return written;
     }
     return imported;
 }
@@ -928,13 +943,7 @@ std::uint32_t coldSmallWrites() {
     }();
     return limit;
 }
-constexpr std::uint64_t InputCopyLimitBytes = 64ull << 10u;
 constexpr std::uint32_t PagesPerChunk = static_cast<std::uint32_t>(ChunkBytes / PageBytes);
-
-bool copiesInputs() {
-    static const bool copies = std::getenv("APS5_RECODE_NO_INPUT_COPIES") == nullptr;
-    return copies;
-}
 
 bool shaderDataBinding(const Resolve::ResolvedStage& stage, std::uint32_t index) {
     const auto& bindings = stage.program.result->bindings;
@@ -3270,6 +3279,7 @@ private:
         std::string reason;
         const bool applied = metadataClears->Apply(*context.recorder, record->key.address, *vulkan, reason);
         for (const auto& [begin, size] : metadataClears->TakeExpanded()) noteWrittenBack(*context.recorder, begin, size);
+        if (applied || !reason.empty()) context.recorder->Keep(record);
         if (applied) {
             markRecordWritten(*context.recorder, *table, *record);
             totals.metadataClears++;
