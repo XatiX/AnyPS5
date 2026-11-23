@@ -176,12 +176,16 @@ std::string frameLine() {
     struct Sample {
         std::uint64_t frames = 0;
         std::uint64_t writeFaults = 0;
+        std::uint64_t lockFreeWrites = 0;
         std::uint64_t ownedFaults = 0;
         std::uint64_t parked = 0;
         std::uint64_t bypassed = 0;
         std::uint64_t protectCalls = 0;
         std::uint64_t faultCalls = 0;
         std::uint64_t faultNanoseconds = 0;
+        std::uint64_t lockNanoseconds = 0;
+        std::uint64_t tableNanoseconds = 0;
+        std::uint64_t protectNanoseconds = 0;
         std::uint64_t readBackBytes = 0;
         std::uint64_t landedBytes = 0;
     };
@@ -191,21 +195,25 @@ std::string frameLine() {
     Sample now;
     now.frames = memoryTotals().frames.load(std::memory_order_relaxed);
     now.writeFaults = core.writesOpened;
+    now.lockFreeWrites = core.lockFreeWrites;
     now.ownedFaults = core.gpuOwnedFaults;
     now.parked = core.faultsParked;
     now.bypassed = core.faultsBypassed;
     now.protectCalls = MemoryCore::Get().Protection().Counts().calls;
     now.faultCalls = core.faultCalls;
     now.faultNanoseconds = core.faultNanoseconds;
+    now.lockNanoseconds = core.faultLockNanoseconds;
+    now.tableNanoseconds = core.faultTableNanoseconds;
+    now.protectNanoseconds = core.faultProtectNanoseconds;
     now.readBackBytes = ResidencyService::Get().ReadBackBytes();
     now.landedBytes = core.ownedLandedBytes + core.diffLandedBytes + core.landedBytes;
     std::lock_guard lock(sampleMutex);
     const auto frames = now.frames - last.frames;
     const auto each = [&](std::uint64_t current, std::uint64_t before) { return frames == 0u ? 0.0 : static_cast<double>(current - before) / static_cast<double>(frames); };
-    char line[640];
-    std::snprintf(line, sizeof(line), "[recode-frame] %llu frames; per frame: write faults %.1f, faults on GPU-owned pages %.2f (parked %.2f, bypassed %.2f), protect calls %.1f, fault handler %.1f us in %.1f calls, read back %.1f KiB, landed %.1f KiB\n",
-        static_cast<unsigned long long>(frames), each(now.writeFaults, last.writeFaults), each(now.ownedFaults, last.ownedFaults), each(now.parked, last.parked), each(now.bypassed, last.bypassed), each(now.protectCalls, last.protectCalls),
-        each(now.faultNanoseconds, last.faultNanoseconds) / 1000.0, each(now.faultCalls, last.faultCalls), each(now.readBackBytes, last.readBackBytes) / 1024.0, each(now.landedBytes, last.landedBytes) / 1024.0);
+    char line[896];
+    std::snprintf(line, sizeof(line), "[recode-frame] %llu frames; per frame: write faults %.1f (%.1f without the core's lock), faults on GPU-owned pages %.2f (parked %.2f, bypassed %.2f), protect calls %.1f, fault handler %.1f us in %.1f calls (waiting for the core's lock %.1f us, page table and change note %.1f us, protection call %.1f us), read back %.1f KiB, landed %.1f KiB\n",
+        static_cast<unsigned long long>(frames), each(now.writeFaults, last.writeFaults), each(now.lockFreeWrites, last.lockFreeWrites), each(now.ownedFaults, last.ownedFaults), each(now.parked, last.parked), each(now.bypassed, last.bypassed), each(now.protectCalls, last.protectCalls),
+        each(now.faultNanoseconds, last.faultNanoseconds) / 1000.0, each(now.faultCalls, last.faultCalls), each(now.lockNanoseconds, last.lockNanoseconds) / 1000.0, each(now.tableNanoseconds, last.tableNanoseconds) / 1000.0, each(now.protectNanoseconds, last.protectNanoseconds) / 1000.0, each(now.readBackBytes, last.readBackBytes) / 1024.0, each(now.landedBytes, last.landedBytes) / 1024.0);
     last = now;
     return line;
 }

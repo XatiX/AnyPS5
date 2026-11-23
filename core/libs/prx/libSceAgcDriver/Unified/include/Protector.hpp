@@ -2,6 +2,7 @@
 #define CORE_LIBS_PRX_LIBSCEAGCDRIVER_UNIFIED_INCLUDE_PROTECTOR_HPP
 
 #include "prx/libSceAgcDriver/Unified/include/PageTable.hpp"
+#include <atomic>
 #include <cstdint>
 #include <map>
 #include <mutex>
@@ -35,6 +36,7 @@ public:
     [[nodiscard]] static bool SectionBacked(std::uint64_t address);
     [[nodiscard]] static std::vector<DirtyRange> ReadableRanges(std::uint64_t address, std::uint64_t size);
     std::size_t Apply(std::span<const ProtectionChange> changes, bool* held = nullptr);
+    bool Open(std::uint64_t address, std::uint64_t size, bool* held = nullptr);
     void Defer(std::span<const ProtectionChange> changes);
     std::size_t Flush();
     [[nodiscard]] ProtectorCounts Counts() const;
@@ -47,7 +49,11 @@ private:
     std::map<std::uint64_t, std::uint64_t> excluded;
     std::vector<ProtectionChange> pending;
     ProtectorCounts counts;
-    Tracker tracker = nullptr;
+    std::atomic<Tracker> tracker{nullptr};
+    std::atomic<std::uint64_t> openCalls{0};
+    std::atomic<std::uint64_t> openBytes{0};
+    std::atomic<std::uint64_t> openFailures{0};
+    std::atomic<std::uint64_t> openHeld{0};
 };
 
 }
