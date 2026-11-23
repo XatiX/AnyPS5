@@ -3,6 +3,7 @@
 #include "prx/libSceAgcDriver/Unified/include/Events.hpp"
 #include <array>
 #include <atomic>
+#include <chrono>
 #include <cstdlib>
 #include <cstring>
 #include "prx/libc/include/GuestArena.hpp"
@@ -13,9 +14,16 @@ namespace {
 
 thread_local volatile bool landing = false;
 
+std::atomic<std::uint64_t> faultCalls{0};
+std::atomic<std::uint64_t> faultNanoseconds{0};
+
 bool handleGuestFault(std::uintptr_t address, bool write) {
     if (landing) return false;
-    return MemoryCore::Get().HandleFault(address, write);
+    const auto start = std::chrono::steady_clock::now();
+    const bool handled = MemoryCore::Get().HandleFault(address, write);
+    faultCalls.fetch_add(1, std::memory_order_relaxed);
+    faultNanoseconds.fetch_add(static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - start).count()), std::memory_order_relaxed);
+    return handled;
 }
 
 void prepareGuestHostWrite(std::uintptr_t address, std::size_t bytes) {
@@ -248,6 +256,8 @@ MemoryCoreCounts MemoryCore::Counts() const {
     counts.gpuOwnedFaults = gpuOwnedFaults.load(std::memory_order_relaxed);
     counts.foreignFaults = foreignFaults.load(std::memory_order_relaxed);
     counts.staleFaults = staleFaults.load(std::memory_order_relaxed);
+    counts.faultCalls = faultCalls.load(std::memory_order_relaxed);
+    counts.faultNanoseconds = faultNanoseconds.load(std::memory_order_relaxed);
     counts.landedBytes = landedBytes.load(std::memory_order_relaxed);
     counts.driverPagesSettled = driverPagesSettled.load(std::memory_order_relaxed);
     counts.rearmedChanged = rearmedChanged.load(std::memory_order_relaxed);

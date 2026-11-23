@@ -678,6 +678,17 @@ std::uint64_t ResidencyService::Removals() const {
     return ledger->Removals();
 }
 
+std::uint64_t ResidencyService::ReadBackBytes() const {
+    std::lock_guard lock(mutex);
+    return readBackBytes;
+}
+
+std::uint64_t ResidencyService::BoundBytes() const {
+    if (!Attached()) return 0;
+    std::lock_guard lock(mutex);
+    return ledger->Counts().boundBytes;
+}
+
 std::string ResidencyService::Line() const {
     if (!Attached()) return {};
     std::lock_guard lock(mutex);

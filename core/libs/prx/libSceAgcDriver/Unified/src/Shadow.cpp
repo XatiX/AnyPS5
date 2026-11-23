@@ -6,6 +6,7 @@
 #include "prx/libSceAgcDriver/Unified/include/ResidencyService.hpp"
 #include "prx/libSceAgcDriver/Unified/include/Events.hpp"
 #include "prx/libSceAgcDriver/Unified/include/ProofVerdict.hpp"
+#include "prx/libc/include/GuestAllocations.hpp"
 #include "prx/libc/include/GuestArena.hpp"
 #include "prx/libSceAgcDriver/Execution/include/GuestMemory.hpp"
 #include "prx/libSceAgcDriver/Unified/include/RecordVerify.hpp"
@@ -14,6 +15,7 @@
 #include "prx/libSceAgcDriver/Unified/include/Resolve.hpp"
 #include "prx/libSceAgcDriver/Unified/include/UploadClash.hpp"
 #include "prx/libSceAgcDriver/Unified/include/DepthRecords.hpp"
+#include "prx/libSceAgcDriver/Unified/include/Images.hpp"
 #include "prx/libSceAgcDriver/Unified/include/MetadataWatch.hpp"
 #include <atomic>
 #include "prx/libSceAgcDriver/Execution/include/PerformanceOverlay.hpp"
@@ -80,6 +82,7 @@ struct MemoryTotals {
     std::atomic<std::uint64_t> ownedWalkNanoseconds{0};
     std::atomic<std::uint64_t> ownedRecords{0};
     std::atomic<std::uint64_t> ownedRecordNanoseconds{0};
+    std::atomic<std::uint64_t> frames{0};
 };
 
 std::uint64_t nanosecondsSince(std::chrono::steady_clock::time_point start) {
@@ -169,6 +172,61 @@ void consumeMemory() {
     }
 }
 
+std::string frameLine() {
+    struct Sample {
+        std::uint64_t frames = 0;
+        std::uint64_t writeFaults = 0;
+        std::uint64_t ownedFaults = 0;
+        std::uint64_t parked = 0;
+        std::uint64_t bypassed = 0;
+        std::uint64_t protectCalls = 0;
+        std::uint64_t faultCalls = 0;
+        std::uint64_t faultNanoseconds = 0;
+        std::uint64_t readBackBytes = 0;
+        std::uint64_t landedBytes = 0;
+    };
+    static std::mutex sampleMutex;
+    static Sample last;
+    const auto core = MemoryCore::Get().Counts();
+    Sample now;
+    now.frames = memoryTotals().frames.load(std::memory_order_relaxed);
+    now.writeFaults = core.writesOpened;
+    now.ownedFaults = core.gpuOwnedFaults;
+    now.parked = core.faultsParked;
+    now.bypassed = core.faultsBypassed;
+    now.protectCalls = MemoryCore::Get().Protection().Counts().calls;
+    now.faultCalls = core.faultCalls;
+    now.faultNanoseconds = core.faultNanoseconds;
+    now.readBackBytes = ResidencyService::Get().ReadBackBytes();
+    now.landedBytes = core.ownedLandedBytes + core.diffLandedBytes + core.landedBytes;
+    std::lock_guard lock(sampleMutex);
+    const auto frames = now.frames - last.frames;
+    const auto each = [&](std::uint64_t current, std::uint64_t before) { return frames == 0u ? 0.0 : static_cast<double>(current - before) / static_cast<double>(frames); };
+    char line[640];
+    std::snprintf(line, sizeof(line), "[recode-frame] %llu frames; per frame: write faults %.1f, faults on GPU-owned pages %.2f (parked %.2f, bypassed %.2f), protect calls %.1f, fault handler %.1f us in %.1f calls, read back %.1f KiB, landed %.1f KiB\n",
+        static_cast<unsigned long long>(frames), each(now.writeFaults, last.writeFaults), each(now.ownedFaults, last.ownedFaults), each(now.parked, last.parked), each(now.bypassed, last.bypassed), each(now.protectCalls, last.protectCalls),
+        each(now.faultNanoseconds, last.faultNanoseconds) / 1000.0, each(now.faultCalls, last.faultCalls), each(now.readBackBytes, last.readBackBytes) / 1024.0, each(now.landedBytes, last.landedBytes) / 1024.0);
+    last = now;
+    return line;
+}
+
+std::string footprintLine() {
+    std::uint64_t gpuVisible = 0;
+    std::uint64_t gpuRanges = 0;
+    for (const auto& range : GuestAllocations::GuestAllocationsAcquireAll_nid_postfix()) {
+        if (range == nullptr || !range->gpu) continue;
+        gpuVisible += range->bytes;
+        ++gpuRanges;
+    }
+    const auto* surfaces = Resolve::Surfaces();
+    char line[512];
+    std::snprintf(line, sizeof(line), "[recode-footprint] GPU-visible guest memory %llu MiB in %llu ranges; registered %llu MiB; mirror bound %llu MiB; image records %llu MiB in %llu records; depth records %llu\n",
+        static_cast<unsigned long long>(gpuVisible >> 20), static_cast<unsigned long long>(gpuRanges), static_cast<unsigned long long>(memoryTotals().registeredBytes.load(std::memory_order_relaxed) >> 20),
+        static_cast<unsigned long long>(ResidencyService::Get().BoundBytes() >> 20), static_cast<unsigned long long>(surfaces != nullptr ? surfaces->HeldBytes() >> 20 : 0u), static_cast<unsigned long long>(surfaces != nullptr ? surfaces->Size() : 0u),
+        static_cast<unsigned long long>(Images::Depths().Size()));
+    return line;
+}
+
 std::string memoryLine() {
     if (!MemoryActive() || memoryRefused().load(std::memory_order_relaxed)) return {};
     auto& totals = memoryTotals();
@@ -206,7 +264,7 @@ std::string memoryLine() {
         owned += gpuOwnedLine;
         owned += "[recode-gpu-owned] landing uploads skipped over later GPU writes: " + std::to_string(Mirror::SkippedUploadBytes() >> 10) + " KiB; CPU faults on records not yet written back: " + std::to_string(core.imageFaults) + " reads, " + std::to_string(core.imageWriteFaults) + " writes; view lookups that waited: " + std::to_string(Mirror::ViewWaits().waited) + " (" + std::to_string(Mirror::ViewWaits().found) + " found, " + std::to_string(Mirror::ViewWaits().microseconds / 1000u) + " ms); writes taken in pieces: " + std::to_string(core.pieceWrites) + ", outside the second view on pages already GPU-owned: " + std::to_string(core.ownedUnviewedBytes >> 10) + " KiB; diff landings: " + std::to_string(core.diffChainedBytes) + " bytes behind an older landing, " + std::to_string(core.diffForeignBytes) + " bytes left unlike the mirror\n";
     }
-    return std::string(line) + eventLine + ResidencyService::Get().Line() + owned + UploadClash::Line() + MetadataWatch::Line();
+    return std::string(line) + eventLine + ResidencyService::Get().Line() + owned + UploadClash::Line() + MetadataWatch::Line() + frameLine() + footprintLine();
 }
 
 void report() {
@@ -673,6 +731,7 @@ void Tee(const DriverDetail::Submission& submission) {
         if (!submission.flips.empty() && memoryInstalled()) {
             MemoryCore::Get().AdvanceFrame();
             ResidencyService::Get().AdvanceFrame();
+            memoryTotals().frames.fetch_add(1, std::memory_order_relaxed);
         }
     }
     if (decoding) front().Push(Copy(submission));

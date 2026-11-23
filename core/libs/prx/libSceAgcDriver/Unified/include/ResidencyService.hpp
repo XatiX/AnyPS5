@@ -62,6 +62,8 @@ public:
     std::optional<DeviceSpan> MirrorSpan(std::uint64_t address, std::uint64_t size);
     [[nodiscard]] std::uint64_t Frame() const { return frame.load(std::memory_order_relaxed); }
     [[nodiscard]] std::uint64_t Removals() const;
+    [[nodiscard]] std::uint64_t ReadBackBytes() const;
+    [[nodiscard]] std::uint64_t BoundBytes() const;
     [[nodiscard]] std::string Line() const;
 
 private:

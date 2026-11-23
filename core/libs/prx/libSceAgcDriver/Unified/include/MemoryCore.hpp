@@ -52,6 +52,8 @@ struct MemoryCoreCounts {
     std::uint64_t ownedUnviewedBytes = 0;
     std::uint64_t diffChainedBytes = 0;
     std::uint64_t diffForeignBytes = 0;
+    std::uint64_t faultCalls = 0;
+    std::uint64_t faultNanoseconds = 0;
 };
 
 struct GpuWriteMark {
