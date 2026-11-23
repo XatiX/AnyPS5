@@ -3839,6 +3839,7 @@ private:
                 if (context.recorder != nullptr) drainSurfaces(context, *context.recorder);
                 absorbLayers(context, *table, record, absorbed);
                 totals.sampledRecordsCreated++;
+                MemoryCore::Get().OpenWhole(surface.address, surface.bytes);
                 Downgrades::WatchTouch("a record made from memory for a sampled read", surface.address, surface.bytes);
             }
         }

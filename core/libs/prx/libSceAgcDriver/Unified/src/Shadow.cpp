@@ -214,13 +214,12 @@ std::string frameLine() {
     std::snprintf(line, sizeof(line), "[recode-frame] %llu frames; per frame: write faults %.1f (%.1f without the core's lock), faults on GPU-owned pages %.2f (parked %.2f, bypassed %.2f), protect calls %.1f, fault handler %.1f us in %.1f calls (waiting for the core's lock %.1f us, page table and change note %.1f us, protection call %.1f us), read back %.1f KiB, landed %.1f KiB\n",
         static_cast<unsigned long long>(frames), each(now.writeFaults, last.writeFaults), each(now.lockFreeWrites, last.lockFreeWrites), each(now.ownedFaults, last.ownedFaults), each(now.parked, last.parked), each(now.bypassed, last.bypassed), each(now.protectCalls, last.protectCalls),
         each(now.faultNanoseconds, last.faultNanoseconds) / 1000.0, each(now.faultCalls, last.faultCalls), each(now.lockNanoseconds, last.lockNanoseconds) / 1000.0, each(now.tableNanoseconds, last.tableNanoseconds) / 1000.0, each(now.protectNanoseconds, last.protectNanoseconds) / 1000.0, each(now.readBackBytes, last.readBackBytes) / 1024.0, each(now.landedBytes, last.landedBytes) / 1024.0);
-    static std::uint64_t lastAdjacent = 0;
-    static std::uint64_t lastFirst = 0;
+    static PageTableCounts lastTable;
     const auto table = MemoryCore::Get().Pages().Counts();
-    char clusters[192];
-    std::snprintf(clusters, sizeof(clusters), "[recode-frame] write faults next to a page opened since the last consume %.1f per frame, first in their 64 KiB chunk %.1f per frame\n", each(table.adjacentFaults, lastAdjacent), each(table.chunkFirstFaults, lastFirst));
-    lastAdjacent = table.adjacentFaults;
-    lastFirst = table.chunkFirstFaults;
+    char clusters[448];
+    std::snprintf(clusters, sizeof(clusters), "[recode-frame] write faults next to a page opened since the last consume %.1f per frame, first in their 64 KiB chunk %.1f per frame; faults that opened more pages %.1f (%.1f of them over an image source), pages opened without their own fault %.1f, found unchanged at consume %.1f, changed %.1f\n",
+        each(table.adjacentFaults, lastTable.adjacentFaults), each(table.chunkFirstFaults, lastTable.chunkFirstFaults), each(table.grownFaults, lastTable.grownFaults), each(table.wholeFaults, lastTable.wholeFaults), each(table.grownPages, lastTable.grownPages), each(table.unprovenUnchanged, lastTable.unprovenUnchanged), each(table.unprovenChanged, lastTable.unprovenChanged));
+    lastTable = table;
     last = now;
     return std::string(line) + clusters;
 }

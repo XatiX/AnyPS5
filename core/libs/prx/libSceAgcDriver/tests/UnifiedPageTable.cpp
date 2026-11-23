@@ -3,6 +3,7 @@
 #include <chrono>
 #include <cstdint>
 #include <cstdio>
+#include <map>
 #include <thread>
 #include <vector>
 
@@ -428,7 +429,81 @@ void testWritersAgainstAConsumer() {
     Expect(table.Counts().writeFaults == opened.load(), "every opening is counted exactly once");
 }
 
+std::uint64_t& unreadablePage() {
+    static std::uint64_t page = 0;
+    return page;
+}
+
+std::map<std::uint64_t, std::uint64_t>& fakeHashes() {
+    static std::map<std::uint64_t, std::uint64_t> hashes;
+    return hashes;
+}
+
+bool fakeHash(std::uint64_t page, std::uint64_t& hash) {
+    if (page == unreadablePage()) return false;
+    hash = fakeHashes()[page];
+    return true;
+}
+
+std::uint64_t pageOf(std::uint64_t index) {
+    return Base / PageBytes + index;
+}
+
+void testAdjacentFaultOpensItsChunk() {
+    PageTable table;
+    table.SetHasher(fakeHash);
+    armed(table, 32);
+    Expect(table.BeginWriteFault(Base + 3 * PageBytes) && table.GrowWriteFault(Base + 3 * PageBytes).empty(), "a lone fault opens only its page");
+    table.EndWriteFault(Base + 3 * PageBytes);
+    Expect(table.BeginWriteFault(Base + 4 * PageBytes), "the neighbouring page opens");
+    const auto runs = table.GrowWriteFault(Base + 4 * PageBytes);
+    table.EndWriteFault(Base + 4 * PageBytes);
+    table.EndGrow(runs);
+    Expect(runs.size() == 2 && runs[0] == DirtyRange{Base, 3 * PageBytes} && runs[1] == DirtyRange{Base + 5 * PageBytes, 11 * PageBytes}, "a fault next to an open page opens the rest of its 64 KiB chunk");
+    Expect(table.StateOf(Base + 15 * PageBytes) == PageState::CpuDirty && table.StateOf(Base + 16 * PageBytes) == PageState::CpuClean, "the next chunk stays armed");
+    fakeHashes()[pageOf(7)] = 0x77;
+    std::vector<ProtectionChange> changes;
+    const auto ranges = table.ConsumeDirty(changes);
+    const auto rearmed = table.TakeRearmedUnproven();
+    Expect(ranges.size() == 1 && ranges[0] == DirtyRange{Base + 3 * PageBytes, 5 * PageBytes}, "the faulted pages and the changed unproven page are reported (merged across the short gap), the unchanged ones are not");
+    Expect(rearmed.size() == 13 && table.Counts().unprovenUnchanged == 13 && table.Counts().unprovenChanged == 1, "thirteen unproven pages were unchanged and are armed again");
+    Expect(table.StateOf(Base) == PageState::CpuClean && table.DirtyPages() == 0, "every page is clean again");
+    fakeHashes().clear();
+}
+
+void testImageSourceOpensWhole() {
+    PageTable table;
+    table.SetHasher(fakeHash);
+    armed(table, 64);
+    table.OpenWhole(Base + 8 * PageBytes, 40 * PageBytes);
+    Expect(table.BeginWriteFault(Base + 20 * PageBytes), "a page of the source opens");
+    const auto runs = table.GrowWriteFault(Base + 20 * PageBytes);
+    table.EndWriteFault(Base + 20 * PageBytes);
+    table.EndGrow(runs);
+    Expect(runs.size() == 2 && runs[0] == DirtyRange{Base + 8 * PageBytes, 12 * PageBytes} && runs[1] == DirtyRange{Base + 21 * PageBytes, 27 * PageBytes}, "its first write opens the whole source range");
+    Expect(table.StateOf(Base + 7 * PageBytes) == PageState::CpuClean && table.StateOf(Base + 48 * PageBytes) == PageState::CpuClean, "pages outside it stay armed");
+    Expect(table.Counts().wholeFaults == 1, "the fault is counted as a whole opening");
+}
+
+void testUnreadablePagesDoNotGrow() {
+    PageTable table;
+    table.SetHasher(fakeHash);
+    armed(table, 16);
+    unreadablePage() = pageOf(9);
+    Expect(table.BeginWriteFault(Base + 2 * PageBytes), "a page opens");
+    table.EndWriteFault(Base + 2 * PageBytes);
+    Expect(table.BeginWriteFault(Base + 3 * PageBytes), "its neighbour opens");
+    const auto runs = table.GrowWriteFault(Base + 3 * PageBytes);
+    table.EndWriteFault(Base + 3 * PageBytes);
+    table.EndGrow(runs);
+    Expect(table.StateOf(Base + 9 * PageBytes) == PageState::CpuClean && table.StateOf(Base + 8 * PageBytes) == PageState::CpuDirty, "a page that cannot be read is not opened without its own fault");
+    unreadablePage() = 0;
+}
+
 int main() {
+    testAdjacentFaultOpensItsChunk();
+    testImageSourceOpensWhole();
+    testUnreadablePagesDoNotGrow();
     testLockFreeWriteFaultIsReportedAtTheNextConsume();
     testGpuTakeSeesAnUndrainedFaultAsDirty();
     testLockHolderWaitsForAnOpeningPage();

@@ -8,6 +8,7 @@
 #include <functional>
 #include <memory>
 #include <mutex>
+#include <span>
 #include <unordered_map>
 #include <utility>
 #include <vector>
@@ -49,6 +50,16 @@ struct PageTableCounts {
     std::uint64_t gpuWrittenPages = 0;
     std::uint64_t adjacentFaults = 0;
     std::uint64_t chunkFirstFaults = 0;
+    std::uint64_t grownFaults = 0;
+    std::uint64_t grownPages = 0;
+    std::uint64_t wholeFaults = 0;
+    std::uint64_t unprovenUnchanged = 0;
+    std::uint64_t unprovenChanged = 0;
+};
+
+struct UnprovenPage {
+    std::uint64_t page = 0;
+    std::uint64_t hash = 0;
 };
 
 struct GpuTake {
@@ -92,6 +103,14 @@ public:
     [[nodiscard]] PageTableCounts Counts() const;
     [[nodiscard]] bool BeginWriteFault(std::uint64_t address);
     void EndWriteFault(std::uint64_t address);
+    using Hasher = bool (*)(std::uint64_t page, std::uint64_t& hash);
+    void SetHasher(Hasher next) { hasher = next; }
+    [[nodiscard]] std::vector<DirtyRange> GrowWriteFault(std::uint64_t address);
+    void EndGrow(std::span<const DirtyRange> runs);
+    void OpenWhole(std::uint64_t address, std::uint64_t size);
+    [[nodiscard]] std::vector<UnprovenPage> TakeRearmedUnproven();
+    static constexpr std::size_t GrowChunkPages = 16;
+    static constexpr std::size_t WholeLimitPages = 256;
 
 private:
     static constexpr std::size_t LeafBits = 13;
@@ -103,6 +122,9 @@ private:
         std::array<std::atomic<std::uint64_t>, RegionPages / 64> faulted{};
         std::array<std::atomic<std::uint64_t>, RegionPages / 64> opening{};
         std::atomic<bool> hasFaults{false};
+        std::array<std::atomic<std::uint64_t>, RegionPages / 64> unproven{};
+        std::array<std::atomic<std::uint64_t>, RegionPages / 64> whole{};
+        std::array<std::uint64_t, RegionPages> openHash{};
         std::array<std::uint8_t, RegionPages> streak{};
         std::array<std::uint32_t, RegionPages> busyUntil{};
         std::array<std::uint32_t, RegionPages> lastConsume{};
@@ -139,6 +161,11 @@ private:
     std::vector<std::pair<std::uint64_t, std::unique_ptr<Region>>> regions;
     std::unordered_map<std::uint64_t, Region*> farRegions;
     std::atomic<std::uint64_t> pendingFaults{0};
+    Hasher hasher = nullptr;
+    std::atomic<std::uint64_t> grownFaults{0};
+    std::atomic<std::uint64_t> grownPages{0};
+    std::atomic<std::uint64_t> wholeFaults{0};
+    std::vector<UnprovenPage> rearmedUnproven;
     std::atomic<std::uint64_t> adjacentFaults{0};
     std::atomic<std::uint64_t> chunkFirstFaults{0};
     std::vector<std::uint64_t> dirty;

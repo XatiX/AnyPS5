@@ -31,6 +31,14 @@ bool lockFreeFaults() {
     return on;
 }
 
+bool growsFaults() {
+    static const bool on = [] {
+        const char* value = std::getenv("APS5_RECODE_GROW_FAULTS");
+        return value != nullptr && std::string_view(value) != "0";
+    }();
+    return on;
+}
+
 std::uint64_t since(std::chrono::steady_clock::time_point start) {
     return static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - start).count());
 }
@@ -56,6 +64,7 @@ MemoryCore& MemoryCore::Get() {
 }
 
 bool MemoryCore::Install() {
+    pages.SetHasher(&MemoryCore::readableHash);
 #ifdef _WIN32
     if (!GuestArena::GuestArenaSetGpuFaultHandler_nid_no_patch(handleGuestFault)) return false;
     GuestArena::GuestArenaSetGpuHostWriteHook_nid_no_patch(prepareGuestHostWrite);
@@ -104,6 +113,12 @@ std::uint64_t MemoryCore::PageHash(std::uint64_t page) {
     return lanes[0] ^ (lanes[1] * 31u) ^ (lanes[2] * 131u) ^ (lanes[3] * 1031u);
 }
 
+bool MemoryCore::readableHash(std::uint64_t page, std::uint64_t& hash) {
+    if (!Protector::Readable(page * PageBytes)) return false;
+    hash = PageHash(page);
+    return true;
+}
+
 bool MemoryCore::rehash(std::uint64_t page, bool proven) {
     if (!Protector::Readable(page * PageBytes)) {
         unreadableHashes.fetch_add(1, std::memory_order_relaxed);
@@ -138,6 +153,11 @@ std::vector<DirtyRange> MemoryCore::ConsumeDirty() {
     };
     auto ranges = hashBusy ? pages.ConsumeDirty(changes, written) : pages.ConsumeDirty(changes);
     protector.Apply(changes);
+    for (const auto& [page, hash] : pages.TakeRearmedUnproven()) {
+        if (pages.StateOf(page * PageBytes) != PageState::CpuClean || PageHash(page) == hash) continue;
+        ranges.push_back({page * PageBytes, PageBytes});
+        rearmedChanged.fetch_add(1, std::memory_order_relaxed);
+    }
     for (const auto page : unchanged) {
         if (pages.StateOf(page * PageBytes) != PageState::CpuClean || !rehash(page, false)) continue;
         ranges.push_back({page * PageBytes, PageBytes});
@@ -162,10 +182,13 @@ bool MemoryCore::HandleFault(std::uint64_t address, bool write) {
         Downgrades::WatchTouch("a CPU write fault", page, PageBytes);
         Events::Shared().Note(page, PageBytes);
         faultTableNanoseconds.fetch_add(since(entered), std::memory_order_relaxed);
+        const auto grown = growsFaults() ? pages.GrowWriteFault(address) : std::vector<DirtyRange>{};
         bool held = false;
         const auto protectStart = std::chrono::steady_clock::now();
         protector.Open(page, PageBytes, &held);
         pages.EndWriteFault(address);
+        for (const auto& run : grown) protector.Open(run.address, run.size);
+        pages.EndGrow(grown);
         faultProtectNanoseconds.fetch_add(since(protectStart), std::memory_order_relaxed);
         writesOpened.fetch_add(1, std::memory_order_relaxed);
         lockFreeWrites.fetch_add(1, std::memory_order_relaxed);

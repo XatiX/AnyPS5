@@ -102,6 +102,7 @@ public:
     void Uninstall();
     void Register(std::uint64_t address, std::uint64_t size);
     void Reserve(std::uint64_t address, std::uint64_t size);
+    void OpenWhole(std::uint64_t address, std::uint64_t size) { pages.OpenWhole(address, size); }
     void MakeResident(std::uint64_t address, std::uint64_t size);
     [[nodiscard]] bool OwnedBy(std::uint64_t address, std::uint64_t size) const { return pages.OwnedBy(address, size); }
     void Unregister(std::uint64_t address, std::uint64_t size);
@@ -139,6 +140,7 @@ private:
     };
 
     static std::uint64_t PageHash(std::uint64_t page);
+    static bool readableHash(std::uint64_t page, std::uint64_t& hash);
     bool rehash(std::uint64_t page, bool proven);
     bool resolveOwnedFault(std::uint64_t address, bool write);
     bool resolvePage(std::uint64_t page, bool write);
