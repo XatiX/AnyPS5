@@ -2928,6 +2928,8 @@ private:
             if (htileClears == nullptr) htileClears = std::make_unique<Images::HtileClears>(context);
             const Images::HtileClear clear{buffer, target.htileAddress - span.origin, bytes, target.htileStencil, target.clearDepth, target.clearStencil};
             if (htileClears->Apply(recorder, record, clear, reason)) {
+                static const bool traced = std::getenv("APS5_RECODE_TRACE_HTILE_CHECKS") != nullptr;
+                if (traced && totals.depthGpuHtileClears < 60u) std::fprintf(stderr, "[recode-htile-check] %llu: before program %016llx on record 0x%llx\n", static_cast<unsigned long long>(totals.depthGpuHtileClears), static_cast<unsigned long long>(Downgrades::ProgramHash(program)), static_cast<unsigned long long>(record->Key().address));
                 totals.depthGpuHtileClears++;
                 if (seen.insert("htile clear checked").second) std::fprintf(stderr, "[recode-depth] first GPU write over HTILE checked for a clear: record 0x%llx htile 0x%llx+0x%llx stencil in tiles %d clear %g/%u\n", static_cast<unsigned long long>(record->Key().address), static_cast<unsigned long long>(target.htileAddress), static_cast<unsigned long long>(bytes), target.htileStencil ? 1 : 0, static_cast<double>(target.clearDepth), static_cast<unsigned>(target.clearStencil));
                 record->SetHtileSaysCleared(true);
@@ -3075,7 +3077,11 @@ private:
             const auto& use = work.uses[index];
             if (!use.write || use.size == 0u || (index >= work.targetBegin && index < work.targetEnd)) continue;
             if (metadataClears != nullptr) metadataClears->NoteWrite(use.address, use.size);
-            if (depth) Images::Depths().NoteGpuHtileWrites(use.address, use.size);
+            if (depth && Images::Depths().NoteGpuHtileWrites(use.address, use.size) != 0u) {
+                static const bool traced = std::getenv("APS5_RECODE_TRACE_HTILE_CHECKS") != nullptr;
+                static std::atomic<std::uint32_t> lines{0};
+                if (traced && !work.stages.empty() && lines.fetch_add(1, std::memory_order_relaxed) < 60u) std::fprintf(stderr, "[recode-htile-write] program %016llx writes 0x%llx+0x%llx over a depth record's HTILE\n", static_cast<unsigned long long>(Downgrades::ProgramHash(work.stages.back().program.codeAddress)), static_cast<unsigned long long>(use.address), static_cast<unsigned long long>(use.size));
+            }
         }
     }
 
