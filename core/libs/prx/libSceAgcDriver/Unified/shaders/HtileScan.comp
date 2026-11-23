@@ -18,6 +18,7 @@ void main() {
     uint word = tiles.words[push.base + index];
     uint found = 0u;
     if ((word & 15u) != 0u) found |= 1u;
+    else found |= 4u;
     if (push.stencil == 0u || ((word >> 8u) & 3u) != 0u) found |= 2u;
     if (found != 0u) atomicOr(result.state, found);
 }

@@ -4,6 +4,7 @@
 #include "prx/libSceAgcDriver/Graphics/include/Context.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/State.hpp"
 #include <array>
+#include <atomic>
 #include <cstdint>
 #include <map>
 #include <memory>
@@ -24,6 +25,7 @@ struct MetadataCounts {
     std::uint64_t pendingCmask = 0;
     std::uint64_t dccApplied = 0;
     std::uint64_t cmaskApplied = 0;
+    std::uint64_t dccMixed = 0;
     std::uint64_t refused = 0;
 };
 
@@ -70,6 +72,7 @@ private:
     VkDescriptorPool pool = VK_NULL_HANDLE;
     std::uint64_t poolBatch = 0;
     MetadataCounts counts;
+    std::shared_ptr<std::atomic<std::uint64_t>> mixedKeys = std::make_shared<std::atomic<std::uint64_t>>(0);
 };
 
 [[nodiscard]] bool MetadataClearsOn();

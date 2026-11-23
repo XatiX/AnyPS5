@@ -245,7 +245,7 @@ bool MetadataClears::applyDcc(Graphics::Recorder& recorder, const Target& target
         reason = "DCC clear descriptor pool full";
         return false;
     }
-    auto result = std::make_shared<Graphics::DeviceBuffer>(context, 16u, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT);
+    auto result = std::make_shared<Graphics::Buffer>(context, 16u, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT);
     const auto buffer = reinterpret_cast<VkBuffer>(static_cast<std::uintptr_t>(span.handle));
     const auto offset = target.dcc - span.origin;
     const auto alignment = std::max<VkDeviceSize>(context.limits.minStorageBufferOffsetAlignment, 4);
@@ -285,8 +285,13 @@ bool MetadataClears::applyDcc(Graphics::Recorder& recorder, const Target& target
     context.Resolved(&Graphics::DeviceFunctions::cmdPushConstants, "vkCmdPushConstants")(commands, pipelineLayout, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(push), &push);
     groups(static_cast<std::uint64_t>(resource.width) * resource.height, x, y);
     context.Resolved(&Graphics::DeviceFunctions::cmdDispatch, "vkCmdDispatch")(commands, x, y, 1);
-    Graphics::RecordMemoryBarrier(context, commands, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_ACCESS_SHADER_WRITE_BIT, VK_ACCESS_MEMORY_READ_BIT | VK_ACCESS_MEMORY_WRITE_BIT);
+    Graphics::RecordMemoryBarrier(context, commands, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT | VK_PIPELINE_STAGE_HOST_BIT, VK_ACCESS_SHADER_WRITE_BIT, VK_ACCESS_MEMORY_READ_BIT | VK_ACCESS_MEMORY_WRITE_BIT | VK_ACCESS_HOST_READ_BIT);
     recorder.Keep(std::static_pointer_cast<void>(result));
+    recorder.OnComplete([result, mixed = mixedKeys] {
+        std::uint32_t state = 0;
+        std::memcpy(&state, result->Bytes().data(), sizeof(state));
+        if (state != 0u) mixed->fetch_add(1, std::memory_order_relaxed);
+    });
     std::lock_guard lock(mutex);
     counts.dccApplied++;
     return true;
@@ -294,7 +299,8 @@ bool MetadataClears::applyDcc(Graphics::Recorder& recorder, const Target& target
 
 MetadataCounts MetadataClears::TakeCounts() {
     std::lock_guard lock(mutex);
-    const auto taken = counts;
+    auto taken = counts;
+    taken.dccMixed = mixedKeys->exchange(0, std::memory_order_relaxed);
     counts = {};
     return taken;
 }

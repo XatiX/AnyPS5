@@ -8,6 +8,7 @@
 #include <algorithm>
 #include <array>
 #include <cstdlib>
+#include <cstring>
 #include <exception>
 #include <string_view>
 
@@ -157,6 +158,10 @@ VkPipeline HtileClears::createPipeline(VkRenderPass renderPass, bool stencil) {
     return made;
 }
 
+HtileOutcomes HtileClears::TakeOutcomes() {
+    return {tally->cleared.exchange(0, std::memory_order_relaxed), tally->untouched.exchange(0, std::memory_order_relaxed), tally->mixed.exchange(0, std::memory_order_relaxed)};
+}
+
 HtileClears::Pass& HtileClears::passFor(VkFormat format, VkImageAspectFlags aspects) {
     auto& pass = passes[format];
     if (pass.renderPass != VK_NULL_HANDLE) return pass;
@@ -225,7 +230,7 @@ bool HtileClears::Apply(Graphics::Recorder& recorder, const std::shared_ptr<Dept
             reason = "HTILE clear descriptor pool full";
             return false;
         }
-        auto result = std::make_shared<Graphics::DeviceBuffer>(context, 16u, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT);
+        auto result = std::make_shared<Graphics::Buffer>(context, 16u, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT);
         const auto alignment = std::max<VkDeviceSize>(context.limits.minStorageBufferOffsetAlignment, 4);
         const auto descriptorOffset = clear.offset - clear.offset % alignment;
         const auto base = clear.offset - descriptorOffset;
@@ -283,7 +288,15 @@ bool HtileClears::Apply(Graphics::Recorder& recorder, const std::shared_ptr<Dept
             if (clearsStencil) draw(pass.stencil, 2u);
             context.Resolved(&Graphics::DeviceFunctions::cmdEndRenderPass, "vkCmdEndRenderPass")(drawCommands);
         });
+        Graphics::RecordMemoryBarrier(context, recorder.Commands(), VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_PIPELINE_STAGE_HOST_BIT, VK_ACCESS_SHADER_WRITE_BIT, VK_ACCESS_HOST_READ_BIT);
         recorder.Keep(std::static_pointer_cast<void>(result));
+        recorder.OnComplete([result, counted = tally] {
+            std::uint32_t state = 0;
+            std::memcpy(&state, result->Bytes().data(), sizeof(state));
+            if ((state & 1u) == 0u) counted->cleared.fetch_add(1, std::memory_order_relaxed);
+            else if ((state & 4u) == 0u) counted->untouched.fetch_add(1, std::memory_order_relaxed);
+            else counted->mixed.fetch_add(1, std::memory_order_relaxed);
+        });
         recorder.Keep(std::static_pointer_cast<void>(framebuffer));
         recorder.Keep(record);
     } catch (const std::exception& error) {

@@ -2,6 +2,7 @@
 #define CORE_LIBS_PRX_LIBSCEAGCDRIVER_UNIFIED_INCLUDE_HTILECLEARS_HPP
 
 #include "prx/libSceAgcDriver/Graphics/include/Context.hpp"
+#include <atomic>
 #include <cstdint>
 #include <map>
 #include <memory>
@@ -24,8 +25,15 @@ struct HtileClear {
     std::uint8_t clearStencil = 0;
 };
 
+struct HtileOutcomes {
+    std::uint64_t cleared = 0;
+    std::uint64_t untouched = 0;
+    std::uint64_t mixed = 0;
+};
+
 class HtileClears {
 public:
+    [[nodiscard]] HtileOutcomes TakeOutcomes();
     explicit HtileClears(const Graphics::Context& context);
     ~HtileClears();
     HtileClears(const HtileClears&) = delete;
@@ -53,6 +61,12 @@ private:
     std::map<VkFormat, Pass> passes;
     VkDescriptorPool pool = VK_NULL_HANDLE;
     std::uint64_t poolBatch = 0;
+    struct Tally {
+        std::atomic<std::uint64_t> cleared{0};
+        std::atomic<std::uint64_t> untouched{0};
+        std::atomic<std::uint64_t> mixed{0};
+    };
+    std::shared_ptr<Tally> tally = std::make_shared<Tally>();
 };
 
 [[nodiscard]] bool HtileClearsOn();
