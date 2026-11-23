@@ -114,6 +114,8 @@ struct SpirvEmitterState {
     bool depthRangeRemap = false;
     std::uint32_t depthRemapClipIndex = 0;
     bool registrationModules = false;
+    bool runtimeSpecs = false;
+    std::vector<std::uint32_t> runtimeSpecIds;
     bool fragmentDescriptorSet = false;
     bool float16DenormPreserve = false;
     bool robustBufferAccess2 = false;

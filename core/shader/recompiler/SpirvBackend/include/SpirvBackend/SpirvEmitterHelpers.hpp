@@ -112,6 +112,7 @@ std::uint32_t EmitBallotLaneActiveBool(SpirvEmitterState& state, std::uint32_t b
 std::uint32_t EmitSubgroupLaneActiveBool(SpirvEmitterState& state, std::uint32_t lane);
 std::uint32_t EmitBinaryU32(SpirvEmitterState& state, std::uint32_t opcode, std::uint32_t lhs, std::uint32_t rhs);
 std::uint32_t EmitShaderDataDwordLoad(SpirvEmitterState& state, std::uint32_t dwordIndex);
+std::uint32_t ImageSpecValue(SpirvEmitterState& state, std::uint32_t constantId, std::uint32_t defaultValue);
 void EmitMemoryOffsets(SpirvEmitterState& state);
 std::uint32_t LdsDwordCount(const SpirvEmitterState& state);
 bool LdsInDeviceMemory(const SpirvEmitterState& state);

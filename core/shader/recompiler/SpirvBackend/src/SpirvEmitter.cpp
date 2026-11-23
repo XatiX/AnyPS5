@@ -270,6 +270,8 @@ std::vector<std::uint32_t> SpirvEmitter::Emit(const IrProgram& program, const Sh
     state.float64DenormPreserve = target.float64DenormPreserve;
     state.depthRangeRemap = target.depthRangeRemap;
     state.registrationModules = target.registrationModules;
+    static const bool runtimeImageSpecs = std::getenv("APS5_RECODE_RUNTIME_IMAGE_SPECS") != nullptr;
+    state.runtimeSpecs = state.program.Metadata().directResources && !target.registrationModules && runtimeImageSpecs;
     state.fragmentDescriptorSet = target.fragmentDescriptorSet;
     state.meshBarycentricPixel = target.meshBarycentricPixel;
     state.meshBarycentricVertex = target.meshBarycentricVertex;
@@ -366,6 +368,7 @@ std::vector<std::uint32_t> SpirvEmitter::Emit(const IrProgram& program, const Sh
         info->meshWindowBuffer = state.meshWindowBuffer;
         info->splitStateLanes = state.splitState ? state.laneCount * MeshWindowInvocations(state) : 0u;
         info->scratchPoolSlotDwords = ScratchPoolActive(state) ? ScratchPoolSlotDwords(state) : 0u;
+        info->runtimeSpecIds = state.runtimeSpecIds;
         info->anySubgroupSize = state.spannedAnySubgroup;
     }
     VerifyScratchPoolReturns(state, words);

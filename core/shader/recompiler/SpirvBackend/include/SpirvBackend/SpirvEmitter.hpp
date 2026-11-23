@@ -61,6 +61,7 @@ struct SpirvEmitInfo {
     std::uint32_t splitStateLanes = 0;
     std::uint32_t scratchPoolSlotDwords = 0;
     bool anySubgroupSize = false;
+    std::vector<std::uint32_t> runtimeSpecIds;
 };
 
 struct SpannedWaveUnsupported : std::runtime_error {

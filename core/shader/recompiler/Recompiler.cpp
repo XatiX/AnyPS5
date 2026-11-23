@@ -943,6 +943,7 @@ CompiledVariant emitVariant(const RecompileRequest& request, IrProgram& program)
     result.dispatchThreadLimit = bindings.layout.dispatchThreadLimit;
     result.splitStateLanes = emitted.splitStateLanes;
     result.scratchPoolSlotDwords = emitted.scratchPoolSlotDwords;
+    result.runtimeSpecIds = emitted.runtimeSpecIds;
     result.vertexOffsetSgpr = program.Info().vertexOffsetSgpr;
     result.instanceOffsetSgpr = program.Info().instanceOffsetSgpr;
     result.vertexOffsetShared = program.Info().vertexOffsetShared;
@@ -1419,6 +1420,7 @@ RecompileResult materializeResult(const CompiledVariant& variant, const Recompil
         .dispatchThreadLimit = artifact.dispatchThreadLimit,
         .splitStateLanes = artifact.splitStateLanes,
         .scratchPoolSlotDwords = artifact.scratchPoolSlotDwords,
+        .runtimeSpecIds = artifact.runtimeSpecIds,
         .parameterExports = artifact.parameterExports,
         .fragmentParameters = artifact.fragmentParameters,
         .barycentricEmulation = artifact.barycentricEmulation,
@@ -1567,6 +1569,20 @@ RecompileResult materializeResult(const CompiledVariant& variant, const Recompil
     if (patch != nullptr) recordMemoPatch(*patch, *bindingPlan, variant);
     result.workgroupMemoryDwords = WorkgroupMemoryStrideDwords(variant.info.info);
     result.bindings = std::move(bindings.bindings);
+    if (!artifact.runtimeSpecIds.empty()) {
+        const auto data = std::ranges::find_if(result.bindings, [](const DescriptorBinding& binding) { return binding.role == DescriptorRole::ShaderData; });
+        if (data == result.bindings.end()) throw std::runtime_error("run-time specialisation words have no shader data");
+        const auto base = variant.bindings.layout.ShaderDataDwords();
+        const auto count = static_cast<std::uint32_t>(artifact.runtimeSpecIds.size());
+        if (data->guestDescriptor.size() < base + count) data->guestDescriptor.resize(base + count, 0u);
+        for (std::uint32_t index = 0; index < count; ++index) {
+            const auto id = artifact.runtimeSpecIds[index];
+            const auto found = std::ranges::find_if(plan->bindings.specialization, [&](const PipelineSpecializationConstant& constant) { return constant.id == id; });
+            if (found == plan->bindings.specialization.end()) throw std::runtime_error("missing run-time specialisation value " + std::to_string(id));
+            data->guestDescriptor[base + index] = found->value;
+        }
+        result.shaderDataDwords = base + count;
+    }
     static const bool reporting = [] {
         const auto* sink = Diagnostics();
         return sink != nullptr && sink->descriptor != nullptr && (sink->enabled == nullptr || sink->enabled());

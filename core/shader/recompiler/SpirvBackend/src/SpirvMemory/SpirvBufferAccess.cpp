@@ -5,6 +5,8 @@
 #include "SpirvBackend/SpirvMemory/SpirvTypes.hpp"
 #include "SpirvBackend/SpirvMemory/SpirvDescriptors.hpp"
 #include <spirv/unified1/spirv.hpp>
+#include <algorithm>
+#include <iterator>
 #include <stdexcept>
 #include <string>
 #include <SpirvBackend/SpirvEmitterInstructions.hpp>
@@ -31,6 +33,17 @@ std::uint32_t EmitBinaryU32(SpirvEmitterState& state, std::uint32_t opcode, std:
     const auto result = state.module.AllocateId();
     state.module.AddFunction(opcode, TypeU32(state), result, lhs, rhs);
     return result;
+}
+
+std::uint32_t ImageSpecValue(SpirvEmitterState& state, std::uint32_t constantId, std::uint32_t defaultValue) {
+    const IrBindingLayout& layout = state.program.Metadata().bindings;
+    if (!state.runtimeSpecs || layout.UsesPushData() || state.shaderDataStorageVariable == 0) return state.module.SpecializationConstant(TypeU32(state), constantId, defaultValue);
+    auto found = std::ranges::find(state.runtimeSpecIds, constantId);
+    if (found == state.runtimeSpecIds.end()) {
+        state.runtimeSpecIds.push_back(constantId);
+        found = std::prev(state.runtimeSpecIds.end());
+    }
+    return EmitShaderDataDwordLoad(state, layout.ShaderDataDwords() + static_cast<std::uint32_t>(found - state.runtimeSpecIds.begin()));
 }
 
 std::uint32_t EmitShaderDataDwordLoad(SpirvEmitterState& state, std::uint32_t dwordIndex) {

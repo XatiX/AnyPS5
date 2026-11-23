@@ -1,4 +1,5 @@
 #include "SpirvBackend/SpirvEmitterInstructions.hpp"
+#include "SpirvBackend/SpirvEmitterHelpers.hpp"
 #include "SpirvBackend/SpirvAnalysis.hpp"
 #include "PipelineSpecialization.hpp"
 #include "SpirvBackend/SpirvMemory/SpirvSubgroup.hpp"
@@ -1704,7 +1705,7 @@ std::uint32_t SampleNanQuery(SpirvValueEmitContext& ctx, const IrValue* source, 
     if (!images || images->empty()) return fallback;
     auto normalized = ConstantBool(ctx.state, true);
     for (const auto image : *images) {
-        const auto flags = ctx.state.module.SpecializationConstant(TypeU32(ctx.state), PipelineSpecialization::NormalizedImageBase + image, 0u);
+        const auto flags = ImageSpecValue(ctx.state, PipelineSpecialization::NormalizedImageBase + image, 0u);
         const auto bounded = Binary(ctx.state, spv::OpINotEqual, TypeBool(ctx.state), flags, ConstantU32(ctx.state, 0u));
         normalized = Binary(ctx.state, spv::OpLogicalAnd, TypeBool(ctx.state), normalized, bounded);
     }
