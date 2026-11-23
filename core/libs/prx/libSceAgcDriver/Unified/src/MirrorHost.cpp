@@ -227,7 +227,7 @@ ViewWaitCounts ViewWaits() {
 }
 
 bool WritesEnabled() {
-    static const bool enabled = ResidencyService::Enabled() && std::getenv("APS5_RECODE_MIRROR_WRITES") != nullptr;
+    static const bool enabled = ResidencyService::MirrorAddressing();
     return enabled;
 }
 
@@ -237,7 +237,6 @@ void Attach(const std::shared_ptr<VulkanDevice>& device) {
     if (attached.exchange(device.get(), std::memory_order_acq_rel) == device.get()) return;
     host().Attach(device);
     MemoryCore::Get().SetHost(&host());
-    ResidencyService::Get().SetMirrorSpaces(true);
     ResidencyService::Get().SetBatchedBinds(std::getenv("APS5_RECODE_SYNC_BINDS") == nullptr);
     ResidencyService::Get().SetKeep([](std::uint64_t address, std::uint64_t size) { return MemoryCore::Get().Written().Any(address, size); });
     GuestMemory::SetMirrorFlushHook([](std::uint64_t address, std::size_t bytes) { MemoryCore::Get().FlushGpuWrites(address, bytes); });

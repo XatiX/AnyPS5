@@ -24,11 +24,6 @@ VkBuffer bufferOf(std::uint64_t handle) {
 
 namespace Abi = ShaderRecompiler::BdaAbi;
 
-static_assert(Abi::PageTablePageBits == GpuPageBits && Abi::PageTableLeafBits == GpuLeafBits && Abi::PageTableRootBits == GpuRootBits);
-static_assert(ChunkBytes == GpuPageBytes);
-
-constexpr std::size_t PageTableRootBytes = Abi::PageTableLeavesWord * sizeof(std::uint32_t);
-constexpr std::size_t PageTableLeafBytes = GpuLeafEntries * sizeof(std::uint64_t);
 constexpr std::size_t ImportSpacesKept = 8;
 constexpr std::size_t StagingMinBytes = std::size_t{1} << 20u;
 constexpr std::size_t StagingIdleBytes = std::size_t{64} << 20u;
@@ -45,13 +40,8 @@ bool ResidencyService::Enabled() {
     return enabled;
 }
 
-bool ResidencyService::PageTableEnabled() {
-    static const bool enabled = Enabled() && std::getenv("APS5_RECODE_NO_PAGE_TABLE") == nullptr && std::getenv("APS5_RECODE_NO_OWNED_REGIONS") == nullptr;
-    return enabled;
-}
-
 bool ResidencyService::MirrorAddressing() {
-    static const bool enabled = PageTableEnabled() && std::getenv("APS5_RECODE_MIRROR_WRITES") != nullptr && std::getenv("APS5_RECODE_PAGE_TABLE_FORM") == nullptr;
+    static const bool enabled = Enabled();
     return enabled;
 }
 
@@ -85,29 +75,19 @@ bool ResidencyService::Attach(const Graphics::Context& graphics) {
     ledger->SetKeep(keep);
     uploads = std::make_unique<ResidentUploads>(*ledger, GuestMemory::CommittedRanges);
     uploads->SetView([](std::uint64_t address, std::size_t bytes) { return static_cast<const std::byte*>(GuestMemory::OwnStoreTarget(address, bytes)); });
-    if (PageTableEnabled()) {
-        pages = std::make_unique<GpuPageTable>();
-        pageBuffer = std::make_shared<Graphics::Buffer>(*context, Abi::PageTableBytes(PageTableLeafCapacity), VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT, ShaderReadMemory(*context, Abi::PageTableBytes(PageTableLeafCapacity)));
-        auto bytes = pageBuffer->Bytes();
+    if (MirrorAddressing()) {
+        constexpr auto tableBytes = Abi::MirrorTableWords * sizeof(std::uint32_t);
+        mirrorTable = std::make_shared<Graphics::Buffer>(*context, tableBytes, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT, ShaderReadMemory(*context, tableBytes));
+        auto bytes = mirrorTable->Bytes();
         std::memset(bytes.data(), 0, bytes.size());
-        const Abi::Header header{Abi::PageTableVersion, 0, sizeof(std::uint64_t), 0};
-        std::memcpy(bytes.data(), &header, sizeof(header));
-        ledger->SetPageTable(pages.get());
-        if (MirrorAddressing()) {
-            const auto window = ledger->OpenWindow();
-            const Abi::Header mirror{Abi::MirrorVersion, 0, sizeof(std::uint64_t), 0};
-            const std::uint64_t limit = MirrorWindow();
-            std::memcpy(bytes.data(), &mirror, sizeof(mirror));
-            std::memcpy(bytes.data() + Abi::MirrorBaseWord * sizeof(std::uint32_t), &window, sizeof(window));
-            std::memcpy(bytes.data() + Abi::MirrorLimitWord * sizeof(std::uint32_t), &limit, sizeof(limit));
-            std::fprintf(stderr, "[recode-residency] mirror addressing: guest 0x0+0x%llx at device 0x%llx\n", static_cast<unsigned long long>(limit), static_cast<unsigned long long>(window));
-            if (window == 0u) throw std::runtime_error("the mirror window could not be created; set APS5_RECODE_PAGE_TABLE_FORM=1");
-        }
-        if (std::getenv("APS5_RECODE_NO_NULL_PAGE") == nullptr) {
-            nullPage = std::make_shared<Graphics::Buffer>(*context, GpuPageBytes, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT, ShaderReadMemory(*context, GpuPageBytes));
-            std::memset(nullPage->Bytes().data(), 0, nullPage->Bytes().size());
-            pages->Map(0, GpuPageBytes, nullPage->DeviceAddress(), GpuPageRead);
-        }
+        const auto window = ledger->OpenWindow();
+        const Abi::Header mirror{Abi::MirrorVersion, 0, sizeof(std::uint64_t), 0};
+        const std::uint64_t limit = MirrorWindow();
+        std::memcpy(bytes.data(), &mirror, sizeof(mirror));
+        std::memcpy(bytes.data() + Abi::MirrorBaseWord * sizeof(std::uint32_t), &window, sizeof(window));
+        std::memcpy(bytes.data() + Abi::MirrorLimitWord * sizeof(std::uint32_t), &limit, sizeof(limit));
+        std::fprintf(stderr, "[recode-residency] mirror addressing: guest 0x0+0x%llx at device 0x%llx\n", static_cast<unsigned long long>(limit), static_cast<unsigned long long>(window));
+        if (window == 0u) throw std::runtime_error("the mirror window could not be created");
     }
     for (const auto& [address, size] : queued) ledger->Add(address, size);
     queued.clear();
@@ -176,19 +156,18 @@ std::optional<DeviceSpan> ResidencyService::Serve(std::uint64_t address, std::ui
 bool ResidencyService::ServeFaultPage(std::uint64_t page, std::uint64_t allocation, std::uint64_t allocationBytes, std::span<const std::pair<std::uint64_t, std::uint64_t>> committed) {
     if (!Attached()) return false;
     std::lock_guard lock(mutex);
-    if (!pages) return false;
-    const auto end = page + GpuPageBytes;
-    if (pages->Lookup(page) != 0) {
+    const auto end = page + ChunkBytes;
+    if (ledger->Translate(page, ChunkBytes)) {
         ++faultPagesMapped;
         return true;
     }
-    if (!ledger->Owns(page, GpuPageBytes)) {
+    if (!ledger->Owns(page, ChunkBytes)) {
         bool added = false;
         if (allocationBytes != 0 && allocation <= page && end - allocation <= allocationBytes) {
             ledger->RemoveUnboundInside(allocation, allocationBytes);
             added = ledger->Add(allocation, allocationBytes);
         }
-        if (!added) added = claim(page, GpuPageBytes, "page");
+        if (!added) added = claim(page, ChunkBytes, "page");
         if (!added) {
             ++faultPagesRefused;
             return false;
@@ -203,7 +182,6 @@ bool ResidencyService::ServeFaultPage(std::uint64_t page, std::uint64_t allocati
             return false;
         }
     }
-    if (const auto bound = ledger->Translate(page, GpuPageBytes); bound && pages->Lookup(page) == 0) pages->Map(page, GpuPageBytes, bound->address, GpuPagePermissions);
     served.try_emplace(page, end);
     ++faultPagesServed;
     return true;
@@ -212,152 +190,33 @@ bool ResidencyService::ServeFaultPage(std::uint64_t page, std::uint64_t allocati
 void ResidencyService::MapImports(std::uint64_t serial, std::shared_ptr<const std::vector<Abi::Range>> ranges) {
     if (!Attached() || ranges == nullptr) return;
     std::vector<SpaceCommit> commits;
-    if (mirrorSpaces.load(std::memory_order_acquire)) {
-        commits.reserve(ranges->size());
-        for (const auto& range : *ranges) {
-            if (range.end > range.begin) commits.push_back({range.begin, range.end - range.begin, GuestMemory::CommittedRanges(range.begin, static_cast<std::size_t>(range.end - range.begin))});
-        }
+    commits.reserve(ranges->size());
+    for (const auto& range : *ranges) {
+        if (range.end > range.begin) commits.push_back({range.begin, range.end - range.begin, GuestMemory::CommittedRanges(range.begin, static_cast<std::size_t>(range.end - range.begin))});
     }
     std::lock_guard lock(mutex);
-    if (!pages || serial == importSerial) return;
-    if (mirrorSpaces.load(std::memory_order_relaxed)) {
-        serveSpaces(commits);
-        importSerial = serial;
-        importSpaces.push_back(std::move(ranges));
-        while (importSpaces.size() > ImportSpacesKept) importSpaces.pop_front();
-        ++importMaps;
-        return;
-    }
-    std::vector<LinearSpan> spans;
-    spans.reserve(ranges->size());
-    for (const auto& range : *ranges) spans.push_back({range.begin, range.end, range.deviceAddress});
-    auto next = WholePages(spans);
-    for (const auto& [page, target] : importPages) {
-        if (const auto found = next.find(page); found != next.end() && found->second == target) continue;
-        if (pages->Lookup(page) != target) continue;
-        pages->Unmap(page, GpuPageBytes);
-        if (const auto bound = ledger->Translate(page, GpuPageBytes)) pages->Map(page, GpuPageBytes, bound->address, GpuPagePermissions);
-    }
-    for (const auto& [page, target] : next) {
-        if (pages->Lookup(page) != target) pages->Map(page, GpuPageBytes, target, GpuPagePermissions);
-    }
-    importPages = std::move(next);
+    if (serial == importSerial) return;
+    serveSpaces(commits);
     importSerial = serial;
     importSpaces.push_back(std::move(ranges));
     while (importSpaces.size() > ImportSpacesKept) importSpaces.pop_front();
     ++importMaps;
 }
 
-std::vector<std::uint64_t> ResidencyService::ForgetImport(std::uint64_t base, std::uint64_t bytes, std::uint64_t deviceBegin, std::uint64_t deviceEnd) {
-    std::vector<std::uint64_t> forgotten;
-    if (!Attached() || bytes == 0u) return forgotten;
-    std::lock_guard lock(mutex);
-    if (!pages) return forgotten;
-    for (auto it = importPages.lower_bound(base & ~(GpuPageBytes - 1)); it != importPages.end() && it->first < base + bytes;) {
-        const auto [page, target] = *it;
-        if (target < deviceBegin || target >= deviceEnd) {
-            ++it;
-            continue;
-        }
-        if (pages->Lookup(page) == target) {
-            pages->Unmap(page, GpuPageBytes);
-            if (const auto bound = ledger->Translate(page, GpuPageBytes)) pages->Map(page, GpuPageBytes, bound->address, GpuPagePermissions);
-        }
-        it = importPages.erase(it);
-        ++importPagesForgotten;
-    }
-    importSerial = 0;
-    for (auto it = writtenImports.lower_bound(base & ~(GpuPageBytes - 1)); it != writtenImports.end() && it->first < base + bytes;) {
-        const auto [chunk, target] = *it;
-        if (target < deviceBegin || target >= deviceEnd) {
-            ++it;
-            continue;
-        }
-        if (pages->Lookup(chunk) == target) {
-            pages->Unmap(chunk, GpuPageBytes);
-            const std::array refresh{DirtyRange{chunk, GpuPageBytes}};
-            uploads->NoteDirty(refresh);
-            if (const auto bound = ledger->Translate(chunk, GpuPageBytes)) pages->Map(chunk, GpuPageBytes, bound->address, GpuPagePermissions);
-        }
-        forgotten.push_back(chunk);
-        it = writtenImports.erase(it);
-        ++writtenImportsForgotten;
-    }
-    return forgotten;
-}
-
-bool ResidencyService::MapWrittenImport(std::uint64_t chunk, std::uint64_t target) {
-    if (!Attached() || target == 0u) return false;
-    std::lock_guard lock(mutex);
-    if (!pages || mirrorSpaces || writtenImports.contains(chunk)) return false;
-    pages->Map(chunk, GpuPageBytes, target, GpuPagePermissions);
-    writtenImports.emplace(chunk, target);
-    return true;
-}
-
-bool ResidencyService::WrittenImportAny(std::uint64_t address, std::uint64_t size) const {
-    if (!Attached() || size == 0) return false;
-    std::lock_guard lock(mutex);
-    const auto found = writtenImports.lower_bound(address & ~(ChunkBytes - 1));
-    return found != writtenImports.end() && found->first < address + size;
-}
-
 std::vector<std::uint64_t> ResidencyService::UnmappedPages(std::uint64_t address, std::uint64_t size) const {
     std::vector<std::uint64_t> missing;
     if (!Attached() || size == 0) return missing;
     std::lock_guard lock(mutex);
-    if (!pages) return missing;
-    for (auto page = address & ~(GpuPageBytes - 1); page < address + size; page += GpuPageBytes) {
-        if (pages->Lookup(page) == 0) missing.push_back(page);
+    for (auto page = address & ~(ChunkBytes - 1); page < address + size; page += ChunkBytes) {
+        if (!ledger->Translate(page, ChunkBytes)) missing.push_back(page);
     }
     return missing;
 }
 
-std::optional<DeviceSpan> ResidencyService::ReturnWrittenImport(std::uint64_t chunk) {
-    if (!Attached()) return std::nullopt;
-    std::lock_guard lock(mutex);
-    if (!pages) return std::nullopt;
-    const auto found = writtenImports.find(chunk);
-    if (found == writtenImports.end()) return std::nullopt;
-    auto bound = ledger->Translate(chunk, GpuPageBytes);
-    if (!bound) {
-        if (!claim(chunk, GpuPageBytes, "chunk")) return std::nullopt;
-        if (!uploads->PrepareFilled(chunk, GpuPageBytes, frame.load(std::memory_order_relaxed))) return std::nullopt;
-        bound = ledger->Translate(chunk, GpuPageBytes);
-        if (!bound) return std::nullopt;
-        served.try_emplace(chunk, chunk + GpuPageBytes);
-        ++writtenImportsBound;
-    }
-    if (pages->Lookup(chunk) == found->second) {
-        pages->Unmap(chunk, GpuPageBytes);
-        pages->Map(chunk, GpuPageBytes, bound->address, GpuPagePermissions);
-    }
-    writtenImports.erase(found);
-    ++writtenImportsReturned;
-    return bound;
-}
-
-bool ResidencyService::WrittenImport(std::uint64_t chunk) const {
-    if (!Attached()) return false;
-    std::lock_guard lock(mutex);
-    return writtenImports.contains(chunk);
-}
-
-bool ResidencyService::WrittenImportThroughout(std::uint64_t address, std::uint64_t size) const {
-    if (!Attached() || size == 0) return false;
-    std::lock_guard lock(mutex);
-    const auto first = address & ~(ChunkBytes - 1);
-    auto found = writtenImports.lower_bound(first);
-    for (auto chunk = first; chunk < address + size; chunk += ChunkBytes, ++found) {
-        if (found == writtenImports.end() || found->first != chunk) return false;
-    }
-    return true;
-}
-
-std::shared_ptr<Graphics::Buffer> ResidencyService::PageTableBuffer() const {
+std::shared_ptr<Graphics::Buffer> ResidencyService::MirrorTable() const {
     if (!Attached()) return nullptr;
     std::lock_guard lock(mutex);
-    return pageBuffer;
+    return mirrorTable;
 }
 
 std::vector<PendingUpload> ResidencyService::ReadBack(std::span<const std::pair<std::uint64_t, std::uint64_t>> ranges) {
@@ -470,33 +329,19 @@ std::optional<DeviceSpan> ResidencyService::Translate(std::uint64_t address, std
     return ledger->Translate(address, size);
 }
 
-std::uint64_t ResidencyService::TranslateMapped(std::uint64_t address, std::uint64_t size, bool write) const {
-    if (!Attached() || size == 0) return 0;
-    std::lock_guard lock(mutex);
-    if (!pages) return 0;
-    const auto device = pages->Lookup(address, write);
-    if (device == 0) return 0;
-    const auto firstPage = address >> GpuPageBits;
-    const auto lastPage = (address + size - 1) >> GpuPageBits;
-    for (auto page = firstPage + 1; page <= lastPage; ++page) {
-        const auto guest = page << GpuPageBits;
-        if (pages->Lookup(guest, write) != device + (guest - address)) return 0;
-    }
-    return device;
+std::uint64_t ResidencyService::TranslateMapped(std::uint64_t address, std::uint64_t size) const {
+    const auto [device, length] = MappedPrefix(address, size);
+    return length == size ? device : 0u;
 }
 
-std::pair<std::uint64_t, std::uint64_t> ResidencyService::MappedPrefix(std::uint64_t address, std::uint64_t size, bool write) const {
+std::pair<std::uint64_t, std::uint64_t> ResidencyService::MappedPrefix(std::uint64_t address, std::uint64_t size) const {
     if (!Attached() || size == 0) return {0u, 0u};
     std::lock_guard lock(mutex);
-    if (!pages) return {0u, 0u};
-    const auto device = pages->Lookup(address, write);
-    if (device == 0) return {0u, 0u};
-    const auto lastPage = (address + size - 1) >> GpuPageBits;
-    for (auto page = (address >> GpuPageBits) + 1; page <= lastPage; ++page) {
-        const auto guest = page << GpuPageBits;
-        if (pages->Lookup(guest, write) != device + (guest - address)) return {device, guest - address};
-    }
-    return {device, size};
+    const auto end = address + size;
+    if (end > MirrorWindow() || !ledger->Translate(address, std::min(end, (address & ~(ChunkBytes - 1)) + ChunkBytes) - address)) return {0u, 0u};
+    auto at = (address & ~(ChunkBytes - 1)) + ChunkBytes;
+    while (at < end && ledger->Translate(at, std::min(end, at + ChunkBytes) - at)) at += ChunkBytes;
+    return {ledger->MirrorAddress(address), std::min(end, at) - address};
 }
 
 std::shared_ptr<Graphics::Buffer> ResidencyService::staging(std::size_t bytes) {
@@ -526,7 +371,7 @@ std::shared_ptr<Graphics::Buffer> ResidencyService::staging(std::size_t bytes) {
 bool ResidencyService::Pending() const {
     if (!Attached()) return false;
     std::lock_guard lock(mutex);
-    return uploads->Pending() || (pages && pages->Dirty()) || device->Queued();
+    return uploads->Pending() || device->Queued();
 }
 
 void ResidencyService::SetBatchedBinds(bool enabled) {
@@ -549,38 +394,15 @@ std::size_t ResidencyService::Record(VkCommandBuffer commands, std::vector<std::
     const auto now = frame.load(std::memory_order_relaxed);
     for (const auto& [address, end] : served) ledger->Touch(address, now);
     auto taken = uploads->Take();
-    auto dirty = pages ? pages->TakeDirty() : GpuPageTableDirty{};
-    if (MirrorAddressing()) dirty = {};
-    std::erase_if(dirty.leaves, [&](std::uint32_t leaf) {
-        if (leaf < PageTableLeafCapacity) return false;
-        ++pageLeavesDropped;
-        return true;
-    });
-    if (taken.empty() && !dirty.root && dirty.leaves.empty()) return 0;
+    if (taken.empty()) return 0;
     std::size_t uploadBytes = 0;
     for (const auto& upload : taken) uploadBytes += upload.bytes.size();
-    const auto tableBytes = (dirty.root ? PageTableRootBytes : 0) + dirty.leaves.size() * PageTableLeafBytes;
-    const auto total = uploadBytes + tableBytes;
-    auto staging = this->staging(total);
+    auto staging = this->staging(uploadBytes);
     auto bytes = staging->Bytes();
     std::size_t at = 0;
     for (const auto& upload : taken) {
         std::memcpy(bytes.data() + at, upload.bytes.data(), upload.bytes.size());
         at += upload.bytes.size();
-    }
-    std::vector<VkBufferCopy> tableRegions;
-    if (dirty.root) {
-        const Abi::Header header{Abi::PageTableVersion, std::min(pages->Leaves(), PageTableLeafCapacity), sizeof(std::uint64_t), 0};
-        std::memcpy(bytes.data() + at, &header, sizeof(header));
-        std::memcpy(bytes.data() + at + Abi::PageTableHeaderWords * sizeof(std::uint32_t), pages->Root().data(), pages->Root().size_bytes());
-        tableRegions.push_back({at, 0, PageTableRootBytes});
-        at += PageTableRootBytes;
-    }
-    for (const auto leaf : dirty.leaves) {
-        const auto entries = pages->Leaf(leaf);
-        std::memcpy(bytes.data() + at, entries.data(), entries.size_bytes());
-        tableRegions.push_back({at, PageTableRootBytes + leaf * PageTableLeafBytes, PageTableLeafBytes});
-        at += PageTableLeafBytes;
     }
     Graphics::RecordMemoryBarrier(*context, commands, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, ResidentAccess, VK_ACCESS_TRANSFER_WRITE_BIT);
     const auto copy = context->Function<PFN_vkCmdCopyBuffer>("vkCmdCopyBuffer");
@@ -590,15 +412,11 @@ std::size_t ResidencyService::Record(VkCommandBuffer commands, std::vector<std::
         copy(commands, staging->Handle(), bufferOf(upload.handle), 1, &region);
         at += upload.bytes.size();
     }
-    if (!tableRegions.empty()) copy(commands, staging->Handle(), pageBuffer->Handle(), static_cast<std::uint32_t>(tableRegions.size()), tableRegions.data());
     Graphics::RecordMemoryBarrier(*context, commands, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_ACCESS_TRANSFER_WRITE_BIT, ResidentAccess);
     kept.push_back(std::move(staging));
-    if (!tableRegions.empty()) kept.push_back(pageBuffer);
     recordedUploads += taken.size();
     recordedBytes += uploadBytes;
-    pageUpdates += tableRegions.size();
-    pageUpdateBytes += tableBytes;
-    return taken.size() + tableRegions.size();
+    return taken.size();
 }
 
 void ResidencyService::AdvanceFrame() {
@@ -607,19 +425,6 @@ void ResidencyService::AdvanceFrame() {
     std::lock_guard lock(mutex);
     ledger->SetBudget(device->BudgetBytes());
     uploads->Evict(now);
-}
-
-void ResidencyService::SetMirrorSpaces(bool enabled) {
-    std::lock_guard lock(mutex);
-    mirrorSpaces.store(enabled, std::memory_order_release);
-    if (!enabled || !pages) return;
-    for (const auto& [page, target] : importPages) {
-        if (pages->Lookup(page) != target) continue;
-        pages->Unmap(page, GpuPageBytes);
-        if (const auto bound = ledger->Translate(page, GpuPageBytes)) pages->Map(page, GpuPageBytes, bound->address, GpuPagePermissions);
-    }
-    importPages.clear();
-    importSerial = 0;
 }
 
 std::optional<DeviceSpan> ResidencyService::MirrorSpan(std::uint64_t address, std::uint64_t size) {
@@ -719,11 +524,10 @@ std::string ResidencyService::Line() const {
         static_cast<unsigned long long>(ledgerCounts.bound), static_cast<unsigned long long>(ledgerCounts.evicted), static_cast<unsigned long long>(ledgerCounts.refused),
         static_cast<unsigned long long>(uploadCounts.dirtyUploads), static_cast<unsigned long long>(uploadCounts.dirtyBytes >> 20), static_cast<unsigned long long>(uploadCounts.fullUploads), static_cast<unsigned long long>(uploadCounts.fullBytes >> 20), static_cast<unsigned long long>(uploadCounts.skippedBytes >> 20),
         static_cast<unsigned long long>(recordedUploads), static_cast<unsigned long long>(recordedBytes >> 20), static_cast<unsigned long long>(stagingCreated), static_cast<unsigned long long>(stagingReused), static_cast<unsigned long long>(stagingPool.size()), static_cast<unsigned long long>(stagingHeld >> 20), static_cast<unsigned long long>(served.size()), static_cast<unsigned long long>(serveRefusals), static_cast<unsigned long long>(ownerRanges), static_cast<unsigned long long>(coveredSpans), static_cast<unsigned long long>(ledgerCounts.gapRanges));
-    if (!pages) return line;
-    char table[768];
-    std::snprintf(table, sizeof(table), "[recode-page-table] leaves %u of %u, updates %llu (%llu MiB), leaves dropped %llu, shared pages %llu; imports mapped %llu pages, %llu spaces, %llu pages of retired imports dropped; fault pages served %llu, already mapped %llu, refused %llu; read backs %llu (%llu KiB), not resident %llu KiB; GPU-written chunks on their import %llu (%llu forgotten, %llu returned, %llu of them bound on return)\n", pages->Leaves(), PageTableLeafCapacity,
-        static_cast<unsigned long long>(pageUpdates), static_cast<unsigned long long>(pageUpdateBytes >> 20), static_cast<unsigned long long>(pageLeavesDropped), static_cast<unsigned long long>(ledgerCounts.sharedPages),
-        static_cast<unsigned long long>(importPages.size()), static_cast<unsigned long long>(importMaps), static_cast<unsigned long long>(importPagesForgotten), static_cast<unsigned long long>(faultPagesServed), static_cast<unsigned long long>(faultPagesMapped), static_cast<unsigned long long>(faultPagesRefused), static_cast<unsigned long long>(readBacks), static_cast<unsigned long long>(readBackBytes >> 10), static_cast<unsigned long long>(readBackMissedBytes >> 10), static_cast<unsigned long long>(writtenImports.size()), static_cast<unsigned long long>(writtenImportsForgotten), static_cast<unsigned long long>(writtenImportsReturned), static_cast<unsigned long long>(writtenImportsBound));
+    if (!mirrorTable) return line;
+    char table[512];
+    std::snprintf(table, sizeof(table), "[recode-mirror] window 0x%llx bytes, import spaces %llu; fault pages served %llu, already bound %llu, refused %llu; read backs %llu (%llu KiB), not resident %llu KiB\n", static_cast<unsigned long long>(MirrorWindow()),
+        static_cast<unsigned long long>(importMaps), static_cast<unsigned long long>(faultPagesServed), static_cast<unsigned long long>(faultPagesMapped), static_cast<unsigned long long>(faultPagesRefused), static_cast<unsigned long long>(readBacks), static_cast<unsigned long long>(readBackBytes >> 10), static_cast<unsigned long long>(readBackMissedBytes >> 10));
     std::string spaces;
     const auto binds = device->TakeCounts();
     if (binds.calls != 0 || binds.queued != 0) {
@@ -736,7 +540,7 @@ std::string ResidencyService::Line() const {
         std::snprintf(text, sizeof(text), "[recode-readback] %llu read-backs on the settle queue, %llu failed\n", static_cast<unsigned long long>(settleReadBacks), static_cast<unsigned long long>(readBackFailures));
         spaces += text;
     }
-    if (mirrorSpaces) {
+    {
         char text[192];
         std::snprintf(text, sizeof(text), "[recode-mirror-spaces] served %llu, refused %llu, %llu MiB\n", static_cast<unsigned long long>(spacesServed), static_cast<unsigned long long>(spacesRefused), static_cast<unsigned long long>(spaceBytes >> 20));
         spaces += text;

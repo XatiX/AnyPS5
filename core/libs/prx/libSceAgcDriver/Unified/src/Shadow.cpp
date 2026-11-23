@@ -547,8 +547,8 @@ bool ServeOwned(const Graphics::Context& context, std::uint64_t address, std::ui
     if (!GuestArena::GuestArenaContains_nid_postfix(reinterpret_cast<const void*>(first), static_cast<std::size_t>(last - first))) return false;
     const auto start = std::chrono::steady_clock::now();
     const auto [owner, ownerEnd] = allocationAround(first, last);
-    const auto from = std::max(owner, first & ~(GpuPageBytes - 1));
-    const auto to = std::min(ownerEnd, (last + GpuPageBytes - 1) & ~(GpuPageBytes - 1));
+    const auto from = std::max(owner, first & ~(ChunkBytes - 1));
+    const auto to = std::min(ownerEnd, (last + ChunkBytes - 1) & ~(ChunkBytes - 1));
     const auto committed = GuestMemory::CommittedRanges(from, static_cast<std::size_t>(to - from));
     auto& core = MemoryCore::Get();
     core.Reserve(from, to - from);
@@ -581,14 +581,14 @@ void ServeFaultPages(std::span<const std::uint64_t> pages) {
     {
         const auto lease = GuestAllocations::GuestAllocationsAcquire_nid_postfix();
         for (const auto address : pages) {
-            const auto page = address & ~(GpuPageBytes - 1);
-            FaultPage entry{page, page, page + GpuPageBytes};
+            const auto page = address & ~(ChunkBytes - 1);
+            FaultPage entry{page, page, page + ChunkBytes};
             auto range = std::upper_bound(lease.begin(), lease.end(), page, [](std::uint64_t at, const auto& candidate) { return at < candidate->address; });
             if (range != lease.begin()) {
                 const auto& allocation = *--range;
                 const auto first = allocation->address & ~(PageBytes - 1);
                 const auto last = (allocation->address + allocation->bytes + PageBytes - 1) & ~(PageBytes - 1);
-                if (allocation->bytes != 0 && first <= page && page + GpuPageBytes <= last) {
+                if (allocation->bytes != 0 && first <= page && page + ChunkBytes <= last) {
                     entry.first = first;
                     entry.last = last;
                 }
@@ -598,11 +598,11 @@ void ServeFaultPages(std::span<const std::uint64_t> pages) {
     }
     auto& core = MemoryCore::Get();
     for (const auto& [page, first, last] : found) {
-        if (!GuestArena::GuestArenaContains_nid_postfix(reinterpret_cast<const void*>(page), static_cast<std::size_t>(GpuPageBytes))) continue;
+        if (!GuestArena::GuestArenaContains_nid_postfix(reinterpret_cast<const void*>(page), static_cast<std::size_t>(ChunkBytes))) continue;
         const bool whole = registerRange(first, last);
-        if (!whole && first != page) registerRange(page, page + GpuPageBytes);
-        const auto committed = GuestMemory::CommittedRanges(page, static_cast<std::size_t>(GpuPageBytes));
-        core.Reserve(page, GpuPageBytes);
+        if (!whole && first != page) registerRange(page, page + ChunkBytes);
+        const auto committed = GuestMemory::CommittedRanges(page, static_cast<std::size_t>(ChunkBytes));
+        core.Reserve(page, ChunkBytes);
         for (const auto& [from, to] : committed) core.MakeResident(from, to - from);
         if (whole) service.ServeFaultPage(page, first, last - first, committed);
         else service.ServeFaultPage(page, 0, 0, committed);
@@ -632,49 +632,6 @@ bool ResidentDrawInputs() {
     return resident;
 }
 
-namespace {
-
-constexpr std::size_t WrittenChunksPendingBound = std::size_t{1} << 16u;
-
-struct WrittenChunks {
-    std::mutex mutex;
-    std::set<std::uint64_t> queued;
-    std::vector<std::uint64_t> pending;
-};
-
-WrittenChunks& writtenChunks() {
-    static auto& chunks = *new WrittenChunks();
-    return chunks;
-}
-
-void queueWrittenChunks(std::uint64_t begin, std::uint64_t end) {
-    auto& chunks = writtenChunks();
-    std::lock_guard lock(chunks.mutex);
-    for (auto chunk = begin & ~(ChunkBytes - 1); chunk < end; chunk += ChunkBytes) {
-        if (chunks.pending.size() < WrittenChunksPendingBound && chunks.queued.insert(chunk).second) chunks.pending.push_back(chunk);
-    }
-}
-
-}
-
-std::vector<std::uint64_t> TakeGpuWrittenChunks() {
-    auto& chunks = writtenChunks();
-    std::lock_guard lock(chunks.mutex);
-    std::vector<std::uint64_t> taken;
-    taken.swap(chunks.pending);
-    return taken;
-}
-
-void ForgetImport(std::uint64_t base, std::uint64_t bytes, std::uint64_t deviceBegin, std::uint64_t deviceEnd) {
-    const auto forgotten = ResidencyService::Get().ForgetImport(base, bytes, deviceBegin, deviceEnd);
-    if (forgotten.empty()) return;
-    auto& chunks = writtenChunks();
-    std::lock_guard lock(chunks.mutex);
-    for (const auto chunk : forgotten) {
-        if (chunks.pending.size() < WrittenChunksPendingBound) chunks.pending.push_back(chunk);
-    }
-}
-
 void NoteGpuWrites(GuestRanges ranges) {
     if (Downgrades::Watching()) {
         for (const auto& [begin, end] : ranges) {
@@ -689,7 +646,6 @@ void NoteGpuWrites(GuestRanges ranges) {
         if (end <= begin) continue;
         begin &= ~(PageBytes - 1);
         end = (end + PageBytes - 1) & ~(PageBytes - 1);
-        queueWrittenChunks(begin, end);
         auto next = marked.upper_bound(begin);
         if (next != marked.begin()) {
             const auto previous = std::prev(next);

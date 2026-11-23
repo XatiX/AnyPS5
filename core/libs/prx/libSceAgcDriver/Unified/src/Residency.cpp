@@ -1,5 +1,4 @@
 #include "prx/libSceAgcDriver/Unified/include/Residency.hpp"
-#include "prx/libSceAgcDriver/Unified/include/GpuPageTable.hpp"
 #include <algorithm>
 #include <atomic>
 #include <cstdio>
@@ -189,7 +188,6 @@ std::uint64_t Residency::release(Range& range) {
         if (found == bound.end()) continue;
         if (--found->second.holders != 0) continue;
         binds.push_back({chunk - segmentBase(chunk), found->second.chunk, false});
-        if (segment != nullptr) unmapChunk(chunk, segment->address + (chunk - segmentBase(chunk)));
         put(found->second.chunk);
         bound.erase(found);
     }
@@ -245,7 +243,6 @@ std::vector<GuestSpan> Residency::MakeResident(std::uint64_t address, std::uint6
         const auto chunk = range.origin + fresh[at] * ChunkBytes;
         bound.emplace(chunk, Held{binds[at].chunk, 1u});
         range.held[fresh[at]] = true;
-        mapChunk(chunk, segment->address + (chunk - segmentBase(chunk)));
     }
     for (const auto index : joined) {
         ++bound.find(range.origin + index * ChunkBytes)->second.holders;
@@ -387,29 +384,6 @@ void Residency::SetBudget(std::uint64_t bytes) {
 void Residency::SetKeep(Keep next) {
     std::lock_guard lock(mutex);
     keep = next;
-}
-
-void Residency::mapChunk(std::uint64_t chunk, std::uint64_t deviceAddress) {
-    if (pageTable == nullptr) return;
-    if (const auto mapped = pageTable->Lookup(chunk); mapped != 0 && mapped != deviceAddress) {
-        ++sharedPages;
-        return;
-    }
-    pageTable->Map(chunk, ChunkBytes, deviceAddress, GpuPagePermissions);
-}
-
-void Residency::unmapChunk(std::uint64_t chunk, std::uint64_t deviceAddress) {
-    if (pageTable == nullptr) return;
-    if (pageTable->Lookup(chunk) == deviceAddress) pageTable->Unmap(chunk, ChunkBytes);
-}
-
-void Residency::SetPageTable(GpuPageTable* table) {
-    std::lock_guard lock(mutex);
-    pageTable = table;
-    if (pageTable == nullptr) return;
-    for (const auto& [chunk, held] : bound) {
-        if (const auto* segment = segmentOf(chunk)) mapChunk(chunk, segment->address + (chunk - segmentBase(chunk)));
-    }
 }
 
 ResidencyCounts Residency::Counts() const {

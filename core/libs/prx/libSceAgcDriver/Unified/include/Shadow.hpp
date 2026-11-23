@@ -47,8 +47,6 @@ void ServeFaultPages(std::span<const std::uint64_t> pages);
 void LandGpuWrites(GuestRanges ranges);
 bool ResidentDrawInputs();
 void NoteGpuWrites(GuestRanges ranges);
-std::vector<std::uint64_t> TakeGpuWrittenChunks();
-void ForgetImport(std::uint64_t base, std::uint64_t bytes, std::uint64_t deviceBegin, std::uint64_t deviceEnd);
 bool OwnedUploadsPending();
 std::size_t RecordOwnedUploads(VkCommandBuffer commands, std::vector<std::shared_ptr<void>>& kept);
 

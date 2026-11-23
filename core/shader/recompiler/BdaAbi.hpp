@@ -9,32 +9,19 @@
 namespace ShaderRecompiler::BdaAbi {
 
 inline constexpr std::uint32_t Version = 1;
-inline constexpr std::uint32_t PageTableVersion = 2;
 inline constexpr std::uint32_t MirrorVersion = 3;
 inline constexpr std::uint32_t Read = 1;
 inline constexpr std::uint32_t Write = 2;
 
 inline constexpr bool Known(std::uint32_t version) {
-    return version == Version || version == PageTableVersion || version == MirrorVersion;
+    return version == Version || version == MirrorVersion;
 }
 
 inline constexpr std::uint32_t MirrorBaseWord = 4;
 inline constexpr std::uint32_t MirrorLimitWord = 6;
 inline constexpr std::uint32_t MirrorTableWords = 8;
 
-inline constexpr std::uint32_t PageTableHeaderWords = 4;
-inline constexpr std::uint32_t PageTablePageBits = 16;
-inline constexpr std::uint32_t PageTableLeafBits = 12;
-inline constexpr std::uint32_t PageTableRootBits = 16;
-inline constexpr std::uint32_t PageTableRootEntries = 1u << PageTableRootBits;
-inline constexpr std::uint32_t PageTableLeafEntries = 1u << PageTableLeafBits;
-inline constexpr std::uint32_t PageTableLeavesWord = PageTableHeaderWords + PageTableRootEntries;
-inline constexpr std::uint64_t PageTableAddressSpace = std::uint64_t{1} << (PageTablePageBits + PageTableLeafBits + PageTableRootBits);
-inline constexpr std::uint64_t PageTablePermissions = Read | Write;
-
-inline constexpr std::uint32_t PageTableBytes(std::uint32_t leaves) {
-    return (PageTableLeavesWord + leaves * PageTableLeafEntries * 2u) * static_cast<std::uint32_t>(sizeof(std::uint32_t));
-}
+inline constexpr std::uint32_t FaultPageBits = 16;
 
 struct Header {
     std::uint32_t version;
@@ -113,10 +100,6 @@ inline constexpr std::uint32_t WrittenChunkKey(std::uint64_t address) {
     return static_cast<std::uint32_t>(address >> WrittenChunkShift) + 1u;
 }
 
-inline constexpr std::uint32_t FaultPageKey(std::uint64_t address) {
-    return static_cast<std::uint32_t>(address >> PageTablePageBits) + 1u;
-}
-
 template<typename TPage>
 bool ForEachFaultPage(const std::uint32_t* words, TPage&& page) {
     const auto count = words[FaultPageCountWord];
@@ -127,7 +110,7 @@ bool ForEachFaultPage(const std::uint32_t* words, TPage&& page) {
     }
     for (std::uint32_t claim = 0; claim < count; ++claim) {
         const auto key = words[FaultPageSlotsWord + words[FaultPageListWord + claim]];
-        page(static_cast<std::uint64_t>(key - 1u) << PageTablePageBits);
+        page(static_cast<std::uint64_t>(key - 1u) << FaultPageBits);
     }
     return true;
 }

@@ -95,7 +95,6 @@ struct ResidencyCounts {
     std::uint64_t gapRanges = 0;
 };
 
-class GpuPageTable;
 
 class Residency {
 public:
@@ -122,7 +121,6 @@ public:
     [[nodiscard]] std::uint64_t Removals() const;
     void SetBudget(std::uint64_t bytes);
     void SetKeep(Keep next);
-    void SetPageTable(GpuPageTable* table);
     std::uint64_t OpenWindow();
     [[nodiscard]] ResidencyCounts Counts() const;
 
@@ -148,11 +146,8 @@ private:
     std::optional<Chunk> take();
     void put(Chunk chunk);
     std::uint64_t release(Range& range);
-    void mapChunk(std::uint64_t chunk, std::uint64_t deviceAddress);
-    void unmapChunk(std::uint64_t chunk, std::uint64_t deviceAddress);
 
     ResidencyDevice& device;
-    GpuPageTable* pageTable = nullptr;
     Keep keep = nullptr;
     std::uint64_t sharedPages = 0;
     mutable std::mutex mutex;
