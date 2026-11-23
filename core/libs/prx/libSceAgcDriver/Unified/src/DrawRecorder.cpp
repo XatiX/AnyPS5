@@ -1274,7 +1274,7 @@ public:
         line += "; record ranges noted GPU-written for the memory core " + std::to_string(totals.recordRangesNoted) + "; records made for a sampled shape after a hand-over " + std::to_string(totals.sampledRecordsCreated) + ", new storage records started from their memory " + std::to_string(totals.storageRecordsSeeded) + "; new chains zeroed " + std::to_string(totals.zeroedChains) + ", new records poisoned " + std::to_string(totals.poisonedRecords);
         if (metadataClears != nullptr) {
             const auto metadata = metadataClears->TakeCounts();
-            line += "; metadata clears: DCC writes " + std::to_string(metadata.pendingDcc) + ", CMASK writes " + std::to_string(metadata.pendingCmask) + ", applied to records " + std::to_string(totals.metadataClears) + " (DCC " + std::to_string(metadata.dccApplied) + ", CMASK " + std::to_string(metadata.cmaskApplied) + "), refused " + std::to_string(metadata.refused) + ", DCC checks that found keys that disagree (not applied) " + std::to_string(metadata.dccMixed);
+            line += "; metadata clears: DCC writes " + std::to_string(metadata.pendingDcc) + ", CMASK writes " + std::to_string(metadata.pendingCmask) + ", applied to records " + std::to_string(totals.metadataClears) + " (DCC " + std::to_string(metadata.dccApplied) + ", CMASK " + std::to_string(metadata.cmaskApplied) + "), refused " + std::to_string(metadata.refused) + ", DCC checks that found keys that disagree (not applied) " + std::to_string(metadata.dccMixed) + ", metadata set to expanded after a check " + std::to_string(metadata.expanded);
         }
         if (htileClears != nullptr) {
             const auto outcomes = htileClears->TakeOutcomes();
@@ -3160,7 +3160,9 @@ private:
         if (vulkan == nullptr || table == nullptr) return;
         drainSurfaces(context, *context.recorder);
         std::string reason;
-        if (metadataClears->Apply(*context.recorder, record->key.address, *vulkan, reason)) {
+        const bool applied = metadataClears->Apply(*context.recorder, record->key.address, *vulkan, reason);
+        for (const auto& [begin, size] : metadataClears->TakeExpanded()) noteWrittenBack(*context.recorder, begin, size);
+        if (applied) {
             markRecordWritten(*context.recorder, *table, *record);
             totals.metadataClears++;
             return;

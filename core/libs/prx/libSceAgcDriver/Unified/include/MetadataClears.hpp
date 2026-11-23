@@ -10,6 +10,8 @@
 #include <memory>
 #include <mutex>
 #include <string>
+#include <utility>
+#include <vector>
 
 namespace AgcDriver::Graphics {
 class Recorder;
@@ -26,6 +28,7 @@ struct MetadataCounts {
     std::uint64_t dccApplied = 0;
     std::uint64_t cmaskApplied = 0;
     std::uint64_t dccMixed = 0;
+    std::uint64_t expanded = 0;
     std::uint64_t refused = 0;
 };
 
@@ -41,6 +44,7 @@ public:
     [[nodiscard]] bool Pending(std::uint64_t target, std::uint64_t bytes) const;
     bool Apply(Graphics::Recorder& recorder, std::uint64_t target, VulkanSurface& surface, std::string& reason);
     [[nodiscard]] MetadataCounts TakeCounts();
+    [[nodiscard]] std::vector<std::pair<std::uint64_t, std::uint64_t>> TakeExpanded();
 
 private:
     struct Target {
@@ -60,6 +64,7 @@ private:
     bool applyDcc(Graphics::Recorder& recorder, const Target& target, VulkanSurface& surface, std::string& reason);
     bool applyCmask(Graphics::Recorder& recorder, const Target& target, VulkanSurface& surface, std::string& reason);
     void createPipeline();
+    void expand(Graphics::Recorder& recorder, VkBuffer buffer, std::uint64_t address, std::uint64_t offset, std::uint64_t bytes);
 
     const Graphics::Context context;
     std::unique_ptr<Graphics::TextureDetiler> detiler;
@@ -72,6 +77,7 @@ private:
     VkDescriptorPool pool = VK_NULL_HANDLE;
     std::uint64_t poolBatch = 0;
     MetadataCounts counts;
+    std::vector<std::pair<std::uint64_t, std::uint64_t>> expanded;
     std::shared_ptr<std::atomic<std::uint64_t>> mixedKeys = std::make_shared<std::atomic<std::uint64_t>>(0);
 };
 

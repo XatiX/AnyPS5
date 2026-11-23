@@ -14,6 +14,7 @@
 #include <cstring>
 #include <exception>
 #include <string_view>
+#include <utility>
 
 namespace AgcDriver::Unified::Images {
 
@@ -168,9 +169,31 @@ bool MetadataClears::applyCmask(Graphics::Recorder& recorder, const Target& targ
     const auto& resource = surface.Resource();
     const auto elementBytes = Graphics::BytesPerElement(resource.format);
     detiler->DispatchCmaskClear(commands, reinterpret_cast<VkBuffer>(static_cast<std::uintptr_t>(span.handle)), target.cmask - span.origin, target.cmaskBytes, surface.StorageView(0u, 0u, elementBytes), resource.width, resource.height, elementBytes, target.clearWords, true);
+    expand(recorder, reinterpret_cast<VkBuffer>(static_cast<std::uintptr_t>(span.handle)), target.cmask, target.cmask - span.origin, target.cmaskBytes);
     std::lock_guard lock(mutex);
     counts.cmaskApplied++;
     return true;
+}
+
+void MetadataClears::expand(Graphics::Recorder& recorder, VkBuffer buffer, std::uint64_t address, std::uint64_t offset, std::uint64_t bytes) {
+    static const bool on = [] {
+        const char* value = std::getenv("APS5_RECODE_METADATA_EXPAND");
+        return value == nullptr || std::string_view(value) != "0";
+    }();
+    const auto whole = bytes & ~std::uint64_t{3u};
+    if (!on || whole == 0u || (offset & 3u) != 0u) return;
+    const auto commands = recorder.Commands();
+    Graphics::RecordMemoryBarrier(context, commands, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT, VK_ACCESS_TRANSFER_WRITE_BIT);
+    context.Resolved(&Graphics::DeviceFunctions::cmdFillBuffer, "vkCmdFillBuffer")(commands, buffer, offset, whole, 0xffffffffu);
+    Graphics::RecordMemoryBarrier(context, commands, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_ACCESS_TRANSFER_WRITE_BIT, VK_ACCESS_MEMORY_READ_BIT | VK_ACCESS_MEMORY_WRITE_BIT);
+    std::lock_guard lock(mutex);
+    expanded.emplace_back(address, whole);
+    counts.expanded++;
+}
+
+std::vector<std::pair<std::uint64_t, std::uint64_t>> MetadataClears::TakeExpanded() {
+    std::lock_guard lock(mutex);
+    return std::exchange(expanded, {});
 }
 
 void MetadataClears::createPipeline() {
@@ -299,6 +322,7 @@ bool MetadataClears::applyDcc(Graphics::Recorder& recorder, const Target& target
     groups(static_cast<std::uint64_t>(resource.width) * resource.height, x, y);
     context.Resolved(&Graphics::DeviceFunctions::cmdDispatch, "vkCmdDispatch")(commands, x, y, 1);
     Graphics::RecordMemoryBarrier(context, commands, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT | VK_PIPELINE_STAGE_HOST_BIT, VK_ACCESS_SHADER_WRITE_BIT, VK_ACCESS_MEMORY_READ_BIT | VK_ACCESS_MEMORY_WRITE_BIT | VK_ACCESS_HOST_READ_BIT);
+    expand(recorder, buffer, target.dcc, offset, target.dccKeys);
     recorder.Keep(std::static_pointer_cast<void>(result));
     recorder.OnComplete([result, mixed = mixedKeys] {
         std::uint32_t state = 0;
