@@ -28,6 +28,10 @@ struct DepthKey {
     }
 };
 
+[[nodiscard]] constexpr std::uint64_t HtileBlockBytes(std::uint32_t width, std::uint32_t height) {
+    return static_cast<std::uint64_t>((width + 1023u) / 1024u) * ((height + 511u) / 512u) * 32768u;
+}
+
 class DepthRecord {
 public:
     DepthRecord(const Graphics::Context& context, const DepthKey& key);
@@ -53,7 +57,11 @@ public:
     void SetInitialized() { initialized = true; }
     void NoteHtileWrite() { htileWritten.store(true, std::memory_order_release); }
     [[nodiscard]] bool TakeHtileWrite() { return htileWritten.exchange(false, std::memory_order_acq_rel); }
-    [[nodiscard]] std::uint64_t HtileBytes() const { return static_cast<std::uint64_t>((key.width + 7u) / 8u) * ((key.height + 7u) / 8u) * 4u; }
+    void NoteGpuHtileWrite() { htileGpuWritten.store(true, std::memory_order_release); }
+    [[nodiscard]] bool TakeGpuHtileWrite() { return htileGpuWritten.exchange(false, std::memory_order_acq_rel); }
+    void SetHtileSaysCleared(bool cleared) { htileSaysCleared = cleared; }
+    [[nodiscard]] bool HtileSaysCleared() const { return htileSaysCleared; }
+    [[nodiscard]] std::uint64_t HtileBytes() const { return HtileBlockBytes(key.width, key.height); }
 
 private:
     VkDevice device = VK_NULL_HANDLE;
@@ -75,6 +83,8 @@ private:
     std::uint32_t pipeBankXor = 0;
     std::atomic<bool> drawn{false};
     std::atomic<bool> htileWritten{false};
+    std::atomic<bool> htileGpuWritten{false};
+    bool htileSaysCleared = false;
 };
 
 enum class HtileState {
@@ -91,6 +101,7 @@ struct DepthCounts {
     std::uint64_t refused = 0;
     std::uint64_t cleared = 0;
     std::uint64_t htileWrites = 0;
+    std::uint64_t gpuHtileWrites = 0;
     std::uint64_t superseded = 0;
 };
 
@@ -100,7 +111,9 @@ public:
     [[nodiscard]] std::shared_ptr<DepthRecord> At(std::uint64_t address, bool& stencil);
     [[nodiscard]] bool Overlaps(std::uint64_t address, std::uint64_t bytes) const;
     [[nodiscard]] std::vector<std::shared_ptr<DepthRecord>> Overlapping(std::uint64_t address, std::uint64_t bytes) const;
-    std::size_t NoteHtileWrites(std::uint64_t address, std::uint64_t bytes);    void NoteCleared() {
+    std::size_t NoteHtileWrites(std::uint64_t address, std::uint64_t bytes);
+    std::size_t NoteGpuHtileWrites(std::uint64_t address, std::uint64_t bytes);
+    void NoteCleared() {
         std::lock_guard lock(mutex);
         counts.cleared++;
     }

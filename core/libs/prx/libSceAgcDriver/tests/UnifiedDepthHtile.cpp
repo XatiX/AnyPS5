@@ -1,4 +1,5 @@
 #include "prx/libSceAgcDriver/Unified/include/DepthRecords.hpp"
+#include "prx/libSceAgcDriver/Unified/include/HtileClears.hpp"
 #include <cstdint>
 #include <cstdio>
 #include <vector>
@@ -52,9 +53,26 @@ void testNoAddressIsUnknown() {
     Expect(ReadHtile(reinterpret_cast<std::uint64_t>(words.data()), 2u, false, false, 0.0f) == HtileState::Unknown, "fewer than four bytes is unknown");
 }
 
+void testMetadataSizeFollowsBlocks() {
+    Expect(HtileBlockBytes(1920u, 1080u) == 0x30000u, "a 1920x1080 target has six HTILE blocks");
+    Expect(HtileBlockBytes(256u, 256u) == 0x8000u, "a 256x256 target has one HTILE block");
+    Expect(HtileBlockBytes(3840u, 2160u) == 0xa0000u, "a 3840x2160 target has twenty HTILE blocks");
+}
+
+void testExpandedWordsNeverProveAClear() {
+    for (const bool stencilInTiles : {false, true}) {
+        const std::vector<std::uint32_t> words(1024, ExpandedHtileWord(stencilInTiles));
+        Expect((words[0] & 15u) == 15u, "an expanded word has every sample mask bit set");
+        Expect(read(words, false, stencilInTiles, 0.0f) == HtileState::Written, "expanded words are no clear to depth 0");
+        Expect(read(words, false, stencilInTiles, 1.0f) == HtileState::Written, "expanded words are no clear to depth 1");
+    }
+}
+
 }
 
 int main() {
+    testMetadataSizeFollowsBlocks();
+    testExpandedWordsNeverProveAClear();
     testZeroWordsProveAClearToZero();
     testFullRangeWordsProveAClearToOne();
     testOneExpandedTileMeansWritten();

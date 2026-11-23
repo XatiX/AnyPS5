@@ -106,6 +106,7 @@ std::string_view KindName(Kind kind) {
         case Kind::SampledStaleRecord: return "sampled-stale-record";
         case Kind::DepthSeedRefused: return "depth-seed-refused";
         case Kind::MetadataClearRefused: return "metadata-clear-refused";
+        case Kind::HtileClearRefused: return "htile-clear-refused";
         default: return "unknown";
     }
 }
@@ -124,7 +125,8 @@ Severity SeverityOf(Kind kind) {
         case Kind::SamplerMode:
         case Kind::SampledStaleRecord:
         case Kind::DepthSeedRefused:
-        case Kind::MetadataClearRefused: return Severity::Severe;
+        case Kind::MetadataClearRefused:
+        case Kind::HtileClearRefused: return Severity::Severe;
         case Kind::ExistingPath:
         case Kind::StorageRecordMissing:
         case Kind::UpstreamSampled:

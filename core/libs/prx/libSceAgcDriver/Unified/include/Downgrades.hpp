@@ -36,6 +36,7 @@ enum class Kind : std::uint32_t {
     SampledStaleRecord,
     DepthSeedRefused,
     MetadataClearRefused,
+    HtileClearRefused,
     Count,
 };
 

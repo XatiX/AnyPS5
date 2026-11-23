@@ -1,0 +1,23 @@
+#version 450
+
+layout(local_size_x = 64) in;
+
+layout(set = 0, binding = 0, std430) readonly buffer Tiles { uint words[]; } tiles;
+layout(set = 0, binding = 1, std430) buffer Result { uint state; } result;
+
+layout(push_constant) uniform Push {
+    uint base;
+    uint count;
+    uint stencil;
+    uint reserved;
+} push;
+
+void main() {
+    uint index = gl_GlobalInvocationID.y * gl_NumWorkGroups.x * 64u + gl_GlobalInvocationID.x;
+    if (index >= push.count) return;
+    uint word = tiles.words[push.base + index];
+    uint found = 0u;
+    if ((word & 15u) != 0u) found |= 1u;
+    if (push.stencil == 0u || ((word >> 8u) & 3u) != 0u) found |= 2u;
+    if (found != 0u) atomicOr(result.state, found);
+}

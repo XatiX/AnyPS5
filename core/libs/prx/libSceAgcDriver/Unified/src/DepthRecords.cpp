@@ -153,6 +153,20 @@ std::size_t DepthRecords::NoteHtileWrites(std::uint64_t address, std::uint64_t b
     return noted;
 }
 
+std::size_t DepthRecords::NoteGpuHtileWrites(std::uint64_t address, std::uint64_t bytes) {
+    std::lock_guard lock(mutex);
+    std::size_t noted = 0;
+    for (const auto& [key, record] : records) {
+        if (key.htileAddress == 0u) continue;
+        if (address < key.htileAddress + record->HtileBytes() && key.htileAddress < address + bytes) {
+            record->NoteGpuHtileWrite();
+            ++noted;
+        }
+    }
+    if (noted != 0u) counts.gpuHtileWrites++;
+    return noted;
+}
+
 std::vector<std::shared_ptr<DepthRecord>> DepthRecords::Overlapping(std::uint64_t address, std::uint64_t bytes) const {
     std::lock_guard lock(mutex);
     std::vector<std::shared_ptr<DepthRecord>> found;
