@@ -1,4 +1,5 @@
 #include "prx/libSceAgcDriver/Unified/include/MetadataClears.hpp"
+#include "prx/libSceAgcDriver/Execution/include/GuestMemory.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/DccMetadata.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/Recorder.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/Resources.hpp"
@@ -8,6 +9,7 @@
 #include "prx/libSceAgcDriver/Unified/include/VulkanImages.hpp"
 #include "prx/libSceAgcDriver/Unified/shaders/DccClear_spv.h"
 #include <algorithm>
+#include <cstdio>
 #include <cstdlib>
 #include <cstring>
 #include <exception>
@@ -47,6 +49,14 @@ void groups(std::uint64_t invocations, std::uint32_t& x, std::uint32_t& y) {
     y = static_cast<std::uint32_t>((total + x - 1u) / x);
 }
 
+std::string notResident(const char* what, std::uint64_t address, std::uint64_t bytes) {
+    std::uint64_t committed = 0;
+    for (const auto& [begin, end] : GuestMemory::CommittedRanges(address, static_cast<std::size_t>(bytes))) committed += end - begin;
+    char text[160];
+    std::snprintf(text, sizeof(text), "%s memory not resident (0x%llx+0x%llx, 0x%llx bytes committed)", what, static_cast<unsigned long long>(address), static_cast<unsigned long long>(bytes), static_cast<unsigned long long>(committed));
+    return text;
+}
+
 bool pack(std::span<const std::byte> bytes, std::uint32_t (&pattern)[4]) {
     if (bytes.size() > 16u) return false;
     std::memset(pattern, 0, sizeof(pattern));
@@ -76,6 +86,9 @@ void MetadataClears::NoteTarget(const Graphics::ColorTarget& color) {
     if (color.dccAddress == 0u && (color.cmaskAddress == 0u || !color.cmaskFastClear)) return;
     std::lock_guard lock(mutex);
     auto& target = targets[color.address];
+    const auto cmask = color.cmaskFastClear ? color.cmaskAddress : 0u;
+    if (target.bytes != color.bytes || target.dcc != color.dccAddress) target.dccPending = false;
+    if (target.bytes != color.bytes || target.cmask != cmask) target.cmaskPending = false;
     target.bytes = color.bytes;
     target.dcc = color.dccAddress;
     target.dccKeys = color.dccAddress != 0u ? Graphics::DccKeyBytes(color.bytes) : 0u;
@@ -142,7 +155,7 @@ bool MetadataClears::Apply(Graphics::Recorder& recorder, std::uint64_t address, 
 bool MetadataClears::applyCmask(Graphics::Recorder& recorder, const Target& target, VulkanSurface& surface, std::string& reason) {
     Shadow::OwnedSpan span;
     if (!Shadow::ServeOwned(context, target.cmask, target.cmaskBytes, &span) || span.handle == 0u || target.cmask < span.origin) {
-        reason = "CMASK memory not resident";
+        reason = notResident("CMASK", target.cmask, target.cmaskBytes);
         return false;
     }
     const auto serial = recorder.OpenBatchSerial();
@@ -215,7 +228,7 @@ bool MetadataClears::applyDcc(Graphics::Recorder& recorder, const Target& target
     static_cast<void>(pack(std::span(texel.data(), std::min<std::size_t>(elementBytes, sizeof(target.clearWords))), push.patterns[4]));
     Shadow::OwnedSpan span;
     if (!Shadow::ServeOwned(context, target.dcc, target.dccKeys, &span) || span.handle == 0u || target.dcc < span.origin) {
-        reason = "DCC memory not resident";
+        reason = notResident("DCC", target.dcc, target.dccKeys);
         return false;
     }
     if (pipeline == VK_NULL_HANDLE) createPipeline();
