@@ -7,6 +7,7 @@
 #include "prx/libSceAgcDriver/Unified/include/Resolve.hpp"
 #include <array>
 #include <cstdint>
+#include <functional>
 #include <memory>
 #include <optional>
 #include <span>
@@ -16,6 +17,10 @@
 
 namespace AgcDriver {
 class VulkanDevice;
+}
+
+namespace AgcDriver::Graphics {
+class Recorder;
 }
 
 namespace AgcDriver::Unified::Record {
@@ -34,6 +39,7 @@ struct DisplaySource {
 };
 [[nodiscard]] std::optional<DisplaySource> DisplayRecord(std::uint64_t address, std::uint64_t bytes);
 [[nodiscard]] bool LandingsPending();
+void LandAfterBatch(Graphics::Recorder& recorder, std::function<void()> landing);
 [[nodiscard]] bool IdleStores();
 bool RecordPrecheck(const Resolve::ResolvedDraw& draw, const Pm4::DrawParameters& parameters, std::vector<std::pair<std::uint64_t, std::uint64_t>>& reads, std::string& reason);
 bool RecordResolved(const Graphics::Context& context, const Resolve::ResolvedDraw& draw, const Pm4::DrawParameters& parameters, std::string& reason);

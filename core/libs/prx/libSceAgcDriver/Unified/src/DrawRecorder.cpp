@@ -1403,16 +1403,8 @@ private:
             it = knownWrites.erase(it);
         }
         if (due.empty()) return;
-        landings.pending.fetch_add(1, std::memory_order_acq_rel);
-        landings.scheduled.fetch_add(1, std::memory_order_relaxed);
-        context.recorder->OnComplete([due = std::move(due)] {
-            try {
-                landInCompletion(due);
-            } catch (const std::exception& error) {
-                std::fprintf(stderr, "[recode-landings] a landing after its batch failed: %s\n", error.what());
-            }
-            batchLandings().pending.fetch_sub(1, std::memory_order_acq_rel);
-        });
+        auto held = std::make_shared<std::vector<KnownWrite>>(std::move(due));
+        LandAfterBatch(*context.recorder, [held] { landInCompletion(*held); });
     }
 
     void landWrites() {
@@ -4137,6 +4129,20 @@ bool LandingsPending() {
     if (batchLandings().pending.load(std::memory_order_acquire) == 0u) return false;
     Releases::NoteLabelBehindLandings();
     return true;
+}
+
+void LandAfterBatch(Graphics::Recorder& recorder, std::function<void()> landing) {
+    auto& landings = batchLandings();
+    landings.pending.fetch_add(1, std::memory_order_acq_rel);
+    landings.scheduled.fetch_add(1, std::memory_order_relaxed);
+    recorder.OnComplete([landing = std::move(landing)] {
+        try {
+            landing();
+        } catch (const std::exception& error) {
+            std::fprintf(stderr, "[recode-landings] a landing after its batch failed: %s\n", error.what());
+        }
+        batchLandings().pending.fetch_sub(1, std::memory_order_acq_rel);
+    });
 }
 
 std::optional<DisplaySource> DisplayRecord(std::uint64_t address, std::uint64_t bytes) {
