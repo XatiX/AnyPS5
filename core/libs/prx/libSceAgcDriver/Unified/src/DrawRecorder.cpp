@@ -1036,6 +1036,8 @@ struct ComputePipeline {
     PFN_vkDestroyPipelineLayout destroyLayout = nullptr;
     VkPipelineLayout layout = VK_NULL_HANDLE;
     VkPipeline pipeline = VK_NULL_HANDLE;
+    VkPipelineCreationFeedbackFlags feedback = 0;
+    std::uint64_t lockNanoseconds = 0;
 
     ComputePipeline() = default;
     ComputePipeline(const ComputePipeline&) = delete;
@@ -2252,11 +2254,21 @@ private:
         subgroup.requiredSubgroupSize = job.subgroupSize;
         if (job.subgroupSize != 0u) info.stage.pNext = &subgroup;
         info.layout = made->layout;
+        VkPipelineCreationFeedback whole{};
+        VkPipelineCreationFeedback stage{};
+        VkPipelineCreationFeedbackCreateInfo feedback{VK_STRUCTURE_TYPE_PIPELINE_CREATION_FEEDBACK_CREATE_INFO};
+        feedback.pPipelineCreationFeedback = &whole;
+        feedback.pipelineStageCreationFeedbackCount = 1;
+        feedback.pPipelineStageCreationFeedbacks = &stage;
+        if (Downgrades::Active()) info.pNext = &feedback;
         VkResult created = VK_SUCCESS;
+        const auto lockStarted = std::chrono::steady_clock::now();
         {
             const auto cacheLock = context.LockPipelineCacheForUse();
+            made->lockNanoseconds = elapsed(lockStarted);
             created = context.Function<PFN_vkCreateComputePipelines>("vkCreateComputePipelines")(context.device, context.pipelineCache, 1, &info, nullptr, &made->pipeline);
         }
+        made->feedback = whole.flags;
         context.Function<PFN_vkDestroyShaderModule>("vkDestroyShaderModule")(context.device, module, nullptr);
         Graphics::Check(created, "vkCreateComputePipelines recode dispatch");
         return made;
@@ -2365,6 +2377,7 @@ private:
                 failure = error.what();
             }
             const auto built = elapsed(started);
+            if (made != nullptr && Downgrades::Active() && job->result != nullptr) std::fprintf(stderr, "[recode-build] %016llx module %016llx %s %.0f ms (cache lock %.0f ms)\n", static_cast<unsigned long long>(Downgrades::ProgramHash(job->codeAddress)), static_cast<unsigned long long>(job->result->spirv.ContentHash().low), (made->feedback & VK_PIPELINE_CREATION_FEEDBACK_VALID_BIT) == 0u ? "no-feedback" : (made->feedback & VK_PIPELINE_CREATION_FEEDBACK_APPLICATION_PIPELINE_CACHE_HIT_BIT) != 0u ? "cache-hit" : "cache-miss", static_cast<double>(built) / 1e6, static_cast<double>(made->lockNanoseconds) / 1e6);
             if (job->result != nullptr) Downgrades::DumpModule(job->codeAddress, job->result->spirv.ContentHash().low, std::span<const std::uint32_t>(job->result->spirv.data(), job->result->spirv.size()));
             Downgrades::NoteBuild(job->codeAddress, built, job->result != nullptr ? job->result->spirv.size() * sizeof(std::uint32_t) : 0u, job->result != nullptr ? job->result->spirv.ContentHash().low : 0u, job->key.size() > 2u ? Downgrades::HashCode(std::as_bytes(std::span(job->key).subspan(2))) : 0u);
             bool save = false;
