@@ -511,6 +511,11 @@ struct RecordDumpRequest {
     std::uint32_t every = 1;
 };
 
+std::chrono::steady_clock::time_point processStart() {
+    static const auto start = std::chrono::steady_clock::now();
+    return start;
+}
+
 const RecordDumpRequest& recordDumpRequest() {
     static const RecordDumpRequest request = [] {
         RecordDumpRequest parsed;
@@ -2385,7 +2390,28 @@ private:
         return count;
     }
 
+    void dumpImageReads(const Context& context, const Resolve::ResolvedDraw& work) {
+        static const bool on = std::getenv("APS5_RECODE_DUMP_SAMPLED_BY") != nullptr;
+        auto* table = Resolve::Surfaces();
+        if (!on || table == nullptr || context.recorder == nullptr || work.stages.empty()) return;
+        const auto program = Downgrades::ProgramHash(work.stages.back().program.codeAddress);
+        std::size_t reads = 0;
+        std::size_t matched = 0;
+        for (std::size_t index = work.imageBegin; index < work.uses.size(); ++index) {
+            const auto& use = work.uses[index];
+            if (use.write) continue;
+            ++reads;
+            for (const auto& record : table->Overlapping(use.address, use.size)) {
+                if (record->key.address != use.address) continue;
+                ++matched;
+                maybeDumpSampled(context, *context.recorder, record, program);
+            }
+        }
+        if (seen.insert("image reads " + std::to_string(program)).second && program == std::strtoull(std::getenv("APS5_RECODE_DUMP_SAMPLED_BY"), nullptr, 16)) std::fprintf(stderr, "[recode-dump] dispatch %016llx: %zu image reads, %zu with a record at their address\n", static_cast<unsigned long long>(program), reads, matched);
+    }
+
     bool recordDispatch(const Context& context, const Resolve::ResolvedDraw& dispatch, const std::array<std::uint32_t, 3>& groups, std::string& reason) {
+        dumpImageReads(context, dispatch);
         writtenRecords.clear();
         stageStorageImages.clear();
         writeBackForReaders(context, dispatch);
@@ -2710,9 +2736,13 @@ private:
         const auto& request = recordDumpRequest();
         if (wanted == 0 || program != wanted || request.directory.empty()) return;
         if (std::chrono::steady_clock::now() - dumpClock < std::chrono::seconds(request.seconds)) return;
-        if (!sampledDumps.insert(record->key.address).second || sampledDumps.size() > 16u) return;
+        if (sampledDumps.contains(record->key.address) || sampledDumps.size() >= 16u) return;
+        sampledDumps.insert(record->key.address);
         auto* vulkan = dynamic_cast<Images::VulkanSurface*>(record->device.get());
-        if (vulkan == nullptr || vulkan->Compressed()) return;
+        if (vulkan == nullptr || vulkan->Compressed()) {
+            std::fprintf(stderr, "[recode-dump] sampled record 0x%llx skipped: %s\n", static_cast<unsigned long long>(record->key.address), vulkan == nullptr ? "not a Vulkan surface" : "block-compressed format");
+            return;
+        }
         const auto elementBytes = Graphics::BytesPerElement(vulkan->Resource().format);
         const auto width = record->key.width;
         const auto height = record->key.height;
@@ -4103,7 +4133,7 @@ private:
     std::map<std::uint64_t, MapBuffer> maps;
     std::uint64_t mapBytes = 0;
     std::set<std::string> seen;
-    std::chrono::steady_clock::time_point dumpClock = std::chrono::steady_clock::now();
+    std::chrono::steady_clock::time_point dumpClock = processStart();
     std::set<std::uint64_t> dumpedRecords;
     std::set<std::uint64_t> sampledDumps;
     std::uint32_t depthDumps = 0;
