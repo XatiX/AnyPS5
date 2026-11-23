@@ -8,6 +8,7 @@
 #include "prx/libSceAgcDriver/Unified/include/Shadow.hpp"
 #include "prx/libSceAgcDriver/Unified/include/VulkanImages.hpp"
 #include "prx/libSceAgcDriver/Unified/shaders/DccClear_spv.h"
+#include "prx/libSceAgcDriver/Unified/shaders/DccClearVolume_spv.h"
 #include <algorithm>
 #include <cstdio>
 #include <cstdlib>
@@ -30,9 +31,15 @@ struct Push {
     std::uint32_t width = 0;
     std::uint32_t height = 0;
     std::uint32_t mode = 0;
-    std::uint32_t reserved[3]{};
+    std::uint32_t slices = 1;
+    std::uint32_t reserved[2]{};
     std::uint32_t patterns[5][4]{};
 };
+
+bool sliceClears() {
+    static const bool on = std::getenv("APS5_RECODE_NO_SLICE_CLEARS") == nullptr;
+    return on;
+}
 
 struct PoolHolder {
     const Graphics::Context* context = nullptr;
@@ -79,6 +86,7 @@ MetadataClears::MetadataClears(const Graphics::Context& context) : context(conte
 
 MetadataClears::~MetadataClears() {
     if (pipeline != VK_NULL_HANDLE) context.Function<PFN_vkDestroyPipeline>("vkDestroyPipeline")(context.device, pipeline, nullptr);
+    if (volumePipeline != VK_NULL_HANDLE) context.Function<PFN_vkDestroyPipeline>("vkDestroyPipeline")(context.device, volumePipeline, nullptr);
     if (pipelineLayout != VK_NULL_HANDLE) context.Function<PFN_vkDestroyPipelineLayout>("vkDestroyPipelineLayout")(context.device, pipelineLayout, nullptr);
     if (setLayout != VK_NULL_HANDLE) context.Function<PFN_vkDestroyDescriptorSetLayout>("vkDestroyDescriptorSetLayout")(context.device, setLayout, nullptr);
 }
@@ -132,8 +140,9 @@ bool MetadataClears::Apply(Graphics::Recorder& recorder, std::uint64_t address, 
         found->second.dccPending = false;
         found->second.cmaskPending = false;
     }
-    if (surface.Compressed() || std::max(surface.Geometry().imageLayers, 1u) != 1u || surface.Geometry().imageDepth > 1u) {
-        reason = "record is compressed, layered or a volume";
+    const bool slices = surface.Volume() || std::max(surface.Geometry().imageLayers, 1u) != 1u;
+    if (surface.Compressed() || (slices && (target.cmaskPending || !sliceClears()))) {
+        reason = surface.Compressed() ? "record is compressed" : target.cmaskPending ? "CMASK clear of a layered or volume record" : "record is layered or a volume";
         std::lock_guard lock(mutex);
         counts.refused++;
         return false;
@@ -215,20 +224,24 @@ void MetadataClears::createPipeline() {
     pipelineLayoutInfo.pushConstantRangeCount = 1;
     pipelineLayoutInfo.pPushConstantRanges = &pushRange;
     Graphics::Check(context.Function<PFN_vkCreatePipelineLayout>("vkCreatePipelineLayout")(context.device, &pipelineLayoutInfo, nullptr, &pipelineLayout), "vkCreatePipelineLayout recode DCC clear");
-    const auto module = Graphics::CreateShaderModule(context, DCC_CLEAR_SPV, sizeof(DCC_CLEAR_SPV), "vkCreateShaderModule recode DCC clear");
-    VkComputePipelineCreateInfo pipelineInfo{VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO};
-    pipelineInfo.stage = {VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO};
-    pipelineInfo.stage.stage = VK_SHADER_STAGE_COMPUTE_BIT;
-    pipelineInfo.stage.module = module;
-    pipelineInfo.stage.pName = "main";
-    pipelineInfo.layout = pipelineLayout;
-    VkResult created;
-    {
-        auto pipelineCacheLock = context.LockPipelineCacheForUse();
-        created = context.Function<PFN_vkCreateComputePipelines>("vkCreateComputePipelines")(context.device, context.pipelineCache, 1, &pipelineInfo, nullptr, &pipeline);
-    }
-    context.Function<PFN_vkDestroyShaderModule>("vkDestroyShaderModule")(context.device, module, nullptr);
-    Graphics::Check(created, "vkCreateComputePipelines recode DCC clear");
+    const auto build = [&](const std::uint32_t* words, std::size_t bytes, VkPipeline& made) {
+        const auto module = Graphics::CreateShaderModule(context, words, bytes, "vkCreateShaderModule recode DCC clear");
+        VkComputePipelineCreateInfo pipelineInfo{VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO};
+        pipelineInfo.stage = {VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO};
+        pipelineInfo.stage.stage = VK_SHADER_STAGE_COMPUTE_BIT;
+        pipelineInfo.stage.module = module;
+        pipelineInfo.stage.pName = "main";
+        pipelineInfo.layout = pipelineLayout;
+        VkResult created;
+        {
+            auto pipelineCacheLock = context.LockPipelineCacheForUse();
+            created = context.Function<PFN_vkCreateComputePipelines>("vkCreateComputePipelines")(context.device, context.pipelineCache, 1, &pipelineInfo, nullptr, &made);
+        }
+        context.Function<PFN_vkDestroyShaderModule>("vkDestroyShaderModule")(context.device, module, nullptr);
+        Graphics::Check(created, "vkCreateComputePipelines recode DCC clear");
+    };
+    build(DCC_CLEAR_SPV, sizeof(DCC_CLEAR_SPV), pipeline);
+    build(DCC_CLEAR_VOLUME_SPV, sizeof(DCC_CLEAR_VOLUME_SPV), volumePipeline);
 }
 
 bool MetadataClears::applyDcc(Graphics::Recorder& recorder, const Target& target, VulkanSurface& surface, std::string& reason) {
@@ -289,7 +302,7 @@ bool MetadataClears::applyDcc(Graphics::Recorder& recorder, const Target& target
     const auto base = offset - descriptorOffset;
     const VkDescriptorBufferInfo keyInfo{buffer, descriptorOffset, (base + target.dccKeys + 3u) & ~std::uint64_t{3u}};
     const VkDescriptorBufferInfo resultInfo{result->Handle(), 0, 16};
-    const VkDescriptorImageInfo imageInfo{VK_NULL_HANDLE, surface.StorageView(0u, 0u, elementBytes), VK_IMAGE_LAYOUT_GENERAL};
+    const VkDescriptorImageInfo imageInfo{VK_NULL_HANDLE, surface.SlicesStorageView(0u, elementBytes), VK_IMAGE_LAYOUT_GENERAL};
     std::array<VkWriteDescriptorSet, 3> writes{};
     for (std::uint32_t index = 0; index < writes.size(); ++index) {
         writes[index].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
@@ -304,12 +317,13 @@ bool MetadataClears::applyDcc(Graphics::Recorder& recorder, const Target& target
     context.Resolved(&Graphics::DeviceFunctions::updateDescriptorSets, "vkUpdateDescriptorSets")(context.device, static_cast<std::uint32_t>(writes.size()), writes.data(), 0, nullptr);
     context.Resolved(&Graphics::DeviceFunctions::cmdFillBuffer, "vkCmdFillBuffer")(commands, result->Handle(), 0, 16, 0u);
     Graphics::RecordMemoryBarrier(context, commands, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_ACCESS_SHADER_WRITE_BIT | VK_ACCESS_TRANSFER_WRITE_BIT | VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT, VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT);
-    context.BindComputePipeline(commands, pipeline);
+    context.BindComputePipeline(commands, surface.Volume() ? volumePipeline : pipeline);
     context.Resolved(&Graphics::DeviceFunctions::cmdBindDescriptorSets, "vkCmdBindDescriptorSets")(commands, VK_PIPELINE_BIND_POINT_COMPUTE, pipelineLayout, 0, 1, &set, 0, nullptr);
     push.base = static_cast<std::uint32_t>(base);
     push.count = static_cast<std::uint32_t>(target.dccKeys);
     push.width = resource.width;
     push.height = resource.height;
+    push.slices = surface.Slices(0u);
     std::uint32_t x = 0;
     std::uint32_t y = 0;
     push.mode = 0u;
@@ -319,7 +333,7 @@ bool MetadataClears::applyDcc(Graphics::Recorder& recorder, const Target& target
     Graphics::RecordMemoryBarrier(context, commands, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_ACCESS_SHADER_WRITE_BIT, VK_ACCESS_SHADER_READ_BIT);
     push.mode = 1u;
     context.Resolved(&Graphics::DeviceFunctions::cmdPushConstants, "vkCmdPushConstants")(commands, pipelineLayout, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(push), &push);
-    groups(static_cast<std::uint64_t>(resource.width) * resource.height, x, y);
+    groups(static_cast<std::uint64_t>(resource.width) * resource.height * push.slices, x, y);
     context.Resolved(&Graphics::DeviceFunctions::cmdDispatch, "vkCmdDispatch")(commands, x, y, 1);
     Graphics::RecordMemoryBarrier(context, commands, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT | VK_PIPELINE_STAGE_HOST_BIT, VK_ACCESS_SHADER_WRITE_BIT, VK_ACCESS_MEMORY_READ_BIT | VK_ACCESS_MEMORY_WRITE_BIT | VK_ACCESS_HOST_READ_BIT);
     expand(recorder, buffer, target.dcc, offset, target.dccKeys);

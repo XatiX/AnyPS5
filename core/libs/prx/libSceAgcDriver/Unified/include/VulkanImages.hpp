@@ -23,6 +23,9 @@ public:
     [[nodiscard]] std::uint64_t View(const ViewKey& view, std::uint32_t kind, std::string& reason) override;
     [[nodiscard]] std::uint32_t Layout() const override { return VK_IMAGE_LAYOUT_GENERAL; }
     [[nodiscard]] VkImageView StorageView(std::uint32_t level, std::uint32_t layer, std::uint32_t elementBytes);
+    [[nodiscard]] VkImageView SlicesStorageView(std::uint32_t level, std::uint32_t elementBytes);
+    [[nodiscard]] std::uint32_t Slices(std::uint32_t level) const;
+    [[nodiscard]] bool Volume() const { return resource.dimension == Graphics::TextureDimension::k3D; }
     [[nodiscard]] VkImageView ShapedStorageView(std::uint32_t level, StorageShape shape, bool uintView, bool atomic, std::string& reason, std::uint32_t layer = 0);
     [[nodiscard]] VkImageView AttachmentView(VkFormat viewFormat, std::uint32_t level, std::uint32_t layer, std::uint32_t layers, std::string& reason);
     [[nodiscard]] bool Attachable() const { return attachable; }

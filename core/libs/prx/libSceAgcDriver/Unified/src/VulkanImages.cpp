@@ -6,6 +6,7 @@
 #include <algorithm>
 #include <cstdlib>
 #include <exception>
+#include <limits>
 #include <vector>
 
 namespace AgcDriver::Unified::Images {
@@ -193,6 +194,28 @@ VkImageView VulkanSurface::StorageView(std::uint32_t level, std::uint32_t layer,
     info.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, level, 1u, layer, 1u};
     VkImageView created = VK_NULL_HANDLE;
     Graphics::Check(context.Function<PFN_vkCreateImageView>("vkCreateImageView")(context.device, &info, nullptr, &created), "vkCreateImageView recode surface storage");
+    storageViews.emplace(key, created);
+    return created;
+}
+
+std::uint32_t VulkanSurface::Slices(std::uint32_t level) const {
+    return Volume() ? std::max(std::max(geometry.imageDepth, 1u) >> level, 1u) : std::max(geometry.imageLayers, 1u);
+}
+
+VkImageView VulkanSurface::SlicesStorageView(std::uint32_t level, std::uint32_t elementBytes) {
+    const auto key = std::make_tuple(level, std::numeric_limits<std::uint32_t>::max(), elementBytes);
+    std::lock_guard lock(mutex);
+    if (const auto found = storageViews.find(key); found != storageViews.end()) return found->second;
+    VkImageViewUsageCreateInfo usage{VK_STRUCTURE_TYPE_IMAGE_VIEW_USAGE_CREATE_INFO};
+    usage.usage = VK_IMAGE_USAGE_STORAGE_BIT;
+    VkImageViewCreateInfo info{VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO};
+    info.pNext = &usage;
+    info.image = image;
+    info.viewType = Volume() ? VK_IMAGE_VIEW_TYPE_3D : VK_IMAGE_VIEW_TYPE_2D_ARRAY;
+    info.format = Graphics::TextureDetiler::ImageElementFormat(elementBytes);
+    info.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, level, 1u, 0u, Volume() ? 1u : std::max(geometry.imageLayers, 1u)};
+    VkImageView created = VK_NULL_HANDLE;
+    Graphics::Check(context.Function<PFN_vkCreateImageView>("vkCreateImageView")(context.device, &info, nullptr, &created), "vkCreateImageView recode surface slices");
     storageViews.emplace(key, created);
     return created;
 }
