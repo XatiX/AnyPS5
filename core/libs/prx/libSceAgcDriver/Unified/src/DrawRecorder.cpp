@@ -1940,7 +1940,14 @@ private:
             const auto zero = ringAddress != 0u ? ringAddress + RingBytes : 0u;
             if (address == 0u || bytes == 0u) {
                 totals.knownSkipped++;
-                noteKnown(stage, Downgrades::Kind::KnownNull, index, address, bytes, 0u);
+                if (Downgrades::Active()) {
+                    char detail[160] = "not captured";
+                    if (index < known.size()) {
+                        const auto& value = known[index];
+                        std::snprintf(detail, sizeof(detail), "%s %u words, available mask %02x, words %08x %08x %08x %08x", index < infos.size() && infos[index].Pointer() ? "pointer" : "descriptor", value.dwordCount, static_cast<unsigned>(value.availableDwordMask), value.dwords[0], value.dwords[1], value.dwords[2], value.dwords[3]);
+                    }
+                    Downgrades::Note(stage.program.codeAddress, Downgrades::Kind::KnownNull, index, detail);
+                }
                 write(zero, 0u);
                 continue;
             }
