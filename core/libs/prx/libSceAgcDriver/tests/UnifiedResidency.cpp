@@ -58,7 +58,7 @@ void testAddBindsNothing() {
     Residency residency(device, 0);
     Expect(residency.Add(0x10008000, 0x30000), "a range is added");
     Expect(!residency.Add(0x10010000, 0x1000), "an overlapping range is refused");
-    Expect(device.buffers.size() == 1 && device.buffers.begin()->second == MirrorSegmentBytes, "the range lies in the mirror segment of its address");
+    Expect(device.buffers.size() == 1 && device.buffers.begin()->second == MirrorWindowBytes, "a range below 960 GiB lies in the one mirror buffer over the window");
     Expect(device.bound.empty() && device.pools.empty(), "adding a range binds no memory");
     Expect(residency.Owns(0x10008000, 0x30000) && !residency.Owns(0x10008000, 0x30001) && !residency.Owns(0x10000000, 1), "ownership follows the added bytes");
     Expect(!residency.Translate(0x10008000, 4).has_value(), "an unbound page has no device address");
@@ -140,10 +140,10 @@ struct GuestBlock {
     std::vector<std::byte> storage = std::vector<std::byte>(9 * ChunkBytes);
     std::uint64_t base = Aligned();
     std::byte* At(std::uint64_t offset) { return reinterpret_cast<std::byte*>(base + offset); }
-    std::uint64_t Mirror(std::uint64_t offset) const { return (base + offset) & (MirrorSegmentBytes - 1); }
+    std::uint64_t Mirror(std::uint64_t offset) const { return base + offset - MirrorSegmentBase(base + offset); }
     std::uint64_t Aligned() const {
         const auto first = (reinterpret_cast<std::uint64_t>(storage.data()) + ChunkBytes - 1) & ~(ChunkBytes - 1);
-        return (first >> MirrorSegmentBits) == ((first + 4 * ChunkBytes - 1) >> MirrorSegmentBits) ? first : first + 4 * ChunkBytes;
+        return MirrorSegmentBase(first) == MirrorSegmentBase(first + 4 * ChunkBytes - 1) ? first : first + 4 * ChunkBytes;
     }
 };
 
@@ -244,8 +244,9 @@ void testRemovedRangesKeepTheMirror() {
     residency.MakeResident(0x90000000, ChunkBytes, 2);
     const auto after = residency.Translate(0x90000000, 4);
     Expect(before && after && before->address == after->address && before->handle == after->handle, "a range added again at an address has the device address it had");
-    Expect(residency.Add(std::uint64_t{3} << MirrorSegmentBits, ChunkBytes) && device.buffers.size() == 2, "a range in another 64 GiB segment gets that segment's buffer");
-    Expect(!residency.Add((std::uint64_t{2} << MirrorSegmentBits) - ChunkBytes, 2 * ChunkBytes) && residency.Counts().refused == 1, "a range across two segments is refused");
+    Expect(residency.Add(std::uint64_t{3} << MirrorSegmentBits, ChunkBytes) && device.buffers.size() == 1, "a range elsewhere below 960 GiB uses the same window buffer");
+    Expect(residency.Add(MirrorWindowBytes + (std::uint64_t{3} << MirrorSegmentBits), ChunkBytes) && device.buffers.size() == 2, "a range above the window gets the buffer of its 64 GiB segment");
+    Expect(!residency.Add(MirrorWindowBytes - ChunkBytes, 2 * ChunkBytes) && residency.Counts().refused == 1, "a range across the end of the window is refused");
 }
 
 void testSpansAcrossAdjacentRangesTranslate() {
@@ -288,7 +289,7 @@ void testCoverFillsTheGapsBetweenRanges() {
     Expect(residency.Counts().ranges == 4 && residency.Counts().gapRanges == 2, "two gap ranges join the two ranges that were there");
     Expect(residency.Owns(0x60010000, 0x8000) && residency.Owns(0x60030000, 0x10000) && residency.Translate(0x60010000, 0x8000).has_value(), "the ranges that were there keep their bytes and their memory");
     Expect(residency.Cover(0x60014000, 0x30000) && residency.Counts().gapRanges == 2, "covering a covered span adds nothing");
-    Expect(!residency.Cover((std::uint64_t{2} << MirrorSegmentBits) - ChunkBytes, 2 * ChunkBytes), "a span across two segments is not covered");
+    Expect(!residency.Cover(MirrorWindowBytes - ChunkBytes, 2 * ChunkBytes), "a span across the end of the window is not covered");
 }
 
 void testSpansOverSeveralRangesAreMadeResidentTogether() {

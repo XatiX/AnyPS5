@@ -9,6 +9,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <stdexcept>
 #include <string>
 
 namespace AgcDriver::Unified {
@@ -46,6 +47,11 @@ bool ResidencyService::Enabled() {
 
 bool ResidencyService::PageTableEnabled() {
     static const bool enabled = Enabled() && std::getenv("APS5_RECODE_NO_PAGE_TABLE") == nullptr && std::getenv("APS5_RECODE_NO_OWNED_REGIONS") == nullptr;
+    return enabled;
+}
+
+bool ResidencyService::MirrorAddressing() {
+    static const bool enabled = PageTableEnabled() && std::getenv("APS5_RECODE_MIRROR_WRITES") != nullptr && std::getenv("APS5_RECODE_PAGE_TABLE_FORM") == nullptr;
     return enabled;
 }
 
@@ -87,6 +93,16 @@ bool ResidencyService::Attach(const Graphics::Context& graphics) {
         const Abi::Header header{Abi::PageTableVersion, 0, sizeof(std::uint64_t), 0};
         std::memcpy(bytes.data(), &header, sizeof(header));
         ledger->SetPageTable(pages.get());
+        if (MirrorAddressing()) {
+            const auto window = ledger->OpenWindow();
+            const Abi::Header mirror{Abi::MirrorVersion, 0, sizeof(std::uint64_t), 0};
+            const std::uint64_t limit = MirrorWindow();
+            std::memcpy(bytes.data(), &mirror, sizeof(mirror));
+            std::memcpy(bytes.data() + Abi::MirrorBaseWord * sizeof(std::uint32_t), &window, sizeof(window));
+            std::memcpy(bytes.data() + Abi::MirrorLimitWord * sizeof(std::uint32_t), &limit, sizeof(limit));
+            std::fprintf(stderr, "[recode-residency] mirror addressing: guest 0x0+0x%llx at device 0x%llx\n", static_cast<unsigned long long>(limit), static_cast<unsigned long long>(window));
+            if (window == 0u) throw std::runtime_error("the mirror window could not be created; set APS5_RECODE_PAGE_TABLE_FORM=1");
+        }
         if (std::getenv("APS5_RECODE_NO_NULL_PAGE") == nullptr) {
             nullPage = std::make_shared<Graphics::Buffer>(*context, GpuPageBytes, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT, ShaderReadMemory(*context, GpuPageBytes));
             std::memset(nullPage->Bytes().data(), 0, nullPage->Bytes().size());
@@ -534,6 +550,7 @@ std::size_t ResidencyService::Record(VkCommandBuffer commands, std::vector<std::
     for (const auto& [address, end] : served) ledger->Touch(address, now);
     auto taken = uploads->Take();
     auto dirty = pages ? pages->TakeDirty() : GpuPageTableDirty{};
+    if (MirrorAddressing()) dirty = {};
     std::erase_if(dirty.leaves, [&](std::uint32_t leaf) {
         if (leaf < PageTableLeafCapacity) return false;
         ++pageLeavesDropped;

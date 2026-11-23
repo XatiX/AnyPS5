@@ -131,7 +131,31 @@ std::uint32_t DefineBdaLookup(SpirvEmitterState& state, const char* name, bool r
             leave(result);
         }
     };
-    if (state.bdaAbiVersion == BdaAbi::PageTableVersion) {
+    const auto emitMirrorLookup = [&] {
+        const auto length = state.module.AllocateId();
+        state.module.AddFunction(spv::OpArrayLength, u32, length, state.bdaPagetableVariable, 0u);
+        fail(binary(spv::OpULessThan, boolean, length, constant(BdaAbi::MirrorTableWords)), BdaAbi::FaultReason::InvalidTable);
+        const auto base = BdaLoadAddress(state, constant(BdaAbi::MirrorBaseWord));
+        const auto limit = BdaLoadAddress(state, constant(BdaAbi::MirrorLimitWord));
+        const auto end = binary(spv::OpIAdd, u64, address, Unary(state, spv::OpUConvert, u64, bytes));
+        failFirst({
+            {binary(spv::OpINotEqual, boolean, BdaLoadWord(state, constant(0)), constant(BdaAbi::MirrorVersion)), BdaAbi::FaultReason::InvalidTable},
+            {binary(spv::OpIEqual, boolean, base, BdaConstant(state, 0u)), BdaAbi::FaultReason::InvalidTable},
+            {binary(spv::OpIEqual, boolean, bytes, constant(0)), BdaAbi::FaultReason::Overflow},
+            {binary(spv::OpULessThanEqual, boolean, end, address), BdaAbi::FaultReason::Overflow},
+            {binary(spv::OpUGreaterThan, boolean, end, limit), BdaAbi::FaultReason::Unmapped},
+        });
+        if (rangeResult) {
+            const auto range = state.module.AllocateId();
+            state.module.AddFunction(spv::OpCompositeConstruct, rangeType, range, BdaConstant(state, 0u), limit, base);
+            leave(range);
+        } else {
+            leave(binary(spv::OpIAdd, u64, base, address));
+        }
+    };
+    if (state.bdaAbiVersion == BdaAbi::MirrorVersion) {
+        emitMirrorLookup();
+    } else if (state.bdaAbiVersion == BdaAbi::PageTableVersion) {
         emitPageTableLookup();
     } else {
         const auto length = state.module.AllocateId();

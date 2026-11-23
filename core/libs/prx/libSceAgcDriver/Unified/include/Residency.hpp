@@ -17,6 +17,25 @@ inline constexpr std::uint64_t PoolBytes = 0x10000000;
 inline constexpr std::uint32_t PoolChunks = static_cast<std::uint32_t>(PoolBytes / ChunkBytes);
 inline constexpr unsigned MirrorSegmentBits = 36;
 inline constexpr std::uint64_t MirrorSegmentBytes = std::uint64_t{1} << MirrorSegmentBits;
+inline constexpr std::uint64_t MirrorWindowBytes = std::uint64_t{0xF0} << 32;
+inline constexpr std::uint64_t MirrorWindowStep = std::uint64_t{32} << 30;
+
+[[nodiscard]] std::uint64_t MirrorWindow();
+void SetMirrorWindow(std::uint64_t bytes);
+
+[[nodiscard]] inline std::uint64_t MirrorSegmentBase(std::uint64_t address) {
+    const auto window = MirrorWindow();
+    if (address < window) return 0u;
+    const auto segment = address & ~(MirrorSegmentBytes - 1);
+    return segment < window ? window : segment;
+}
+
+[[nodiscard]] inline std::uint64_t MirrorSegmentSize(std::uint64_t base) {
+    const auto window = MirrorWindow();
+    if (base == 0u) return window;
+    if (base == window && (window & (MirrorSegmentBytes - 1)) != 0u) return ((window + MirrorSegmentBytes - 1) & ~(MirrorSegmentBytes - 1)) - window;
+    return MirrorSegmentBytes;
+}
 
 struct Chunk {
     std::uint32_t pool = 0;
@@ -104,6 +123,7 @@ public:
     void SetBudget(std::uint64_t bytes);
     void SetKeep(Keep next);
     void SetPageTable(GpuPageTable* table);
+    std::uint64_t OpenWindow();
     [[nodiscard]] ResidencyCounts Counts() const;
 
 private:

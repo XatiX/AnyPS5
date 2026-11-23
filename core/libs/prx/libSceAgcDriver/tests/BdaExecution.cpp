@@ -620,9 +620,53 @@ void RunBdaPageTableExecutionTests(const Context& context) {
     Unified::GpuPageTable writable;
     Require(writable.Map(guest, page, near.DeviceAddress(), Unified::GpuPageWrite), "a write-only page maps");
     run(writable, guest, 8, 0, Abi::FaultReason::Permission);
+    RunBdaMirrorExecutionTests(context);
 #else
     static_cast<void>(context);
 #endif
+}
+
+void RunBdaMirrorExecutionTests(const Context& context) {
+    namespace Abi = ShaderRecompiler::BdaAbi;
+    constexpr std::uint64_t window = 0x10000;
+    Buffer mirror(context, window, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT);
+    const std::array<std::uint8_t, 4> head{0x11, 0x22, 0x33, 0x44};
+    const std::array<std::uint8_t, 4> tail{0xa1, 0xa2, 0xa3, 0xa4};
+    std::memcpy(mirror.Bytes().data() + 0x100, head.data(), head.size());
+    std::memcpy(mirror.Bytes().data() + window - 4, tail.data(), tail.size());
+    Buffer fault(context, Abi::FaultBufferBytes, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT);
+    Buffer output(context, 4, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT);
+    const auto run = [&](std::uint64_t base, std::uint64_t address, std::uint32_t bits, std::uint32_t expected, Abi::FaultReason reason) {
+        Buffer table(context, Abi::MirrorTableWords * sizeof(std::uint32_t), VK_BUFFER_USAGE_STORAGE_BUFFER_BIT);
+        const Abi::Header header{Abi::MirrorVersion, 0, sizeof(std::uint64_t), 0};
+        auto* bytes = table.Bytes().data();
+        std::memcpy(bytes, &header, sizeof(header));
+        std::memcpy(bytes + Abi::MirrorBaseWord * sizeof(std::uint32_t), &base, sizeof(base));
+        std::memcpy(bytes + Abi::MirrorLimitWord * sizeof(std::uint32_t), &window, sizeof(window));
+        std::memset(fault.Bytes().data(), 0, fault.Bytes().size());
+        const std::uint32_t sentinel = 0xdeadbeef;
+        std::memcpy(output.Bytes().data(), &sentinel, sizeof(sentinel));
+        Pipeline pipeline(context, MakeBdaTestShader(address, bits, 0, Abi::MirrorVersion), {&table, &fault, &output});
+        pipeline.Run(1);
+        Abi::Fault report{};
+        std::uint32_t result = 0;
+        std::memcpy(&report, fault.Bytes().data(), sizeof(report));
+        std::memcpy(&result, output.Bytes().data(), sizeof(result));
+        if (static_cast<std::uint32_t>(reason) == 0) {
+            Require(report.state == Abi::FaultState::Empty && result == expected, "mirror BDA read produced incorrect data or a fault at " + Hex(address));
+        } else {
+            Require(report.state == Abi::FaultState::Ready && report.reason == reason && report.instruction == 0x1234, "mirror BDA fault was not published correctly at " + Hex(address));
+            Require(result == sentinel, "faulting mirror BDA shader continued to output a substitute value");
+        }
+    };
+    const auto base = mirror.DeviceAddress();
+    run(base, 0x100, 8, 0x11, static_cast<Abi::FaultReason>(0));
+    run(base, 0x101, 16, 0x3322, static_cast<Abi::FaultReason>(0));
+    run(base, 0x100, 32, 0x44332211, static_cast<Abi::FaultReason>(0));
+    run(base, window - 4, 32, 0xa4a3a2a1, static_cast<Abi::FaultReason>(0));
+    run(base, window - 2, 32, 0, Abi::FaultReason::Unmapped);
+    run(base, window, 8, 0, Abi::FaultReason::Unmapped);
+    run(0, 0x100, 8, 0, Abi::FaultReason::InvalidTable);
 }
 
 void RunBdaStoreExecutionTests(const Context& context) {

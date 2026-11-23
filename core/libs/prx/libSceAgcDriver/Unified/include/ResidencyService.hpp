@@ -30,6 +30,7 @@ public:
     static ResidencyService& Get();
     static bool Enabled();
     static bool PageTableEnabled();
+    static bool MirrorAddressing();
     static VkMemoryPropertyFlags ShaderReadMemory(const Graphics::Context& context, VkDeviceSize bytes);
 
     bool Attach(const Graphics::Context& context);

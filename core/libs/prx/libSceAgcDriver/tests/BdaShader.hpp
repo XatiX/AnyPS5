@@ -35,6 +35,7 @@ void RunBdaStoreExecutionTests(const AgcDriver::Graphics::Context& context);
 void RunBdaFaultSlotExecutionTests(const AgcDriver::Graphics::Context& context);
 void RunBdaExecutionTests(const AgcDriver::Graphics::Context& context);
 void RunBdaPageTableExecutionTests(const AgcDriver::Graphics::Context& context);
+void RunBdaMirrorExecutionTests(const AgcDriver::Graphics::Context& context);
 void RunBdaContractTests();
 
 #endif
