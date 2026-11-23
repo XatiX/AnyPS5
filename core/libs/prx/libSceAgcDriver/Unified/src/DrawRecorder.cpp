@@ -765,6 +765,11 @@ std::uint32_t mipChainMinWidth() {
     return width;
 }
 
+bool countsSamples() {
+    static const bool counts = std::getenv("APS5_RECODE_NO_SAMPLE_COUNTS") == nullptr;
+    return counts;
+}
+
 bool recordsLayeredTargets() {
     static const bool records = std::getenv("APS5_RECODE_NO_LAYERED_TARGETS") == nullptr;
     return records;
@@ -3801,6 +3806,7 @@ private:
         for (const auto& one : draw.stages) {
             if (timedProgram == 0 || one.program.stage == ShaderRecompiler::ShaderStage::Fragment) timedProgram = one.program.codeAddress;
         }
+        if (countsSamples()) recorder->NoteSampledDraw(commands);
         const auto drawTiming = recorder->BeginInPassGpuTiming(DrawTimingKey | (std::uint64_t{0x7ec} << 48u) | (timedProgram & 0xffffffffffffull));
         if (meshGrid) {
             if (Downgrades::Active() && meshTraceLines.fetch_add(1, std::memory_order_relaxed) < 40u) {
