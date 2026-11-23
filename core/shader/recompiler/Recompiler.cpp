@@ -1150,6 +1150,12 @@ SpecializedSpirv buildSpecializedModule(const CompiledShaderArtifact& artifact, 
     module->hash = spirv.ContentHash();
     module->spirv = spirv.Weaken();
     module->specializationId = constants.empty() ? 0u : nextVariantId();
+    static const bool dumpConstants = std::getenv("APS5_SPEC_DUMP") != nullptr;
+    if (dumpConstants) {
+        std::string line = "[spec-module] " + std::to_string(module->hash.low) + ":";
+        for (const auto& constant : constants) line += " " + std::to_string(constant.id) + "=" + std::to_string(constant.value);
+        std::fprintf(stderr, "%s\n", line.c_str());
+    }
     return {std::move(module), std::move(spirv)};
 }
 
