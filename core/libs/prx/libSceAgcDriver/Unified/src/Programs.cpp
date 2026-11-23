@@ -252,6 +252,16 @@ bool DecodePrograms(const ProgramInputs& inputs, DriverDetail::DrawDecode& decod
     auto& state = decode.state;
     if (state.stages.mesh || state.stages.tessellation || state.stages.tessellationGeometry) {
         reason = state.stages.mesh ? "mesh or tessellation stages: mesh" : state.stages.tessellationGeometry ? "mesh or tessellation stages: tessellation with geometry" : "mesh or tessellation stages: tessellation";
+        if (Downgrades::Active()) {
+            static std::mutex mutex;
+            static std::vector<std::uint64_t> seen;
+            std::lock_guard lock(mutex);
+            for (const auto& color : state.colors) {
+                if (color.address == 0 || std::ranges::find(seen, color.address) != seen.end() || seen.size() >= 64u) continue;
+                seen.push_back(color.address);
+                std::fprintf(stderr, "[recode-refused-target] %s draw writes colour 0x%llx %ux%u format %d\n", reason.c_str(), static_cast<unsigned long long>(color.address), color.extent.width, color.extent.height, static_cast<int>(color.format));
+            }
+        }
         return false;
     }
     if (std::ranges::any_of(decode.roles, [](Role role) { return role == Role::GeometryBack; })) {
