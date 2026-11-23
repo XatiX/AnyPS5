@@ -250,6 +250,22 @@ bool DecodePrograms(const ProgramInputs& inputs, DriverDetail::DrawDecode& decod
     decode.state = Graphics::DecodeState(queue, DriverDetail::VertexWorkgroupRequired(queue, inputs.registry));
     DriverDetail::DecodeGraphicsPrograms(decode, queue, inputs.registry, false, true);
     auto& state = decode.state;
+    if (static const bool masks = std::getenv("APS5_RECODE_TRACE_CB_MASKS") != nullptr; masks) {
+        static std::mutex mutex;
+        static std::vector<std::array<std::uint32_t, 5>> seen;
+        const std::array<std::uint32_t, 5> key{DriverDetail::readRegister(queue.context, 0x8e), DriverDetail::readRegister(queue.context, 0x8f), DriverDetail::readRegister(queue.context, 0x1c5), DriverDetail::readRegister(queue.context, 0x202), static_cast<std::uint32_t>(state.colors.size())};
+        std::lock_guard lock(mutex);
+        if (std::ranges::find(seen, key) == seen.end() && seen.size() < 200u) {
+            seen.push_back(key);
+            std::string slots;
+            for (const auto& color : state.colors) {
+                char text[24];
+                std::snprintf(text, sizeof(text), " 0x%llx", static_cast<unsigned long long>(color.address));
+                slots += text;
+            }
+            std::fprintf(stderr, "[recode-cb-masks] target mask %08x shader mask %08x export format %08x color control %08x -> %u colours:%s\n", key[0], key[1], key[2], key[3], key[4], slots.c_str());
+        }
+    }
     if (state.stages.mesh || state.stages.tessellation || state.stages.tessellationGeometry) {
         reason = state.stages.mesh ? "mesh or tessellation stages: mesh" : state.stages.tessellationGeometry ? "mesh or tessellation stages: tessellation with geometry" : "mesh or tessellation stages: tessellation";
         if (Downgrades::Active()) {

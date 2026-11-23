@@ -561,6 +561,55 @@ const std::string& targetTraceList() {
 
 std::atomic<std::uint32_t> targetTraceLines{0};
 
+std::uint64_t targetTraceAddress() {
+    static const std::uint64_t address = [] {
+        const char* value = std::getenv("APS5_RECODE_TRACE_TARGET_ADDRESS");
+        return value == nullptr ? std::uint64_t{0} : static_cast<std::uint64_t>(std::strtoull(value, nullptr, 16));
+    }();
+    return address;
+}
+
+bool targetDetailOn() {
+    static const bool on = std::getenv("APS5_RECODE_TRACE_TARGET_DETAIL") != nullptr;
+    return on;
+}
+
+std::atomic<std::uint32_t> targetDetailLines{0};
+
+std::uint64_t sourcesOfProgram() {
+    static const std::uint64_t program = [] {
+        const char* value = std::getenv("APS5_RECODE_TRACE_SOURCES_OF");
+        return value == nullptr ? std::uint64_t{0} : static_cast<std::uint64_t>(std::strtoull(value, nullptr, 16));
+    }();
+    return program;
+}
+
+std::mutex sourcesMutex;
+std::vector<std::uint64_t> sourceRecords;
+std::atomic<std::uint32_t> sourceTargetLines{0};
+
+void noteSampledSource(std::uint64_t program, std::uint64_t record) {
+    if (sourcesOfProgram() == 0 || program != sourcesOfProgram()) return;
+    std::lock_guard lock(sourcesMutex);
+    if (std::ranges::find(sourceRecords, record) == sourceRecords.end() && sourceRecords.size() < 64u) {
+        sourceRecords.push_back(record);
+        std::fprintf(stderr, "[recode-source] program %016llx samples record 0x%llx\n", static_cast<unsigned long long>(program), static_cast<unsigned long long>(record));
+    }
+}
+
+bool sourceTarget(std::uint64_t record) {
+    if (sourcesOfProgram() == 0) return false;
+    std::lock_guard lock(sourcesMutex);
+    return std::ranges::find(sourceRecords, record) != sourceRecords.end() && sourceTargetLines.fetch_add(1, std::memory_order_relaxed) < 2000u;
+}
+
+bool traceTargetRecord(std::uint64_t address, std::uint64_t bytes) {
+    if (sourcesOfProgram() != 0) return sourceTarget(address);
+    const auto wanted = targetTraceAddress();
+    if (wanted == 0) return targetTraceLines.fetch_add(1, std::memory_order_relaxed) < (targetTraceList() == "all" ? 20000u : 400u);
+    return wanted >= address && wanted < address + bytes;
+}
+
 bool tracedProgram(std::uint64_t hash) {
     return targetTraceList() == "all" || Downgrades::ListedHash(targetTraceList(), hash);
 }
@@ -3187,7 +3236,11 @@ private:
                     }
                     VkImageView view = VK_NULL_HANDLE;
                     auto record = targetRecord(context, color, view);
-                    if (record != nullptr && !targetTraceList().empty() && !draw.stages.empty() && tracedProgram(Downgrades::ProgramHash(draw.stages.back().program.codeAddress)) && targetTraceLines.fetch_add(1, std::memory_order_relaxed) < (targetTraceList() == "all" ? 20000u : 400u)) {
+                    if (targetDetailOn() && !draw.stages.empty() && tracedProgram(Downgrades::ProgramHash(draw.stages.back().program.codeAddress)) && targetDetailLines.fetch_add(1, std::memory_order_relaxed) < 200u) {
+                        const auto resource = Graphics::SurfaceForTarget(color);
+                        std::fprintf(stderr, "[recode-target-detail] program %016llx slot %zu cb 0x%llx surface 0x%llx resource 0x%llx %ux%u bytes 0x%llx format %d tile %d element %u dcc 0x%llx cmask 0x%llx mip %u slice %u -> %s 0x%llx+0x%llx\n", static_cast<unsigned long long>(Downgrades::ProgramHash(draw.stages.back().program.codeAddress)), static_cast<std::size_t>(&color - state.colors.data()), static_cast<unsigned long long>(color.address), static_cast<unsigned long long>(color.surfaceAddress), static_cast<unsigned long long>(resource.baseAddress), color.extent.width, color.extent.height, static_cast<unsigned long long>(color.bytes), static_cast<int>(color.format), static_cast<int>(color.tileMode), color.elementBytes, static_cast<unsigned long long>(color.dccAddress), static_cast<unsigned long long>(color.cmaskAddress), color.mip, color.arraySlice, record != nullptr ? "record" : "no record", static_cast<unsigned long long>(record != nullptr ? record->key.address : 0u), static_cast<unsigned long long>(record != nullptr ? record->key.bytes : 0u));
+                    }
+                    if (record != nullptr && !targetTraceList().empty() && !draw.stages.empty() && tracedProgram(Downgrades::ProgramHash(draw.stages.back().program.codeAddress)) && traceTargetRecord(record->key.address, record->key.bytes)) {
                         const auto resource = Graphics::SurfaceForTarget(color);
                         std::fprintf(stderr, "[recode-target] program %016llx color 0x%llx %ux%u mip %u tail %u slice %u extent %ux%u -> record 0x%llx+0x%llx %ux%u mips %u dimension %u\n", static_cast<unsigned long long>(Downgrades::ProgramHash(draw.stages.back().program.codeAddress)), static_cast<unsigned long long>(resource.baseAddress), resource.width, resource.height, color.mip, color.mipTail ? 1u : 0u, color.arraySlice, color.extent.width, color.extent.height, static_cast<unsigned long long>(record->key.address), static_cast<unsigned long long>(record->key.bytes), record->key.width, record->key.height, record->key.mips, record->key.dimension);
                     }
@@ -3848,7 +3901,8 @@ private:
         auto viewKey = key->view;
         viewKey.baseArray += layer;
         viewKey.lastArray += layer;
-        if (record != nullptr && !targetTraceList().empty() && tracedProgram(Downgrades::ProgramHash(stage.program.codeAddress)) && targetTraceLines.fetch_add(1, std::memory_order_relaxed) < (targetTraceList() == "all" ? 20000u : 400u)) {
+        if (record != nullptr) noteSampledSource(Downgrades::ProgramHash(stage.program.codeAddress), record->key.address);
+        if (record != nullptr && sourcesOfProgram() == 0 && !targetTraceList().empty() && tracedProgram(Downgrades::ProgramHash(stage.program.codeAddress)) && targetTraceLines.fetch_add(1, std::memory_order_relaxed) < (targetTraceList() == "all" ? 20000u : 400u)) {
             std::fprintf(stderr, "[recode-sampled] program %016llx slot %u kind %u 0x%llx %ux%u mips %u view levels %u-%u layers %u-%u format %u -> record 0x%llx mips %u\n", static_cast<unsigned long long>(Downgrades::ProgramHash(stage.program.codeAddress)), deferred.index, deferred.request.kind, static_cast<unsigned long long>(surface.address), surface.width, surface.height, surface.mips, viewKey.baseLevel, viewKey.lastLevel, viewKey.baseArray, viewKey.lastArray, viewKey.format, static_cast<unsigned long long>(record->key.address), record->key.mips);
         }
         const auto view = record != nullptr ? record->device->View(viewKey, deferred.request.kind, why) : std::uint64_t{0};
