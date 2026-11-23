@@ -2610,18 +2610,19 @@ private:
 
     void maybeDumpRecord(const Context& context, Graphics::Recorder& recorder, const std::shared_ptr<Images::Surface>& record, std::uint64_t program, std::uint32_t writtenLevel = 0) {
         const auto& request = recordDumpRequest();
-        if (record->key.width < request.width || record->key.mips <= 1u || (request.trace && record->key.width != request.width)) return;
+        static const bool single = std::getenv("APS5_RECODE_DUMP_SINGLE") != nullptr;
+        if (record->key.width < request.width || (record->key.mips <= 1u && !single) || (request.trace && record->key.width != request.width)) return;
         const auto now = std::chrono::steady_clock::now();
         if (now - dumpClock < std::chrono::seconds(request.seconds)) return;
         std::string prefix;
         if (request.trace) {
-            if (traceAddress == 0u) traceAddress = record->key.address;
-            if (record->key.address != traceAddress || traceDumps >= 40u) return;
             if (!request.program.empty()) {
                 char hash[20];
                 std::snprintf(hash, sizeof(hash), "%016llx", static_cast<unsigned long long>(program));
                 if (std::string_view(hash).rfind(request.program, 0) != 0) return;
             }
+            if (traceAddress == 0u) traceAddress = record->key.address;
+            if (record->key.address != traceAddress || traceDumps >= 40u) return;
             if (request.every > 1u && traceSeen++ % request.every != 0u) return;
             char tag[48];
             std::snprintf(tag, sizeof(tag), "trace%02u-p%016llx-", traceDumps++, static_cast<unsigned long long>(program));

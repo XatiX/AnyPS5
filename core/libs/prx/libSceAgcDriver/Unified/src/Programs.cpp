@@ -266,6 +266,16 @@ bool DecodePrograms(const ProgramInputs& inputs, DriverDetail::DrawDecode& decod
             std::fprintf(stderr, "[recode-cb-masks] target mask %08x shader mask %08x export format %08x color control %08x -> %u colours:%s\n", key[0], key[1], key[2], key[3], key[4], slots.c_str());
         }
     }
+    if (static const bool depths = std::getenv("APS5_RECODE_TRACE_DEPTH_STATE") != nullptr; depths && state.depth) {
+        static std::mutex mutex;
+        static std::vector<std::array<std::uint64_t, 6>> seen;
+        const std::array<std::uint64_t, 6> key{DriverDetail::readRegister(queue.context, 0x200), DriverDetail::readRegister(queue.context, 0x010), DriverDetail::readRegister(queue.context, 0x00b), DriverDetail::readRegister(queue.context, 0x000), state.depth->address, state.colors.size()};
+        std::lock_guard lock(mutex);
+        if (std::ranges::find(seen, key) == seen.end() && seen.size() < 120u) {
+            seen.push_back(key);
+            std::fprintf(stderr, "[recode-depth-state] depth control %08llx z info %08llx clear %08llx render control %08llx depth 0x%llx colours %llu\n", static_cast<unsigned long long>(key[0]), static_cast<unsigned long long>(key[1]), static_cast<unsigned long long>(key[2]), static_cast<unsigned long long>(key[3]), static_cast<unsigned long long>(key[4]), static_cast<unsigned long long>(key[5]));
+        }
+    }
     if (state.stages.mesh || state.stages.tessellation || state.stages.tessellationGeometry) {
         reason = state.stages.mesh ? "mesh or tessellation stages: mesh" : state.stages.tessellationGeometry ? "mesh or tessellation stages: tessellation with geometry" : "mesh or tessellation stages: tessellation";
         if (Downgrades::Active()) {
