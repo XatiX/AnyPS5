@@ -2488,7 +2488,7 @@ private:
                 sampled.push_back(&deferred);
                 continue;
             }
-            auto record = ownsImages() ? ownedStorage(context, deferred.request, slot) : Resolve::BindDeferredRecord(deferred.request, slot);
+            auto record = ownsImages() ? ownedStorage(context, deferred.request, slot, stage.program.codeAddress) : Resolve::BindDeferredRecord(deferred.request, slot);
             if (record == nullptr && !ownsImages()) {
                 if (auto adopted = adoptStorage(context, deferred.request)) record = Resolve::BindRecordSlot(deferred.request, std::move(adopted), slot);
             }
@@ -2997,7 +2997,7 @@ private:
         return mask;
     }
 
-    void prepareDepth(const Context& context, Graphics::Recorder& recorder, const std::shared_ptr<Images::DepthRecord>& record, const Graphics::DepthTarget& target) {
+    void prepareDepth(const Context& context, Graphics::Recorder& recorder, const std::shared_ptr<Images::DepthRecord>& record, const Graphics::DepthTarget& target, std::uint64_t program) {
         const bool fresh = !record->Initialized();
         const bool htileWritten = record->TakeHtileWrite();
         if (!fresh && !htileWritten) return;
@@ -3026,6 +3026,11 @@ private:
         }
         totals.depthSeedRefusals++;
         if (seen.insert("depth seed: " + reason).second) std::fprintf(stderr, "[recode-depth] first refused seed from memory: %s (record 0x%llx %ux%u format %d)\n", reason.c_str(), static_cast<unsigned long long>(record->Key().address), record->Key().width, record->Key().height, static_cast<int>(record->Key().format));
+        if (Downgrades::Active() && program != 0u) {
+            char detail[160];
+            std::snprintf(detail, sizeof(detail), "depth record 0x%llx started from its clear value, not memory: %s", static_cast<unsigned long long>(record->Key().address), reason.c_str());
+            Downgrades::Note(program, Downgrades::Kind::DepthSeedRefused, 8u, detail);
+        }
         record->Initialize(recorder.Commands(), target.clearDepth, target.clearStencil);
         Images::Depths().NoteCleared();
     }
@@ -3072,7 +3077,7 @@ private:
         }
     }
 
-    void applyMetadataClear(const Context& context, const std::shared_ptr<Images::Surface>& record) {
+    void applyMetadataClear(const Context& context, const std::shared_ptr<Images::Surface>& record, std::uint64_t program) {
         if (metadataClears == nullptr || record == nullptr || context.recorder == nullptr || !metadataClears->Pending(record->key.address)) return;
         auto* vulkan = dynamic_cast<Images::VulkanSurface*>(record->device.get());
         auto* table = Resolve::Surfaces();
@@ -3084,7 +3089,13 @@ private:
             totals.metadataClears++;
             return;
         }
-        if (!reason.empty() && seen.insert("metadata clear: " + reason).second) std::fprintf(stderr, "[recode-metadata] first refused clear: %s (record 0x%llx %ux%u format %u)\n", reason.c_str(), static_cast<unsigned long long>(record->key.address), record->key.width, record->key.height, record->key.format);
+        if (reason.empty()) return;
+        if (seen.insert("metadata clear: " + reason).second) std::fprintf(stderr, "[recode-metadata] first refused clear: %s (record 0x%llx %ux%u format %u)\n", reason.c_str(), static_cast<unsigned long long>(record->key.address), record->key.width, record->key.height, record->key.format);
+        if (Downgrades::Active() && program != 0u) {
+            char detail[160];
+            std::snprintf(detail, sizeof(detail), "fast clear of record 0x%llx not applied: %s", static_cast<unsigned long long>(record->key.address), reason.c_str());
+            Downgrades::Note(program, Downgrades::Kind::MetadataClearRefused, 0u, detail);
+        }
     }
 
     void writeBackForReaders(const Context& context, const Resolve::ResolvedDraw& work) {
@@ -3229,6 +3240,7 @@ private:
         std::vector<std::shared_ptr<void>> owners;
         std::vector<std::shared_ptr<Graphics::StorageTexture>> residents;
         phase = std::chrono::steady_clock::now();
+        recordingProgram = draw.stages.empty() ? 0u : draw.stages.back().program.codeAddress;
         const bool memoUsable = std::exchange(targetMemo.valid, false) && !recordsTargets();
         std::vector<std::shared_ptr<Images::Surface>> targetRecords;
         if (memoUsable && targetsFromMemo(context, *recorder, state, views, owners, residents)) {
@@ -3296,7 +3308,7 @@ private:
                 std::string why;
                 depthRecord = Images::Depths().Find(context, *state.depth, why);
                 if (depthRecord == nullptr && seen.insert("depth: " + why).second) std::fprintf(stderr, "[recode-depth] first refusal: %s (0x%llx %ux%u format %d samples %u slices %u-%u)", why.c_str(), static_cast<unsigned long long>(state.depth->address), state.depth->extent.width, state.depth->extent.height, static_cast<int>(state.depth->format), state.depth->samples, state.depth->firstSlice, state.depth->lastSlice), std::fputc(10, stderr);
-                if (depthRecord != nullptr) prepareDepth(context, *recorder, depthRecord, *state.depth);
+                if (depthRecord != nullptr) prepareDepth(context, *recorder, depthRecord, *state.depth, recordingProgram);
             }
             if (depthRecord != nullptr) {
                 depthRecord->MarkDrawn();
@@ -3710,7 +3722,7 @@ private:
                 absorbLayers(context, *table, owned, absorbed);
             }
             if (owned == nullptr) return refuse("target surface: " + ownedWhy);
-            applyMetadataClear(context, owned);
+            applyMetadataClear(context, owned, recordingProgram);
             auto* ownedVulkan = dynamic_cast<Images::VulkanSurface*>(owned->device.get());
             if (ownedVulkan == nullptr) return refuse("target surface without a Vulkan image");
             view = ownedVulkan->AttachmentView(color.format, color.mip, containingLayer + ownedResource.baseArray + color.arraySlice, std::max(color.layers, 1u), ownedWhy);
@@ -3903,7 +3915,7 @@ private:
         }
     }
 
-    std::shared_ptr<Images::Surface> ownedStorage(const Context& context, const Heap::SlotRequest& request, std::uint32_t& slot) {
+    std::shared_ptr<Images::Surface> ownedStorage(const Context& context, const Heap::SlotRequest& request, std::uint32_t& slot, std::uint64_t program) {
         auto* table = Resolve::Surfaces();
         if (table == nullptr) return nullptr;
         std::string why;
@@ -3934,7 +3946,7 @@ private:
                 totals.storageRecordsSeeded++;
             }
         }
-        applyMetadataClear(context, record);
+        applyMetadataClear(context, record, program);
         if (record != nullptr) record = Resolve::BindRecordSlot(request, std::move(record), slot, layer);
         if (record == nullptr) {
             claimUpstream(context, surface.address, surface.bytes, "storage: " + (why.empty() ? std::string("no view") : why));
@@ -4003,7 +4015,7 @@ private:
             }
         }
         if (Downgrades::Watching()) Downgrades::WatchProgramRead(stage.program.codeAddress, surface.address, surface.bytes);
-        applyMetadataClear(context, record);
+        applyMetadataClear(context, record, stage.program.codeAddress);
         auto viewKey = key->view;
         viewKey.baseArray += layer;
         viewKey.lastArray += layer;
@@ -4112,6 +4124,7 @@ private:
     std::set<std::uint32_t> seenFaults;
     std::unique_ptr<Images::SurfaceDetiler> surfaceDetiler;
     std::unique_ptr<Images::MetadataClears> metadataClears;
+    std::uint64_t recordingProgram = 0;
     std::map<std::vector<std::uint64_t>, std::shared_ptr<ComputePipeline>> computePipelines;
     std::vector<std::pair<std::uint64_t, std::uint64_t>> landing;
     std::vector<std::uint64_t> landingSerials;

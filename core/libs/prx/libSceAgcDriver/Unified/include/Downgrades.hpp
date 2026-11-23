@@ -34,6 +34,8 @@ enum class Kind : std::uint32_t {
     SamplerMode,
     UpstreamDepth,
     SampledStaleRecord,
+    DepthSeedRefused,
+    MetadataClearRefused,
     Count,
 };
 
