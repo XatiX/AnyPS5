@@ -47,6 +47,8 @@ struct PageTableCounts {
     std::uint64_t unchangedBusy = 0;
     std::uint64_t gpuOwnedPages = 0;
     std::uint64_t gpuWrittenPages = 0;
+    std::uint64_t adjacentFaults = 0;
+    std::uint64_t chunkFirstFaults = 0;
 };
 
 struct GpuTake {
@@ -137,6 +139,8 @@ private:
     std::vector<std::pair<std::uint64_t, std::unique_ptr<Region>>> regions;
     std::unordered_map<std::uint64_t, Region*> farRegions;
     std::atomic<std::uint64_t> pendingFaults{0};
+    std::atomic<std::uint64_t> adjacentFaults{0};
+    std::atomic<std::uint64_t> chunkFirstFaults{0};
     std::vector<std::uint64_t> dirty;
     std::uint32_t consumeEpoch = 0;
     std::uint32_t frameEpoch = 0;

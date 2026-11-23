@@ -160,6 +160,12 @@ bool PageTable::BeginWriteFault(std::uint64_t address) {
         region->opening[slot / 64].fetch_and(~bit, std::memory_order_acq_rel);
         return false;
     }
+    const auto pendingAt = [&](std::size_t other) { return (region->faulted[other / 64].load(std::memory_order_relaxed) & (std::uint64_t{1} << (other % 64))) != 0; };
+    if ((slot > 0 && pendingAt(slot - 1)) || (slot + 1 < RegionPages && pendingAt(slot + 1))) adjacentFaults.fetch_add(1, std::memory_order_relaxed);
+    const auto chunk = slot & ~std::size_t{15};
+    bool first = true;
+    for (std::size_t other = chunk; other < chunk + 16 && first; ++other) first = !pendingAt(other);
+    if (first) chunkFirstFaults.fetch_add(1, std::memory_order_relaxed);
     region->faulted[slot / 64].fetch_or(bit, std::memory_order_acq_rel);
     region->hasFaults.store(true, std::memory_order_release);
     pendingFaults.fetch_add(1, std::memory_order_acq_rel);
@@ -611,7 +617,10 @@ std::size_t PageTable::DirtyPages() const {
 PageTableCounts PageTable::Counts() const {
     std::lock_guard lock(mutex);
     const_cast<PageTable*>(this)->drainFaults();
-    return counts;
+    auto total = counts;
+    total.adjacentFaults = adjacentFaults.load(std::memory_order_relaxed);
+    total.chunkFirstFaults = chunkFirstFaults.load(std::memory_order_relaxed);
+    return total;
 }
 
 }
