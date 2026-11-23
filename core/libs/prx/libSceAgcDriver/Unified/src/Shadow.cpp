@@ -1,5 +1,6 @@
 #include "prx/libSceAgcDriver/Unified/include/Shadow.hpp"
 #include "prx/libSceAgcDriver/Unified/include/Downgrades.hpp"
+#include "prx/libSceAgcDriver/Unified/include/FaultSites.hpp"
 #include "prx/libSceAgcDriver/Unified/include/Front.hpp"
 #include "prx/libSceAgcDriver/Unified/include/MemoryCore.hpp"
 #include "prx/libSceAgcDriver/Unified/include/MirrorHost.hpp"
@@ -278,7 +279,7 @@ std::string memoryLine() {
         owned += gpuOwnedLine;
         owned += "[recode-gpu-owned] landing uploads skipped over later GPU writes: " + std::to_string(Mirror::SkippedUploadBytes() >> 10) + " KiB; CPU faults on records not yet written back: " + std::to_string(core.imageFaults) + " reads, " + std::to_string(core.imageWriteFaults) + " writes; view lookups that waited: " + std::to_string(Mirror::ViewWaits().waited) + " (" + std::to_string(Mirror::ViewWaits().found) + " found, " + std::to_string(Mirror::ViewWaits().microseconds / 1000u) + " ms); writes taken in pieces: " + std::to_string(core.pieceWrites) + ", outside the second view on pages already GPU-owned: " + std::to_string(core.ownedUnviewedBytes >> 10) + " KiB; diff landings: " + std::to_string(core.diffChainedBytes) + " bytes behind an older landing, " + std::to_string(core.diffForeignBytes) + " bytes left unlike the mirror\n";
     }
-    return std::string(line) + eventLine + ResidencyService::Get().Line() + owned + UploadClash::Line() + MetadataWatch::Line() + frameLine() + footprintLine();
+    return std::string(line) + eventLine + ResidencyService::Get().Line() + owned + UploadClash::Line() + MetadataWatch::Line() + frameLine() + footprintLine() + FaultSites::Line();
 }
 
 void report() {

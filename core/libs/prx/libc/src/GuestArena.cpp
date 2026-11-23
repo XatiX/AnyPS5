@@ -740,6 +740,12 @@ std::atomic<bool (*)(std::uintptr_t, bool)>& gpuFaultHandler() {
     return handler;
 }
 
+std::atomic<void (*)(std::uintptr_t)> gpuFaultSiteHook{nullptr};
+
+}
+
+void GuestArenaSetGpuFaultSiteHook_nid_no_patch(void (*hook)(std::uintptr_t site)) {
+    gpuFaultSiteHook.store(hook, std::memory_order_release);
 }
 
 bool GuestArenaWriteFaultsAllowed_nid_no_patch() {
@@ -764,6 +770,7 @@ bool GuestArenaHandleGpuFault_nid_no_patch(EXCEPTION_POINTERS* exception) {
     if (record->ExceptionCode != EXCEPTION_ACCESS_VIOLATION || record->NumberParameters < 2) return false;
     const auto kind = record->ExceptionInformation[0];
     if (kind != 0 && kind != 1) return false;
+    if (const auto site = gpuFaultSiteHook.load(std::memory_order_acquire); site != nullptr && kind == 1) site(reinterpret_cast<std::uintptr_t>(record->ExceptionAddress));
     return handler(static_cast<std::uintptr_t>(record->ExceptionInformation[1]), kind == 1);
 }
 
