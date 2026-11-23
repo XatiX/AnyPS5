@@ -442,7 +442,7 @@ void Driver::dispatch(QueueState& queue, std::span<const std::uint32_t> packet, 
             if (recodeKernels) return true;
             return !resolving && !matchesCopyKernel(kernelCode, userData, compute) && !MatchesStreamCopyKernel(kernelCode, userData, compute) && !MatchesTableCopyKernel(kernelCode, userData, compute) && !MatchesIndexedCopyKernel(kernelCode, userData, compute);
         };
-        if (Unified::Record::RecordActive() && Unified::Resolve::DispatchesRoutedOn(submission.queue) && (indirectArguments == 0 || (packet[4] & 0x20u) == 0) && recodeCandidate() && !htileClearCompletion.has_value() && htileMask.bytes == 0u) {
+        if (Unified::Record::RecordActive() && Unified::Resolve::DispatchesRoutedOn(submission.queue) && (indirectArguments == 0 || (packet[4] & 0x20u) == 0) && recodeCandidate() && (Unified::Record::RecordsHtileClears() || (!htileClearCompletion.has_value() && htileMask.bytes == 0u))) {
             auto& resolvedDispatches = Unified::Resolve::ResolvedDispatches();
             const auto packetOffset = currentPacketOffset();
             const auto found = resolvedDispatches.Find(submission.queue, submission.serial, packetOffset, Unified::Resolve::HandoffWait());

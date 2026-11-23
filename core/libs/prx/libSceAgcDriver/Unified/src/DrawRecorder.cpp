@@ -4131,6 +4131,10 @@ bool LandingsPending() {
     return true;
 }
 
+bool RecordsHtileClears() {
+    return Images::DepthRecordsOn() && Images::HtileClearsOn();
+}
+
 void LandAfterBatch(Graphics::Recorder& recorder, std::function<void()> landing) {
     auto& landings = batchLandings();
     landings.pending.fetch_add(1, std::memory_order_acq_rel);

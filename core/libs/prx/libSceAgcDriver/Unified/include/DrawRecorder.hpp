@@ -39,6 +39,7 @@ struct DisplaySource {
 };
 [[nodiscard]] std::optional<DisplaySource> DisplayRecord(std::uint64_t address, std::uint64_t bytes);
 [[nodiscard]] bool LandingsPending();
+[[nodiscard]] bool RecordsHtileClears();
 void LandAfterBatch(Graphics::Recorder& recorder, std::function<void()> landing);
 [[nodiscard]] bool IdleStores();
 bool RecordPrecheck(const Resolve::ResolvedDraw& draw, const Pm4::DrawParameters& parameters, std::vector<std::pair<std::uint64_t, std::uint64_t>>& reads, std::string& reason);
