@@ -1263,6 +1263,7 @@ public:
     }
 
     void noteUses(const Resolve::ResolvedDraw& work, const char* what) {
+        traceSourceWrites(work);
         if (!Downgrades::Active() || work.stages.empty()) return;
         const auto code = work.stages.back().program.codeAddress;
         if (!usesNoted.insert(code).second) return;
@@ -2388,6 +2389,23 @@ private:
             return std::clamp(std::thread::hardware_concurrency() / 2u, 1u, 4u);
         }();
         return count;
+    }
+
+    static void traceSourceWrites(const Resolve::ResolvedDraw& work) {
+        if (sourcesOfProgram() == 0 || work.stages.empty()) return;
+        static const long long after = [] {
+            const char* value = std::getenv("APS5_RECODE_TRACE_SOURCES_AFTER");
+            return value == nullptr ? 0ll : std::strtoll(value, nullptr, 10);
+        }();
+        if (std::chrono::steady_clock::now() - processStart() < std::chrono::seconds(after)) return;
+        const auto program = Downgrades::ProgramHash(work.stages.back().program.codeAddress);
+        for (std::size_t index = 0; index < work.uses.size(); ++index) {
+            const auto& use = work.uses[index];
+            static std::atomic<std::uint32_t> lines{0};
+            if (!use.write || !sourceTarget(use.address, use.size) || lines.fetch_add(1, std::memory_order_relaxed) >= 3000u) continue;
+            const char* kind = index >= work.imageBegin ? "image" : index >= work.targetBegin && index < work.targetEnd ? "target" : "memory";
+            std::fprintf(stderr, "[recode-source-write] %lld s: program %016llx writes %s 0x%llx+0x%llx\n", static_cast<long long>(std::chrono::duration_cast<std::chrono::seconds>(std::chrono::steady_clock::now() - processStart()).count()), static_cast<unsigned long long>(program), kind, static_cast<unsigned long long>(use.address), static_cast<unsigned long long>(use.size));
+        }
     }
 
     void dumpImageReads(const Context& context, const Resolve::ResolvedDraw& work) {
