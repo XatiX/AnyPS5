@@ -25,7 +25,6 @@ namespace AgcDriver::Unified::Record {
 [[nodiscard]] bool RecordsKernels(std::uint32_t queue);
 enum class Kernel : std::uint8_t { Fill, Copy };
 void NoteKernel(Kernel kernel);
-void PublishRecords(const Graphics::Context& context, std::uint64_t address, std::uint64_t bytes);
 void FlipSource(const Graphics::Context& context, std::uint64_t address, std::uint64_t bytes);
 struct DisplaySource {
     VkImage image = VK_NULL_HANDLE;

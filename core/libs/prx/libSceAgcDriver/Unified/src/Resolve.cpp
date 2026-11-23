@@ -899,8 +899,7 @@ private:
         if (!Images::OwnersEnabled()) return false;
         try {
             const auto resource = Graphics::DecodeTextureResource(request.words);
-            const auto side = surfaces->OwnerOfRange(resource.baseAddress, Graphics::SurfaceGuestBytes(resource));
-            return side == Images::Side::Record || (side == Images::Side::None && SampledRecordFor(resource.baseAddress, Graphics::SurfaceGuestBytes(resource)));
+            return surfaces->Holds(resource.baseAddress, Graphics::SurfaceGuestBytes(resource)) || SampledRecordFor(resource.baseAddress, Graphics::SurfaceGuestBytes(resource));
         } catch (const std::exception&) {
             return false;
         }

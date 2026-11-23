@@ -85,16 +85,6 @@ struct Surface {
     bool mirrorStale = false;
 };
 
-enum class Side : std::uint8_t { None, Record, Upstream };
-
-struct OwnerCounts {
-    std::uint64_t recordRanges = 0;
-    std::uint64_t recordBytes = 0;
-    std::uint64_t upstreamRanges = 0;
-    std::uint64_t upstreamBytes = 0;
-    std::uint64_t demoted = 0;
-};
-
 [[nodiscard]] bool MetadataRecords();
 
 [[nodiscard]] inline std::uintptr_t OwnerOf(const Surface& surface) {
@@ -132,8 +122,8 @@ public:
     [[nodiscard]] std::optional<Found> FindResource(const SurfaceKey& key, const Graphics::GuestTextureResource& resource, std::string& reason);
     [[nodiscard]] std::vector<std::shared_ptr<Surface>> TakeWork();
     void MarkReady(Surface& surface, std::uint64_t stamp, std::uint64_t imageStamp);
-    [[nodiscard]] std::shared_ptr<Surface> Adopt(const SurfaceKey& key, std::span<const std::uint32_t, 8> words, std::string& reason);
-    [[nodiscard]] std::shared_ptr<Surface> AdoptResource(const SurfaceKey& key, const Graphics::GuestTextureResource& resource, std::string& reason);
+    [[nodiscard]] std::shared_ptr<Surface> Create(const SurfaceKey& key, std::span<const std::uint32_t, 8> words, std::string& reason);
+    [[nodiscard]] std::shared_ptr<Surface> CreateResource(const SurfaceKey& key, const Graphics::GuestTextureResource& resource, std::string& reason);
     void MarkGpuWritten(Surface& surface);
     void ClearGpuNewer(Surface& surface);
     void MarkWrittenBack(Surface& surface);
@@ -144,9 +134,8 @@ public:
     void Touch(Surface& surface);
     [[nodiscard]] std::vector<std::shared_ptr<Surface>> Overlapping(std::uint64_t address, std::uint64_t bytes) const;
     void Requeue(const std::shared_ptr<Surface>& surface);
-    [[nodiscard]] Side OwnerOfRange(std::uint64_t address, std::uint64_t bytes) const;
-    Side Claim(std::uint64_t address, std::uint64_t bytes, Side side, std::string_view reason);
-    void Demote(std::uint64_t address, std::uint64_t bytes, std::string_view reason);
+    [[nodiscard]] bool Holds(std::uint64_t address, std::uint64_t bytes) const;
+    void NoteRefused(std::string_view reason);
     void Retire(const std::shared_ptr<Surface>& surface);
     [[nodiscard]] std::shared_ptr<Surface> Seed(const std::shared_ptr<Surface>& surface);
     [[nodiscard]] std::string OwnersLine() const;
@@ -164,7 +153,7 @@ private:
     template<typename TCreate>
     std::optional<Found> findWith(const SurfaceKey& key, TCreate&& create, std::string& reason);
     template<typename TCreate>
-    std::shared_ptr<Surface> adoptWith(const SurfaceKey& key, TCreate&& create, std::string& reason);
+    std::shared_ptr<Surface> createWith(const SurfaceKey& key, TCreate&& create, std::string& reason);
 
     SurfaceDevice& device;
     const Events::ChangeLog& shared;
@@ -173,17 +162,11 @@ private:
     std::unordered_map<SurfaceKey, std::shared_ptr<Surface>, KeyHash> surfaces;
     std::vector<std::shared_ptr<Surface>> work;
     std::vector<std::shared_ptr<Surface>> newer;
-    struct Claimed {
-        std::uint64_t begin = 0;
-        std::uint64_t end = 0;
-        Side side = Side::None;
-        std::string reason;
-    };
-    std::vector<Claimed> claims;
+    std::vector<std::pair<std::string, std::uint64_t>> refusals;
+    std::uint64_t refusedImages = 0;
     mutable std::mutex staleMutex;
     std::map<std::uint64_t, std::shared_ptr<Surface>> stale;
     std::uint64_t staleSpan = 0;
-    OwnerCounts owners;
     TableCounts counts;
     std::uint64_t budget = 0;
     std::uint64_t heldBytes = 0;

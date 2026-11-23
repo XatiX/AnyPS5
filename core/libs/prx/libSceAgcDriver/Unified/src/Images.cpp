@@ -210,16 +210,16 @@ void SurfaceTable::MarkReady(Surface& surface, std::uint64_t stamp, std::uint64_
     counts.detiled++;
 }
 
-std::shared_ptr<Surface> SurfaceTable::Adopt(const SurfaceKey& key, std::span<const std::uint32_t, 8> words, std::string& reason) {
-    return adoptWith(key, [&](std::string& why) { return device.Create(key, words, why); }, reason);
+std::shared_ptr<Surface> SurfaceTable::Create(const SurfaceKey& key, std::span<const std::uint32_t, 8> words, std::string& reason) {
+    return createWith(key, [&](std::string& why) { return device.Create(key, words, why); }, reason);
 }
 
-std::shared_ptr<Surface> SurfaceTable::AdoptResource(const SurfaceKey& key, const Graphics::GuestTextureResource& resource, std::string& reason) {
-    return adoptWith(key, [&](std::string& why) { return device.CreateFromResource(key, resource, why); }, reason);
+std::shared_ptr<Surface> SurfaceTable::CreateResource(const SurfaceKey& key, const Graphics::GuestTextureResource& resource, std::string& reason) {
+    return createWith(key, [&](std::string& why) { return device.CreateFromResource(key, resource, why); }, reason);
 }
 
 template<typename TCreate>
-std::shared_ptr<Surface> SurfaceTable::adoptWith(const SurfaceKey& key, TCreate&& create, std::string& reason) {
+std::shared_ptr<Surface> SurfaceTable::createWith(const SurfaceKey& key, TCreate&& create, std::string& reason) {
     std::lock_guard lock(mutex);
     if (const auto found = surfaces.find(key); found != surfaces.end()) {
         found->second->used = ++clock;
@@ -341,62 +341,20 @@ std::vector<std::shared_ptr<Surface>> SurfaceTable::Overlapping(std::uint64_t ad
     return overlapping;
 }
 
-Side SurfaceTable::OwnerOfRange(std::uint64_t address, std::uint64_t bytes) const {
+bool SurfaceTable::Holds(std::uint64_t address, std::uint64_t bytes) const {
     std::lock_guard lock(mutex);
-    auto side = Side::None;
-    for (const auto& claim : claims) {
-        if (claim.begin >= address + bytes || address >= claim.end) continue;
-        if (claim.side == Side::Upstream) return Side::Upstream;
-        side = claim.side;
+    for (const auto& [key, surface] : surfaces) {
+        if (key.address < address + bytes && address < key.address + key.bytes) return true;
     }
-    return side;
+    return false;
 }
 
-Side SurfaceTable::Claim(std::uint64_t address, std::uint64_t bytes, Side side, std::string_view reason) {
+void SurfaceTable::NoteRefused(std::string_view reason) {
     std::lock_guard lock(mutex);
-    auto owner = Side::None;
-    bool covered = false;
-    for (const auto& claim : claims) {
-        if (claim.begin >= address + bytes || address >= claim.end) continue;
-        if (claim.side == Side::Upstream) return Side::Upstream;
-        owner = claim.side;
-        covered = covered || (claim.begin <= address && address + bytes <= claim.end);
-    }
-    if (owner != Side::None && (covered || side != Side::Record || owner != Side::Record)) return owner;
-    claims.push_back({address, address + bytes, side, std::string(reason)});
-    if (side == Side::Record) {
-        owners.recordRanges++;
-        owners.recordBytes += bytes;
-    } else {
-        owners.upstreamRanges++;
-        owners.upstreamBytes += bytes;
-    }
-    return side;
-}
-
-void SurfaceTable::Demote(std::uint64_t address, std::uint64_t bytes, std::string_view reason) {
-    std::lock_guard lock(mutex);
-    for (auto& claim : claims) {
-        if (claim.begin >= address + bytes || address >= claim.end || claim.side != Side::Record) continue;
-        claim.side = Side::Upstream;
-        claim.reason = "demoted: " + std::string(reason);
-        owners.recordRanges--;
-        owners.recordBytes -= claim.end - claim.begin;
-        owners.upstreamRanges++;
-        owners.upstreamBytes += claim.end - claim.begin;
-        owners.demoted++;
-    }
-    for (auto at = surfaces.begin(); at != surfaces.end();) {
-        const auto& key = at->first;
-        if (key.address >= address + bytes || address >= key.address + key.bytes || !at->second->seeded) {
-            ++at;
-            continue;
-        }
-        at->second->retired = true;
-        dropStale(*at->second);
-        heldBytes -= key.bytes;
-        at = surfaces.erase(at);
-    }
+    refusedImages++;
+    const auto found = std::ranges::find(refusals, reason, &std::pair<std::string, std::uint64_t>::first);
+    if (found != refusals.end()) found->second++;
+    else if (refusals.size() < 16u) refusals.emplace_back(std::string(reason), 1u);
 }
 
 void SurfaceTable::Retire(const std::shared_ptr<Surface>& surface) {
@@ -411,15 +369,6 @@ void SurfaceTable::Retire(const std::shared_ptr<Surface>& surface) {
         surfaces.erase(found);
     }
     std::erase_if(newer, [&](const std::shared_ptr<Surface>& other) { return other == surface; });
-    for (auto at = claims.begin(); at != claims.end();) {
-        if (at->side != Side::Record || at->begin != surface->key.address || at->end != surface->key.address + surface->key.bytes) {
-            ++at;
-            continue;
-        }
-        owners.recordRanges--;
-        owners.recordBytes -= at->end - at->begin;
-        at = claims.erase(at);
-    }
     counts.retired++;
 }
 
@@ -433,15 +382,8 @@ std::shared_ptr<Surface> SurfaceTable::Seed(const std::shared_ptr<Surface>& surf
 
 std::string SurfaceTable::OwnersLine() const {
     std::lock_guard lock(mutex);
-    std::string line = "image owners: " + std::to_string(owners.recordRanges) + " ranges on recode records (" + std::to_string(owners.recordBytes >> 20u) + " MiB), " + std::to_string(owners.upstreamRanges) + " on the existing cache (" + std::to_string(owners.upstreamBytes >> 20u) + " MiB), " + std::to_string(owners.demoted) + " demoted";
-    std::vector<std::pair<std::string, std::uint64_t>> reasons;
-    for (const auto& claim : claims) {
-        if (claim.side != Side::Upstream) continue;
-        const auto found = std::ranges::find(reasons, claim.reason, &std::pair<std::string, std::uint64_t>::first);
-        if (found != reasons.end()) found->second++;
-        else if (reasons.size() < 16u) reasons.emplace_back(claim.reason, 1u);
-    }
-    for (const auto& [reason, count] : reasons) line += " [" + reason + " " + std::to_string(count) + "]";
+    std::string line = "image records: " + std::to_string(surfaces.size()) + " holding " + std::to_string(heldBytes >> 20u) + " MiB; images the records refused " + std::to_string(refusedImages);
+    for (const auto& [reason, count] : refusals) line += " [" + reason + " " + std::to_string(count) + "]";
     return line;
 }
 

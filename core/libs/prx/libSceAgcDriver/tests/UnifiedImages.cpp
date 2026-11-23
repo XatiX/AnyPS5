@@ -210,11 +210,11 @@ void testRetiredRecordLeavesTheTable() {
     auto work = table.TakeWork();
     table.MarkReady(*work.front(), shared.Serial(), gpuWrites.Serial());
     table.MarkGpuWritten(*created->surface);
-    static_cast<void>(table.Claim(key.address, key.bytes, Side::Record, "target"));
+    Expect(table.Holds(key.address, key.bytes), "a record holds its range");
     table.Retire(created->surface);
     Expect(created->surface->retired && !created->surface->gpuNewer, "a retired record is no longer newer than memory");
     Expect(table.Overlapping(key.address, key.bytes).empty() && table.Size() == 0u, "a retired record leaves the table");
-    Expect(table.OwnerOfRange(key.address, key.bytes) == Side::None, "its claim goes with it, so another shape can claim the range");
+    Expect(!table.Holds(key.address, key.bytes), "its range is free for another shape");
     Expect(table.TakeCounts().retired == 1u, "the retirement is counted");
 }
 
@@ -280,27 +280,25 @@ void testBudgetDropsLeastRecentlyUsed() {
 
 }
 
-void testRangesKeepTheirFirstOwner() {
+void testRecordsHoldTheirRangesAndRefusalsAreCounted() {
     FakeDevice device;
     Events::ChangeLog shared;
     Events::ChangeLog gpuWrites;
     SurfaceTable table(device, shared, gpuWrites);
     std::string reason;
-    Expect(table.OwnerOfRange(0xc00000000ull, 0x10000) == Side::None, "an unclaimed range has no owner");
-    Expect(table.Claim(0xc00000000ull, 0x10000, Side::Record, "target") == Side::Record, "the first claim takes the range");
-    Expect(table.Claim(0xc00008000ull, 0x100, Side::Upstream, "late") == Side::Record, "a later claim inside it does not move it");
-    Expect(table.OwnerOfRange(0xc0000ff00ull, 0x200) == Side::Record, "a range touching it reads the owner");
-    Expect(table.Claim(0xc00010000ull, 0x10000, Side::Upstream, "metadata") == Side::Upstream, "the neighbouring range is claimed separately");
-    Expect(table.OwnerOfRange(0xc0000ff00ull, 0x200) == Side::Upstream, "the existing cache wins a range across both owners");
-    const auto record = table.Seed(table.Adopt(Key(0xc00000000ull), words, reason));
+    Expect(!table.Holds(0xc00000000ull, 0x10000), "an empty table holds no range");
+    const auto record = table.Seed(table.Create(Key(0xc00000000ull), words, reason));
     Expect(record != nullptr && record->seeded && table.TakeWork().size() == 1u, "a seeded record is queued once for its first content");
     static_cast<void>(table.Seed(record));
     Expect(table.TakeWork().empty(), "seeding it again queues nothing");
-    table.Demote(0xc00000000ull, 0x10000, "another shape");
-    Expect(table.OwnerOfRange(0xc00000000ull, 0x10000) == Side::Upstream, "a demoted range belongs to the existing cache");
-    Expect(record->retired && table.Overlapping(0xc00000000ull, 0x10000).empty(), "its record is retired");
-    Expect(table.Claim(0xc00000000ull, 0x10000, Side::Record, "again") == Side::Upstream, "a demoted range is not claimed back");
-    Expect(table.OwnersLine().find("1 demoted") != std::string::npos, "the owners line counts the demotion");
+    Expect(table.Holds(0xc00000000ull, 0x10000) && table.Holds(0xc0000ff00ull, 0x200), "a range touching a record is held");
+    Expect(!table.Holds(0xc00010000ull, 0x10000), "the neighbouring range is not held");
+    table.NoteRefused("storage: another shape");
+    table.NoteRefused("storage: another shape");
+    table.NoteRefused("sampled: multisampled image");
+    const auto line = table.OwnersLine();
+    Expect(line.find("image records: 1 ") != std::string::npos, "the owners line counts the records");
+    Expect(line.find("refused 3") != std::string::npos && line.find("[storage: another shape 2]") != std::string::npos && line.find("[sampled: multisampled image 1]") != std::string::npos, "the owners line counts refusals by reason");
 }
 
 void testCpuWrittenRecordIsDetiledAgain() {
@@ -309,7 +307,7 @@ void testCpuWrittenRecordIsDetiledAgain() {
     Events::ChangeLog gpuWrites;
     SurfaceTable table(device, shared, gpuWrites);
     std::string reason;
-    const auto record = table.Seed(table.Adopt(Key(0xc00040000ull), words, reason));
+    const auto record = table.Seed(table.Create(Key(0xc00040000ull), words, reason));
     Expect(record != nullptr && table.TakeWork().size() == 1u, "a new record is queued for its first content");
     table.MarkReady(*record, shared.Serial(), gpuWrites.Serial());
     Expect(!table.RefreshIfChanged(record), "an unchanged record is not detiled again");
@@ -322,22 +320,8 @@ void testCpuWrittenRecordIsDetiledAgain() {
     Expect(!table.RefreshIfChanged(record), "a GPU-written record keeps its content");
 }
 
-void testArrayClaimOutlivesItsSlices() {
-    FakeDevice device;
-    Events::ChangeLog shared;
-    Events::ChangeLog gpuWrites;
-    SurfaceTable table(device, shared, gpuWrites);
-    std::string reason;
-    const auto slice = table.Seed(table.Adopt(Key(0xc00020000ull), words, reason));
-    Expect(slice != nullptr && table.Claim(0xc00020000ull, 0x10000, Side::Record, "target") == Side::Record, "a slice claims its own range");
-    Expect(table.Claim(0xc00000000ull, 0x40000, Side::Record, "sampled") == Side::Record, "an array over the slice is a record range too");
-    table.Retire(slice);
-    Expect(table.OwnerOfRange(0xc00000000ull, 0x40000) == Side::Record, "retiring the slice leaves the array's claim");
-}
-
 int main() {
     testBudgetDropsLeastRecentlyUsed();
-    testArrayClaimOutlivesItsSlices();
     testCpuWrittenRecordIsDetiledAgain();
     testGpuWrittenSurfacesAreLeftToTheExistingCache();
     testImageSetNotesAreNotGpuWrites();
@@ -350,7 +334,7 @@ int main() {
     testRetiredRecordLeavesTheTable();
     testStaleMirrorIndex();
     testOverlapQuery();
-    testRangesKeepTheirFirstOwner();
+    testRecordsHoldTheirRangesAndRefusalsAreCounted();
     if (failures != 0) return 1;
     std::printf("unified images tests passed\n");
     return 0;
