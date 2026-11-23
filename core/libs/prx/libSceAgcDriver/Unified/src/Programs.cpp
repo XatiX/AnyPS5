@@ -17,7 +17,11 @@
 #include <spirv/unified1/spirv.hpp>
 #include <cstdlib>
 #include <exception>
+#include <mutex>
+#include <string>
 #include <string_view>
+#include <unordered_map>
+#include <vector>
 
 namespace AgcDriver::Unified::Resolve {
 
@@ -61,6 +65,54 @@ void reportLargeTemplate(const ShaderRecompiler::ResultTemplate& shape) {
     std::uint64_t readRanges = capacityBytes(result.imageTableReadRanges);
     for (const auto& ranges : result.imageTableReadRanges) readRanges += capacityBytes(ranges);
     std::fprintf(stderr, "[recode-resolve] first large template: %llu bytes; %zu bindings, descriptor words %llu bytes (largest %llu words), push %zu, table poison %llu, table ranges %llu, table read ranges %llu, vertex patches %llu, runtime images %llu, fragment parameters %llu, vertex attributes %llu\n", static_cast<unsigned long long>(bytes), result.bindings.size(), static_cast<unsigned long long>(descriptors), static_cast<unsigned long long>(largestBinding), result.pushConstants.size(), static_cast<unsigned long long>(capacityBytes(result.imageTablePoison)), static_cast<unsigned long long>(capacityBytes(result.imageTableRanges)), static_cast<unsigned long long>(readRanges), static_cast<unsigned long long>(capacityBytes(result.vertexInputPatches)), static_cast<unsigned long long>(capacityBytes(result.runtimeImageResources)), static_cast<unsigned long long>(capacityBytes(result.fragmentParameters)), static_cast<unsigned long long>(capacityBytes(result.vertexAttributes)));
+}
+
+struct ForkSeen {
+    std::vector<std::uint64_t> modules;
+    ShaderRecompiler::ResourceSnapshot last;
+};
+
+void appendDescriptorChanges(std::string& line, const char* kind, const std::vector<ShaderRecompiler::DescriptorValue>& before, const std::vector<ShaderRecompiler::DescriptorValue>& after, std::uint32_t& shown) {
+    if (before.size() != after.size()) {
+        line += " " + std::string(kind) + "s " + std::to_string(before.size()) + "->" + std::to_string(after.size());
+        return;
+    }
+    for (std::size_t index = 0; index < after.size(); ++index) {
+        const auto& a = before[index];
+        const auto& b = after[index];
+        for (std::uint32_t word = 0; word < std::max(a.dwordCount, b.dwordCount) && word < b.dwords.size(); ++word) {
+            if (a.dwords[word] == b.dwords[word]) continue;
+            if (shown++ >= 8u) return;
+            char text[96];
+            std::snprintf(text, sizeof(text), " %s%zu.w%u %08x->%08x", kind, index, word, a.dwords[word], b.dwords[word]);
+            line += text;
+        }
+    }
+}
+
+void reportModuleFork(std::uint64_t codeAddress, const ShaderRecompiler::ResultTemplate& shape, const ShaderRecompiler::ResourceSnapshot& snapshot) {
+    if (!Downgrades::Active() || shape.result == nullptr) return;
+    static std::mutex mutex;
+    static std::unordered_map<std::uint64_t, ForkSeen> seen;
+    static std::uint32_t lines = 0;
+    const auto module = shape.result->spirv.ContentHash().low;
+    std::lock_guard lock(mutex);
+    auto& entry = seen[codeAddress];
+    const bool known = std::ranges::find(entry.modules, module) != entry.modules.end();
+    if (!known && !entry.modules.empty() && lines < 400u) {
+        ++lines;
+        std::string line;
+        std::uint32_t shown = 0;
+        appendDescriptorChanges(line, "image", entry.last.images, snapshot.images, shown);
+        appendDescriptorChanges(line, "sampler", entry.last.samplers, snapshot.samplers, shown);
+        appendDescriptorChanges(line, "buffer", entry.last.buffers, snapshot.buffers, shown);
+        if (entry.last.registeredImages.size() != snapshot.registeredImages.size()) line += " registered " + std::to_string(entry.last.registeredImages.size()) + "->" + std::to_string(snapshot.registeredImages.size());
+        if (entry.last.userData != snapshot.userData) line += " userData";
+        if (entry.last.flattenedSrt != snapshot.flattenedSrt) line += " flattenedSrt";
+        std::fprintf(stderr, "[recode-module-fork] %016llx module %zu %016llx:%s\n", static_cast<unsigned long long>(Downgrades::ProgramHash(codeAddress)), entry.modules.size() + 1u, static_cast<unsigned long long>(module), line.empty() ? " no descriptor word differs" : line.c_str());
+    }
+    if (!known) entry.modules.push_back(module);
+    entry.last = snapshot;
 }
 
 bool usesSamplerTables(const ShaderRecompiler::ShaderInfo& info) {
@@ -132,6 +184,7 @@ bool materializeStage(const ProgramInputs& inputs, ShaderRecompiler::RecompileRe
             inputs.templates->CountBuild(stale);
             inputs.templates->Store(key, shape);
             reportLargeTemplate(*shape);
+            reportModuleFork(snapshot.codeAddress + codeOffset * sizeof(std::uint32_t), *shape, capture->snapshot);
         }
         result = shape->result;
         if (shape->refillable) {
