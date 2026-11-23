@@ -238,6 +238,7 @@ struct Totals {
     std::uint64_t depthHtileClears = 0;
     std::uint64_t depthHtileOther = 0;
     std::uint64_t depthReseeds = 0;
+    std::uint64_t depthSupersedeSeeds = 0;
     std::uint64_t depthGpuHtileClears = 0;
     std::uint64_t depthGpuHtileRefusals = 0;
     std::uint64_t depthHtileExpanded = 0;
@@ -1314,7 +1315,7 @@ public:
             line += "; HTILE checks finished: every tile cleared " + std::to_string(outcomes.cleared) + ", no tile cleared " + std::to_string(outcomes.untouched) + ", tiles disagree (not applied) " + std::to_string(outcomes.mixed);
         }
         line += "; records written back for buffer readers " + std::to_string(totals.readerWriteBacks) + " (" + std::to_string(totals.readerWriteBackBytes >> 20u) + " MiB, " + std::to_string(totals.readerWriteBackRefusals) + " refused, " + std::to_string(totals.readerStale) + " skipped: memory changed since their GPU write), handed over before a buffer writer " + std::to_string(totals.writerHandOvers);
-        line += "; records handed to another shape " + std::to_string(totals.shapesHandedOver) + " (" + std::to_string(totals.writeBacks) + " written back into the mirror, " + std::to_string(totals.writeBackBytes >> 20u) + " MiB, " + std::to_string(totals.writeBackRefusals) + " refused, " + std::to_string(totals.staleShapes) + " not written back: memory changed since their GPU write, " + std::to_string(totals.writeBacksUnserved) + " retired unwritten: the write-back was refused); draws with a recode depth record " + std::to_string(totals.depthRecordDraws) + " (" + std::to_string(Images::Depths().Size()) + " records, " + std::to_string(Images::Depths().Counts().cleared) + " started from their clear value, " + std::to_string(Images::Depths().Counts().refused) + " refused, " + std::to_string(Images::Depths().Counts().superseded) + " superseded by a record over their memory, " + std::to_string(Images::Depths().Counts().htileWrites) + " driver writes over HTILE, " + std::to_string(totals.depthRecordsSampled) + " sampled reads of them, " + std::to_string(totals.depthBufferReads) + " buffer reads of their memory, " + std::to_string(totals.depthWriteBacks) + " depth write-backs into the mirror for them, " + std::to_string(totals.depthWriteBackRefusals) + " refused; " + std::to_string(totals.depthSeeds) + " started from memory (" + std::to_string(totals.depthSeedRefusals) + " refused), HTILE writes re-cleared " + std::to_string(totals.depthHtileClears) + ", HTILE writes without a clear " + std::to_string(totals.depthHtileOther) + "; CPU writes over their planes " + std::to_string(Images::Depths().Counts().cpuPlaneWrites) + ", seeded again from memory " + std::to_string(totals.depthReseeds) + "; GPU writes over HTILE " + std::to_string(Images::Depths().Counts().gpuHtileWrites) +", checked for a clear on the GPU " + std::to_string(totals.depthGpuHtileClears) + " (" + std::to_string(totals.depthGpuHtileRefusals) + " refused), HTILE set to expanded after a clear " + std::to_string(totals.depthHtileExpanded) + " (" + std::to_string(totals.depthHtileExpandRefusals) + " refused)); targets and sampled views served as layers of a containing record " + std::to_string(totals.layerTargets) + ", records copied in as layers of a new record " + std::to_string(totals.layersAbsorbed) + " (" + std::to_string(totals.layersAbsorbedOverChanges) + " over a change note); CPU-content records detiled again after their memory changed " + std::to_string(totals.recordsRefreshed);
+        line += "; records handed to another shape " + std::to_string(totals.shapesHandedOver) + " (" + std::to_string(totals.writeBacks) + " written back into the mirror, " + std::to_string(totals.writeBackBytes >> 20u) + " MiB, " + std::to_string(totals.writeBackRefusals) + " refused, " + std::to_string(totals.staleShapes) + " not written back: memory changed since their GPU write, " + std::to_string(totals.writeBacksUnserved) + " retired unwritten: the write-back was refused); draws with a recode depth record " + std::to_string(totals.depthRecordDraws) + " (" + std::to_string(Images::Depths().Size()) + " records, " + std::to_string(Images::Depths().Counts().cleared) + " started from their clear value, " + std::to_string(Images::Depths().Counts().refused) + " refused, " + std::to_string(Images::Depths().Counts().superseded) + " superseded by a record over their memory, " + std::to_string(Images::Depths().Counts().htileWrites) + " driver writes over HTILE, " + std::to_string(totals.depthRecordsSampled) + " sampled reads of them, " + std::to_string(totals.depthBufferReads) + " buffer reads of their memory, " + std::to_string(totals.depthWriteBacks) + " depth write-backs into the mirror for them, " + std::to_string(totals.depthWriteBackRefusals) + " refused; " + std::to_string(totals.depthSeeds) + " started from memory (" + std::to_string(totals.depthSeedRefusals) + " refused), HTILE writes re-cleared " + std::to_string(totals.depthHtileClears) + ", HTILE writes without a clear " + std::to_string(totals.depthHtileOther) + "; CPU writes over their planes " + std::to_string(Images::Depths().Counts().cpuPlaneWrites) + ", seeded again from memory " + std::to_string(totals.depthReseeds) + ", seeded from a superseded record " + std::to_string(totals.depthSupersedeSeeds) + "; GPU writes over HTILE " + std::to_string(Images::Depths().Counts().gpuHtileWrites) +", checked for a clear on the GPU " + std::to_string(totals.depthGpuHtileClears) + " (" + std::to_string(totals.depthGpuHtileRefusals) + " refused), HTILE set to expanded after a clear " + std::to_string(totals.depthHtileExpanded) + " (" + std::to_string(totals.depthHtileExpandRefusals) + " refused)); targets and sampled views served as layers of a containing record " + std::to_string(totals.layerTargets) + ", records copied in as layers of a new record " + std::to_string(totals.layersAbsorbed) + " (" + std::to_string(totals.layersAbsorbedOverChanges) + " over a change note); CPU-content records detiled again after their memory changed " + std::to_string(totals.recordsRefreshed);
         line += "; flips from a GPU-written record " + std::to_string(flipsFromNewRecords.load(std::memory_order_relaxed)) + ", over a record not GPU-written " + std::to_string(flipsFromOldRecords.load(std::memory_order_relaxed)) + ", with no record " + std::to_string(flipsWithoutRecords.load(std::memory_order_relaxed)) + ", presented straight from the record " + std::to_string(flipsPresentedFromRecords.load(std::memory_order_relaxed));
         {
             auto& landings = batchLandings();
@@ -2951,8 +2952,34 @@ private:
         totals.depthHtileExpanded++;
     }
 
+    bool seedFromPredecessors(const Context& context, Graphics::Recorder& recorder, const std::shared_ptr<Images::DepthRecord>& record) {
+        const auto predecessors = record->TakePredecessors();
+        if (predecessors.empty() || !seedsDepth() || !writesBackDepth()) return false;
+        if (surfaceDetiler == nullptr) surfaceDetiler = std::make_unique<Images::SurfaceDetiler>(context);
+        std::string reason;
+        for (const auto& previous : predecessors) {
+            std::vector<std::pair<std::uint64_t, std::uint64_t>> written;
+            if (!surfaceDetiler->WriteBackDepth(recorder, previous, written, reason)) {
+                reason = "writing back the superseded record: " + reason;
+                break;
+            }
+            for (const auto& [begin, size] : written) noteWrittenBack(recorder, begin, size);
+        }
+        if (reason.empty() && surfaceDetiler->SeedDepth(recorder, record, reason)) {
+            if (totals.depthSupersedeSeeds++ == 0u) std::fprintf(stderr, "[recode-depth] first record seeded from the record it superseded: 0x%llx from %zu records\n", static_cast<unsigned long long>(record->Key().address), predecessors.size());
+            static_cast<void>(record->TakeHtileWrite());
+            static_cast<void>(record->TakePlaneWrite());
+            record->SetHtileSaysCleared(false);
+            return true;
+        }
+        totals.depthSeedRefusals++;
+        if (seen.insert("supersede seed: " + reason).second) std::fprintf(stderr, "[recode-depth] first refused seed from a superseded record: %s (record 0x%llx)\n", reason.c_str(), static_cast<unsigned long long>(record->Key().address));
+        return false;
+    }
+
     void startDepth(const Context& context, Graphics::Recorder& recorder, const std::shared_ptr<Images::DepthRecord>& record, const Graphics::DepthTarget& target, std::uint64_t program) {
         const bool fresh = !record->Initialized();
+        if (fresh && seedFromPredecessors(context, recorder, record)) return;
         const bool htileWritten = record->TakeHtileWrite();
         const bool planeWritten = record->TakePlaneWrite();
         if (!fresh && !htileWritten && !planeWritten) return;

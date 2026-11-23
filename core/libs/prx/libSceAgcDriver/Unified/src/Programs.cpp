@@ -268,12 +268,14 @@ bool DecodePrograms(const ProgramInputs& inputs, DriverDetail::DrawDecode& decod
     }
     if (static const bool depths = std::getenv("APS5_RECODE_TRACE_DEPTH_STATE") != nullptr; depths && state.depth) {
         static std::mutex mutex;
-        static std::vector<std::array<std::uint64_t, 6>> seen;
-        const std::array<std::uint64_t, 6> key{DriverDetail::readRegister(queue.context, 0x200), DriverDetail::readRegister(queue.context, 0x010), DriverDetail::readRegister(queue.context, 0x00b), DriverDetail::readRegister(queue.context, 0x000), state.depth->address, state.colors.size()};
+        static std::vector<std::array<std::uint64_t, 7>> seen;
+        const auto& last = decode.programs.empty() ? nullptr : decode.programs.back().snapshot;
+        const auto program = last != nullptr ? Downgrades::ProgramHash(last->codeAddress + decode.programs.back().codeOffset * sizeof(std::uint32_t)) : 0u;
+        const std::array<std::uint64_t, 7> key{DriverDetail::readRegister(queue.context, 0x200), DriverDetail::readRegister(queue.context, 0x010), DriverDetail::readRegister(queue.context, 0x00b), DriverDetail::readRegister(queue.context, 0x000), state.depth->address, state.colors.size(), program};
         std::lock_guard lock(mutex);
-        if (std::ranges::find(seen, key) == seen.end() && seen.size() < 120u) {
+        if (std::ranges::find(seen, key) == seen.end() && seen.size() < 200u) {
             seen.push_back(key);
-            std::fprintf(stderr, "[recode-depth-state] depth control %08llx z info %08llx clear %08llx render control %08llx depth 0x%llx colours %llu\n", static_cast<unsigned long long>(key[0]), static_cast<unsigned long long>(key[1]), static_cast<unsigned long long>(key[2]), static_cast<unsigned long long>(key[3]), static_cast<unsigned long long>(key[4]), static_cast<unsigned long long>(key[5]));
+            std::fprintf(stderr, "[recode-depth-state] program %016llx depth control %08llx z info %08llx clear %08llx render control %08llx depth 0x%llx colours %llu; z read %08x write %08x stencil read %08x write %08x depth view %08x size %08x\n", static_cast<unsigned long long>(key[6]), static_cast<unsigned long long>(key[0]), static_cast<unsigned long long>(key[1]), static_cast<unsigned long long>(key[2]), static_cast<unsigned long long>(key[3]), static_cast<unsigned long long>(key[4]), static_cast<unsigned long long>(key[5]), DriverDetail::readRegister(queue.context, 0x012), DriverDetail::readRegister(queue.context, 0x014), DriverDetail::readRegister(queue.context, 0x013), DriverDetail::readRegister(queue.context, 0x015), DriverDetail::readRegister(queue.context, 0x002), DriverDetail::readRegister(queue.context, 0x007));
         }
     }
     if (state.stages.mesh || state.stages.tessellation || state.stages.tessellationGeometry) {
