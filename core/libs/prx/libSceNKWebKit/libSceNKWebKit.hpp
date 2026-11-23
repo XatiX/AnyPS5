@@ -1,5 +1,7 @@
 #pragma once
 #include "prx/libSceNKWebKit/include/BidiContextExports.hpp"
+#include "prx/libSceNKWebKit/include/CrossThreadTaskHandlerExports.hpp"
+#include "prx/libSceNKWebKit/include/DOMCacheEngineExports.hpp"
 #include "prx/libSceNKWebKit/include/DoViCodecParameters.hpp"
 #include "prx/libSceNKWebKit/include/HitTestLocationExports.hpp"
 #include "prx/libSceNKWebKit/include/KeyedDecoderExports.hpp"
@@ -108,6 +110,7 @@
 #include "prx/libSceNKWebKit/include/CacheControlExports.hpp"
 #include "prx/libSceNKWebKit/include/FloatSizeExports.hpp"
 #include "prx/libSceNKWebKit/include/EnclosingRectExports.hpp"
+#include "prx/libSceNKWebKit/include/TiledBackingStoreExports.hpp"
 #include "prx/libSceNKWebKit/include/DoubleConversionExports.hpp"
 #include "prx/libSceNKWebKit/include/SVGPathStringBuilderExports.hpp"
 #include "prx/libSceNKWebKit/include/PublicSuffixExports.hpp"
@@ -121,6 +124,7 @@
 #include "prx/libSceNKWebKit/include/GraphemeClusterExports.hpp"
 #include "prx/libSceNKWebKit/include/YarrRegularExpressionExports.hpp"
 #include "prx/libSceNKWebKit/include/EmptyLoaderErrorExports.hpp"
+#include "prx/libSceNKWebKit/include/AdClickAttributionExports.hpp"
 #include "prx/libSceNKWebKit/include/NodeTraversalExports.hpp"
 #include "prx/libSceNKWebKit/include/BasicFilterOperationExports.hpp"
 #include "prx/libSceNKWebKit/include/MarkingConstraintExports.hpp"

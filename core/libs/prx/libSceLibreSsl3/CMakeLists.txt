@@ -927,6 +927,17 @@ if(BUILD_TESTING)
         set_tests_properties(guest_libressl3_pkey_context PROPERTIES ENVIRONMENT_MODIFICATION
             "PATH=path_list_prepend:$<TARGET_FILE_DIR:libSceLibreSsl3>")
     endif()
+
+    add_test_executable(guest_libressl3_wycheproof_rsa_pss_tests ${CMAKE_CURRENT_SOURCE_DIR}/tests/WycheproofRsaPss.cpp)
+    target_include_directories(guest_libressl3_wycheproof_rsa_pss_tests PRIVATE ${LIBS_INCLUDE_DIR})
+    target_link_libraries(guest_libressl3_wycheproof_rsa_pss_tests PRIVATE libSceLibreSsl3 libSceLibreSsl libc)
+    configure_windows_unwind(guest_libressl3_wycheproof_rsa_pss_tests)
+    add_test(NAME guest_libressl3_wycheproof_rsa_pss COMMAND guest_libressl3_wycheproof_rsa_pss_tests)
+    set_tests_properties(guest_libressl3_wycheproof_rsa_pss PROPERTIES TIMEOUT 60)
+    if(WIN32)
+        set_tests_properties(guest_libressl3_wycheproof_rsa_pss PROPERTIES ENVIRONMENT_MODIFICATION
+            "PATH=path_list_prepend:$<TARGET_FILE_DIR:libSceLibreSsl3>")
+    endif()
 endif()
 
 target_sources(libSceLibreSsl3 PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src/X509ItemFree.cpp)
@@ -1176,6 +1187,19 @@ if(BUILD_TESTING)
     endif()
 endif()
 
+if(BUILD_TESTING)
+    add_test_executable(guest_libressl3_wycheproof_aes_gcm_tests ${CMAKE_CURRENT_SOURCE_DIR}/tests/WycheproofAesGcm.cpp)
+    target_include_directories(guest_libressl3_wycheproof_aes_gcm_tests PRIVATE ${LIBS_INCLUDE_DIR})
+    target_link_libraries(guest_libressl3_wycheproof_aes_gcm_tests PRIVATE libSceLibreSsl3 libSceLibreSsl libc)
+    configure_windows_unwind(guest_libressl3_wycheproof_aes_gcm_tests)
+    add_test(NAME guest_libressl3_wycheproof_aes_gcm COMMAND guest_libressl3_wycheproof_aes_gcm_tests)
+    set_tests_properties(guest_libressl3_wycheproof_aes_gcm PROPERTIES TIMEOUT 60)
+    if(WIN32)
+        set_tests_properties(guest_libressl3_wycheproof_aes_gcm PROPERTIES ENVIRONMENT_MODIFICATION
+            "PATH=path_list_prepend:$<TARGET_FILE_DIR:libSceLibreSsl3>")
+    endif()
+endif()
+
 target_sources(libSceLibreSsl3 PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src/SslVerifiedChain.cpp)
 
 if(BUILD_TESTING)
@@ -1217,6 +1241,19 @@ if(BUILD_TESTING)
     set_tests_properties(guest_libressl3_ssl_do_handshake PROPERTIES TIMEOUT 20)
     if(WIN32)
         set_tests_properties(guest_libressl3_ssl_do_handshake PROPERTIES ENVIRONMENT_MODIFICATION
+            "PATH=path_list_prepend:$<TARGET_FILE_DIR:libSceLibreSsl3>")
+    endif()
+endif()
+
+if(BUILD_TESTING)
+    add_test_executable(guest_libressl3_regress_bn_tests ${CMAKE_CURRENT_SOURCE_DIR}/tests/RegressBn.cpp)
+    target_include_directories(guest_libressl3_regress_bn_tests PRIVATE ${LIBS_INCLUDE_DIR})
+    target_link_libraries(guest_libressl3_regress_bn_tests PRIVATE libSceLibreSsl3 libSceLibreSsl libc)
+    configure_windows_unwind(guest_libressl3_regress_bn_tests)
+    add_test(NAME guest_libressl3_regress_bn COMMAND guest_libressl3_regress_bn_tests)
+    set_tests_properties(guest_libressl3_regress_bn PROPERTIES TIMEOUT 30)
+    if(WIN32)
+        set_tests_properties(guest_libressl3_regress_bn PROPERTIES ENVIRONMENT_MODIFICATION
             "PATH=path_list_prepend:$<TARGET_FILE_DIR:libSceLibreSsl3>")
     endif()
 endif()

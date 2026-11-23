@@ -31,9 +31,11 @@ MARKER = "<!-- pr-overlap -->"
 FETCH_REFS = 100
 BASE_REF = "refs/pr/base"
 PROGRESS_EVERY = 100
+PAIR_PROGRESS_EVERY = 1000
 MAX_REPORT_CHARS = 60000
 EXPORT_PATHS = ("core/libs/prx/*.cpp", ":(exclude,icase)**/test/**", ":(exclude,icase)**/tests/**")
 _REPO_ROOTS = {}
+GIT_CONFIG = ("-c", "gc.auto=0", "-c", "maintenance.auto=false")
 
 
 def _repository_root():
@@ -41,7 +43,7 @@ def _repository_root():
     root = _REPO_ROOTS.get(cwd)
     if root is None:
         output = subprocess.run(
-            ["git", "rev-parse", "--show-toplevel"],
+            ["git", *GIT_CONFIG, "rev-parse", "--show-toplevel"],
             cwd=cwd,
             capture_output=True,
             check=True,
@@ -49,7 +51,7 @@ def _repository_root():
         root = Path(output)
         if os.name == "nt" and not root.is_dir():
             relative = subprocess.run(
-                ["git", "rev-parse", "--show-cdup"],
+                ["git", *GIT_CONFIG, "rev-parse", "--show-cdup"],
                 cwd=cwd,
                 capture_output=True,
                 check=True,
@@ -85,7 +87,7 @@ def git(*args):
                 except ValueError:
                     pass
     result = subprocess.run(
-        ["git", "-c", "core.quotePath=false", *args],
+        ["git", "-c", "core.quotePath=false", *GIT_CONFIG, *args],
         cwd=root,
         capture_output=True,
     )
@@ -308,12 +310,12 @@ def fetch_heads(base_sha, prs):
 
 def merge(*args):
     root = _repository_root()
-    result = subprocess.run(["git", "-c", "core.quotePath=false", "merge-tree", "--write-tree", "--name-only", "--no-messages", "-z", *args],
+    result = subprocess.run(["git", "-c", "core.quotePath=false", *GIT_CONFIG, "merge-tree", "--write-tree", "--name-only", "--no-messages", "-z", *args],
                             cwd=root, capture_output=True)
     lines = result.stdout.decode("utf-8", errors="replace").rstrip("\0").split("\0")
     if result.returncode not in (0, 1) or not lines[0]:
         required = (2, 40) if any(arg.startswith("--merge-base") for arg in args) else (2, 38)
-        found = re.match(rb"git version (\d+)\.(\d+)", subprocess.run(["git", "version"], capture_output=True).stdout)
+        found = re.match(rb"git version (\d+)\.(\d+)", subprocess.run(["git", *GIT_CONFIG, "version"], capture_output=True).stdout)
         version = (int(found.group(1)), int(found.group(2))) if found else None
         if version and version < required:
             raise RuntimeError(f"git merge-tree {' '.join(args)} needs git {required[0]}.{required[1]} or newer; "
@@ -480,7 +482,7 @@ def save_export_cache(path, version, files):
 
 
 def base_sources(root, ref):
-    listing = subprocess.run(["git", "-C", root, "ls-tree", "-r", "-z", ref, "--", "core/libs"],
+    listing = subprocess.run(["git", *GIT_CONFIG, "-C", root, "ls-tree", "-r", "-z", ref, "--", "core/libs"],
                              capture_output=True, check=True).stdout.decode("utf-8", errors="replace")
     sources = []
     for entry in filter(None, listing.split("\0")):
@@ -496,7 +498,7 @@ def base_sources(root, ref):
 def blob_texts(root, blobs):
     if not blobs:
         return {}
-    out = subprocess.run(["git", "-C", root, "cat-file", "--batch"], input="".join(f"{blob}\n" for blob in blobs).encode(),
+    out = subprocess.run(["git", *GIT_CONFIG, "-C", root, "cat-file", "--batch"], input="".join(f"{blob}\n" for blob in blobs).encode(),
                          capture_output=True, check=True).stdout
     texts, offset = {}, 0
     for blob in blobs:
@@ -658,6 +660,27 @@ def overlaps(prs, a, b):
                 found["uncompared"] = uncompared
     return found if any(found.values()) else None
 
+
+
+def compare_all(prs, pairs, jobs):
+    rows = {n: {} for n in prs}
+    with ThreadPoolExecutor(max_workers=jobs) as executor:
+        try:
+            merging = {}
+            for a, b in pairs:
+                if prs[a].get("author") != prs[b].get("author") and prs[a].get("files", set()) & prs[b].get("files", set()):
+                    merging[a, b] = executor.submit(overlaps, prs, a, b)
+                elif found := overlaps(prs, a, b):
+                    rows[a][b] = rows[b][a] = found
+            for index, ((a, b), future) in enumerate(merging.items(), 1):
+                if found := future.result():
+                    rows[a][b] = rows[b][a] = found
+                if index % PAIR_PROGRESS_EVERY == 0 or index == len(merging):
+                    progress(f"compared {index}/{len(merging)} pull request pairs that change the same files")
+        except BaseException:
+            executor.shutdown(cancel_futures=True)
+            raise
+    return rows
 
 
 def code_span(item):
@@ -894,7 +917,7 @@ def pull_requests_with(names, prs, jobs):
 
 
 def library_status(ref, library):
-    archive = subprocess.run(["git", "archive", "--format=tar", ref, "--", library], capture_output=True, check=True).stdout
+    archive = subprocess.run(["git", *GIT_CONFIG, "archive", "--format=tar", ref, "--", library], capture_output=True, check=True).stdout
     scanner = importlib.import_module("progress")
     with tempfile.TemporaryDirectory() as root:
         with tarfile.open(fileobj=io.BytesIO(archive)) as tar:
@@ -1004,12 +1027,9 @@ def main(argv=None):
             prs[0] = {"ref": sha, "author": None, "depends": set()}
         scan_all(prs, args.jobs)
         current_exports = base_exports(BASE_REF)
-        rows = {n: {} for n in prs}
         main_exports = main_export_findings(prs, current_exports)
         pairs = [(0, n) for n in prs if n] if args.branch else combinations(prs, 2)
-        for a, b in pairs:
-            if found := overlaps(prs, a, b):
-                rows[a][b] = rows[b][a] = found
+        rows = compare_all(prs, pairs, args.jobs)
         blob = f'https://github.com/{REPO}/blob/{BASE_REF}'
     except subprocess.CalledProcessError as error:
         raise SystemExit(describe_failure(error))
