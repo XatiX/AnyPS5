@@ -20,6 +20,7 @@
 #include <optional>
 #include <mutex>
 #include <thread>
+#include <utility>
 #include <vector>
 
 namespace AgcDriver::Unified::Loop {
@@ -48,6 +49,7 @@ struct Totals {
     std::atomic<std::uint64_t> runTimeStores{0};
     std::atomic<std::uint64_t> runTimeRefused{0};
     std::atomic<std::uint64_t> sampleDumps{0};
+    std::atomic<std::uint64_t> seals{0};
     std::atomic<std::uint64_t> guarded{0};
     std::atomic<std::uint64_t> skipped{0};
     std::atomic<std::uint64_t> conditionsRead{0};
@@ -207,7 +209,7 @@ private:
         if (item.operation.predicated && item.guards.empty()) totals().predicated.fetch_add(1, std::memory_order_relaxed);
         const auto device = Resolve::AttachedDevice();
         if (device == nullptr) {
-            if (item.operation.kind != OpKind::Wait && item.operation.kind != OpKind::Flip) Record::RefuseUnrecorded("loop operation", 0, "the recode has no device yet");
+            if (item.operation.kind != OpKind::Wait && item.operation.kind != OpKind::Flip && item.operation.kind != OpKind::Marker) Record::RefuseUnrecorded("loop operation", 0, "the recode has no device yet");
             return;
         }
         switch (item.operation.kind) {
@@ -229,7 +231,9 @@ private:
                 return;
             case OpKind::Wait: wait(*device, item); return;
             case OpKind::Flip: totals().flips.fetch_add(1, std::memory_order_relaxed); return;
-            case OpKind::Marker: return;
+            case OpKind::Marker:
+                sealPassWrites(*device);
+                return;
         }
     }
 
@@ -319,6 +323,15 @@ private:
         GuestMemory::TagGpuLockSite(GuestMemory::GpuLockSite::Draw);
         std::lock_guard lock(GuestMemory::GpuMutex());
         if (Record::RecordResolved(device.graphicsContext(), *item.resolved, *item.parameters, reason)) totals().draws.fetch_add(1, std::memory_order_relaxed);
+        drawnSinceSeal = true;
+    }
+
+    void sealPassWrites(VulkanDevice& device) {
+        if (queue != 0u || !std::exchange(drawnSinceSeal, false)) return;
+        GuestMemory::TagGpuLockSite(GuestMemory::GpuLockSite::Flush);
+        std::lock_guard lock(GuestMemory::GpuMutex());
+        device.SealPassWriteOnly();
+        totals().seals.fetch_add(1, std::memory_order_relaxed);
     }
 
     void dispatch(VulkanDevice& device, const Item& item) {
@@ -497,6 +510,7 @@ private:
 
     std::uint32_t queue;
     Progress* busy = nullptr;
+    bool drawnSinceSeal = false;
     std::array<Decided, 8> decided{};
     std::size_t decidedNext = 0;
     std::array<Stored, 6> recent{};
@@ -555,7 +569,7 @@ bool Takes(std::span<const std::uint32_t> packet, std::uint32_t opcode, std::uin
                 if (packet.size() >= 6u && Pm4::CopyDataToRegister(packet)) return false;
                 return !Pm4::DecodeStores(packet).empty();
             case 0x50: return !Pm4::DecodeStores(packet).empty();
-            case 0x46: return Pm4::SampleDump(packet);
+            case 0x46: case 0x58: return true;
             default: return false;
         }
     } catch (const std::exception&) {
@@ -583,8 +597,8 @@ LoopCounts Counts() {
 std::string Line() {
     const auto counts = Counts();
     char text[512];
-    std::snprintf(text, sizeof(text), "draws %llu, dispatches %llu, refused %llu; label stores %llu (%llu at once on the CPU), interrupts %llu; waits %llu (%llu from the label table, %llu from guest memory, %llu polls); copies %llu (%llu on the CPU in stream order); run-time stores %llu (%llu refused); occlusion dumps %llu; flips %llu; guarded operations %llu (%llu skipped, %llu conditions read); predicated operations with no guard %llu; idle reaps %llu",
-                  static_cast<unsigned long long>(counts.draws), static_cast<unsigned long long>(counts.dispatches), static_cast<unsigned long long>(counts.refused), static_cast<unsigned long long>(counts.labels), static_cast<unsigned long long>(counts.labelsAtOnce), static_cast<unsigned long long>(counts.interrupts), static_cast<unsigned long long>(counts.waits), static_cast<unsigned long long>(counts.waitsFromTable), static_cast<unsigned long long>(counts.waitsFromGuest), static_cast<unsigned long long>(counts.waitPolls), static_cast<unsigned long long>(counts.copies), static_cast<unsigned long long>(counts.copiesOnCpu), static_cast<unsigned long long>(totals().runTimeStores.load()), static_cast<unsigned long long>(totals().runTimeRefused.load()), static_cast<unsigned long long>(totals().sampleDumps.load()), static_cast<unsigned long long>(counts.flips), static_cast<unsigned long long>(totals().guarded.load()), static_cast<unsigned long long>(totals().skipped.load()), static_cast<unsigned long long>(totals().conditionsRead.load()), static_cast<unsigned long long>(totals().predicated.load()), static_cast<unsigned long long>(totals().idleReaps.load()));
+    std::snprintf(text, sizeof(text), "draws %llu, dispatches %llu, refused %llu; label stores %llu (%llu at once on the CPU), interrupts %llu; waits %llu (%llu from the label table, %llu from guest memory, %llu polls); copies %llu (%llu on the CPU in stream order); run-time stores %llu (%llu refused); occlusion dumps %llu; pass write seals %llu; flips %llu; guarded operations %llu (%llu skipped, %llu conditions read); predicated operations with no guard %llu; idle reaps %llu",
+                  static_cast<unsigned long long>(counts.draws), static_cast<unsigned long long>(counts.dispatches), static_cast<unsigned long long>(counts.refused), static_cast<unsigned long long>(counts.labels), static_cast<unsigned long long>(counts.labelsAtOnce), static_cast<unsigned long long>(counts.interrupts), static_cast<unsigned long long>(counts.waits), static_cast<unsigned long long>(counts.waitsFromTable), static_cast<unsigned long long>(counts.waitsFromGuest), static_cast<unsigned long long>(counts.waitPolls), static_cast<unsigned long long>(counts.copies), static_cast<unsigned long long>(counts.copiesOnCpu), static_cast<unsigned long long>(totals().runTimeStores.load()), static_cast<unsigned long long>(totals().runTimeRefused.load()), static_cast<unsigned long long>(totals().sampleDumps.load()), static_cast<unsigned long long>(totals().seals.load()), static_cast<unsigned long long>(counts.flips), static_cast<unsigned long long>(totals().guarded.load()), static_cast<unsigned long long>(totals().skipped.load()), static_cast<unsigned long long>(totals().conditionsRead.load()), static_cast<unsigned long long>(totals().predicated.load()), static_cast<unsigned long long>(totals().idleReaps.load()));
     return text;
 }
 

@@ -309,7 +309,7 @@ public:
             return;
         }
         if (!IsDraw(operation.kind)) {
-            if (Loop::OwnsLoop() && operation.kind != OpKind::Marker) Loop::QueueFor(operation.queue).Push(loopItem(operation, nullptr, state));
+            if (Loop::OwnsLoop()) Loop::QueueFor(operation.queue).Push(loopItem(operation, nullptr, state));
             return;
         }
         std::shared_ptr<const ResolvedDraw> draw;

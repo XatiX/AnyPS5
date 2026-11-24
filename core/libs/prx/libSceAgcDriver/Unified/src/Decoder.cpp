@@ -41,6 +41,14 @@ std::uint8_t touchedBanks(std::span<const std::uint32_t> packet, std::uint32_t o
     }
 }
 
+bool sealsPassWrites(std::span<const std::uint32_t> packet) {
+    if (packet.size() < 2) return false;
+    switch (packet[1] & 0x3fu) {
+        case 0x07: case 0x0f: case 0x10: case 0x16: case 0x2a: case 0x2c: case 0x2e: case 0x31: return true;
+        default: return false;
+    }
+}
+
 bool executesWithoutMemory(std::span<const std::uint32_t> packet, std::uint32_t opcode) {
     switch (opcode) {
         case 0x10: {
@@ -159,7 +167,11 @@ private:
                     store(packet, opcode);
                     return;
                 }
+                if (sealsPassWrites(packet)) emit(OpKind::Marker, 0, 0, 0);
                 break;
+            case 0x58:
+                emit(OpKind::Marker, 0, 0, 0);
+                return;
             default: break;
         }
         if (changesStateFromMemory(packet, opcode)) {
