@@ -3263,6 +3263,9 @@ int VulkanDevice::WriteLabelOnGpu(std::uint64_t address, std::span<const std::by
     // Debug aid: APS5_LABEL_REAP_ALL_QUEUES=1 reaps on every queue as before.
     static const bool reapAllQueues = std::getenv("APS5_LABEL_REAP_ALL_QUEUES") != nullptr;
     if (reapFirst && (queue == 0 || reapAllQueues) && OpportunisticReap()) recorder.Reap();
+#if ANYPS5_UNIFIED
+    if (Unified::Record::StoresToMirror(bytes.size(), address)) return Unified::Record::StoreToMirror(recorder, address, bytes, stamp, queue);
+#endif
     if (recorder.Idle()) return 1;
     static const bool drain = std::getenv("APS5_DRAIN_COMPLETION_LABELS") != nullptr;
     const auto context = graphicsContext();
@@ -3373,6 +3376,18 @@ bool VulkanDevice::AfterRecordedWork(std::function<void()> action, bool reapFirs
 
 void VulkanDevice::NoteHtileMask(const Graphics::HtileMaskClear& clear) const {
     Graphics::NoteHtileMaskOnGpu(graphicsContext(), clear);
+}
+
+bool VulkanDevice::CopyInMirror(std::span<const std::uint32_t> packet) {
+#if ANYPS5_UNIFIED
+    const auto copy = Unified::Record::MirrorCopyOf(packet);
+    if (!copy || !state->recorder) return false;
+    if (OpportunisticReap()) state->recorder->Reap();
+    return Unified::Record::CopyInMirror(graphicsContext(), *state->recorder, *copy);
+#else
+    static_cast<void>(packet);
+    return false;
+#endif
 }
 
 bool VulkanDevice::DumpSamplesOnGpu(std::uint64_t address, std::uint32_t blocks) {

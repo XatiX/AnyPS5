@@ -54,6 +54,7 @@
 #include <numeric>
 #include <optional>
 #include <set>
+#include <tuple>
 #include <unordered_map>
 #include <thread>
 
@@ -415,6 +416,14 @@ std::atomic<std::uint64_t> flipsWithoutRecords{0};
 std::atomic<std::uint32_t> flipNotes{0};
 std::atomic<std::uint32_t> flipMemoryNotes{0};
 std::atomic<std::uint64_t> sampleDumpsLanded{0};
+std::atomic<std::uint64_t> storesToMirror{0};
+std::atomic<std::uint64_t> storesBesideMirror{0};
+std::atomic<std::uint64_t> storesAtOnce{0};
+std::atomic<std::uint64_t> copiesInMirror{0};
+std::atomic<std::uint64_t> copiesBesideMirror{0};
+std::atomic<std::uint64_t> storeLandings{0};
+std::atomic<std::uint64_t> storeLandingNanoseconds{0};
+std::atomic<std::uint64_t> storeLandingMaxNanoseconds{0};
 
 bool argumentCensusOn() {
     static const bool on = std::getenv("APS5_RECODE_ARGUMENT_CENSUS") != nullptr;
@@ -440,6 +449,17 @@ void printExistingPackets() {
         char text[64];
         std::snprintf(text, sizeof(text), " q%llx:0x%02llx %llu", static_cast<unsigned long long>(key >> 32u), static_cast<unsigned long long>((key >> 8u) & 0xffu), static_cast<unsigned long long>(count));
         line += text;
+    }
+    char totals[320];
+    std::snprintf(totals, sizeof(totals), "; recode stores into the mirror %llu, outside it %llu, at once (nothing in flight) %llu; copies in the mirror %llu, outside it %llu; occlusion dumps %llu (whole run)", static_cast<unsigned long long>(storesToMirror.load()), static_cast<unsigned long long>(storesBesideMirror.load()), static_cast<unsigned long long>(storesAtOnce.load()), static_cast<unsigned long long>(copiesInMirror.load()), static_cast<unsigned long long>(copiesBesideMirror.load()), static_cast<unsigned long long>(sampleDumpsLanded.load()));
+    line += totals;
+    const auto landed = storeLandings.exchange(0);
+    const auto landedNanoseconds = storeLandingNanoseconds.exchange(0);
+    const auto landedMax = storeLandingMaxNanoseconds.exchange(0);
+    if (landed != 0u) {
+        char delay[160];
+        std::snprintf(delay, sizeof(delay), "; store landings since the last line %llu, %.1f us average and %.1f ms longest from recording to landing", static_cast<unsigned long long>(landed), static_cast<double>(landedNanoseconds) / static_cast<double>(landed) / 1e3, static_cast<double>(landedMax) / 1e6);
+        line += delay;
     }
     std::fprintf(stderr, "%s\n", line.c_str());
     existingPackets.clear();
@@ -4533,15 +4553,224 @@ bool DumpSamplesToMirror(const Context& context, Graphics::Recorder& recorder, s
     LandAfterBatch(recorder, [buffer, offset, address, bytes] {
         buffer->Invalidate();
         MemoryCore::Get().LandGpuWrite(address, std::span<const std::byte>(buffer->Bytes().data() + offset, static_cast<std::size_t>(bytes)));
+        static const long traced = [] {
+            const char* value = std::getenv("APS5_RECODE_TRACE_DUMP_VALUES");
+            return value != nullptr ? std::strtol(value, nullptr, 0) : 0L;
+        }();
+        static std::atomic<long> lines{0};
+        if (traced > 0 && elapsed(processStart()) > 60'000'000'000ull && lines.fetch_add(1, std::memory_order_relaxed) < traced) {
+            std::string line;
+            const auto* values = reinterpret_cast<const std::uint64_t*>(buffer->Bytes().data() + offset);
+            for (std::uint64_t db = 0; db < bytes / 16u + 1u && db < 16u; ++db) {
+                char text[24];
+                std::snprintf(text, sizeof(text), " %llx", static_cast<unsigned long long>(values[db * 2u]));
+                line += text;
+            }
+            std::fprintf(stderr, "[recode-dump-values] 0x%llx per DB:%s\n", static_cast<unsigned long long>(address), line.c_str());
+        }
     });
     sampleDumpsLanded.fetch_add(1, std::memory_order_relaxed);
     return true;
 }
 
-void NoteExistingPacket(std::uint32_t header, std::uint32_t queue) {
-    if (!RecordActive() || !Downgrades::Active()) return;
-    const auto key = (static_cast<std::uint64_t>(queue) << 32u) | (header & 0x0000ff00u);
+int StoreToMirror(Graphics::Recorder& recorder, std::uint64_t address, std::span<const std::byte> bytes, std::uint64_t stamp, std::uint32_t queue) {
+    if (recorder.Idle()) {
+        storesAtOnce.fetch_add(1, std::memory_order_relaxed);
+        return 1;
+    }
+    const auto span = ResidencyService::Get().MirrorSpan(address, bytes.size());
+    if (!span || span->handle == 0u) {
+        storesBesideMirror.fetch_add(1, std::memory_order_relaxed);
+        recorder.NoteLabel(address, bytes, stamp, queue);
+        LandAfterBatch(recorder, [address, stored = std::vector<std::byte>(bytes.begin(), bytes.end())] { MemoryCore::Get().LandGpuWrite(address, stored); });
+        return 0;
+    }
+    static const char* tracing = std::getenv("APS5_RECODE_TRACE_MIRROR_STORES");
+    static const bool traced = tracing != nullptr;
+    static const bool everyAddress = traced && std::strcmp(tracing, "all") == 0;
+    if (everyAddress) {
+        static std::mutex seenMutex;
+        static std::set<std::uint64_t> seen;
+        std::lock_guard seenLock(seenMutex);
+        if (seen.size() < 400u && seen.insert(address).second) {
+            std::uint64_t value = 0;
+            std::memcpy(&value, bytes.data(), std::min<std::size_t>(bytes.size(), sizeof(value)));
+            std::fprintf(stderr, "[recode-mirror-store] %.2f s q%u 0x%llx+0x%llx first value 0x%llx\n", static_cast<double>(elapsed(processStart())) / 1e9, queue, static_cast<unsigned long long>(address), static_cast<unsigned long long>(bytes.size()), static_cast<unsigned long long>(value));
+        }
+    } else if (traced && bytes.size() >= 16u) {
+        static std::atomic<std::uint32_t> lines{0};
+        if (lines.fetch_add(1, std::memory_order_relaxed) < 300u) {
+            std::uint32_t words[4] = {};
+            std::memcpy(words, bytes.data(), sizeof(words));
+            std::fprintf(stderr, "[recode-mirror-store] %.2f s q%u 0x%llx+0x%llx words %08x %08x %08x %08x\n", static_cast<double>(elapsed(processStart())) / 1e9, queue, static_cast<unsigned long long>(address), static_cast<unsigned long long>(bytes.size()), words[0], words[1], words[2], words[3]);
+        }
+    }
+    recorder.RecordStore(reinterpret_cast<VkBuffer>(static_cast<std::uintptr_t>(span->handle)), static_cast<VkDeviceSize>(span->offset), bytes, address);
+    const std::array written{std::pair{address, address + bytes.size()}};
+    static const bool unmarked = std::getenv("APS5_RECODE_MIRROR_STORES_UNMARKED") != nullptr;
+    std::uint64_t sequence = 0;
+    if (!unmarked) {
+        Shadow::NoteGpuWrites(written);
+        static const bool takesDirty = std::getenv("APS5_RECODE_MIRROR_STORES_KEEP_DIRTY") == nullptr;
+        const auto mark = MemoryCore::Get().NoteGpuWrite(address, bytes.size(), recorder.OpenBatchSerial(), takesDirty);
+        if (!mark.upload.empty()) ResidencyService::Get().NoteDirty(mark.upload);
+        sequence = mark.sequence;
+    }
+    Events::NoteRanges(written);
+    recorder.NoteLabel(address, bytes, stamp, queue);
+    LandAfterBatch(recorder, [address, sequence, recorded = std::chrono::steady_clock::now(), stored = std::vector<std::byte>(bytes.begin(), bytes.end())] {
+        auto& core = MemoryCore::Get();
+        core.LandGpuWrite(address, stored);
+        core.ReleaseLandedWrite(address, stored.size(), sequence);
+        const auto waited = elapsed(recorded);
+        storeLandingNanoseconds.fetch_add(waited, std::memory_order_relaxed);
+        storeLandings.fetch_add(1, std::memory_order_relaxed);
+        auto seen = storeLandingMaxNanoseconds.load(std::memory_order_relaxed);
+        while (waited > seen && !storeLandingMaxNanoseconds.compare_exchange_weak(seen, waited, std::memory_order_relaxed)) {
+        }
+    });
+    storesToMirror.fetch_add(1, std::memory_order_relaxed);
+    return 0;
+}
+
+std::optional<Pm4::MemoryCopy> MirrorCopyOf(std::span<const std::uint32_t> packet) {
+    if (packet.empty() || !StoresToMirror(0, 0)) return std::nullopt;
+    const auto opcode = (packet[0] >> 8u) & 0xffu;
+    if (opcode == 0x50) {
+        const auto copy = Pm4::DecodeMemoryCopy(packet);
+        if (!copy || !StoresToMirror(copy->bytes, copy->destination)) return std::nullopt;
+        return copy;
+    }
+    if (opcode != 0x40 || packet.size() < 6 || Pm4::CopyDataToRegister(packet)) return std::nullopt;
+    const auto source = Pm4::CopyDataSource(packet);
+    const auto destination = Pm4::CopyDataDestination(packet);
+    if ((source != 2 && source != 4) || (destination != 2 && destination != 4)) return std::nullopt;
+    const Pm4::MemoryCopy copy{packet[2] | (static_cast<std::uint64_t>(packet[3]) << 32u), packet[4] | (static_cast<std::uint64_t>(packet[5]) << 32u), Pm4::CopyDataBytes(packet)};
+    if (!StoresToMirror(copy.bytes, copy.destination)) return std::nullopt;
+    return copy;
+}
+
+bool CopyInMirror(const Context& context, Graphics::Recorder& recorder, const Pm4::MemoryCopy& copy) {
+    auto& residency = ResidencyService::Get();
+    const auto from = residency.MirrorSpan(copy.source, copy.bytes);
+    const auto to = residency.MirrorSpan(copy.destination, copy.bytes);
+    if (!from || !to || from->handle == 0u || to->handle == 0u) {
+        copiesBesideMirror.fetch_add(1, std::memory_order_relaxed);
+        return false;
+    }
+    if (Shadow::OwnedUploadsPending()) {
+        std::vector<std::shared_ptr<void>> kept;
+        static_cast<void>(Shadow::RecordOwnedUploads(recorder.Commands(), kept));
+        for (auto& object : kept) recorder.Keep(std::move(object));
+    }
+    if (recorder.HasQueuedKeyStores()) recorder.FlushKeyStores();
+    if (recorder.HasQueuedStores()) recorder.FlushStores();
+    auto landing = std::make_shared<Graphics::Buffer>(context, copy.bytes, VK_BUFFER_USAGE_TRANSFER_DST_BIT);
+    const auto commands = recorder.Commands();
+    Graphics::RecordMemoryBarrier(context, commands, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT | VK_PIPELINE_STAGE_HOST_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_ACCESS_SHADER_WRITE_BIT | VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT | VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT | VK_ACCESS_TRANSFER_WRITE_BIT | VK_ACCESS_HOST_WRITE_BIT, VK_ACCESS_TRANSFER_READ_BIT | VK_ACCESS_TRANSFER_WRITE_BIT);
+    const auto record = context.Function<PFN_vkCmdCopyBuffer>("vkCmdCopyBuffer");
+    const auto source = reinterpret_cast<VkBuffer>(static_cast<std::uintptr_t>(from->handle));
+    const auto destination = reinterpret_cast<VkBuffer>(static_cast<std::uintptr_t>(to->handle));
+    const VkBufferCopy inMirror{from->offset, to->offset, copy.bytes};
+    record(commands, source, destination, 1, &inMirror);
+    const VkBufferCopy toLanding{from->offset, 0, copy.bytes};
+    record(commands, source, landing->Handle(), 1, &toLanding);
+    Graphics::RecordMemoryBarrier(context, commands, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT | VK_PIPELINE_STAGE_HOST_BIT, VK_ACCESS_TRANSFER_WRITE_BIT, VK_ACCESS_MEMORY_READ_BIT | VK_ACCESS_MEMORY_WRITE_BIT | VK_ACCESS_HOST_READ_BIT);
+    recorder.Keep(landing);
+    const std::array written{std::pair{copy.destination, copy.destination + copy.bytes}};
+    Shadow::NoteGpuWrites(written);
+    const auto mark = MemoryCore::Get().NoteGpuWrite(copy.destination, copy.bytes, recorder.OpenBatchSerial());
+    if (!mark.upload.empty()) ResidencyService::Get().NoteDirty(mark.upload);
+    Events::NoteRanges(written);
+    LandAfterBatch(recorder, [landing, sequence = mark.sequence, address = copy.destination, bytes = copy.bytes] {
+        landing->Invalidate();
+        auto& core = MemoryCore::Get();
+        core.LandGpuWrite(address, std::span<const std::byte>(landing->Bytes().data(), bytes));
+        core.ReleaseLandedWrite(address, bytes, sequence);
+    });
+    copiesInMirror.fetch_add(1, std::memory_order_relaxed);
+    return true;
+}
+
+bool StoresToMirror(std::size_t bytes, std::uint64_t address) {
+    static const bool stores = RecordActive() && std::getenv("APS5_RECODE_MIRROR_STORES") != nullptr;
+    static const std::size_t smallest = [] {
+        const char* value = std::getenv("APS5_RECODE_MIRROR_STORES_FROM");
+        return value != nullptr ? static_cast<std::size_t>(std::strtoull(value, nullptr, 0)) : std::size_t{0};
+    }();
+    static const std::pair<std::uint64_t, std::uint64_t> range = [] {
+        const char* value = std::getenv("APS5_RECODE_MIRROR_STORES_RANGE");
+        if (value == nullptr) return std::pair<std::uint64_t, std::uint64_t>{0u, ~0ull};
+        const char* colon = std::strchr(value, ':');
+        return std::pair<std::uint64_t, std::uint64_t>{std::strtoull(value, nullptr, 16), colon != nullptr ? std::strtoull(colon + 1, nullptr, 16) : ~0ull};
+    }();
+    static const std::pair<std::uint64_t, std::uint64_t> skipped = [] {
+        const char* value = std::getenv("APS5_RECODE_MIRROR_STORES_SKIP");
+        if (value == nullptr) return std::pair<std::uint64_t, std::uint64_t>{0u, 0u};
+        const char* colon = std::strchr(value, ':');
+        return std::pair<std::uint64_t, std::uint64_t>{std::strtoull(value, nullptr, 16), colon != nullptr ? std::strtoull(colon + 1, nullptr, 16) : ~0ull};
+    }();
+    const bool skip = address != 0u && address >= skipped.first && address < skipped.second;
+    return stores && !skip && bytes >= smallest && (address == 0u || (address >= range.first && address < range.second));
+}
+
+static void censusMemoryPacket(std::span<const std::uint32_t> packet, std::uint32_t queue, std::uint32_t opcode) {
+    static const char* filter = std::getenv("APS5_RECODE_PACKET_CENSUS");
+    if (filter == nullptr) return;
+    std::uint64_t source = 0;
+    std::uint64_t destination = 0;
+    std::uint64_t bytes = 0;
+    std::uint32_t sourceSelect = 0;
+    std::uint32_t destinationSelect = 0;
+    if (opcode == 0x40 && packet.size() >= 6) {
+        sourceSelect = Pm4::CopyDataSource(packet);
+        destinationSelect = Pm4::CopyDataDestination(packet);
+        if (Pm4::CopyDataToRegister(packet)) return;
+        source = packet[2] | (static_cast<std::uint64_t>(packet[3]) << 32u);
+        destination = packet[4] | (static_cast<std::uint64_t>(packet[5]) << 32u);
+        bytes = Pm4::CopyDataBytes(packet);
+    } else if (opcode == 0x37 && packet.size() >= 5) {
+        destinationSelect = (packet[1] >> 8u) & 0xfu;
+        destination = packet[2] | (static_cast<std::uint64_t>(packet[3]) << 32u);
+        bytes = (packet.size() - 4u) * 4u;
+    } else if (opcode == 0x50 && packet.size() >= 7) {
+        sourceSelect = (packet[1] >> 29u) & 3u;
+        destinationSelect = (packet[1] >> 20u) & 3u;
+        source = packet[2] | (static_cast<std::uint64_t>(packet[3]) << 32u);
+        destination = packet[4] | (static_cast<std::uint64_t>(packet[5]) << 32u);
+        bytes = packet[6] & 0x3ffffffu;
+    } else {
+        return;
+    }
+    if (*filter != '\0') {
+        const auto low = std::strtoull(filter, nullptr, 16);
+        const char* colon = std::strchr(filter, ':');
+        const auto high = colon != nullptr ? std::strtoull(colon + 1, nullptr, 16) : low + 0x100000u;
+        const bool touches = (destination < high && destination + bytes > low) || (source != 0 && source < high && source + bytes > low);
+        if (!touches) return;
+    }
+    static std::mutex mutex;
+    static std::map<std::tuple<std::uint32_t, std::uint32_t, std::uint32_t, std::uint64_t, std::uint64_t>, std::uint64_t> seen;
+    static std::uint64_t lines = 0;
+    const auto key = std::tuple{opcode, sourceSelect, destinationSelect, source >> 8u, destination >> 8u};
+    std::lock_guard lock(mutex);
+    if (seen[key]++ != 0 || lines >= 400) return;
+    ++lines;
+    const auto& pages = MemoryCore::Get().Pages();
+    const bool sourceGpu = source != 0 && bytes != 0 && pages.GpuWrittenIn(source, bytes);
+    const bool destinationGpu = destination != 0 && bytes != 0 && pages.GpuWrittenIn(destination, bytes);
+    std::uint64_t sourceValue = 0;
+    if (source != 0 && GuestMemory::Accessible(reinterpret_cast<const void*>(static_cast<std::uintptr_t>(source)), 8, false)) std::memcpy(&sourceValue, reinterpret_cast<const void*>(static_cast<std::uintptr_t>(source)), 8);
+    std::fprintf(stderr, "[recode-packet-census] q%u %s src sel %u 0x%llx (gpu-written %d, guest 0x%016llx) dst sel %u 0x%llx+0x%llx (gpu-written %d) word1 0x%08x data0 0x%08x\n", queue, opcode == 0x40 ? "COPY_DATA" : opcode == 0x37 ? "WRITE_DATA" : "DMA_DATA", sourceSelect, static_cast<unsigned long long>(source), sourceGpu ? 1 : 0, static_cast<unsigned long long>(sourceValue), destinationSelect, static_cast<unsigned long long>(destination), static_cast<unsigned long long>(bytes), destinationGpu ? 1 : 0, packet[1], packet.size() > 4 ? packet[4] : 0u);
+}
+
+void NoteExistingPacket(std::span<const std::uint32_t> packet, std::uint32_t queue) {
+    if (!RecordActive() || packet.empty()) return;
+    const auto header = packet[0];
     const auto opcode = (header >> 8u) & 0xffu;
+    censusMemoryPacket(packet, queue, opcode);
+    if (!Downgrades::Active()) return;
+    const auto key = (static_cast<std::uint64_t>(queue) << 32u) | (header & 0x0000ff00u);
     const char* served = nullptr;
     switch (opcode) {
         case 0x37: served = "WRITE_DATA"; break;

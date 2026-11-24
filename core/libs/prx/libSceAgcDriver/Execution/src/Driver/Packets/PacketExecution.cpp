@@ -313,7 +313,7 @@ void Driver::execute(Submission& submission) {
         const auto packet = std::span(submission.commands).subspan(cursor, count);
         const auto opcode = (header >> 8u) & 0xffu;
 #if ANYPS5_UNIFIED
-        Unified::Record::NoteExistingPacket(header, submission.queue);
+        Unified::Record::NoteExistingPacket(packet, submission.queue);
 #endif
         if (executingPacket != nullptr) executingPacket->store((static_cast<std::uint64_t>(cursor + 1) << 8u) | opcode, std::memory_order_relaxed);
         auto nextCursor = cursor + count;

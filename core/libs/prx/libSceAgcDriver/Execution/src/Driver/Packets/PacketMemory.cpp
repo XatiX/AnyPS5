@@ -13,6 +13,9 @@
 #include "prx/libSceAgcDriver/Graphics/include/MultisampleTarget.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/Texture.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/UnitShadow.hpp"
+#if ANYPS5_UNIFIED
+#include "prx/libSceAgcDriver/Unified/include/DrawRecorder.hpp"
+#endif
 #include <algorithm>
 #include <bit>
 #include <cstdlib>
@@ -159,7 +162,19 @@ bool Driver::preparePacketMemory(const Submission& submission, QueueState& queue
     }
 
     static const bool cpuStores = std::getenv("APS5_CPU_STORES") != nullptr;
-    if (!drainAll && !cpuStores && (opcode == 0x40 || opcode == 0x50 || opcode == 0x83)) {
+    bool copiedInMirror = false;
+#if ANYPS5_UNIFIED
+    if (!drainAll && (opcode == 0x40 || opcode == 0x50) && Unified::Record::MirrorCopyOf(packet)) {
+        GuestMemory::TagGpuLockSite(GuestMemory::GpuLockSite::Copy);
+        std::lock_guard gpuLock(GuestMemory::GpuMutex());
+        if (const auto localDevice = device.Load()) {
+            recordDeferredLabels(localDevice.get(), submission.queue);
+            copiedInMirror = localDevice->CopyInMirror(packet);
+        }
+        wroteOnGpu = copiedInMirror;
+    }
+#endif
+    if (!copiedInMirror && !drainAll && !cpuStores && (opcode == 0x40 || opcode == 0x50 || opcode == 0x83)) {
         constexpr std::size_t gpuStoreLimit = 65536;
         bool drained = true;
         const auto copy = opcode == 0x50 ? decodeCopy(packet) : std::nullopt;

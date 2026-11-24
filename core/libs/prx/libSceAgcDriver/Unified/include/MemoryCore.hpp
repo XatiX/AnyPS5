@@ -64,6 +64,7 @@ struct GpuWriteMark {
     std::vector<DirtyRange> owned;
     std::vector<DirtyRange> open;
     std::vector<DirtyRange> upload;
+    std::uint64_t sequence = 0;
 };
 
 class MemoryHost {
@@ -117,6 +118,7 @@ public:
     void SetHost(MemoryHost* next);
     GpuWriteMark NoteGpuWrite(std::uint64_t address, std::uint64_t size, std::uint64_t serial, bool takeDirty = true);
     void NoteLandedGpuWrite(std::uint64_t address, std::uint64_t size, std::uint64_t serial);
+    void ReleaseLandedWrite(std::uint64_t address, std::uint64_t size, std::uint64_t sequence);
     void LandDiff(std::uint64_t address, std::span<const std::byte> before, std::span<const std::byte> after, std::uint64_t serial);
     void FlushGpuWrites(std::uint64_t address, std::uint64_t size);
     void LandAhead();

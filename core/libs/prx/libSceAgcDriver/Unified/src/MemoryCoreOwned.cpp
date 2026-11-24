@@ -52,7 +52,7 @@ void MemoryCore::SetHost(MemoryHost* next) {
 GpuWriteMark MemoryCore::NoteGpuWrite(std::uint64_t address, std::uint64_t size, std::uint64_t serial, bool takeDirty) {
     GpuWriteMark mark;
     if (size == 0) return mark;
-    written.Note(address, size, serial);
+    mark.sequence = written.Note(address, size, serial);
     auto* current = host.load(std::memory_order_acquire);
     if (current != nullptr && current->PatientView(address, static_cast<std::size_t>(size)) != nullptr) {
         takeViewed(mark, address, size, takeDirty);
@@ -118,6 +118,10 @@ void MemoryCore::leaveUnviewed(GpuWriteMark& mark, std::uint64_t address, std::u
 void MemoryCore::NoteLandedGpuWrite(std::uint64_t address, std::uint64_t size, std::uint64_t serial) {
     if (size == 0) return;
     written.Take(address, size, serial);
+}
+
+void MemoryCore::ReleaseLandedWrite(std::uint64_t address, std::uint64_t size, std::uint64_t sequence) {
+    static_cast<void>(written.TakeNoted(address, size, sequence));
 }
 
 void MemoryCore::LandDiff(std::uint64_t address, std::span<const std::byte> before, std::span<const std::byte> after, std::uint64_t serial) {

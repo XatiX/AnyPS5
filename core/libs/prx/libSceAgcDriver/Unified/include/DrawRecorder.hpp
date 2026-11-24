@@ -41,7 +41,11 @@ struct DisplaySource {
 [[nodiscard]] bool PresentsExistingResidents();
 void NoteSampleDumpBefore(std::uint64_t address);
 [[nodiscard]] bool DumpSamplesToMirror(const Graphics::Context& context, Graphics::Recorder& recorder, std::uint64_t address, std::uint64_t bytes, std::uint32_t blocks);
-void NoteExistingPacket(std::uint32_t header, std::uint32_t queue);
+[[nodiscard]] bool StoresToMirror(std::size_t bytes, std::uint64_t address);
+[[nodiscard]] std::optional<Pm4::MemoryCopy> MirrorCopyOf(std::span<const std::uint32_t> packet);
+[[nodiscard]] bool CopyInMirror(const Graphics::Context& context, Graphics::Recorder& recorder, const Pm4::MemoryCopy& copy);
+[[nodiscard]] int StoreToMirror(Graphics::Recorder& recorder, std::uint64_t address, std::span<const std::byte> bytes, std::uint64_t stamp, std::uint32_t queue);
+void NoteExistingPacket(std::span<const std::uint32_t> packet, std::uint32_t queue);
 [[nodiscard]] bool LandingsPending();
 [[nodiscard]] bool RecordsHtileClears();
 void LandAfterBatch(Graphics::Recorder& recorder, std::function<void()> landing);
