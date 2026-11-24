@@ -4741,20 +4741,81 @@ bool RecordsHtileClears() {
     return Images::DepthRecordsOn() && Images::HtileClearsOn();
 }
 
+void runLanding(const std::function<void()>& landing) {
+    const auto started = std::chrono::steady_clock::now();
+    try {
+        landing();
+    } catch (const std::exception& error) {
+        std::fprintf(stderr, "[recode-landings] a landing after its batch failed: %s\n", error.what());
+    }
+    StageCosts::Note(StageCosts::Stage::HostCopy, elapsed(started));
+    batchLandings().pending.fetch_sub(1, std::memory_order_acq_rel);
+}
+
+struct HostCopies {
+    std::mutex mutex;
+    std::condition_variable wake;
+    std::condition_variable drained;
+    std::deque<std::function<void()>> queue;
+    bool running = false;
+    bool started = false;
+};
+
+HostCopies& hostCopies() {
+    static auto& copies = *new HostCopies();
+    return copies;
+}
+
+bool usesHostCopyThread() {
+    static const bool uses = std::getenv("APS5_RECODE_HOST_COPY_THREAD") != nullptr;
+    return uses;
+}
+
+void hostCopyLoop() {
+    auto& copies = hostCopies();
+    std::unique_lock lock(copies.mutex);
+    for (;;) {
+        copies.wake.wait(lock, [&] { return !copies.queue.empty(); });
+        auto landing = std::move(copies.queue.front());
+        copies.queue.pop_front();
+        copies.running = true;
+        lock.unlock();
+        runLanding(landing);
+        lock.lock();
+        copies.running = false;
+        if (copies.queue.empty()) copies.drained.notify_all();
+    }
+}
+
+void queueHostCopy(std::function<void()> landing) {
+    auto& copies = hostCopies();
+    {
+        std::lock_guard lock(copies.mutex);
+        copies.queue.push_back(std::move(landing));
+        if (!copies.started) {
+            copies.started = true;
+            std::thread(hostCopyLoop).detach();
+        }
+    }
+    copies.wake.notify_one();
+}
+
+void DrainHostCopies() {
+    if (!usesHostCopyThread()) return;
+    auto& copies = hostCopies();
+    std::unique_lock lock(copies.mutex);
+    copies.drained.wait(lock, [&] { return copies.queue.empty() && !copies.running; });
+}
+
 void LandAfterBatch(Graphics::Recorder& recorder, std::function<void()> landing) {
     auto& landings = batchLandings();
     landings.pending.fetch_add(1, std::memory_order_acq_rel);
     landings.scheduled.fetch_add(1, std::memory_order_relaxed);
-    recorder.OnComplete([landing = std::move(landing)] {
-        const auto started = std::chrono::steady_clock::now();
-        try {
-            landing();
-        } catch (const std::exception& error) {
-            std::fprintf(stderr, "[recode-landings] a landing after its batch failed: %s\n", error.what());
-        }
-        StageCosts::Note(StageCosts::Stage::HostCopy, elapsed(started));
-        batchLandings().pending.fetch_sub(1, std::memory_order_acq_rel);
-    });
+    if (usesHostCopyThread()) {
+        recorder.OnComplete([landing = std::move(landing)]() mutable { queueHostCopy(std::move(landing)); });
+        return;
+    }
+    recorder.OnComplete([landing = std::move(landing)] { runLanding(landing); });
 }
 
 std::optional<DisplaySource> DisplayRecord(std::uint64_t address, std::uint64_t bytes) {
@@ -4833,6 +4894,7 @@ void DeviceReplaced(const Context& context, Graphics::Recorder& recorder) {
     if (!RecordActive()) return;
     const auto written = shared().WriteBackAll(context, recorder);
     recorder.Sync();
+    DrainHostCopies();
     auto& core = MemoryCore::Get();
     std::uint64_t landed = 0;
     for (const auto& piece : core.Written().In(0u, MirrorWindow())) {
