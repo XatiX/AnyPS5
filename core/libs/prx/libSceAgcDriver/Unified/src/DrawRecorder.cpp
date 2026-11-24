@@ -166,11 +166,14 @@ void watchHangMarks() {
         if (seen == shown) {
             if (++still == 4u) {
                 std::uint32_t finished = 0;
+                std::uint32_t phase = 0;
                 {
                     std::lock_guard lock(marks.mutex);
                     std::memcpy(&finished, marks.buffer->Bytes().data() + 4, sizeof(finished));
+                    std::memcpy(&phase, marks.buffer->Bytes().data() + 8, sizeof(phase));
                 }
-                std::fprintf(stderr, "[recode-hang-mark] the GPU has not passed dispatch %u for 1 s (%s): program %016llx, %llu groups%s\n", seen, finished == seen ? "that dispatch finished, the stall is in later work" : "that dispatch did not finish", static_cast<unsigned long long>(program.first), static_cast<unsigned long long>(program.second), inputs.c_str());
+                static constexpr std::array<const char*, 3> phases{"none", "before the store flush", "before the owned uploads"};
+                std::fprintf(stderr, "[recode-hang-mark] the GPU has not passed dispatch %u for 1 s (%s; last phase mark: item %u %s): program %016llx, %llu groups%s\n", seen, finished == seen ? "that dispatch finished, the stall is in later work" : "that dispatch did not finish", phase >> 4u, phases[std::min<std::uint32_t>(phase & 15u, 2u)], static_cast<unsigned long long>(program.first), static_cast<unsigned long long>(program.second), inputs.c_str());
             }
             continue;
         }
@@ -182,6 +185,22 @@ void watchHangMarks() {
 bool hangMarking() {
     static const bool marking = std::getenv("APS5_RECODE_HANG_MARKS") != nullptr;
     return marking;
+}
+
+void markHangPhase(const Context& context, Graphics::Recorder& recorder, std::uint32_t phase) {
+    if (!hangMarking()) return;
+    auto& marks = hangMarks();
+    std::uint32_t value = 0;
+    std::shared_ptr<Graphics::Buffer> buffer;
+    {
+        std::lock_guard lock(marks.mutex);
+        value = (marks.next << 4u) | phase;
+        buffer = marks.buffer;
+    }
+    if (buffer == nullptr) return;
+    const auto commands = recorder.Commands();
+    Graphics::RecordMemoryBarrier(context, commands, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_ACCESS_MEMORY_WRITE_BIT, VK_ACCESS_TRANSFER_WRITE_BIT);
+    context.Function<PFN_vkCmdFillBuffer>("vkCmdFillBuffer")(commands, buffer->Handle(), 8, 4, value);
 }
 
 void finishHangMark(const Context& context, VkCommandBuffer commands) {
@@ -3389,8 +3408,10 @@ private:
             return false;
         }
 
+        markHangPhase(context, *recorder, 1u);
         if (recorder->HasQueuedKeyStores()) recorder->FlushKeyStores();
         if (recorder->HasQueuedStores()) recorder->FlushStores();
+        markHangPhase(context, *recorder, 2u);
         if (Shadow::OwnedUploadsPending()) {
             std::vector<std::shared_ptr<void>> kept;
             if (Shadow::RecordOwnedUploads(recorder->Commands(), kept) != 0u) totals.residencyLands++;
@@ -4130,8 +4151,10 @@ private:
         }
         split(4);
 
+        markHangPhase(context, *recorder, 1u);
         if (recorder->HasQueuedKeyStores()) recorder->FlushKeyStores();
         if (recorder->HasQueuedStores()) recorder->FlushStores();
+        markHangPhase(context, *recorder, 2u);
         if (Shadow::OwnedUploadsPending()) {
             phase = std::chrono::steady_clock::now();
             std::vector<std::shared_ptr<void>> kept;
