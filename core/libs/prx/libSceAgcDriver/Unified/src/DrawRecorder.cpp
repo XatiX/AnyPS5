@@ -1464,7 +1464,38 @@ public:
         if (import != nullptr) read(import->buffer, Graphics::HostImportOffset(*import, address), "arguments-in-import");
     }
 
+    void traceSmallReads(const Resolve::ResolvedDraw& work) {
+        static const char* listed = std::getenv("APS5_RECODE_TRACE_READS");
+        if (listed == nullptr || work.stages.empty()) return;
+        const auto hash = Downgrades::ProgramHash(work.stages.back().program.codeAddress);
+        if (!Downgrades::ListedHash(listed, hash)) return;
+        static std::atomic<std::uint32_t> lines{0};
+        if (lines.fetch_add(1, std::memory_order_relaxed) >= 20000u) return;
+        std::string line;
+        char text[160];
+        std::snprintf(text, sizeof(text), "[recode-reads] %.3f s %016llx:", static_cast<double>(elapsed(processStart())) / 1e9, static_cast<unsigned long long>(hash));
+        line += text;
+        for (std::size_t index = 0; index < work.uses.size() && index < work.imageBegin; ++index) {
+            const auto& use = work.uses[index];
+            if (use.write || use.size == 0u || use.size > 64u) continue;
+            std::snprintf(text, sizeof(text), " 0x%llx:", static_cast<unsigned long long>(use.address));
+            line += text;
+            if (!Protector::Readable(use.address) || !Protector::Readable(use.address + use.size - 1u)) {
+                line += " unreadable";
+                continue;
+            }
+            for (std::uint64_t at = 0; at + 8u <= use.size; at += 8u) {
+                std::uint64_t value = 0;
+                std::memcpy(&value, reinterpret_cast<const void*>(static_cast<std::uintptr_t>(use.address + at)), sizeof(value));
+                std::snprintf(text, sizeof(text), " %llx", static_cast<unsigned long long>(value));
+                line += text;
+            }
+        }
+        std::fprintf(stderr, "%s\n", line.c_str());
+    }
+
     void noteUses(const Resolve::ResolvedDraw& work, const char* what) {
+        traceSmallReads(work);
         traceSourceWrites(work);
         if (!Downgrades::Active() || work.stages.empty()) return;
         const auto code = work.stages.back().program.codeAddress;
@@ -4659,6 +4690,22 @@ int StoreToMirror(const Context& context, Graphics::Recorder& recorder, std::uin
         recorder.RecordStore(imported->buffer, imported->offset, bytes, address);
         recorder.NoteLabel(address, bytes, stamp, queue);
         storesThroughImports.fetch_add(1, std::memory_order_relaxed);
+        static const std::pair<std::uint64_t, std::uint64_t> tracedRange = [] {
+            const char* value = std::getenv("APS5_RECODE_TRACE_STORE_RANGE");
+            if (value == nullptr) return std::pair<std::uint64_t, std::uint64_t>{0u, 0u};
+            const char* colon = std::strchr(value, ':');
+            return std::pair<std::uint64_t, std::uint64_t>{std::strtoull(value, nullptr, 16), colon != nullptr ? std::strtoull(colon + 1, nullptr, 16) : ~0ull};
+        }();
+        if (address >= tracedRange.first && address < tracedRange.second) {
+            static std::atomic<std::uint32_t> lines{0};
+            if (lines.fetch_add(1, std::memory_order_relaxed) < 20000u) {
+                std::uint64_t value = 0;
+                std::uint64_t previous = 0;
+                std::memcpy(&value, bytes.data(), std::min<std::size_t>(bytes.size(), sizeof(value)));
+                if (Protector::Readable(address)) std::memcpy(&previous, reinterpret_cast<const void*>(static_cast<std::uintptr_t>(address)), std::min<std::size_t>(bytes.size(), sizeof(previous)));
+                std::fprintf(stderr, "[recode-store] %.3f s q%u 0x%llx+0x%llx value %llx over guest %llx\n", static_cast<double>(elapsed(processStart())) / 1e9, queue, static_cast<unsigned long long>(address), static_cast<unsigned long long>(bytes.size()), static_cast<unsigned long long>(value), static_cast<unsigned long long>(previous));
+            }
+        }
         return 0;
     }
     if (!span || span->handle == 0u) {
