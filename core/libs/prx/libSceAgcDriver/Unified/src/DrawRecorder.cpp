@@ -1823,6 +1823,7 @@ public:
     std::uint64_t WriteBackAll(const Context& context, Graphics::Recorder& recorder) {
         std::lock_guard lock(mutex);
         std::uint64_t written = 0;
+        if (device != context.device) return 0u;
         if (surfaceDetiler == nullptr) surfaceDetiler = std::make_unique<Images::SurfaceDetiler>(context);
         if (auto* table = Resolve::Surfaces(); table != nullptr && ownsImages()) {
             for (const auto& record : table->StaleOverlapping(0u, MirrorWindow())) {
@@ -1853,7 +1854,7 @@ public:
             pipelinesDone.wait(jobs, [&] { return pipelineJobs.empty() && buildingPipelines.empty(); });
         }
         std::lock_guard lock(mutex);
-        if (device != replaced) return;
+        if (device != replaced && device != VK_NULL_HANDLE) return;
         device = VK_NULL_HANDLE;
         attachedDevice.store(VK_NULL_HANDLE, std::memory_order_release);
         ring.reset();
