@@ -2370,6 +2370,7 @@ private:
             }
             if (index < infos.size() && infos[index].written && mirrorPart("writes")) {
                 const auto mapped = mirrorKnownWrite(address, bytes, serial);
+                noteKnownPath(mapped != 0u ? "write-mirror" : "write-refused", address, bytes);
                 if (mapped != 0u) {
                     totals.knownWritten++;
                 } else {
@@ -2382,11 +2383,13 @@ private:
             if (index < infos.size() && infos[index].written) {
                 auto served = bytes;
                 if (const auto direct = directSmallWrite(context, address, bytes); direct != 0u) {
+                    noteKnownPath("write-direct", address, bytes);
                     totals.knownWritten++;
                     write(direct, bytes);
                     continue;
                 }
                 const auto mapped = serveKnownWrite(context, address, served, serial, queueCopyBack(context, address, bytes));
+                noteKnownPath(mapped != 0u ? "write-served" : "write-refused", address, served);
                 if (mapped != 0u) totals.knownWritten++;
                 else totals.knownWriteLookups++;
                 if (mapped == 0u) noteKnown(stage, Downgrades::Kind::KnownWriteRefused, index, address, bytes, 0u);
