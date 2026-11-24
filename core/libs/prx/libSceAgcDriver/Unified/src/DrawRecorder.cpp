@@ -4431,6 +4431,22 @@ std::optional<DisplaySource> DisplayRecord(std::uint64_t address, std::uint64_t 
     return std::nullopt;
 }
 
+bool DumpSamplesToMirror(Graphics::Recorder& recorder, std::uint64_t address, std::uint64_t bytes, std::uint32_t blocks) {
+    const auto span = ResidencyService::Get().MirrorSpan(address, bytes);
+    if (!span || span->address == 0u) {
+        static std::atomic<std::uint32_t> missing{0};
+        if (missing.fetch_add(1, std::memory_order_relaxed) < 8u) std::fprintf(stderr, "[recode-fatal] occlusion dump at 0x%llx+0x%llx dropped: no mirror span\n", static_cast<unsigned long long>(address), static_cast<unsigned long long>(bytes));
+        return false;
+    }
+    if (!recorder.DumpSamples(span->address, address, blocks)) return false;
+    const std::array written{std::pair{address, address + bytes}};
+    Shadow::NoteGpuWrites(written);
+    const auto mark = MemoryCore::Get().NoteGpuWrite(address, bytes, recorder.OpenBatchSerial());
+    if (!mark.upload.empty()) ResidencyService::Get().NoteDirty(mark.upload);
+    Events::NoteRanges(written);
+    return true;
+}
+
 void NoteExistingPacket(std::uint32_t header, std::uint32_t queue) {
     if (!RecordActive() || !Downgrades::Active()) return;
     const auto key = (static_cast<std::uint64_t>(queue) << 32u) | (header & 0x0000ff00u);

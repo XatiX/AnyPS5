@@ -40,6 +40,7 @@ struct DisplaySource {
 [[nodiscard]] std::optional<DisplaySource> DisplayRecord(std::uint64_t address, std::uint64_t bytes);
 [[nodiscard]] bool PresentsExistingResidents();
 void NoteSampleDumpBefore(std::uint64_t address);
+[[nodiscard]] bool DumpSamplesToMirror(Graphics::Recorder& recorder, std::uint64_t address, std::uint64_t bytes, std::uint32_t blocks);
 void NoteExistingPacket(std::uint32_t header, std::uint32_t queue);
 [[nodiscard]] bool LandingsPending();
 [[nodiscard]] bool RecordsHtileClears();
