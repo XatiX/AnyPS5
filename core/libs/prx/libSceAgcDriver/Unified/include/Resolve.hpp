@@ -67,6 +67,7 @@ void Consume(const Operation& operation, const DecodeState& state);
 [[nodiscard]] PacketTable<ResolvedDraw>& ResolvedDraws();
 [[nodiscard]] PacketTable<ResolvedDraw>& ResolvedDispatches();
 [[nodiscard]] const Heap::VulkanHeapDevice* HeapDevice();
+[[nodiscard]] std::shared_ptr<VulkanDevice> AttachedDevice();
 [[nodiscard]] Images::SurfaceTable* Surfaces();
 [[nodiscard]] std::shared_ptr<Images::Surface> BindDeferredRecord(const Heap::SlotRequest& request, std::uint32_t& slot);
 [[nodiscard]] std::shared_ptr<Images::Surface> BindRecordSlot(const Heap::SlotRequest& request, std::shared_ptr<Images::Surface> record, std::uint32_t& slot, std::uint32_t layer = 0);

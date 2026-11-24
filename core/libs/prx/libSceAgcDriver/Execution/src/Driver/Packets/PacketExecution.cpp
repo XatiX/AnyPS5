@@ -25,6 +25,8 @@
 #include <utility>
 #if ANYPS5_UNIFIED
 #include "prx/libSceAgcDriver/Unified/include/DrawRecorder.hpp"
+#include "prx/libSceAgcDriver/Unified/include/RecordLoop.hpp"
+#include "prx/libSceAgcDriver/Unified/include/RecordQueue.hpp"
 #include "prx/libSceAgcDriver/Unified/include/Releases.hpp"
 #include "prx/libSceAgcDriver/Unified/include/Resolve.hpp"
 #include "prx/libSceAgcDriver/Unified/include/Shadow.hpp"
@@ -313,6 +315,19 @@ void Driver::execute(Submission& submission) {
         const auto packet = std::span(submission.commands).subspan(cursor, count);
         const auto opcode = (header >> 8u) & 0xffu;
 #if ANYPS5_UNIFIED
+        if (Unified::Loop::OwnsLoop()) {
+            static const bool hooked = [this] {
+                Unified::Loop::SetInterruptHook([](void* owner, std::uint32_t target, std::uint32_t context) { static_cast<Driver*>(owner)->deliverGuestEopInterrupt(target, context); }, this);
+                return true;
+            }();
+            static_cast<void>(hooked);
+            const bool flipHere = submission.flips.contains(cursor);
+            if (!flipHere && header != RenderingWaitPacketHeader && Unified::Loop::Takes(packet, opcode, submission.queue)) {
+                cursor += count;
+                continue;
+            }
+            if (flipHere) static_cast<void>(Unified::Loop::WaitPassed(submission.queue, submission.serial, static_cast<std::uint32_t>(cursor), std::chrono::seconds(60)));
+        }
         Unified::Record::NoteExistingPacket(packet, submission.queue);
 #endif
         if (executingPacket != nullptr) executingPacket->store((static_cast<std::uint64_t>(cursor + 1) << 8u) | opcode, std::memory_order_relaxed);

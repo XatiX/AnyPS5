@@ -1,8 +1,11 @@
 #include "prx/libSceAgcDriver/Unified/include/Resolve.hpp"
 #include "prx/libSceAgcDriver/Unified/include/MemoryCore.hpp"
+#include "prx/libSceAgcDriver/Unified/include/RecordLoop.hpp"
 #include "prx/libSceAgcDriver/Unified/include/RecordQueue.hpp"
 #include "prx/libSceAgcDriver/Unified/include/Downgrades.hpp"
 #include "prx/libSceAgcDriver/Unified/include/DrawRecorder.hpp"
+#include "prx/libSceAgcDriver/Execution/include/Driver/Diagnostics.hpp"
+#include "prx/libSceAgcDriver/Execution/include/Driver/Driver.hpp"
 #include "prx/libSceAgcDriver/Execution/include/GuestMemory.hpp"
 #include "prx/libSceAgcDriver/Execution/include/VulkanDevice.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/GuestTextureResource.hpp"
@@ -259,6 +262,32 @@ public:
         }
     }
 
+    static Loop::Item loopItem(const Operation& operation, std::shared_ptr<const ResolvedDraw> resolved, const DecodeState& state) {
+        Loop::Ensure(operation.queue);
+        Loop::Item item{operation, std::move(resolved), state.Held(), std::nullopt, {}, {}};
+        const auto* submission = state.CurrentSubmission();
+        if (submission == nullptr || operation.packetOffset >= submission->commands.size()) return item;
+        const auto header = submission->commands[operation.packetOffset];
+        const auto count = std::min<std::size_t>(Pm4::PacketWords(header), submission->commands.size() - operation.packetOffset);
+        const auto packet = std::span(submission->commands).subspan(operation.packetOffset, count);
+        try {
+            if (IsDraw(operation.kind)) {
+                item.parameters = Pm4::ResolveDraw(packet, state.Live());
+            } else if (IsDispatch(operation.kind)) {
+                if (packet.size() >= 5u) {
+                    item.groups = {packet[1], packet[2], packet[3]};
+                    if ((packet[4] & 0x20u) != 0u) {
+                        for (std::uint32_t axis = 0; axis < 3u; ++axis) item.groups[axis] = DriverDetail::ThreadDimensionGroups(item.groups[axis], std::max(DriverDetail::readRegister(state.Live().shader, 0x207 + axis) & 0xffffu, 1u));
+                    }
+                }
+            } else {
+                item.words.assign(packet.begin(), packet.end());
+            }
+        } catch (const std::exception&) {
+        }
+        return item;
+    }
+
     void Consume(const Operation& operation, const DecodeState& state) {
         if (IsDispatch(operation.kind)) {
             if (!routesQueue(operation.queue)) return;
@@ -273,14 +302,14 @@ public:
             }
             if (dispatch != nullptr && device != nullptr && bound != nullptr) Record::PrebuildDispatch(*bound, *device, *dispatch);
             if (Loop::OwnsLoop()) {
-                Loop::QueueFor(operation.queue).Push({operation, std::move(dispatch), state.Held()});
+                Loop::QueueFor(operation.queue).Push(loopItem(operation, std::move(dispatch), state));
                 return;
             }
             dispatchHandoff.Offer(operation.queue, operation.submission, operation.packetOffset, std::move(dispatch));
             return;
         }
         if (!IsDraw(operation.kind)) {
-            if (Loop::OwnsLoop() && operation.kind != OpKind::Marker) Loop::QueueFor(operation.queue).Push({operation, nullptr, state.Held()});
+            if (Loop::OwnsLoop() && operation.kind != OpKind::Marker) Loop::QueueFor(operation.queue).Push(loopItem(operation, nullptr, state));
             return;
         }
         std::shared_ptr<const ResolvedDraw> draw;
@@ -289,7 +318,7 @@ public:
             draw = resolve(operation, state);
         }
         if (Loop::OwnsLoop()) {
-            Loop::QueueFor(operation.queue).Push({operation, std::move(draw), state.Held()});
+            Loop::QueueFor(operation.queue).Push(loopItem(operation, std::move(draw), state));
             return;
         }
         handoff.Offer(operation.queue, operation.submission, operation.packetOffset, std::move(draw));
@@ -302,9 +331,18 @@ public:
             lastRefusal = reason;
             if (thrown.insert(reason.substr(0, 80)).second) std::fprintf(stderr, "[recode-resolve] first exception while resolving: %s\n", what);
         }
-        if (Loop::OwnsLoop()) Loop::QueueFor(operation.queue).Push({operation, nullptr, nullptr});
+        if (Loop::OwnsLoop()) {
+            Loop::Item failed;
+            failed.operation = operation;
+            Loop::QueueFor(operation.queue).Push(std::move(failed));
+        }
         else if (IsDispatch(operation.kind)) dispatchHandoff.Offer(operation.queue, operation.submission, operation.packetOffset, nullptr);
         else if (IsDraw(operation.kind)) handoff.Offer(operation.queue, operation.submission, operation.packetOffset, nullptr);
+    }
+
+    std::shared_ptr<VulkanDevice> AttachedDevice() {
+        std::lock_guard lock(mutex);
+        return attached;
     }
 
     PacketTable<ResolvedDraw>& Table() { return handoff; }
@@ -1008,6 +1046,10 @@ PacketTable<ResolvedDraw>& ResolvedDispatches() {
 
 const Heap::VulkanHeapDevice* HeapDevice() {
     return shared().Device();
+}
+
+std::shared_ptr<VulkanDevice> AttachedDevice() {
+    return shared().AttachedDevice();
 }
 
 Images::SurfaceTable* Surfaces() {

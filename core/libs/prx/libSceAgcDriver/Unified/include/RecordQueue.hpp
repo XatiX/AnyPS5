@@ -2,6 +2,8 @@
 #define CORE_LIBS_PRX_LIBSCEAGCDRIVER_UNIFIED_INCLUDE_RECORDQUEUE_HPP
 
 #include "prx/libSceAgcDriver/Unified/include/Operation.hpp"
+#include "prx/libSceAgcDriver/Execution/include/Pm4.hpp"
+#include <array>
 #include <chrono>
 #include <condition_variable>
 #include <cstdint>
@@ -9,6 +11,7 @@
 #include <memory>
 #include <mutex>
 #include <optional>
+#include <vector>
 
 namespace AgcDriver::DriverDetail {
 struct Submission;
@@ -24,6 +27,9 @@ struct Item {
     Operation operation;
     std::shared_ptr<const Resolve::ResolvedDraw> resolved;
     std::shared_ptr<const DriverDetail::Submission> submission;
+    std::optional<Pm4::DrawParameters> parameters;
+    std::array<std::uint32_t, 3> groups{};
+    std::vector<std::uint32_t> words;
 };
 
 struct QueueCounts {
