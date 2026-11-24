@@ -348,10 +348,25 @@ constexpr std::uint64_t KnownReadableBytes = 32;
 constexpr std::uint32_t PoolSets = 512;
 constexpr std::uint32_t PoolBuffers = 4096;
 constexpr std::uint64_t MapBudgetBytes = 256ull << 20u;
+constexpr std::size_t TableImagesBound = 4096;
 
 struct MapBuffer {
     std::shared_ptr<Graphics::Buffer> buffer;
     std::uint64_t serial = 0;
+};
+
+struct TableImages {
+    std::weak_ptr<const Tables::Mirror> base;
+    std::shared_ptr<const Tables::Mirror> bound;
+    std::uint64_t depths = 0;
+    std::uint64_t sharedStamp = 0;
+    std::uint64_t imagesStamp = 0;
+    std::vector<std::uint32_t> regions;
+    std::vector<Heap::DeferredImage> elements;
+    std::vector<std::uint32_t> slots;
+    std::vector<Heap::Span> memory;
+    std::vector<std::shared_ptr<const void>> owners;
+    std::vector<std::shared_ptr<Images::Surface>> records;
 };
 
 struct FaultBuffer {
@@ -384,6 +399,14 @@ struct Totals {
     std::uint64_t mapUploads = 0;
     std::uint64_t mapUploadBytes = 0;
     std::uint64_t mapRetired = 0;
+    std::uint64_t tableImageHits = 0;
+    std::uint64_t tableImageBuilds = 0;
+    std::uint64_t tableImageWhole = 0;
+    std::uint64_t tableImageBinds = 0;
+    std::uint64_t tableImageRefreshes = 0;
+    std::uint64_t tableImageDepthKept = 0;
+    std::uint64_t tableImageRetired = 0;
+    std::uint64_t compressedAliases = 0;
     std::uint64_t surfaceFailures = 0;
     std::uint64_t faultReads = 0;
     std::uint64_t batchMoves = 0;
@@ -1734,7 +1757,7 @@ public:
         line += text;
         std::snprintf(text, sizeof(text), "; dispatches %llu recorded (%llu indirect, %llu storage images written), %llu to the existing path, %.1f us per dispatch; compute pipelines %zu held, %llu queued (%llu ahead of recording), %llu built in %.1f ms, %zu building, %zu failed", static_cast<unsigned long long>(totals.dispatches), static_cast<unsigned long long>(totals.indirectDispatches), static_cast<unsigned long long>(totals.storageWrites), static_cast<unsigned long long>(totals.dispatchExisting), totals.dispatches == 0 ? 0.0 : static_cast<double>(totals.dispatchNanoseconds) / 1000.0 / static_cast<double>(totals.dispatches), pipelineCounts.held, static_cast<unsigned long long>(pipelinesQueued.load(std::memory_order_relaxed)), static_cast<unsigned long long>(pipelinesPrebuilt.load(std::memory_order_relaxed)), static_cast<unsigned long long>(pipelineCounts.built), static_cast<double>(pipelineCounts.nanoseconds) / 1e6, pipelineCounts.building, pipelineCounts.failed);
         line += text;
-        std::snprintf(text, sizeof(text), "; table maps %llu hits, %llu uploads (%.1f MiB), %llu retired, %zu held (%.1f MiB)", static_cast<unsigned long long>(totals.mapHits), static_cast<unsigned long long>(totals.mapUploads), static_cast<double>(totals.mapUploadBytes) / 1048576.0, static_cast<unsigned long long>(totals.mapRetired), maps.size(), static_cast<double>(mapBytes) / 1048576.0);
+        std::snprintf(text, sizeof(text), "; table maps %llu hits, %llu uploads (%.1f MiB), %llu retired, %zu held (%.1f MiB); table images %llu reused, %llu bound (%llu whole), %llu elements bound, %llu checked for a refresh, %llu depth kept, %llu retired, %zu held; compressed records beside another format %llu",static_cast<unsigned long long>(totals.mapHits), static_cast<unsigned long long>(totals.mapUploads), static_cast<double>(totals.mapUploadBytes) / 1048576.0, static_cast<unsigned long long>(totals.mapRetired), maps.size(), static_cast<double>(mapBytes) / 1048576.0, static_cast<unsigned long long>(totals.tableImageHits), static_cast<unsigned long long>(totals.tableImageBuilds), static_cast<unsigned long long>(totals.tableImageWhole), static_cast<unsigned long long>(totals.tableImageBinds), static_cast<unsigned long long>(totals.tableImageRefreshes), static_cast<unsigned long long>(totals.tableImageDepthKept), static_cast<unsigned long long>(totals.tableImageRetired), tableImages.size(), static_cast<unsigned long long>(totals.compressedAliases));
         line += text;
         line += "; record ranges noted GPU-written for the memory core " + std::to_string(totals.recordRangesNoted) + "; records made for a sampled shape after a hand-over " + std::to_string(totals.sampledRecordsCreated) + ", new storage records started from their memory " + std::to_string(totals.storageRecordsSeeded) + "; new chains zeroed " + std::to_string(totals.zeroedChains) + ", new records poisoned " + std::to_string(totals.poisonedRecords);
         if (metadataClears != nullptr) {
@@ -1877,6 +1900,7 @@ public:
         spare.clear();
         maps.clear();
         mapBytes = 0;
+        tableImages.clear();
         surfaceDetiler.reset();
         metadataClears.reset();
         htileClears.reset();
@@ -2983,10 +3007,11 @@ private:
         if (hangMarking() && context.recorder != nullptr) markHangPhase(context, *context.recorder, 5u);
         handOverForWriters(context, dispatch);
         if (hangMarking() && context.recorder != nullptr) markHangPhase(context, *context.recorder, 6u);
-        if (dispatch.stages.size() != 1u || dispatch.stages.front().deferredImages.empty()) return recordBound(context, dispatch, groups, {}, reason);
+        if (dispatch.stages.size() != 1u || (dispatch.stages.front().deferredImages.empty() && !tableImagesDeferred(dispatch.stages.front()))) return recordBound(context, dispatch, groups, {}, reason);
         auto bound = dispatch;
         std::vector<std::shared_ptr<Graphics::StorageTexture>> written;
-        if (!bindDeferredImages(context, bound.stages.front(), written, reason)) return false;
+        if (!bindTableImages(context, bound.stages.front(), reason)) return false;
+        if (!bound.stages.front().deferredImages.empty() && !bindDeferredImages(context, bound.stages.front(), written, reason)) return false;
         return recordBound(context, bound, groups, written, reason);
     }
 
@@ -3026,6 +3051,138 @@ private:
             return false;
         }
         return Resolve::PatchSlots(*stage.program.result, stage.slots, stage.program.words, reason);
+    }
+
+    static bool tableImagesDeferred(const Resolve::ResolvedStage& stage) {
+        return stage.tableMap != nullptr && !stage.tableMap->deferred.empty();
+    }
+
+    bool bindTableImages(const Context& context, Resolve::ResolvedStage& stage, std::string& reason) {
+        const auto base = stage.tableMap;
+        if (base == nullptr || base->deferred.empty()) return true;
+        const auto sharedStamp = Events::Shared().Serial();
+        const auto imagesStamp = Events::Images().Serial();
+        const auto depthGeneration = Images::DepthRecordsOn() ? Images::Depths().Generation() : std::uint64_t{0};
+        if (tableImages.size() >= TableImagesBound) std::erase_if(tableImages, [](const auto& held) { return held.second.base.expired(); });
+        auto& entry = tableImages[base->lineage];
+        const bool fresh = entry.bound == nullptr || entry.depths != depthGeneration;
+        const bool rebased = !fresh && entry.base.lock() != base;
+        std::vector<bool> stale(fresh ? 0u : entry.elements.size(), false);
+        bool anyStale = false;
+        if (!fresh && (Events::Shared().RegionsChangedSince(entry.regions, entry.sharedStamp) || Events::Images().RegionsChangedSince(entry.regions, entry.imagesStamp))) {
+            auto* table = Resolve::Surfaces();
+            bool refreshed = false;
+            for (std::size_t position = 0; position < entry.elements.size(); ++position) {
+                const auto& memory = entry.memory[position];
+                if (memory.bytes != 0u && !Events::Shared().ChangedSince(memory.address, memory.bytes, entry.sharedStamp) && !Events::Images().ChangedSince(memory.address, memory.bytes, entry.imagesStamp)) continue;
+                const auto& record = entry.records[position];
+                if (record == nullptr && entry.owners[position] != nullptr) {
+                    totals.tableImageDepthKept++;
+                    continue;
+                }
+                if (record != nullptr && !record->retired && table != nullptr) {
+                    if (refreshesRecords() && table->RefreshIfChanged(record)) {
+                        totals.recordsRefreshed++;
+                        refreshed = true;
+                    }
+                    totals.tableImageRefreshes++;
+                    continue;
+                }
+                if (record != nullptr) totals.tableImageRetired++;
+                stale[position] = true;
+                anyStale = true;
+            }
+            if (refreshed && context.recorder != nullptr) drainSurfaces(context, *context.recorder);
+        }
+        entry.sharedStamp = sharedStamp;
+        entry.imagesStamp = imagesStamp;
+        if (!fresh && !rebased && !anyStale) {
+            totals.tableImageHits++;
+            stage.tableMap = entry.bound;
+            return true;
+        }
+        std::vector<std::size_t> rebind;
+        if (fresh || rebased) {
+            std::unordered_map<std::uint32_t, std::size_t> previous;
+            if (rebased) {
+                previous.reserve(entry.elements.size());
+                for (std::size_t position = 0; position < entry.elements.size(); ++position) previous.emplace(entry.elements[position].index, position);
+            }
+            const auto count = base->deferred.size();
+            std::vector<std::uint32_t> slots(count, 0u);
+            std::vector<Heap::Span> memory(count);
+            std::vector<std::shared_ptr<const void>> owners(count);
+            std::vector<std::shared_ptr<Images::Surface>> records(count);
+            for (std::size_t position = 0; position < count; ++position) {
+                const auto& element = base->deferred[position];
+                const auto found = rebased ? previous.find(element.index) : previous.end();
+                if (found != previous.end() && !stale[found->second] && sameRequest(entry.elements[found->second].request, element.request)) {
+                    slots[position] = entry.slots[found->second];
+                    memory[position] = entry.memory[found->second];
+                    owners[position] = std::move(entry.owners[found->second]);
+                    records[position] = std::move(entry.records[found->second]);
+                    continue;
+                }
+                rebind.push_back(position);
+            }
+            entry.elements = base->deferred;
+            entry.slots = std::move(slots);
+            entry.memory = std::move(memory);
+            entry.owners = std::move(owners);
+            entry.records = std::move(records);
+            entry.base = base;
+            if (fresh) totals.tableImageWhole++;
+        } else {
+            for (std::size_t position = 0; position < stale.size(); ++position) {
+                if (stale[position]) rebind.push_back(position);
+            }
+        }
+        for (const auto position : rebind) {
+            const auto& deferred = entry.elements[position];
+            lastRefusedImage().clear();
+            if (!ownedSampledSlot(context, stage.program, deferred, entry.slots[position], &entry.owners[position], &entry.records[position])) {
+                entry.bound.reset();
+                const auto why = "table image without a record (" + (lastRefusedImage().empty() ? std::string(Resolve::Surfaces() == nullptr ? "no surface table" : "not held") : lastRefusedImage()) + ")";
+                noteImage(stage, Downgrades::Kind::UpstreamSampled, deferred.index, deferred.request, why.c_str());
+                reason = why;
+                return false;
+            }
+            try {
+                const auto resource = Graphics::DecodeTextureResource(deferred.request.words);
+                entry.memory[position] = {resource.baseAddress, Graphics::SurfaceGuestBytes(resource)};
+            } catch (const std::exception&) {
+                entry.memory[position] = {};
+            }
+        }
+        auto bound = std::make_shared<Tables::Mirror>();
+        bound->id = nextTableImagesId++;
+        bound->lineage = base->lineage;
+        bound->map = base->map;
+        bound->slotBase = base->slotBase;
+        for (std::size_t position = 0; position < entry.elements.size(); ++position) bound->map[base->slotBase + entry.elements[position].index] = entry.slots[position];
+        bound->owners = base->owners;
+        for (const auto& owner : entry.owners) {
+            if (owner != nullptr) bound->owners.push_back(owner);
+        }
+        if (fresh || rebased) {
+            std::vector<Heap::ImageUse> uses;
+            uses.reserve(entry.memory.size());
+            for (const auto& memory : entry.memory) uses.push_back({memory, false});
+            entry.regions.clear();
+            for (const auto& [begin, end] : Tables::CoalescedSpans(uses)) Events::ChangeLog::AppendRegions(begin, end - begin, entry.regions);
+            std::sort(entry.regions.begin(), entry.regions.end());
+            entry.regions.erase(std::unique(entry.regions.begin(), entry.regions.end()), entry.regions.end());
+        }
+        entry.depths = Images::DepthRecordsOn() ? Images::Depths().Generation() : std::uint64_t{0};
+        entry.bound = bound;
+        stage.tableMap = std::move(bound);
+        totals.tableImageBuilds++;
+        totals.tableImageBinds += rebind.size();
+        return true;
+    }
+
+    static bool sameRequest(const Heap::SlotRequest& left, const Heap::SlotRequest& right) {
+        return left.kind == right.kind && left.flags == right.flags && left.words == right.words;
     }
 
     void noteStorageWrites(const Context& context, Graphics::Recorder& recorder, std::span<const std::shared_ptr<Graphics::StorageTexture>> written) {
@@ -3845,13 +4002,14 @@ private:
         handOverForWriters(context, draw);
         if (hangMarking() && context.recorder != nullptr) markHangPhase(context, *context.recorder, 6u);
         totals.preSplit[1] += elapsed(preMark);
-        if (std::ranges::all_of(draw.stages, [](const Resolve::ResolvedStage& stage) { return stage.deferredImages.empty(); })) return recordWithSlots(context, draw, parameters, reason);
+        if (std::ranges::all_of(draw.stages, [](const Resolve::ResolvedStage& stage) { return stage.deferredImages.empty() && !tableImagesDeferred(stage); })) return recordWithSlots(context, draw, parameters, reason);
         preMark = std::chrono::steady_clock::now();
         auto bound = draw;
         std::vector<std::shared_ptr<Graphics::StorageTexture>> written;
         std::vector<std::pair<std::uint64_t, std::uint64_t>> writtenRanges;
         constexpr auto storageWrite = Heap::RequestFlag::Storage | Heap::RequestFlag::Written;
         for (auto& stage : bound.stages) {
+            if (!bindTableImages(context, stage, reason)) return false;
             if (stage.deferredImages.empty()) continue;
             if (!bindDeferredImages(context, stage, written, reason)) return false;
             for (const auto& deferred : stage.deferredImages) {
@@ -4540,6 +4698,10 @@ private:
                 absorbed->emplace_back(record, first);
                 continue;
             }
+            if (!record->gpuNewer && Graphics::IsBlockCompressed(key.format) && Graphics::IsBlockCompressed(record->key.format)) {
+                totals.compressedAliases++;
+                continue;
+            }
             if (Downgrades::Active() && firstShapePair(key, record->key)) {
                 const auto& held = record->key;
                 std::fprintf(stderr, "[recode-images] another shape: asked 0x%llx+0x%llx %ux%u depth %u mips %u format %u tile %u dimension %u pitch %u xor %u; record 0x%llx+0x%llx %ux%u depth %u mips %u format %u tile %u dimension %u pitch %u xor %u layers %u%s\n", static_cast<unsigned long long>(key.address), static_cast<unsigned long long>(key.bytes), key.width, key.height, key.depth, key.mips, key.format, key.tileMode, key.dimension, key.pitch, key.pipeBankXor, static_cast<unsigned long long>(held.address), static_cast<unsigned long long>(held.bytes), held.width, held.height, held.depth, held.mips, held.format, held.tileMode, held.dimension, held.pitch, held.pipeBankXor, record->device != nullptr && dynamic_cast<Images::VulkanSurface*>(record->device.get()) != nullptr ? dynamic_cast<Images::VulkanSurface*>(record->device.get())->Geometry().imageLayers : 0u, record->gpuNewer ? " (GPU-written: written back)" : "");
@@ -4596,7 +4758,13 @@ private:
         Events::NoteRanges(written);
     }
 
+    static std::string& lastRefusedImage() {
+        thread_local std::string why;
+        return why;
+    }
+
     static void noteRefusedImage(std::string_view why) {
+        lastRefusedImage() = why;
         if (auto* table = Resolve::Surfaces(); table != nullptr && ownsImages()) table->NoteRefused(why);
     }
 
@@ -4657,6 +4825,14 @@ private:
     }
 
     bool bindOwnedSampled(const Context& context, Resolve::ResolvedStage& stage, const Heap::DeferredImage& deferred) {
+        std::uint32_t slot = 0;
+        if (!ownedSampledSlot(context, stage.program, deferred, slot)) return false;
+        stage.slots[deferred.index] = slot;
+        return true;
+    }
+
+    bool ownedSampledSlot(const Context& context, const Resolve::StageProgram& program, const Heap::DeferredImage& deferred, std::uint32_t& boundSlot, std::shared_ptr<const void>* bound = nullptr, std::shared_ptr<Images::Surface>* boundRecord = nullptr) {
+        const auto codeAddress = program.codeAddress;
         auto* table = Resolve::Surfaces();
         if (table == nullptr) return false;
         std::string why;
@@ -4673,7 +4849,9 @@ private:
                 const auto depthView = depth->SampledView(stencilPlane);
                 std::uint32_t depthSlot = 0;
                 if (depthView != VK_NULL_HANDLE && Resolve::BindViewSlot(deferred.request, reinterpret_cast<std::uint64_t>(depthView), VK_IMAGE_LAYOUT_GENERAL, depth, depthSlot)) {
-                    stage.slots[deferred.index] = depthSlot;
+                    boundSlot = depthSlot;
+                    if (bound != nullptr) *bound = depth;
+                    if (boundRecord != nullptr) boundRecord->reset();
                     if (context.recorder != nullptr) context.recorder->Keep(depth);
                     totals.depthRecordsSampled++;
                     return true;
@@ -4694,22 +4872,22 @@ private:
                 totals.sampledRecordsCreated++;
                 if (Downgrades::Active()) {
                     char shape[200];
-                    std::snprintf(shape, sizeof(shape), "0x%llx+0x%llx %ux%u depth %u mips %u format %u dimension %u tile %u pitch %u xor %u by %016llx", static_cast<unsigned long long>(surface.address), static_cast<unsigned long long>(surface.bytes), surface.width, surface.height, surface.depth, surface.mips, surface.format, surface.dimension, surface.tileMode, surface.pitch, surface.pipeBankXor, static_cast<unsigned long long>(Downgrades::ProgramHash(stage.program.codeAddress)));
+                    std::snprintf(shape, sizeof(shape), "0x%llx+0x%llx %ux%u depth %u mips %u format %u dimension %u tile %u pitch %u xor %u by %016llx", static_cast<unsigned long long>(surface.address), static_cast<unsigned long long>(surface.bytes), surface.width, surface.height, surface.depth, surface.mips, surface.format, surface.dimension, surface.tileMode, surface.pitch, surface.pipeBankXor, static_cast<unsigned long long>(Downgrades::ProgramHash(codeAddress)));
                     totals.sampledCreations[shape]++;
                 }
                 MemoryCore::Get().OpenWhole(surface.address, surface.bytes);
                 Downgrades::WatchTouch("a record made from memory for a sampled read", surface.address, surface.bytes);
             }
         }
-        if (Downgrades::Watching()) Downgrades::WatchProgramRead(stage.program.codeAddress, surface.address, surface.bytes);
-        applyMetadataClear(context, record, stage.program.codeAddress);
+        if (Downgrades::Watching()) Downgrades::WatchProgramRead(codeAddress, surface.address, surface.bytes);
+        applyMetadataClear(context, record, codeAddress);
         auto viewKey = key->view;
         viewKey.baseArray += layer;
         viewKey.lastArray += layer;
-        if (record != nullptr) noteSampledSource(Downgrades::ProgramHash(stage.program.codeAddress), record->key.address, record->key.bytes);
-        if (record != nullptr && context.recorder != nullptr) maybeDumpSampled(context, *context.recorder, record, Downgrades::ProgramHash(stage.program.codeAddress));
-        if (record != nullptr && sourcesOfProgram() == 0 && !targetTraceList().empty() && tracedProgram(Downgrades::ProgramHash(stage.program.codeAddress)) && targetTraceLines.fetch_add(1, std::memory_order_relaxed) < (targetTraceList() == "all" ? 20000u : 400u)) {
-            std::fprintf(stderr, "[recode-sampled] program %016llx slot %u kind %u 0x%llx %ux%u mips %u view levels %u-%u layers %u-%u format %u -> record 0x%llx mips %u\n", static_cast<unsigned long long>(Downgrades::ProgramHash(stage.program.codeAddress)), deferred.index, deferred.request.kind, static_cast<unsigned long long>(surface.address), surface.width, surface.height, surface.mips, viewKey.baseLevel, viewKey.lastLevel, viewKey.baseArray, viewKey.lastArray, viewKey.format, static_cast<unsigned long long>(record->key.address), record->key.mips);
+        if (record != nullptr) noteSampledSource(Downgrades::ProgramHash(codeAddress), record->key.address, record->key.bytes);
+        if (record != nullptr && context.recorder != nullptr) maybeDumpSampled(context, *context.recorder, record, Downgrades::ProgramHash(codeAddress));
+        if (record != nullptr && sourcesOfProgram() == 0 && !targetTraceList().empty() && tracedProgram(Downgrades::ProgramHash(codeAddress)) && targetTraceLines.fetch_add(1, std::memory_order_relaxed) < (targetTraceList() == "all" ? 20000u : 400u)) {
+            std::fprintf(stderr, "[recode-sampled] program %016llx slot %u kind %u 0x%llx %ux%u mips %u view levels %u-%u layers %u-%u format %u -> record 0x%llx mips %u\n", static_cast<unsigned long long>(Downgrades::ProgramHash(codeAddress)), deferred.index, deferred.request.kind, static_cast<unsigned long long>(surface.address), surface.width, surface.height, surface.mips, viewKey.baseLevel, viewKey.lastLevel, viewKey.baseArray, viewKey.lastArray, viewKey.format, static_cast<unsigned long long>(record->key.address), record->key.mips);
         }
         const auto view = record != nullptr ? record->device->View(viewKey, deferred.request.kind, why) : std::uint64_t{0};
         std::uint32_t slot = 0;
@@ -4717,9 +4895,11 @@ private:
             noteRefusedImage("sampled: " + (why.empty() ? std::string("another shape of a recode record") : why));
             return false;
         }
-        stage.slots[deferred.index] = slot;
+        boundSlot = slot;
+        if (bound != nullptr) *bound = record;
+        if (boundRecord != nullptr) *boundRecord = record;
         if (context.recorder != nullptr) context.recorder->Keep(record);
-        if (context.recorder != nullptr && nanCensus().draws != 0u && censusReadsOf(Downgrades::ProgramHash(stage.program.codeAddress))) censusRecord(context, *context.recorder, record, Downgrades::ProgramHash(stage.program.codeAddress), true);
+        if (context.recorder != nullptr && nanCensus().draws != 0u && censusReadsOf(Downgrades::ProgramHash(codeAddress))) censusRecord(context, *context.recorder, record, Downgrades::ProgramHash(codeAddress), true);
         totals.recordSampled++;
         return true;
     }
@@ -4801,6 +4981,8 @@ private:
     std::map<std::pair<std::uint64_t, std::uint64_t>, std::uint32_t> outputs;
     std::map<std::uint64_t, MapBuffer> maps;
     std::uint64_t mapBytes = 0;
+    std::unordered_map<std::uint64_t, TableImages> tableImages;
+    std::uint64_t nextTableImagesId = std::uint64_t{1} << 62u;
     std::set<std::string> seen;
     std::chrono::steady_clock::time_point dumpClock = processStart();
     std::set<std::uint64_t> dumpedRecords;

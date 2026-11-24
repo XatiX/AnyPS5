@@ -61,11 +61,17 @@ bool Refill::Fill(std::span<const SlotRequest> requests, std::vector<std::uint32
     return true;
 }
 
-std::uint32_t Refill::FillOne(const SlotRequest& request, std::string& reason, Span& memory, std::shared_ptr<const void>& owner) {
+std::uint32_t Refill::FillOne(const SlotRequest& request, std::string& reason, Span& memory, std::shared_ptr<const void>& owner, bool* deferred) {
+    if (deferred != nullptr) *deferred = false;
     const auto slot = (request.flags & RequestFlag::Sampler) != 0u ? sampler(request, reason) : image(request, reason, memory, owner);
     if (slot == NoSlot) counts.failures++;
     if (slot == DeferSlot) {
-        counts.placeholders++;
+        if (deferred != nullptr) {
+            *deferred = true;
+            counts.deferred++;
+        } else {
+            counts.placeholders++;
+        }
         return 0u;
     }
     return slot;

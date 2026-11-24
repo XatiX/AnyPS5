@@ -237,6 +237,7 @@ std::shared_ptr<DepthRecord> DepthRecords::Find(const Graphics::Context& context
     created->SetPredecessors(std::move(superseded));
     created->SetTiling(target.depthSwizzle, target.pipeBankXor);
     records.emplace(key, created);
+    generation.fetch_add(1, std::memory_order_release);
     counts.created++;
     if (counts.created <= 16u) std::fprintf(stderr, "[recode-depth] record 0x%llx stencil 0x%llx htile 0x%llx %ux%u format %d clear %g/%u\n", static_cast<unsigned long long>(key.address), static_cast<unsigned long long>(key.stencilAddress), static_cast<unsigned long long>(key.htileAddress), key.width, key.height, static_cast<int>(key.format), static_cast<double>(target.clearDepth), static_cast<unsigned>(target.clearStencil));
     return created;

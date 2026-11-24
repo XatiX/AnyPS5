@@ -133,7 +133,9 @@ public:
     void Clear() {
         std::lock_guard lock(mutex);
         records.clear();
+        generation.fetch_add(1, std::memory_order_release);
     }
+    [[nodiscard]] std::uint64_t Generation() const { return generation.load(std::memory_order_acquire); }
     [[nodiscard]] std::size_t Size() const {
         std::lock_guard lock(mutex);
         return records.size();
@@ -143,6 +145,7 @@ private:
     mutable std::mutex mutex;
     std::map<DepthKey, std::shared_ptr<DepthRecord>> records;
     DepthCounts counts;
+    std::atomic<std::uint64_t> generation{0};
 };
 
 DepthRecords& Depths();
