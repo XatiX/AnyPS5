@@ -421,6 +421,9 @@ std::atomic<std::uint64_t> storesBesideMirror{0};
 std::atomic<std::uint64_t> storesAtOnce{0};
 std::atomic<std::uint64_t> copiesInMirror{0};
 std::atomic<std::uint64_t> copiesBesideMirror{0};
+std::atomic<std::uint64_t> storeLandings{0};
+std::atomic<std::uint64_t> storeLandingNanoseconds{0};
+std::atomic<std::uint64_t> storeLandingMaxNanoseconds{0};
 
 bool argumentCensusOn() {
     static const bool on = std::getenv("APS5_RECODE_ARGUMENT_CENSUS") != nullptr;
@@ -450,6 +453,14 @@ void printExistingPackets() {
     char totals[320];
     std::snprintf(totals, sizeof(totals), "; recode stores into the mirror %llu, outside it %llu, at once (nothing in flight) %llu; copies in the mirror %llu, outside it %llu; occlusion dumps %llu (whole run)", static_cast<unsigned long long>(storesToMirror.load()), static_cast<unsigned long long>(storesBesideMirror.load()), static_cast<unsigned long long>(storesAtOnce.load()), static_cast<unsigned long long>(copiesInMirror.load()), static_cast<unsigned long long>(copiesBesideMirror.load()), static_cast<unsigned long long>(sampleDumpsLanded.load()));
     line += totals;
+    const auto landed = storeLandings.exchange(0);
+    const auto landedNanoseconds = storeLandingNanoseconds.exchange(0);
+    const auto landedMax = storeLandingMaxNanoseconds.exchange(0);
+    if (landed != 0u) {
+        char delay[160];
+        std::snprintf(delay, sizeof(delay), "; store landings since the last line %llu, %.1f us average and %.1f ms longest from recording to landing", static_cast<unsigned long long>(landed), static_cast<double>(landedNanoseconds) / static_cast<double>(landed) / 1e3, static_cast<double>(landedMax) / 1e6);
+        line += delay;
+    }
     std::fprintf(stderr, "%s\n", line.c_str());
     existingPackets.clear();
 }
@@ -4607,10 +4618,16 @@ int StoreToMirror(Graphics::Recorder& recorder, std::uint64_t address, std::span
     }
     Events::NoteRanges(written);
     recorder.NoteLabel(address, bytes, stamp, queue);
-    LandAfterBatch(recorder, [address, sequence, stored = std::vector<std::byte>(bytes.begin(), bytes.end())] {
+    LandAfterBatch(recorder, [address, sequence, recorded = std::chrono::steady_clock::now(), stored = std::vector<std::byte>(bytes.begin(), bytes.end())] {
         auto& core = MemoryCore::Get();
         core.LandGpuWrite(address, stored);
         core.ReleaseLandedWrite(address, stored.size(), sequence);
+        const auto waited = elapsed(recorded);
+        storeLandingNanoseconds.fetch_add(waited, std::memory_order_relaxed);
+        storeLandings.fetch_add(1, std::memory_order_relaxed);
+        auto seen = storeLandingMaxNanoseconds.load(std::memory_order_relaxed);
+        while (waited > seen && !storeLandingMaxNanoseconds.compare_exchange_weak(seen, waited, std::memory_order_relaxed)) {
+        }
     });
     storesToMirror.fetch_add(1, std::memory_order_relaxed);
     return 0;
