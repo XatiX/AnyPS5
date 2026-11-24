@@ -92,6 +92,17 @@ void LastRecordIndices(std::span<const void* const> logged, std::span<const void
 // The cached storage image of a surface (render targets use it as their resident image); brought up
 // to date with guest memory before it is returned.
 std::shared_ptr<StorageTexture> CachedStorageSurface(const Context& context, const GuestTextureResource& resource);
+const ShaderRecompiler::ImageOverwriteDispatch*& OverwriteDispatch();
+class OverwriteDispatchScope {
+public:
+    explicit OverwriteDispatchScope(const ShaderRecompiler::ImageOverwriteDispatch* dispatch) : previous(OverwriteDispatch()) { OverwriteDispatch() = dispatch; }
+    ~OverwriteDispatchScope() { OverwriteDispatch() = previous; }
+    OverwriteDispatchScope(const OverwriteDispatchScope&) = delete;
+    OverwriteDispatchScope& operator=(const OverwriteDispatchScope&) = delete;
+
+private:
+    const ShaderRecompiler::ImageOverwriteDispatch* previous;
+};
 std::shared_ptr<StorageTexture> CachedStorageLayers(const Context& context, const GuestTextureResource& resource, std::uint32_t firstLayer, std::uint32_t layerCount);
 std::shared_ptr<StorageTexture> CachedStorageImage(const Context& context, std::span<const std::uint32_t> words, const GuestTextureResource& resource, std::uint32_t mip, bool written);
 // Whether `image` is still the storage cache's image of its surface (what CachedStorageSurface

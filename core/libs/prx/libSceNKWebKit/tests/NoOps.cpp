@@ -23,10 +23,7 @@ int main() {
     WKBundleExtendClassesForParameterCoder();
     WKBundleNodeHandleSetHTMLInputElementAutoFillButtonEnabled();
     WKBundlePageClickMenuItem();
-    WKBundlePageSetBottomOverhangImage();
     WKBundlePageSetContextMenuClient();
-    WKBundlePageSetPaintedObjectsCounterThreshold();
-    WKBundlePageSetTopOverhangImage();
     WKContextAddSupportedPlugin();
     WKContextAllowSpecificHTTPSCertificateForHost();
     WKContextClearSupportedPlugins();
