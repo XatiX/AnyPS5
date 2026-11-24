@@ -4586,14 +4586,19 @@ int StoreToMirror(Graphics::Recorder& recorder, std::uint64_t address, std::span
     recorder.RecordStore(reinterpret_cast<VkBuffer>(static_cast<std::uintptr_t>(span->handle)), static_cast<VkDeviceSize>(span->offset), bytes, address);
     const std::array written{std::pair{address, address + bytes.size()}};
     static const bool unmarked = std::getenv("APS5_RECODE_MIRROR_STORES_UNMARKED") != nullptr;
+    const auto serial = recorder.OpenBatchSerial();
     if (!unmarked) {
         Shadow::NoteGpuWrites(written);
-        const auto mark = MemoryCore::Get().NoteGpuWrite(address, bytes.size(), recorder.OpenBatchSerial());
+        const auto mark = MemoryCore::Get().NoteGpuWrite(address, bytes.size(), serial);
         if (!mark.upload.empty()) ResidencyService::Get().NoteDirty(mark.upload);
     }
     Events::NoteRanges(written);
     recorder.NoteLabel(address, bytes, stamp, queue);
-    LandAfterBatch(recorder, [address, stored = std::vector<std::byte>(bytes.begin(), bytes.end())] { MemoryCore::Get().LandGpuWrite(address, stored); });
+    LandAfterBatch(recorder, [address, serial, stored = std::vector<std::byte>(bytes.begin(), bytes.end())] {
+        auto& core = MemoryCore::Get();
+        core.LandGpuWrite(address, stored);
+        core.NoteLandedGpuWrite(address, stored.size(), serial);
+    });
     storesToMirror.fetch_add(1, std::memory_order_relaxed);
     return 0;
 }
@@ -4644,12 +4649,15 @@ bool CopyInMirror(const Context& context, Graphics::Recorder& recorder, const Pm
     recorder.Keep(landing);
     const std::array written{std::pair{copy.destination, copy.destination + copy.bytes}};
     Shadow::NoteGpuWrites(written);
-    const auto mark = MemoryCore::Get().NoteGpuWrite(copy.destination, copy.bytes, recorder.OpenBatchSerial());
+    const auto serial = recorder.OpenBatchSerial();
+    const auto mark = MemoryCore::Get().NoteGpuWrite(copy.destination, copy.bytes, serial);
     if (!mark.upload.empty()) ResidencyService::Get().NoteDirty(mark.upload);
     Events::NoteRanges(written);
-    LandAfterBatch(recorder, [landing, address = copy.destination, bytes = copy.bytes] {
+    LandAfterBatch(recorder, [landing, serial, address = copy.destination, bytes = copy.bytes] {
         landing->Invalidate();
-        MemoryCore::Get().LandGpuWrite(address, std::span<const std::byte>(landing->Bytes().data(), bytes));
+        auto& core = MemoryCore::Get();
+        core.LandGpuWrite(address, std::span<const std::byte>(landing->Bytes().data(), bytes));
+        core.NoteLandedGpuWrite(address, bytes, serial);
     });
     copiesInMirror.fetch_add(1, std::memory_order_relaxed);
     return true;
