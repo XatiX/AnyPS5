@@ -95,12 +95,25 @@ private:
     void decodePacket(std::span<const std::uint32_t> packet, std::size_t cursor) {
         const auto header = packet[0];
         const auto opcode = (header >> 8u) & 0xffu;
-        const bool conditional = cursor < conditionalUntil || (Pm4::Predicated(header) && state.state.predication.operation != 0);
+        const bool predicatedPacket = Pm4::Predicated(header) && state.state.predication.operation != 0;
+        const bool conditional = cursor < conditionalUntil || predicatedPacket;
         current = {cursor, opcode, conditional};
+        if (!ranges.empty()) std::erase_if(ranges, [cursor](const OperationGuard& guard) { return guard.end <= cursor; });
+        state.guards.assign(ranges.begin(), ranges.end());
+        if (predicatedPacket) state.guards.push_back(predicationGuard(cursor, cursor + packet.size()));
 
         if (opcode == 0x3f || opcode == 0x22) {
             const auto end = submission.conditionalEnds.find(cursor);
-            if (end != submission.conditionalEnds.end() && (opcode == 0x22 || conditional)) conditionalUntil = std::max(conditionalUntil, end->second);
+            if (end != submission.conditionalEnds.end() && (opcode == 0x22 || conditional)) {
+                conditionalUntil = std::max(conditionalUntil, end->second);
+                if (opcode == 0x22 && packet.size() == 5u) {
+                    OperationGuard guard{submission.serial, cursor, end->second, true};
+                    std::copy(packet.begin(), packet.end(), guard.words.begin());
+                    ranges.push_back(guard);
+                } else if (opcode == 0x3f && predicatedPacket) {
+                    ranges.push_back(predicationGuard(cursor, end->second));
+                }
+            }
             return;
         }
         if (header == RenderingWaitPacketHeader) {
@@ -153,6 +166,13 @@ private:
             ++state.counts.stateErrors;
         }
         markDirty(touchedBanks(packet, opcode));
+    }
+
+    OperationGuard predicationGuard(std::size_t start, std::size_t end) const {
+        OperationGuard guard{submission.serial, start, end, false};
+        guard.predication = state.state.predication;
+        guard.sampleDumpBlocks = state.state.sampleDumpBlocks;
+        return guard;
     }
 
     void markDirty(std::uint8_t banks) {
@@ -376,6 +396,7 @@ private:
     DecodeState& state;
     Sink& sink;
     std::size_t conditionalUntil = 0;
+    std::vector<OperationGuard> ranges;
     Current current;
     std::optional<std::uint64_t> resolvedKey;
     DispatchFacts pendingDispatch;

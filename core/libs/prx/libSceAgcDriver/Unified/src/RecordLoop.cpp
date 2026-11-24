@@ -3,17 +3,21 @@
 #include "prx/libSceAgcDriver/Unified/include/LabelTable.hpp"
 #include "prx/libSceAgcDriver/Unified/include/MemoryCore.hpp"
 #include "prx/libSceAgcDriver/Unified/include/RecordQueue.hpp"
+#include "prx/libSceAgcDriver/Unified/include/Releases.hpp"
 #include "prx/libSceAgcDriver/Unified/include/Resolve.hpp"
 #include "prx/libSceAgcDriver/Execution/include/GuestMemory.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Pm4.hpp"
 #include "prx/libSceAgcDriver/Execution/include/VulkanDevice.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/Recorder.hpp"
+#include <algorithm>
 #include <atomic>
 #include <condition_variable>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <limits>
 #include <map>
+#include <optional>
 #include <mutex>
 #include <thread>
 #include <vector>
@@ -41,6 +45,11 @@ struct Totals {
     std::atomic<std::uint64_t> flips{0};
     std::atomic<std::uint64_t> predicated{0};
     std::atomic<std::uint64_t> idleReaps{0};
+    std::atomic<std::uint64_t> runTimeStores{0};
+    std::atomic<std::uint64_t> runTimeRefused{0};
+    std::atomic<std::uint64_t> guarded{0};
+    std::atomic<std::uint64_t> skipped{0};
+    std::atomic<std::uint64_t> conditionsRead{0};
 };
 
 Totals& totals() {
@@ -103,7 +112,8 @@ public:
             }
             lastWork = std::chrono::steady_clock::now();
             try {
-                handle(*item);
+                if (item->guards.empty() || guardsPass(*item)) handle(*item);
+                else trace(*item, "skip");
             } catch (const std::exception& error) {
                 Record::RefuseUnrecorded("loop operation", 0, std::string("record loop threw: ") + error.what());
                 totals().refused.fetch_add(1, std::memory_order_relaxed);
@@ -135,7 +145,7 @@ private:
         }
         const auto device = Resolve::AttachedDevice();
         const auto* recorder = device != nullptr ? device->graphicsContext().recorder : nullptr;
-        std::fprintf(stderr, "[recode-loop] queue 0x%x idle %.1f s, recorder %s; last label stores:%s\n", queue, std::chrono::duration<double>(now - lastWork).count(), recorder == nullptr ? "none" : recorder->Idle() ? "idle" : "busy", line.c_str());
+        std::fprintf(stderr, "[recode-loop] queue 0x%x idle %.1f s, recorder %s; last label stores:%s\n%s\n", queue, std::chrono::duration<double>(now - lastWork).count(), recorder == nullptr ? "none" : recorder->Idle() ? "idle" : "busy", line.c_str(), Releases::Line().c_str());
     }
 
     void settleIdle() {
@@ -156,12 +166,14 @@ private:
         static std::atomic<std::uint32_t> lines{0};
         if (!traced || lines.fetch_add(1, std::memory_order_relaxed) >= 400u) return;
         const auto& operation = item.operation;
-        std::fprintf(stderr, "[recode-loop-trace] %s runner 0x%x q%u kind %u submission %llu offset %u opcode 0x%x address 0x%llx size %llu value 0x%llx function %u words %zu\n", stage, queue, operation.queue, static_cast<unsigned>(operation.kind), static_cast<unsigned long long>(operation.submission), operation.packetOffset, operation.opcode, static_cast<unsigned long long>(operation.address), static_cast<unsigned long long>(operation.size), static_cast<unsigned long long>(operation.value), static_cast<unsigned>(operation.function), item.words.size());
+        const auto select = item.words.size() >= 8u && operation.opcode == 0x49u ? (item.words[2] >> 24u) & 7u : 0u;
+        const auto context = item.words.size() >= 8u && operation.opcode == 0x49u ? item.words[7] : 0u;
+        std::fprintf(stderr, "[recode-loop-trace] %s runner 0x%x q%u kind %u submission %llu offset %u opcode 0x%x address 0x%llx size %llu value 0x%llx function %u words %zu interrupt %u context 0x%x\n", stage, queue, operation.queue, static_cast<unsigned>(operation.kind), static_cast<unsigned long long>(operation.submission), operation.packetOffset, operation.opcode, static_cast<unsigned long long>(operation.address), static_cast<unsigned long long>(operation.size), static_cast<unsigned long long>(operation.value), static_cast<unsigned>(operation.function), item.words.size(), select, context);
     }
 
     void handle(const Item& item) {
         trace(item, "take");
-        if (item.operation.predicated) totals().predicated.fetch_add(1, std::memory_order_relaxed);
+        if (item.operation.predicated && item.guards.empty()) totals().predicated.fetch_add(1, std::memory_order_relaxed);
         const auto device = Resolve::AttachedDevice();
         if (device == nullptr) {
             if (item.operation.kind != OpKind::Wait && item.operation.kind != OpKind::Flip) Record::RefuseUnrecorded("loop operation", 0, "the recode has no device yet");
@@ -179,6 +191,57 @@ private:
             case OpKind::Flip: totals().flips.fetch_add(1, std::memory_order_relaxed); return;
             case OpKind::Marker: return;
         }
+    }
+
+    struct Decided {
+        std::uint64_t submission = 0;
+        std::size_t start = 0;
+        bool condition = false;
+        bool passes = true;
+    };
+
+    bool guardsPass(const Item& item) {
+        totals().guarded.fetch_add(1, std::memory_order_relaxed);
+        for (const auto& guard : item.guards) {
+            const auto known = std::find_if(decided.begin(), decided.end(), [&](const Decided& entry) { return entry.submission == guard.submission && entry.start == guard.start && entry.condition == guard.condition; });
+            const bool passes = known != decided.end() ? known->passes : evaluate(guard);
+            if (known == decided.end()) decided[decidedNext++ % decided.size()] = {guard.submission, guard.start, guard.condition, passes};
+            if (!passes) {
+                totals().skipped.fetch_add(1, std::memory_order_relaxed);
+                return false;
+            }
+        }
+        return true;
+    }
+
+    void settle(VulkanDevice& device) {
+        for (;;) {
+            {
+                GuestMemory::TagGpuLockSite(GuestMemory::GpuLockSite::Wait);
+                std::lock_guard lock(GuestMemory::GpuMutex());
+                auto* recorder = device.graphicsContext().recorder;
+                if (recorder == nullptr || recorder->Idle()) return;
+                recorder->Submit();
+                static_cast<void>(recorder->Reap());
+                if (recorder->Idle()) return;
+            }
+            std::this_thread::sleep_for(std::chrono::microseconds(50));
+        }
+    }
+
+    bool evaluate(const OperationGuard& guard) {
+        totals().conditionsRead.fetch_add(1, std::memory_order_relaxed);
+        if (const auto device = Resolve::AttachedDevice()) settle(*device);
+        if (guard.condition) {
+            const auto address = static_cast<std::uint64_t>(guard.words[1]) | (static_cast<std::uint64_t>(guard.words[2]) << 32u);
+            MemoryCore::Get().FlushGpuWrites(address, 4u);
+            return Pm4::ReadCondition(guard.words) != 0u;
+        }
+        thread_local QueueState probe;
+        probe.predication = guard.predication;
+        probe.sampleDumpBlocks = guard.sampleDumpBlocks;
+        MemoryCore::Get().FlushGpuWrites(guard.predication.address, Pm4::PredicationBytes(guard.predication));
+        return Pm4::PredicationPasses(probe);
     }
 
     static std::uint64_t codeOf(const Item& item) {
@@ -242,9 +305,38 @@ private:
         totals().labelsAtOnce.fetch_add(1, std::memory_order_relaxed);
     }
 
+    static std::optional<Pm4::MemoryCopy> memoryCopyOf(std::span<const std::uint32_t> words) {
+        if (auto copy = Pm4::DecodeMemoryCopy(words)) return copy;
+        if (words.size() != 6u || ((words[0] >> 8u) & 0xffu) != 0x40u || Pm4::CopyDataToRegister(words)) return std::nullopt;
+        const auto source = Pm4::CopyDataSource(words);
+        if (source == 0u || source == Pm4::CopyDataSelectGds || source == Pm4::CopyDataGpuClockSource || Pm4::CopyDataImmediate(source)) return std::nullopt;
+        const auto from = static_cast<std::uint64_t>(words[2]) | (static_cast<std::uint64_t>(words[3]) << 32u);
+        const auto to = static_cast<std::uint64_t>(words[4]) | (static_cast<std::uint64_t>(words[5]) << 32u);
+        const auto bytes = Pm4::CopyDataBytes(words);
+        if (from == 0u || to == 0u || (from < to + bytes && to < from + bytes)) return std::nullopt;
+        return Pm4::MemoryCopy{from, to, bytes};
+    }
+
+    static void landRunTime(const Graphics::Context& context, const std::vector<std::uint32_t>& words) {
+        totals().runTimeStores.fetch_add(1, std::memory_order_relaxed);
+        const auto land = [words] {
+            static const QueueState unwritten{};
+            const auto resolved = Pm4::ResolveStore(words, unwritten, std::numeric_limits<std::size_t>::max());
+            if (!resolved) {
+                totals().runTimeRefused.fetch_add(1, std::memory_order_relaxed);
+                Record::RefuseUnrecorded("loop store", 0, "a store computed at run time has no CPU form (opcode 0x" + std::to_string((words[0] >> 8u) & 0xffu) + ")");
+                return;
+            }
+            const auto bytes = resolved->Bytes();
+            if (!bytes.empty()) GuestMemory::Write(resolved->address, bytes, 1);
+        };
+        if (!context.recorder->AfterRecordedWork(land)) land();
+    }
+
     void store(VulkanDevice& device, const Item& item) {
         if (item.words.empty()) return;
         const auto opcode = (item.words[0] >> 8u) & 0xffu;
+        if (opcode == 0x83u) return;
         GuestMemory::TagGpuLockSite(GuestMemory::GpuLockSite::Label);
         std::lock_guard lock(GuestMemory::GpuMutex());
         const auto context = device.graphicsContext();
@@ -275,10 +367,13 @@ private:
                 storeBytes(context, piece.address, filled);
                 continue;
             }
-            const auto copy = Pm4::DecodeMemoryCopy(item.words);
-            if (!copy) continue;
+            const auto copy = memoryCopyOf(item.words);
+            if (!copy) {
+                landRunTime(context, item.words);
+                continue;
+            }
             totals().copies.fetch_add(1, std::memory_order_relaxed);
-            if (Record::CopyInMirror(context, *context.recorder, *copy)) continue;
+            if (Record::StoresToMirror(copy->bytes, copy->destination) && Record::CopyInMirror(context, *context.recorder, *copy)) continue;
             totals().copiesOnCpu.fetch_add(1, std::memory_order_relaxed);
             const auto moved = *copy;
             const auto land = [moved] {
@@ -332,6 +427,8 @@ private:
     };
 
     std::uint32_t queue;
+    std::array<Decided, 8> decided{};
+    std::size_t decidedNext = 0;
     std::array<Stored, 6> recent{};
     std::size_t recentNext = 0;
     std::chrono::steady_clock::time_point lastWork{};
@@ -348,6 +445,20 @@ void SetInterruptHook(InterruptHook hook, void* owner) {
     held.hook = hook;
     held.owner = owner;
     interruptHook.store(&held, std::memory_order_release);
+}
+
+void TraceKept(std::span<const std::uint32_t> packet, std::uint32_t opcode, std::uint32_t queue, std::uint64_t submission, std::size_t offset, bool flip) {
+    static const bool traced = std::getenv("APS5_RECODE_TRACE_LOOP") != nullptr;
+    static std::atomic<std::uint32_t> lines{0};
+    if (!traced || packet.empty() || lines.fetch_add(1, std::memory_order_relaxed) >= 400u) return;
+    const auto word = [&](std::size_t at) { return at < packet.size() ? packet[at] : 0u; };
+    std::fprintf(stderr, "[recode-loop-trace] kept q%u submission %llu offset %zu opcode 0x%x%s words %zu: %08x %08x %08x %08x %08x %08x %08x\n", queue, static_cast<unsigned long long>(submission), offset, opcode, flip ? " flip" : "", packet.size(), word(1), word(2), word(3), word(4), word(5), word(6), word(7));
+}
+
+void TraceInterrupt(std::uint32_t queue, std::uint32_t context) {
+    static const bool traced = std::getenv("APS5_RECODE_TRACE_LOOP") != nullptr;
+    static const auto started = std::chrono::steady_clock::now();
+    if (traced) std::fprintf(stderr, "[recode-loop-trace] interrupt queue 0x%x context 0x%x at %.3f s\n", queue, context, std::chrono::duration<double>(std::chrono::steady_clock::now() - started).count());
 }
 
 void Ensure(std::uint32_t queue) {
@@ -373,7 +484,7 @@ bool Takes(std::span<const std::uint32_t> packet, std::uint32_t opcode, std::uin
             case 0x40:
                 if (packet.size() >= 6u && Pm4::CopyDataToRegister(packet)) return false;
                 return !Pm4::DecodeStores(packet).empty();
-            case 0x50: case 0x83: return !Pm4::DecodeStores(packet).empty();
+            case 0x50: return !Pm4::DecodeStores(packet).empty();
             default: return false;
         }
     } catch (const std::exception&) {
@@ -400,9 +511,9 @@ LoopCounts Counts() {
 
 std::string Line() {
     const auto counts = Counts();
-    char text[400];
-    std::snprintf(text, sizeof(text), "draws %llu, dispatches %llu, refused %llu; label stores %llu (%llu at once on the CPU), interrupts %llu; waits %llu (%llu from the label table, %llu from guest memory, %llu polls); copies %llu (%llu on the CPU after their batch); flips %llu; predicated operations recorded unconditionally %llu; idle reaps %llu",
-                  static_cast<unsigned long long>(counts.draws), static_cast<unsigned long long>(counts.dispatches), static_cast<unsigned long long>(counts.refused), static_cast<unsigned long long>(counts.labels), static_cast<unsigned long long>(counts.labelsAtOnce), static_cast<unsigned long long>(counts.interrupts), static_cast<unsigned long long>(counts.waits), static_cast<unsigned long long>(counts.waitsFromTable), static_cast<unsigned long long>(counts.waitsFromGuest), static_cast<unsigned long long>(counts.waitPolls), static_cast<unsigned long long>(counts.copies), static_cast<unsigned long long>(counts.copiesOnCpu), static_cast<unsigned long long>(counts.flips), static_cast<unsigned long long>(totals().predicated.load()), static_cast<unsigned long long>(totals().idleReaps.load()));
+    char text[512];
+    std::snprintf(text, sizeof(text), "draws %llu, dispatches %llu, refused %llu; label stores %llu (%llu at once on the CPU), interrupts %llu; waits %llu (%llu from the label table, %llu from guest memory, %llu polls); copies %llu (%llu on the CPU after their batch); run-time stores %llu (%llu refused); flips %llu; guarded operations %llu (%llu skipped, %llu conditions read); predicated operations with no guard %llu; idle reaps %llu",
+                  static_cast<unsigned long long>(counts.draws), static_cast<unsigned long long>(counts.dispatches), static_cast<unsigned long long>(counts.refused), static_cast<unsigned long long>(counts.labels), static_cast<unsigned long long>(counts.labelsAtOnce), static_cast<unsigned long long>(counts.interrupts), static_cast<unsigned long long>(counts.waits), static_cast<unsigned long long>(counts.waitsFromTable), static_cast<unsigned long long>(counts.waitsFromGuest), static_cast<unsigned long long>(counts.waitPolls), static_cast<unsigned long long>(counts.copies), static_cast<unsigned long long>(counts.copiesOnCpu), static_cast<unsigned long long>(totals().runTimeStores.load()), static_cast<unsigned long long>(totals().runTimeRefused.load()), static_cast<unsigned long long>(counts.flips), static_cast<unsigned long long>(totals().guarded.load()), static_cast<unsigned long long>(totals().skipped.load()), static_cast<unsigned long long>(totals().conditionsRead.load()), static_cast<unsigned long long>(totals().predicated.load()), static_cast<unsigned long long>(totals().idleReaps.load()));
     return text;
 }
 

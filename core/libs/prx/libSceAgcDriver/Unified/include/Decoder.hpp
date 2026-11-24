@@ -4,6 +4,7 @@
 #include "prx/libSceAgcDriver/Execution/include/Driver/Queues/Submission.hpp"
 #include "prx/libSceAgcDriver/Execution/include/QueueState.hpp"
 #include "prx/libSceAgcDriver/Unified/include/Operation.hpp"
+#include "prx/libSceAgcDriver/Unified/include/OperationGuard.hpp"
 #include "prx/libSceAgcDriver/Unified/include/SnapshotRing.hpp"
 #include "prx/libSceAgcDriver/Unified/include/Ranges.hpp"
 #include <cstddef>
@@ -80,6 +81,7 @@ public:
     [[nodiscard]] const DriverDetail::Submission* CurrentSubmission() const { return submission; }
     void Hold(std::shared_ptr<const DriverDetail::Submission> current) { held = std::move(current); }
     [[nodiscard]] const std::shared_ptr<const DriverDetail::Submission>& Held() const { return held; }
+    [[nodiscard]] const std::vector<OperationGuard>& Guards() const { return guards; }
 
 private:
     friend class Decoder;
@@ -100,6 +102,7 @@ private:
     bool resolve = false;
     UseSink uses;
     std::vector<GuestUse> useBuffer;
+    std::vector<OperationGuard> guards;
     std::uint64_t targetContext = ~std::uint64_t{0};
     std::uint64_t sequence = 0;
     DecodeCounts counts;

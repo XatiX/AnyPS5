@@ -2,6 +2,7 @@
 #define CORE_LIBS_PRX_LIBSCEAGCDRIVER_UNIFIED_INCLUDE_RECORDQUEUE_HPP
 
 #include "prx/libSceAgcDriver/Unified/include/Operation.hpp"
+#include "prx/libSceAgcDriver/Unified/include/OperationGuard.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Pm4.hpp"
 #include <array>
 #include <chrono>
@@ -30,6 +31,7 @@ struct Item {
     std::optional<Pm4::DrawParameters> parameters;
     std::array<std::uint32_t, 3> groups{};
     std::vector<std::uint32_t> words;
+    std::vector<OperationGuard> guards;
 };
 
 struct QueueCounts {
