@@ -48,6 +48,7 @@ void LandGpuWrites(GuestRanges ranges);
 bool ResidentDrawInputs();
 void NoteGpuWrites(GuestRanges ranges);
 bool OwnedUploadsPending();
+void ConsumeNow();
 std::size_t RecordOwnedUploads(VkCommandBuffer commands, std::vector<std::shared_ptr<void>>& kept);
 
 }

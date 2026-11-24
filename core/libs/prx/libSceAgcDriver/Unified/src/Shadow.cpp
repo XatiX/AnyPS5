@@ -666,6 +666,10 @@ void NoteGpuWrites(GuestRanges ranges) {
     }
 }
 
+void ConsumeNow() {
+    if (MemoryActive()) consumeMemory();
+}
+
 bool OwnedUploadsPending() {
     return ServesOwned() && ResidencyService::Get().Pending();
 }

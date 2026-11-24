@@ -1176,6 +1176,11 @@ bool copiesInputs() {
     return copies;
 }
 
+std::atomic<std::uint64_t>& inputConsumes() {
+    static std::atomic<std::uint64_t> count{0};
+    return count;
+}
+
 bool shadowInputs() {
     static const bool shadow = std::getenv("APS5_RECODE_MIRROR_INPUTS") == nullptr;
     return shadow;
@@ -1186,6 +1191,11 @@ std::optional<DrawInput> drawInput(const Context& context, std::uint64_t address
     auto& pages = MemoryCore::Get().Pages();
     if (!shadowInputs() && mirrorMode() && !DirectMemoryAliased_nid_postfix(static_cast<std::uintptr_t>(address), static_cast<std::size_t>(bytes))) {
         if (auto input = mirrorInput(address, bytes)) {
+            const bool gpu = pages.GpuWrittenIn(address, bytes) || !pages.GpuOwnedIn(address, bytes).empty() || gpuPending(address, bytes);
+            if (!gpu && !pages.CleanIn(address, bytes)) {
+                Shadow::ConsumeNow();
+                inputConsumes().fetch_add(1, std::memory_order_relaxed);
+            }
             source = InputSource::Mirrored;
             return input;
         }
@@ -1774,7 +1784,7 @@ public:
         line += text;
         std::snprintf(text, sizeof(text), "; dispatches %llu recorded (%llu indirect, %llu storage images written), %llu to the existing path, %.1f us per dispatch; compute pipelines %zu held, %llu queued (%llu ahead of recording), %llu built in %.1f ms, %zu building, %zu failed", static_cast<unsigned long long>(totals.dispatches), static_cast<unsigned long long>(totals.indirectDispatches), static_cast<unsigned long long>(totals.storageWrites), static_cast<unsigned long long>(totals.dispatchExisting), totals.dispatches == 0 ? 0.0 : static_cast<double>(totals.dispatchNanoseconds) / 1000.0 / static_cast<double>(totals.dispatches), pipelineCounts.held, static_cast<unsigned long long>(pipelinesQueued.load(std::memory_order_relaxed)), static_cast<unsigned long long>(pipelinesPrebuilt.load(std::memory_order_relaxed)), static_cast<unsigned long long>(pipelineCounts.built), static_cast<double>(pipelineCounts.nanoseconds) / 1e6, pipelineCounts.building, pipelineCounts.failed);
         line += text;
-        std::snprintf(text, sizeof(text), "; table maps %llu hits, %llu uploads (%.1f MiB), %llu retired, %zu held (%.1f MiB); table images %llu reused, %llu bound (%llu whole), %llu elements bound, %llu checked for a refresh, %llu depth kept, %llu retired, %zu held; compressed records beside another format %llu",static_cast<unsigned long long>(totals.mapHits), static_cast<unsigned long long>(totals.mapUploads), static_cast<double>(totals.mapUploadBytes) / 1048576.0, static_cast<unsigned long long>(totals.mapRetired), maps.size(), static_cast<double>(mapBytes) / 1048576.0, static_cast<unsigned long long>(totals.tableImageHits), static_cast<unsigned long long>(totals.tableImageBuilds), static_cast<unsigned long long>(totals.tableImageWhole), static_cast<unsigned long long>(totals.tableImageBinds), static_cast<unsigned long long>(totals.tableImageRefreshes), static_cast<unsigned long long>(totals.tableImageDepthKept), static_cast<unsigned long long>(totals.tableImageRetired), tableImages.size(), static_cast<unsigned long long>(totals.compressedAliases));
+        std::snprintf(text, sizeof(text), "; table maps %llu hits, %llu uploads (%.1f MiB), %llu retired, %zu held (%.1f MiB); table images %llu reused, %llu bound (%llu whole), %llu elements bound, %llu checked for a refresh, %llu depth kept, %llu retired, %zu held; compressed records beside another format %llu; consumes for CPU-written mirror inputs %llu",static_cast<unsigned long long>(totals.mapHits), static_cast<unsigned long long>(totals.mapUploads), static_cast<double>(totals.mapUploadBytes) / 1048576.0, static_cast<unsigned long long>(totals.mapRetired), maps.size(), static_cast<double>(mapBytes) / 1048576.0, static_cast<unsigned long long>(totals.tableImageHits), static_cast<unsigned long long>(totals.tableImageBuilds), static_cast<unsigned long long>(totals.tableImageWhole), static_cast<unsigned long long>(totals.tableImageBinds), static_cast<unsigned long long>(totals.tableImageRefreshes), static_cast<unsigned long long>(totals.tableImageDepthKept), static_cast<unsigned long long>(totals.tableImageRetired), tableImages.size(), static_cast<unsigned long long>(totals.compressedAliases), static_cast<unsigned long long>(inputConsumes().load(std::memory_order_relaxed)));
         line += text;
         line += "; record ranges noted GPU-written for the memory core " + std::to_string(totals.recordRangesNoted) + "; records made for a sampled shape after a hand-over " + std::to_string(totals.sampledRecordsCreated) + ", new storage records started from their memory " + std::to_string(totals.storageRecordsSeeded) + "; new chains zeroed " + std::to_string(totals.zeroedChains) + ", new records poisoned " + std::to_string(totals.poisonedRecords);
         if (metadataClears != nullptr) {
