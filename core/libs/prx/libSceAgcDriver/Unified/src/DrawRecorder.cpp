@@ -179,6 +179,11 @@ struct Totals {
     std::uint64_t mirrorArguments = 0;
     std::uint64_t patchedArguments = 0;
     std::uint64_t depthWriterHandOvers = 0;
+    std::uint64_t drawLockNanoseconds = 0;
+    std::uint64_t drawBodyNanoseconds = 0;
+    std::uint64_t drawLandingNanoseconds = 0;
+    std::array<std::uint64_t, 9> recordSplit{};
+    std::array<std::uint64_t, 3> preSplit{};
     std::uint64_t meshDraws = 0;
     std::uint64_t meshEmpty = 0;
     std::uint64_t edgeSnapshotBytes = 0;
@@ -1254,13 +1259,18 @@ public:
     }
 
     bool Record(const Context& context, const Resolve::ResolvedDraw& draw, const Pm4::DrawParameters& parameters, std::string& reason) {
+        const auto waitStarted = std::chrono::steady_clock::now();
         std::lock_guard lock(mutex);
         const auto started = std::chrono::steady_clock::now();
+        totals.drawLockNanoseconds += elapsed(waitStarted) - elapsed(started);
         bool recorded = false;
         try {
             recorded = record(context, draw, parameters, reason);
+            const auto landStarted = std::chrono::steady_clock::now();
+            totals.drawBodyNanoseconds += elapsed(started) - elapsed(landStarted);
             landWrites();
             scheduleLandings(context);
+            totals.drawLandingNanoseconds += elapsed(landStarted);
         } catch (const std::exception& error) {
             reason = std::string("record failed: ") + error.what();
         }
@@ -1403,6 +1413,7 @@ public:
         std::lock_guard lock(mutex);
         printArgumentCensus();
         printExistingPackets();
+        if (Downgrades::Active()) std::fprintf(stderr, "[recode-record-split] ms: write-backs for readers %.1f, hand-overs for writers %.1f, deferred images %.1f; inputs %.1f, targets and pipeline %.1f, open batch %.1f, input copies and sets %.1f, push and draw inputs %.1f, uploads and stores %.1f, pass access %.1f, start pass %.1f, binds and draw %.1f\n", totals.preSplit[0] / 1e6, totals.preSplit[1] / 1e6, totals.preSplit[2] / 1e6, totals.recordSplit[0] / 1e6, totals.recordSplit[1] / 1e6, totals.recordSplit[2] / 1e6, totals.recordSplit[3] / 1e6, totals.recordSplit[4] / 1e6, totals.recordSplit[5] / 1e6, totals.recordSplit[6] / 1e6, totals.recordSplit[7] / 1e6, totals.recordSplit[8] / 1e6);
         const auto pipelineCounts = takePipelineCounts();
         char text[384];
         const auto draws = totals.recorded + totals.refused;
@@ -1454,7 +1465,7 @@ public:
             std::snprintf(text, sizeof(text), "; mirror writes %.1f MiB, pages left GPU-owned %.1f MiB, edges landed whole %.1f MiB, edges snapshot %.1f MiB and landed by diff %.1f MiB, indirect arguments from the mirror %llu", static_cast<double>(totals.mirrorWriteBytes) / 1048576.0, static_cast<double>(totals.ownedBytes) / 1048576.0, static_cast<double>(totals.openLandedBytes) / 1048576.0, static_cast<double>(totals.edgeSnapshotBytes) / 1048576.0, static_cast<double>(totals.edgeDiffBytes) / 1048576.0, static_cast<unsigned long long>(totals.mirrorArguments));
             line += text;
         }
-        std::snprintf(text, sizeof(text), "; indirect draw arguments patched on the GPU for a constant rule %llu; mesh draws %llu (%llu empty); depth records written back before a buffer writer %llu", static_cast<unsigned long long>(totals.patchedArguments), static_cast<unsigned long long>(totals.meshDraws), static_cast<unsigned long long>(totals.meshEmpty), static_cast<unsigned long long>(totals.depthWriterHandOvers));
+        std::snprintf(text, sizeof(text), "; indirect draw arguments patched on the GPU for a constant rule %llu; mesh draws %llu (%llu empty); depth records written back before a buffer writer %llu; draw record split: lock wait %.1f ms, body %.1f ms, landings %.1f ms", static_cast<unsigned long long>(totals.patchedArguments), static_cast<unsigned long long>(totals.meshDraws), static_cast<unsigned long long>(totals.meshEmpty), static_cast<unsigned long long>(totals.depthWriterHandOvers), static_cast<double>(totals.drawLockNanoseconds) / 1e6, static_cast<double>(totals.drawBodyNanoseconds) / 1e6, static_cast<double>(totals.drawLandingNanoseconds) / 1e6);
         line += text;
         std::snprintf(text, sizeof(text), "; GPU-written chunks %llu switched to their import from the written bitmap (%.1f MiB copied over), %llu from other GPU writes, %llu refused, %llu written pieces already on an import", static_cast<unsigned long long>(totals.importSwitches), static_cast<double>(totals.switchBytes) / 1048576.0, static_cast<unsigned long long>(totals.writtenSwitches), static_cast<unsigned long long>(totals.switchRefused), static_cast<unsigned long long>(totals.writtenOnImports));
         line += text;
@@ -3413,9 +3424,14 @@ private:
         writtenRecords.clear();
         stageStorageImages.clear();
         directWrites.clear();
+        auto preMark = std::chrono::steady_clock::now();
         writeBackForReaders(context, draw);
+        totals.preSplit[0] += elapsed(preMark);
+        preMark = std::chrono::steady_clock::now();
         handOverForWriters(context, draw);
+        totals.preSplit[1] += elapsed(preMark);
         if (std::ranges::all_of(draw.stages, [](const Resolve::ResolvedStage& stage) { return stage.deferredImages.empty(); })) return recordWithSlots(context, draw, parameters, reason);
+        preMark = std::chrono::steady_clock::now();
         auto bound = draw;
         std::vector<std::shared_ptr<Graphics::StorageTexture>> written;
         std::vector<std::pair<std::uint64_t, std::uint64_t>> writtenRanges;
@@ -3433,6 +3449,7 @@ private:
             }
         }
         totals.deferredReads++;
+        totals.preSplit[2] += elapsed(preMark);
         if (!recordWithSlots(context, bound, parameters, reason)) return false;
         if (!written.empty() || !writtenRecords.empty()) {
             noteStorageWrites(context, *context.recorder, written);
@@ -3485,6 +3502,12 @@ private:
         totals.surfaceNanoseconds += elapsed(phase);
         std::vector<Graphics::CompiledShader> shaders;
         for (const auto& stage : draw.stages) shaders.push_back({stage.program.stage, stage.program.result.get(), stage.program.pushOffset});
+        auto splitMark = std::chrono::steady_clock::now();
+        const auto split = [&](std::size_t index) {
+            const auto now = std::chrono::steady_clock::now();
+            totals.recordSplit[index] += static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(now - splitMark).count());
+            splitMark = now;
+        };
         const auto& attributes = draw.stages.front().program.vertexAttributes;
         Graphics::VertexInputLayout vertexInput;
         std::vector<VkBuffer> vertexBuffers;
@@ -3526,6 +3549,7 @@ private:
             }
             totals.inputsMerged += inputRanges.size() - unions.size();
         }
+        split(0);
         std::vector<VkImageView> views;
         std::vector<std::shared_ptr<void>> owners;
         std::vector<std::shared_ptr<Graphics::StorageTexture>> residents;
@@ -3622,10 +3646,12 @@ private:
         if (meshWindow) Graphics::PrepareMeshWindow(context);
         auto framebuffer = pipeline->AcquireFramebuffer(views, owners, state.renderExtent, state.renderLayers);
         const auto masked = maskedOutputs(state, fragmentOutputs(shaders));
+        split(1);
 
         recorder->OpenBatch();
         const auto serial = recorder->OpenBatchSerial();
         const auto completed = recorder->CompletedThrough();
+        split(2);
         std::vector<CopiedSpan> copiedInputs;
         for (const auto& copy : inputCopies) {
             const auto input = copiedInput(copiedInputs, copy.address, copy.bytes, serial, completed);
@@ -3643,6 +3669,7 @@ private:
             descriptorSets[set] = allocateSet(context, set == 0u ? sets.main : sets.fragment, serial, completed);
             if (!writeSet(context, draw, set, descriptorSets[set], serial, completed, pageTable, reason)) return false;
         }
+        split(3);
 
         std::array<std::byte, Graphics::PipelinePushConstantBytes> block{};
         for (std::size_t index = 0; index < draw.stages.size(); ++index) {
@@ -3773,6 +3800,7 @@ private:
             }
             recorder->NotePendingRead(parameters.indexAddress, bytes, Graphics::Recorder::ReadKind::DrawInput);
         }
+        split(4);
 
         if (Shadow::OwnedUploadsPending()) {
             phase = std::chrono::steady_clock::now();
@@ -3786,6 +3814,7 @@ private:
         }
         if (recorder->HasQueuedKeyStores()) recorder->FlushKeyStores();
         if (recorder->HasQueuedStores()) recorder->FlushStores();
+        split(5);
         const auto key = Graphics::DrawRenderPassKey(context, state, views);
         std::vector<std::pair<std::uint64_t, std::uint64_t>> passReads;
         std::vector<std::pair<std::uint64_t, std::uint64_t>> passWrites;
@@ -3811,7 +3840,9 @@ private:
         const bool snapshotArguments = parameters.indirect && ring != nullptr && argumentBuffer == ring->Handle() && !argumentPatch.has_value();
         const bool forced = !mergesPasses() || !draw.complete || feedback || storesImages || (parameters.indirect && !snapshotArguments) || indirectCount.has_value();
         const bool fenced = state.depth.has_value();
+        split(6);
         const auto start = recorder->StartDrawPass(key, forced, fenced, access);
+        split(7);
         if (recorder->OpenBatchSerial() != serial) totals.batchMoves++;
         const auto commands = start.commands;
         auto& recording = recorder->GraphicsState();
@@ -3893,6 +3924,7 @@ private:
             context.Resolved(&Graphics::DeviceFunctions::cmdDraw, "vkCmdDraw")(commands, parameters.indexCount, parameters.instanceCount, parameters.firstVertex, parameters.firstInstance);
         }
         recorder->EndGpuTiming(drawTiming);
+        split(8);
 
         recorder->LeaveRenderPassOpen(key, 0, fenced, access);
         recorder->Keep(pipeline);
