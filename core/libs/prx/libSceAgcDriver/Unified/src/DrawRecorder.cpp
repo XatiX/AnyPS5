@@ -79,6 +79,16 @@ bool writesFaultTokens() {
     return writes;
 }
 
+thread_local std::string knownPaths;
+
+void noteKnownPath(const char* path, std::uint64_t address, std::uint64_t bytes) {
+    static const bool marking = std::getenv("APS5_RECODE_HANG_MARKS") != nullptr;
+    if (!marking || knownPaths.size() > 200u) return;
+    char text[64];
+    std::snprintf(text, sizeof(text), " %s 0x%llx+0x%llx", path, static_cast<unsigned long long>(address), static_cast<unsigned long long>(bytes));
+    knownPaths += text;
+}
+
 struct HangMarks {
     static constexpr std::uint32_t Slots = 1u << 16u;
     static constexpr std::uint32_t Snapshots = 256u;
@@ -92,6 +102,7 @@ struct HangMarks {
         std::array<std::uint64_t, Inputs> writtenSerial{};
         std::array<std::uint32_t, Inputs> pageState{};
         std::uint64_t completed = 0;
+        std::string known;
     };
     std::mutex mutex;
     std::shared_ptr<Graphics::Buffer> buffer;
@@ -102,9 +113,9 @@ struct HangMarks {
 };
 
 std::string hangInputs(HangMarks& marks, std::uint32_t sequence) {
-    std::string line;
     const auto slot = sequence % HangMarks::Snapshots;
     const auto& snapshot = marks.snapshots[slot];
+    std::string line = " | known buffers:" + snapshot.known;
     marks.mirrorCopies->Invalidate();
     const auto* mirror = marks.mirrorCopies->Bytes().data() + static_cast<std::size_t>(slot) * HangMarks::Inputs * HangMarks::InputBytes;
     char text[64];
@@ -180,6 +191,8 @@ void markHang(const Context& context, Graphics::Recorder& recorder, VkCommandBuf
         marks.programs[sequence % HangMarks::Slots] = {hash, groups};
         auto& snapshot = marks.snapshots[sequence % HangMarks::Snapshots];
         snapshot = {};
+        snapshot.known = std::move(knownPaths);
+        knownPaths.clear();
         std::uint32_t input = 0;
         for (std::size_t index = 0; index < work.uses.size() && index < work.imageBegin && input < HangMarks::Inputs; ++index) {
             const auto& use = work.uses[index];
@@ -2305,6 +2318,7 @@ private:
             }
             if (const auto copied = copyKnownBuffer(address, bytes, serial, completed); copied != 0u) {
                 totals.knownCopied++;
+                noteKnownPath("copied", address, bytes);
                 write(copied, bytes);
                 continue;
             }
@@ -2312,6 +2326,7 @@ private:
             Shadow::OwnedSpan span;
             if (bytes <= KnownBufferLimitBytes && !MemoryCore::Get().Pages().GpuWrittenIn(address, reach) && ((reach != bytes && Shadow::ServeOwned(context, address, reach, &span)) || Shadow::ServeOwned(context, address, bytes, &span)) && span.address != 0u) {
                 totals.knownServed++;
+                noteKnownPath("owned", address, bytes);
                 write(span.address, bytes);
                 continue;
             }
@@ -2326,6 +2341,7 @@ private:
             }
             if (mapped != 0u) {
                 totals.knownMapped++;
+                noteKnownPath("mapped", address, bytes);
                 write(mapped, bytes);
                 continue;
             }
