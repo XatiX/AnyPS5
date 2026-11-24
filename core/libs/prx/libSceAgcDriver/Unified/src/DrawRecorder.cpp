@@ -79,11 +79,66 @@ bool writesFaultTokens() {
     return writes;
 }
 
+struct HangMarks {
+    static constexpr std::uint32_t Slots = 1u << 16u;
+    std::mutex mutex;
+    std::shared_ptr<Graphics::Buffer> buffer;
+    std::array<std::pair<std::uint64_t, std::uint64_t>, Slots> programs{};
+    std::uint32_t next = 0;
+};
+
+HangMarks& hangMarks() {
+    static auto& marks = *new HangMarks();
+    return marks;
+}
+
+void watchHangMarks() {
+    auto& marks = hangMarks();
+    std::uint32_t shown = 0;
+    std::uint32_t still = 0;
+    for (;;) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(250));
+        std::uint32_t seen = 0;
+        std::pair<std::uint64_t, std::uint64_t> program{};
+        {
+            std::lock_guard lock(marks.mutex);
+            if (marks.buffer == nullptr) continue;
+            marks.buffer->Invalidate();
+            std::memcpy(&seen, marks.buffer->Bytes().data(), sizeof(seen));
+            program = marks.programs[seen % HangMarks::Slots];
+        }
+        if (seen == shown) {
+            if (++still == 4u) std::fprintf(stderr, "[recode-hang-mark] the GPU has not passed dispatch %u for 1 s: program %016llx, %llu groups\n", seen, static_cast<unsigned long long>(program.first), static_cast<unsigned long long>(program.second));
+            continue;
+        }
+        shown = seen;
+        still = 0;
+    }
+}
+
+void markHang(const Context& context, Graphics::Recorder& recorder, VkCommandBuffer commands, std::uint64_t hash, std::uint64_t groups) {
+    static const bool marking = std::getenv("APS5_RECODE_HANG_MARKS") != nullptr;
+    if (!marking) return;
+    auto& marks = hangMarks();
+    std::uint32_t sequence = 0;
+    {
+        std::lock_guard lock(marks.mutex);
+        if (marks.buffer == nullptr) {
+            marks.buffer = std::make_shared<Graphics::Buffer>(context, 256u, VK_BUFFER_USAGE_TRANSFER_DST_BIT);
+            std::memset(marks.buffer->Bytes().data(), 0, 256u);
+            std::thread(watchHangMarks).detach();
+        }
+        sequence = ++marks.next;
+        marks.programs[sequence % HangMarks::Slots] = {hash, groups};
+    }
+    recorder.Keep(marks.buffer);
+    context.Function<PFN_vkCmdFillBuffer>("vkCmdFillBuffer")(commands, marks.buffer->Handle(), 0, 4, sequence);
+}
+
 void noteFaultToken(const Context& context, Graphics::Recorder& recorder, VkCommandBuffer commands, std::span<const Resolve::ResolvedStage> stages, FaultStage stage, const char* kind, std::uint32_t count, std::uint32_t instances) {
     try {
         if (!writesFaultTokens()) return;
-        const auto queue = GuestMemory::GpuLockThreadTag();
-        if (queue != 0) return;
+        constexpr std::uint32_t queue = 0;
         auto& ring = FaultTokenRing::Instance();
         const auto token = ring.Claim();
         auto* entry = ring.Mutable(token);
@@ -3107,15 +3162,16 @@ private:
             return false;
         }
 
+        if (recorder->HasQueuedKeyStores()) recorder->FlushKeyStores();
+        if (recorder->HasQueuedStores()) recorder->FlushStores();
         if (Shadow::OwnedUploadsPending()) {
             std::vector<std::shared_ptr<void>> kept;
             if (Shadow::RecordOwnedUploads(recorder->Commands(), kept) != 0u) totals.residencyLands++;
             for (auto& object : kept) recorder->Keep(std::move(object));
         }
-        if (recorder->HasQueuedKeyStores()) recorder->FlushKeyStores();
-        if (recorder->HasQueuedStores()) recorder->FlushStores();
         const auto commands = recorder->Commands();
         Graphics::RecordMemoryBarrier(context, commands, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT | VK_PIPELINE_STAGE_HOST_BIT, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT | (indirect ? VK_PIPELINE_STAGE_DRAW_INDIRECT_BIT : 0u), VK_ACCESS_SHADER_WRITE_BIT | VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT | VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT | VK_ACCESS_TRANSFER_WRITE_BIT | VK_ACCESS_HOST_WRITE_BIT, VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT | (indirect ? VK_ACCESS_INDIRECT_COMMAND_READ_BIT : 0u));
+        markHang(context, *recorder, commands, Downgrades::ProgramHash(stage.program.codeAddress), groups[0] * groups[1] * groups[2]);
         context.BindComputePipeline(commands, pipeline->pipeline);
         Downgrades::NotePipeline(reinterpret_cast<std::uint64_t>(pipeline->pipeline), stage.program.codeAddress, stage.program.result != nullptr ? stage.program.result->spirv.ContentHash().low : 0u);
         const auto bind = context.Resolved(&Graphics::DeviceFunctions::cmdBindDescriptorSets, "vkCmdBindDescriptorSets");
@@ -3846,6 +3902,8 @@ private:
         }
         split(4);
 
+        if (recorder->HasQueuedKeyStores()) recorder->FlushKeyStores();
+        if (recorder->HasQueuedStores()) recorder->FlushStores();
         if (Shadow::OwnedUploadsPending()) {
             phase = std::chrono::steady_clock::now();
             std::vector<std::shared_ptr<void>> kept;
@@ -3856,8 +3914,6 @@ private:
             for (auto& object : kept) recorder->Keep(std::move(object));
             totals.uploadNanoseconds += elapsed(phase);
         }
-        if (recorder->HasQueuedKeyStores()) recorder->FlushKeyStores();
-        if (recorder->HasQueuedStores()) recorder->FlushStores();
         split(5);
         const auto key = Graphics::DrawRenderPassKey(context, state, views);
         std::vector<std::pair<std::uint64_t, std::uint64_t>> passReads;
@@ -4684,13 +4740,13 @@ bool CopyInMirror(const Context& context, Graphics::Recorder& recorder, const Pm
         copiesBesideMirror.fetch_add(1, std::memory_order_relaxed);
         return false;
     }
+    if (recorder.HasQueuedKeyStores()) recorder.FlushKeyStores();
+    if (recorder.HasQueuedStores()) recorder.FlushStores();
     if (Shadow::OwnedUploadsPending()) {
         std::vector<std::shared_ptr<void>> kept;
         static_cast<void>(Shadow::RecordOwnedUploads(recorder.Commands(), kept));
         for (auto& object : kept) recorder.Keep(std::move(object));
     }
-    if (recorder.HasQueuedKeyStores()) recorder.FlushKeyStores();
-    if (recorder.HasQueuedStores()) recorder.FlushStores();
     auto landing = std::make_shared<Graphics::Buffer>(context, copy.bytes, VK_BUFFER_USAGE_TRANSFER_DST_BIT);
     const auto commands = recorder.Commands();
     Graphics::RecordMemoryBarrier(context, commands, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT | VK_PIPELINE_STAGE_HOST_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_ACCESS_SHADER_WRITE_BIT | VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT | VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT | VK_ACCESS_TRANSFER_WRITE_BIT | VK_ACCESS_HOST_WRITE_BIT, VK_ACCESS_TRANSFER_READ_BIT | VK_ACCESS_TRANSFER_WRITE_BIT);
