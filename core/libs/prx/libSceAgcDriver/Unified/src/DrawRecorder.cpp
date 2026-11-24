@@ -88,6 +88,10 @@ struct HangMarks {
         std::array<std::uint64_t, Inputs> addresses{};
         std::array<std::uint32_t, Inputs> sizes{};
         std::array<std::array<std::byte, InputBytes>, Inputs> guest{};
+        std::array<std::uint32_t, Inputs> writtenPieces{};
+        std::array<std::uint64_t, Inputs> writtenSerial{};
+        std::array<std::uint32_t, Inputs> pageState{};
+        std::uint64_t completed = 0;
     };
     std::mutex mutex;
     std::shared_ptr<Graphics::Buffer> buffer;
@@ -106,7 +110,7 @@ std::string hangInputs(HangMarks& marks, std::uint32_t sequence) {
     char text[64];
     for (std::uint32_t input = 0; input < HangMarks::Inputs; ++input) {
         if (snapshot.sizes[input] == 0u) continue;
-        std::snprintf(text, sizeof(text), " | 0x%llx guest", static_cast<unsigned long long>(snapshot.addresses[input]));
+        std::snprintf(text, sizeof(text), " | 0x%llx (page %u, %u written pieces, newest serial %llu of %llu done) guest", static_cast<unsigned long long>(snapshot.addresses[input]), snapshot.pageState[input], snapshot.writtenPieces[input], static_cast<unsigned long long>(snapshot.writtenSerial[input]), static_cast<unsigned long long>(snapshot.completed));
         line += text;
         for (std::uint32_t at = 0; at + 8u <= snapshot.sizes[input]; at += 8u) {
             std::uint64_t value = 0;
@@ -182,6 +186,12 @@ void markHang(const Context& context, Graphics::Recorder& recorder, VkCommandBuf
             if (use.write || use.size == 0u || use.size > HangMarks::InputBytes) continue;
             snapshot.addresses[input] = use.address;
             snapshot.sizes[input] = static_cast<std::uint32_t>(use.size);
+            auto& core = MemoryCore::Get();
+            const auto pieces = core.Written().In(use.address, use.size);
+            snapshot.writtenPieces[input] = static_cast<std::uint32_t>(pieces.size());
+            for (const auto& piece : pieces) snapshot.writtenSerial[input] = std::max(snapshot.writtenSerial[input], piece.serial);
+            snapshot.pageState[input] = static_cast<std::uint32_t>(core.Pages().StateOf(use.address & ~(PageBytes - 1u)));
+            snapshot.completed = recorder.CompletedThrough();
             if (Protector::Readable(use.address) && Protector::Readable(use.address + use.size - 1u)) std::memcpy(snapshot.guest[input].data(), reinterpret_cast<const void*>(static_cast<std::uintptr_t>(use.address)), static_cast<std::size_t>(use.size));
             if (const auto span = ResidencyService::Get().MirrorSpan(use.address, use.size); span && span->handle != 0u) copies.emplace_back(input, *span);
             ++input;
@@ -541,8 +551,7 @@ std::atomic<std::uint64_t> storesAtOnce{0};
 std::atomic<std::uint64_t> copiesInMirror{0};
 std::atomic<std::uint64_t> copiesBesideMirror{0};
 std::atomic<std::uint64_t> storesThroughImports{0};
-std::atomic<std::uint64_t> storesRewrittenByCpu{0};
-std::atomic<std::uint64_t> storeLandings{0};
+std::atomic<std::uint64_t> storesRewrittenByCpu{0};std::atomic<std::uint64_t> storeLandings{0};
 std::atomic<std::uint64_t> storeLandingNanoseconds{0};
 std::atomic<std::uint64_t> storeLandingMaxNanoseconds{0};
 
