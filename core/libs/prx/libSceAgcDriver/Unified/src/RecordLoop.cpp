@@ -229,8 +229,8 @@ private:
             recent[recentNext++ % recent.size()] = {address, std::min<std::size_t>(bytes.size(), 8u), value};
         }
         totals().labels.fetch_add(1, std::memory_order_relaxed);
-        static const bool storesOtherQueues = std::getenv("APS5_RECODE_LOOP_QUEUE_STORES") != nullptr;
-        if ((queue == 0u || storesOtherQueues) && bytes.size() <= GpuStoreLimit && address % 4u == 0u && bytes.size() % 4u == 0u && !bytes.empty()) {
+        static const bool mirrorLabels = std::getenv("APS5_RECODE_LOOP_MIRROR_LABELS") != nullptr;
+        if (mirrorLabels && bytes.size() <= GpuStoreLimit && address % 4u == 0u && bytes.size() % 4u == 0u && !bytes.empty()) {
             if (Record::StoreToMirror(context, *context.recorder, address, bytes, stamp, queue) == 0) return;
             GuestMemory::Write(address, bytes, 4);
             totals().labelsAtOnce.fetch_add(1, std::memory_order_relaxed);
