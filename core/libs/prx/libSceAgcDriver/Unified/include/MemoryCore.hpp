@@ -110,6 +110,8 @@ public:
     [[nodiscard]] bool OwnedBy(std::uint64_t address, std::uint64_t size) const { return pages.OwnedBy(address, size); }
     void Unregister(std::uint64_t address, std::uint64_t size);
     std::vector<DirtyRange> ConsumeDirty();
+    std::vector<DirtyRange> ConsumeDirtyQuick();
+    std::vector<DirtyRange> ConsumeDirtyIn(std::span<const std::pair<std::uint64_t, std::uint64_t>> spans);
     void AdvanceFrame() { pages.AdvanceFrame(); }
     void MarkGpuOwned(std::uint64_t address, std::uint64_t size);
     bool HandleFault(std::uint64_t address, bool write);
@@ -154,6 +156,7 @@ private:
     static std::uint64_t PageHash(std::uint64_t page);
     static bool readableHash(std::uint64_t page, std::uint64_t& hash);
     bool rehash(std::uint64_t page, bool proven);
+    std::vector<DirtyRange> narrowShared(std::vector<DirtyRange> ranges);
     bool resolveOwnedFault(std::uint64_t address, bool write);
     bool resolvePage(std::uint64_t page, bool write);
     void takeViewed(GpuWriteMark& mark, std::uint64_t address, std::uint64_t size, bool takeDirty);

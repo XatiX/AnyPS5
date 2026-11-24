@@ -3028,15 +3028,34 @@ private:
     }
 
     static void consumeForUses(const Resolve::ResolvedDraw& operation) {
-        static const bool consumes = std::getenv("APS5_RECODE_CONSUME_USES") != nullptr;
-        if (!consumes) return;
-        auto& pages = MemoryCore::Get().Pages();
-        for (const auto& use : operation.uses) {
-            if (use.size == 0u || use.write || pages.CleanIn(use.address, use.size)) continue;
-            Shadow::ConsumeNow();
-            inputConsumes().fetch_add(1, std::memory_order_relaxed);
+        static const char* const mode = std::getenv("APS5_RECODE_CONSUME_USES");
+        static const bool global = mode != nullptr && std::string_view(mode) == "global";
+        static const bool quick = mode != nullptr && std::string_view(mode) == "quick";
+        if (mode == nullptr || std::string_view(mode) == "0") return;
+        if (quick) {
+            for (const auto& use : operation.uses) {
+                if (use.size == 0u || use.write || MemoryCore::Get().Pages().CleanIn(use.address, use.size)) continue;
+                static_cast<void>(Shadow::ConsumeIn({}));
+                inputConsumes().fetch_add(1, std::memory_order_relaxed);
+                return;
+            }
             return;
         }
+        auto& pages = MemoryCore::Get().Pages();
+        thread_local std::vector<std::pair<std::uint64_t, std::uint64_t>> dirty;
+        dirty.clear();
+        for (const auto& use : operation.uses) {
+            if (use.size == 0u || use.write || pages.CleanIn(use.address, use.size)) continue;
+            if (global) {
+                Shadow::ConsumeNow();
+                inputConsumes().fetch_add(1, std::memory_order_relaxed);
+                return;
+            }
+            dirty.emplace_back(use.address, use.size);
+        }
+        if (dirty.empty()) return;
+        static_cast<void>(Shadow::ConsumeIn(dirty));
+        inputConsumes().fetch_add(1, std::memory_order_relaxed);
     }
 
     bool recordDispatch(const Context& context, const Resolve::ResolvedDraw& dispatch, const std::array<std::uint32_t, 3>& groups, std::string& reason) {

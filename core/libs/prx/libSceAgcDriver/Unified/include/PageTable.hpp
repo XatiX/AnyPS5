@@ -43,6 +43,8 @@ struct PageTableCounts {
     std::uint64_t gpuFaults = 0;
     std::uint64_t consumes = 0;
     std::uint64_t consumedPages = 0;
+    std::uint64_t rangedConsumes = 0;
+    std::uint64_t rangedPages = 0;
     std::uint64_t keptBusy = 0;
     std::uint64_t rearmed = 0;
     std::uint64_t unchangedBusy = 0;
@@ -85,6 +87,7 @@ public:
     bool HandleWrite(std::uint64_t address, std::vector<ProtectionChange>& changes);
     using WriteCheck = std::function<bool(std::uint64_t page, bool proven)>;
     std::vector<DirtyRange> ConsumeDirty(std::vector<ProtectionChange>& changes, const WriteCheck& written = {});
+    std::vector<DirtyRange> ConsumeDirtyIn(std::span<const std::pair<std::uint64_t, std::uint64_t>> spans, std::vector<ProtectionChange>& changes, const WriteCheck& written = {});
     void AdvanceFrame();
     std::vector<ProtectionChange> MarkGpuOwned(std::uint64_t address, std::uint64_t size);
     GpuTake TakeForGpu(std::uint64_t address, std::uint64_t size, bool takeDirty = true);

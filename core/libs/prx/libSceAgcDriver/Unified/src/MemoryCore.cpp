@@ -170,6 +170,33 @@ std::vector<DirtyRange> MemoryCore::ConsumeDirty() {
         Downgrades::WatchTouch("a CPU change found on consume", range.address, range.size);
         Events::Shared().Note(range.address, range.size);
     }
+    return narrowShared(std::move(ranges));
+}
+
+std::vector<DirtyRange> MemoryCore::ConsumeDirtyQuick() {
+    std::lock_guard lock(mutex);
+    std::vector<ProtectionChange> changes;
+    auto ranges = pages.ConsumeDirty(changes);
+    protector.Apply(changes);
+    for (const auto& range : ranges) Events::Shared().Note(range.address, range.size);
+    return narrowShared(std::move(ranges));
+}
+
+std::vector<DirtyRange> MemoryCore::ConsumeDirtyIn(std::span<const std::pair<std::uint64_t, std::uint64_t>> spans) {
+    std::lock_guard hashLock(hashMutex);
+    std::lock_guard lock(mutex);
+    std::vector<ProtectionChange> changes;
+    const PageTable::WriteCheck written = [this](std::uint64_t page, bool proven) { return rehash(page, proven); };
+    auto ranges = pages.ConsumeDirtyIn(spans, changes, written);
+    protector.Apply(changes);
+    for (const auto& range : ranges) {
+        Downgrades::WatchTouch("a CPU change found on an operation's consume", range.address, range.size);
+        Events::Shared().Note(range.address, range.size);
+    }
+    return narrowShared(std::move(ranges));
+}
+
+std::vector<DirtyRange> MemoryCore::narrowShared(std::vector<DirtyRange> ranges) {
     if (sharedPreImages.empty()) return ranges;
     std::vector<DirtyRange> narrowed;
     for (const auto& range : ranges) {
