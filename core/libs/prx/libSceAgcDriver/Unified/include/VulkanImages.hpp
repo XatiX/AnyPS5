@@ -4,8 +4,10 @@
 #include "prx/libSceAgcDriver/Graphics/include/Context.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/GuestTextureResource.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/TextureTiling.hpp"
+#include "prx/libSceAgcDriver/Unified/include/ImagePool.hpp"
 #include "prx/libSceAgcDriver/Unified/include/Images.hpp"
 #include <map>
+#include <memory>
 #include <mutex>
 #include <tuple>
 
@@ -45,6 +47,8 @@ private:
     VkFormat format = VK_FORMAT_UNDEFINED;
     VkImage image = VK_NULL_HANDLE;
     VkDeviceMemory memory = VK_NULL_HANDLE;
+    std::shared_ptr<ImagePool> pool;
+    PooledMemory pooled;
     bool initialized = false;
     bool compressed = false;
     bool identity = false;

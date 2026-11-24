@@ -93,6 +93,7 @@ bool SameBacking(const SurfaceKey& left, const SurfaceKey& right) {
     if (left.address != right.address || left.bytes != right.bytes || left.tileMode != right.tileMode || left.width != right.width || left.height != right.height || left.mips != right.mips || left.pipeBankXor != right.pipeBankXor || left.pitch != right.pitch) return false;
     const auto flat = [](std::uint32_t dimension) { return dimension == static_cast<std::uint32_t>(Graphics::TextureDimension::k2D) || dimension == static_cast<std::uint32_t>(Graphics::TextureDimension::k2DArray); };
     if (left.dimension != right.dimension && !(flat(left.dimension) && flat(right.dimension) && left.depth == right.depth)) return false;
+    if (CompressedSiblings(left.format, right.format)) return true;
     return Graphics::BlockWidth(left.format) == 1u && Graphics::BlockWidth(right.format) == 1u && Graphics::BytesPerElement(left.format) == Graphics::BytesPerElement(right.format);
 }
 
@@ -166,6 +167,7 @@ std::optional<Found> SurfaceTable::findWith(const SurfaceKey& key, TCreate&& cre
     surface->device = std::move(created);
     surface->used = ++clock;
     surfaces.emplace(key, surface);
+    indexSurface(surface);
     heldBytes += key.bytes;
     work.push_back(surface);
     counts.created++;
@@ -189,6 +191,7 @@ void SurfaceTable::evict() {
         }
         found->second->retired = true;
         dropStale(*found->second);
+        unindexSurface(*found->second);
         heldBytes -= key.bytes;
         surfaces.erase(found);
         counts.evicted++;
@@ -236,6 +239,7 @@ std::shared_ptr<Surface> SurfaceTable::createWith(const SurfaceKey& key, TCreate
     surface->device = std::move(created);
     surface->used = ++clock;
     surfaces.emplace(key, surface);
+    indexSurface(surface);
     heldBytes += key.bytes;
     counts.created++;
     if (budget != 0u && heldBytes > budget) evict();
@@ -332,22 +336,44 @@ std::string SurfaceTable::ChangeOf(const Surface& surface) const {
     return "unchanged";
 }
 
+void SurfaceTable::indexSurface(const std::shared_ptr<Surface>& surface) {
+    byAddress.emplace(surface->key.address, surface);
+    widest = std::max(widest, surface->key.bytes);
+}
+
+void SurfaceTable::unindexSurface(const Surface& surface) {
+    const auto [first, last] = byAddress.equal_range(surface.key.address);
+    for (auto at = first; at != last; ++at) {
+        if (at->second.get() != &surface) continue;
+        byAddress.erase(at);
+        break;
+    }
+    Events::Images().Note(surface.key.address, surface.key.bytes, Events::ImageSetOwner);
+}
+
+template<typename TVisit>
+bool SurfaceTable::visitOverlapping(std::uint64_t address, std::uint64_t bytes, TVisit&& visit) const {
+    const auto end = address + bytes;
+    for (auto at = byAddress.lower_bound(address > widest ? address - widest : 0u); at != byAddress.end() && at->first < end; ++at) {
+        const auto& key = at->second->key;
+        if (address < key.address + key.bytes && visit(at->second)) return true;
+    }
+    return false;
+}
+
 std::vector<std::shared_ptr<Surface>> SurfaceTable::Overlapping(std::uint64_t address, std::uint64_t bytes) const {
     std::lock_guard lock(mutex);
     std::vector<std::shared_ptr<Surface>> overlapping;
-    const auto end = address + bytes;
-    for (const auto& [key, surface] : surfaces) {
-        if (key.address < end && address < key.address + key.bytes) overlapping.push_back(surface);
-    }
+    static_cast<void>(visitOverlapping(address, bytes, [&](const std::shared_ptr<Surface>& surface) {
+        overlapping.push_back(surface);
+        return false;
+    }));
     return overlapping;
 }
 
 bool SurfaceTable::Holds(std::uint64_t address, std::uint64_t bytes) const {
     std::lock_guard lock(mutex);
-    for (const auto& [key, surface] : surfaces) {
-        if (key.address < address + bytes && address < key.address + key.bytes) return true;
-    }
-    return false;
+    return visitOverlapping(address, bytes, [](const std::shared_ptr<Surface>&) { return true; });
 }
 
 void SurfaceTable::NoteRefused(std::string_view reason) {
@@ -366,6 +392,7 @@ void SurfaceTable::Retire(const std::shared_ptr<Surface>& surface) {
     dropStale(*surface);
     const auto found = surfaces.find(surface->key);
     if (found != surfaces.end() && found->second == surface) {
+        unindexSurface(*surface);
         heldBytes -= surface->key.bytes;
         surfaces.erase(found);
     }

@@ -53,6 +53,7 @@ struct ImageKey {
 [[nodiscard]] std::optional<ImageKey> KeyOf(std::span<const std::uint32_t, 8> words, std::string& reason);
 [[nodiscard]] std::optional<ImageKey> KeyOf(const Graphics::GuestTextureResource& resource, std::string& reason);
 [[nodiscard]] bool SameBacking(const SurfaceKey& left, const SurfaceKey& right);
+[[nodiscard]] bool CompressedSiblings(std::uint32_t left, std::uint32_t right);
 [[nodiscard]] bool OwnersEnabled();
 [[nodiscard]] bool OwnsClass(std::string_view name);
 
@@ -150,6 +151,10 @@ private:
 
     void evict();
     void dropStale(Surface& surface);
+    void indexSurface(const std::shared_ptr<Surface>& surface);
+    void unindexSurface(const Surface& surface);
+    template<typename TVisit>
+    bool visitOverlapping(std::uint64_t address, std::uint64_t bytes, TVisit&& visit) const;
     template<typename TCreate>
     std::optional<Found> findWith(const SurfaceKey& key, TCreate&& create, std::string& reason);
     template<typename TCreate>
@@ -160,6 +165,8 @@ private:
     const Events::ChangeLog& gpuWrites;
     mutable std::mutex mutex;
     std::unordered_map<SurfaceKey, std::shared_ptr<Surface>, KeyHash> surfaces;
+    std::multimap<std::uint64_t, std::shared_ptr<Surface>> byAddress;
+    std::uint64_t widest = 0;
     std::vector<std::shared_ptr<Surface>> work;
     std::vector<std::shared_ptr<Surface>> newer;
     std::vector<std::pair<std::string, std::uint64_t>> refusals;
