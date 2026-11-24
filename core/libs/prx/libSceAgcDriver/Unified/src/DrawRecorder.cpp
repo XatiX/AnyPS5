@@ -197,17 +197,18 @@ void markHang(const Context& context, Graphics::Recorder& recorder, VkCommandBuf
         std::uint32_t input = 0;
         for (std::size_t index = 0; index < work.uses.size() && index < work.imageBegin && input < HangMarks::Inputs; ++index) {
             const auto& use = work.uses[index];
-            if (use.write || use.size == 0u || use.size > HangMarks::InputBytes) continue;
+            if (use.write || use.size == 0u) continue;
+            const auto shown = std::min<std::uint64_t>(use.size, HangMarks::InputBytes);
             snapshot.addresses[input] = use.address;
-            snapshot.sizes[input] = static_cast<std::uint32_t>(use.size);
+            snapshot.sizes[input] = static_cast<std::uint32_t>(shown);
             auto& core = MemoryCore::Get();
             const auto pieces = core.Written().In(use.address, use.size);
             snapshot.writtenPieces[input] = static_cast<std::uint32_t>(pieces.size());
             for (const auto& piece : pieces) snapshot.writtenSerial[input] = std::max(snapshot.writtenSerial[input], piece.serial);
             snapshot.pageState[input] = static_cast<std::uint32_t>(core.Pages().StateOf(use.address & ~(PageBytes - 1u)));
             snapshot.completed = recorder.CompletedThrough();
-            if (Protector::Readable(use.address) && Protector::Readable(use.address + use.size - 1u)) std::memcpy(snapshot.guest[input].data(), reinterpret_cast<const void*>(static_cast<std::uintptr_t>(use.address)), static_cast<std::size_t>(use.size));
-            if (const auto span = ResidencyService::Get().MirrorSpan(use.address, use.size); span && span->handle != 0u) copies.emplace_back(input, *span);
+            if (Protector::Readable(use.address) && Protector::Readable(use.address + shown - 1u)) std::memcpy(snapshot.guest[input].data(), reinterpret_cast<const void*>(static_cast<std::uintptr_t>(use.address)), static_cast<std::size_t>(shown));
+            if (const auto span = ResidencyService::Get().MirrorSpan(use.address, shown); span && span->handle != 0u) copies.emplace_back(input, *span);
             ++input;
         }
     }
