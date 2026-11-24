@@ -30,6 +30,7 @@ void SetInterruptHook(InterruptHook hook, void* owner);
 [[nodiscard]] bool Takes(std::span<const std::uint32_t> packet, std::uint32_t opcode, std::uint32_t queue);
 void TraceKept(std::span<const std::uint32_t> packet, std::uint32_t opcode, std::uint32_t queue, std::uint64_t submission, std::size_t offset, bool flip);
 void TraceInterrupt(std::uint32_t queue, std::uint32_t context);
+void NoteRefreshedSegment(std::uint32_t queue, std::uint64_t submission, std::size_t offset);
 void Ensure(std::uint32_t queue);
 [[nodiscard]] bool Passed(std::uint32_t queue, std::uint64_t submission, std::uint32_t packetOffset);
 bool WaitPassed(std::uint32_t queue, std::uint64_t submission, std::uint32_t packetOffset, std::chrono::milliseconds limit);

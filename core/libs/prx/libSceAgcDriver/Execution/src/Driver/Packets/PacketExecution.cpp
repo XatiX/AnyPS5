@@ -306,6 +306,9 @@ void Driver::execute(Submission& submission) {
         CheckFailure();
         while (nextSegment < submission.indirectSegments.size() && submission.indirectSegments[nextSegment].start <= cursor) {
             if (submission.indirectSegments[nextSegment].start == cursor && refreshIndirectSegment(submission, nextSegment)) {
+#if ANYPS5_UNIFIED
+                Unified::Loop::NoteRefreshedSegment(submission.queue, submission.serial, cursor);
+#endif
                 recent.commands = submission.commands;
                 continue;
             }
