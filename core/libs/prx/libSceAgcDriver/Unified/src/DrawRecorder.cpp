@@ -4600,7 +4600,8 @@ int StoreToMirror(Graphics::Recorder& recorder, std::uint64_t address, std::span
     std::uint64_t sequence = 0;
     if (!unmarked) {
         Shadow::NoteGpuWrites(written);
-        const auto mark = MemoryCore::Get().NoteGpuWrite(address, bytes.size(), recorder.OpenBatchSerial());
+        static const bool takesDirty = std::getenv("APS5_RECODE_MIRROR_STORES_KEEP_DIRTY") == nullptr;
+        const auto mark = MemoryCore::Get().NoteGpuWrite(address, bytes.size(), recorder.OpenBatchSerial(), takesDirty);
         if (!mark.upload.empty()) ResidencyService::Get().NoteDirty(mark.upload);
         sequence = mark.sequence;
     }
