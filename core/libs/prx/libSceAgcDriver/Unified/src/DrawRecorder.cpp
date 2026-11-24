@@ -81,11 +81,49 @@ bool writesFaultTokens() {
 
 struct HangMarks {
     static constexpr std::uint32_t Slots = 1u << 16u;
+    static constexpr std::uint32_t Snapshots = 256u;
+    static constexpr std::uint32_t Inputs = 4u;
+    static constexpr std::uint32_t InputBytes = 64u;
+    struct Snapshot {
+        std::array<std::uint64_t, Inputs> addresses{};
+        std::array<std::uint32_t, Inputs> sizes{};
+        std::array<std::array<std::byte, InputBytes>, Inputs> guest{};
+    };
     std::mutex mutex;
     std::shared_ptr<Graphics::Buffer> buffer;
+    std::shared_ptr<Graphics::Buffer> mirrorCopies;
     std::array<std::pair<std::uint64_t, std::uint64_t>, Slots> programs{};
+    std::array<Snapshot, Snapshots> snapshots{};
     std::uint32_t next = 0;
 };
+
+std::string hangInputs(HangMarks& marks, std::uint32_t sequence) {
+    std::string line;
+    const auto slot = sequence % HangMarks::Snapshots;
+    const auto& snapshot = marks.snapshots[slot];
+    marks.mirrorCopies->Invalidate();
+    const auto* mirror = marks.mirrorCopies->Bytes().data() + static_cast<std::size_t>(slot) * HangMarks::Inputs * HangMarks::InputBytes;
+    char text[64];
+    for (std::uint32_t input = 0; input < HangMarks::Inputs; ++input) {
+        if (snapshot.sizes[input] == 0u) continue;
+        std::snprintf(text, sizeof(text), " | 0x%llx guest", static_cast<unsigned long long>(snapshot.addresses[input]));
+        line += text;
+        for (std::uint32_t at = 0; at + 8u <= snapshot.sizes[input]; at += 8u) {
+            std::uint64_t value = 0;
+            std::memcpy(&value, snapshot.guest[input].data() + at, sizeof(value));
+            std::snprintf(text, sizeof(text), " %llx", static_cast<unsigned long long>(value));
+            line += text;
+        }
+        line += " mirror";
+        for (std::uint32_t at = 0; at + 8u <= snapshot.sizes[input]; at += 8u) {
+            std::uint64_t value = 0;
+            std::memcpy(&value, mirror + input * HangMarks::InputBytes + at, sizeof(value));
+            std::snprintf(text, sizeof(text), " %llx", static_cast<unsigned long long>(value));
+            line += text;
+        }
+    }
+    return line;
+}
 
 HangMarks& hangMarks() {
     static auto& marks = *new HangMarks();
@@ -100,15 +138,17 @@ void watchHangMarks() {
         std::this_thread::sleep_for(std::chrono::milliseconds(250));
         std::uint32_t seen = 0;
         std::pair<std::uint64_t, std::uint64_t> program{};
+        std::string inputs;
         {
             std::lock_guard lock(marks.mutex);
             if (marks.buffer == nullptr) continue;
             marks.buffer->Invalidate();
             std::memcpy(&seen, marks.buffer->Bytes().data(), sizeof(seen));
             program = marks.programs[seen % HangMarks::Slots];
+            if (seen == shown && still == 3u) inputs = hangInputs(marks, seen);
         }
         if (seen == shown) {
-            if (++still == 4u) std::fprintf(stderr, "[recode-hang-mark] the GPU has not passed dispatch %u for 1 s: program %016llx, %llu groups\n", seen, static_cast<unsigned long long>(program.first), static_cast<unsigned long long>(program.second));
+            if (++still == 4u) std::fprintf(stderr, "[recode-hang-mark] the GPU has not passed dispatch %u for 1 s: program %016llx, %llu groups%s\n", seen, static_cast<unsigned long long>(program.first), static_cast<unsigned long long>(program.second), inputs.c_str());
             continue;
         }
         shown = seen;
@@ -116,22 +156,45 @@ void watchHangMarks() {
     }
 }
 
-void markHang(const Context& context, Graphics::Recorder& recorder, VkCommandBuffer commands, std::uint64_t hash, std::uint64_t groups) {
+void markHang(const Context& context, Graphics::Recorder& recorder, VkCommandBuffer commands, std::uint64_t hash, std::uint64_t groups, const Resolve::ResolvedDraw& work) {
     static const bool marking = std::getenv("APS5_RECODE_HANG_MARKS") != nullptr;
     if (!marking) return;
     auto& marks = hangMarks();
     std::uint32_t sequence = 0;
+    std::vector<std::pair<std::uint32_t, DeviceSpan>> copies;
     {
         std::lock_guard lock(marks.mutex);
         if (marks.buffer == nullptr) {
             marks.buffer = std::make_shared<Graphics::Buffer>(context, 256u, VK_BUFFER_USAGE_TRANSFER_DST_BIT);
             std::memset(marks.buffer->Bytes().data(), 0, 256u);
+            const auto snapshotBytes = static_cast<std::size_t>(HangMarks::Snapshots) * HangMarks::Inputs * HangMarks::InputBytes;
+            marks.mirrorCopies = std::make_shared<Graphics::Buffer>(context, snapshotBytes, VK_BUFFER_USAGE_TRANSFER_DST_BIT);
+            std::memset(marks.mirrorCopies->Bytes().data(), 0, snapshotBytes);
             std::thread(watchHangMarks).detach();
         }
         sequence = ++marks.next;
         marks.programs[sequence % HangMarks::Slots] = {hash, groups};
+        auto& snapshot = marks.snapshots[sequence % HangMarks::Snapshots];
+        snapshot = {};
+        std::uint32_t input = 0;
+        for (std::size_t index = 0; index < work.uses.size() && index < work.imageBegin && input < HangMarks::Inputs; ++index) {
+            const auto& use = work.uses[index];
+            if (use.write || use.size == 0u || use.size > HangMarks::InputBytes) continue;
+            snapshot.addresses[input] = use.address;
+            snapshot.sizes[input] = static_cast<std::uint32_t>(use.size);
+            if (Protector::Readable(use.address) && Protector::Readable(use.address + use.size - 1u)) std::memcpy(snapshot.guest[input].data(), reinterpret_cast<const void*>(static_cast<std::uintptr_t>(use.address)), static_cast<std::size_t>(use.size));
+            if (const auto span = ResidencyService::Get().MirrorSpan(use.address, use.size); span && span->handle != 0u) copies.emplace_back(input, *span);
+            ++input;
+        }
     }
     recorder.Keep(marks.buffer);
+    recorder.Keep(marks.mirrorCopies);
+    const auto slot = sequence % HangMarks::Snapshots;
+    const auto copy = context.Function<PFN_vkCmdCopyBuffer>("vkCmdCopyBuffer");
+    for (const auto& [input, span] : copies) {
+        const VkBufferCopy region{span.offset, (static_cast<VkDeviceSize>(slot) * HangMarks::Inputs + input) * HangMarks::InputBytes, std::min<VkDeviceSize>(span.bytes, HangMarks::InputBytes)};
+        copy(commands, reinterpret_cast<VkBuffer>(static_cast<std::uintptr_t>(span.handle)), marks.mirrorCopies->Handle(), 1, &region);
+    }
     context.Function<PFN_vkCmdFillBuffer>("vkCmdFillBuffer")(commands, marks.buffer->Handle(), 0, 4, sequence);
 }
 
@@ -3202,7 +3265,7 @@ private:
         }
         const auto commands = recorder->Commands();
         Graphics::RecordMemoryBarrier(context, commands, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT | VK_PIPELINE_STAGE_HOST_BIT, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT | (indirect ? VK_PIPELINE_STAGE_DRAW_INDIRECT_BIT : 0u), VK_ACCESS_SHADER_WRITE_BIT | VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT | VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT | VK_ACCESS_TRANSFER_WRITE_BIT | VK_ACCESS_HOST_WRITE_BIT, VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT | (indirect ? VK_ACCESS_INDIRECT_COMMAND_READ_BIT : 0u));
-        markHang(context, *recorder, commands, Downgrades::ProgramHash(stage.program.codeAddress), groups[0] * groups[1] * groups[2]);
+        markHang(context, *recorder, commands, Downgrades::ProgramHash(stage.program.codeAddress), groups[0] * groups[1] * groups[2], dispatch);
         context.BindComputePipeline(commands, pipeline->pipeline);
         Downgrades::NotePipeline(reinterpret_cast<std::uint64_t>(pipeline->pipeline), stage.program.codeAddress, stage.program.result != nullptr ? stage.program.result->spirv.ContentHash().low : 0u);
         const auto bind = context.Resolved(&Graphics::DeviceFunctions::cmdBindDescriptorSets, "vkCmdBindDescriptorSets");
