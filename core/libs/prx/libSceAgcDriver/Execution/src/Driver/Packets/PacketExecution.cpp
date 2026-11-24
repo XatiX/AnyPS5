@@ -326,7 +326,7 @@ void Driver::execute(Submission& submission) {
                 cursor += count;
                 continue;
             }
-            if (flipHere) static_cast<void>(Unified::Loop::WaitPassed(submission.queue, submission.serial, static_cast<std::uint32_t>(cursor), std::chrono::seconds(60)));
+            if (flipHere && !Unified::Loop::WaitPassed(submission.queue, submission.serial, static_cast<std::uint32_t>(cursor), std::chrono::seconds(60))) std::fprintf(stderr, "[recode-loop] flip at submission %llu offset %zu waited 60 s for the record loop\n", static_cast<unsigned long long>(submission.serial), cursor);
         }
         Unified::Record::NoteExistingPacket(packet, submission.queue);
 #endif
