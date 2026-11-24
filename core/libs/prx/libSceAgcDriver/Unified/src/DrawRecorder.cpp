@@ -3027,10 +3027,23 @@ private:
         if (seen.insert("image reads " + std::to_string(program)).second && program == std::strtoull(std::getenv("APS5_RECODE_DUMP_SAMPLED_BY"), nullptr, 16)) std::fprintf(stderr, "[recode-dump] dispatch %016llx: %zu image reads, %zu with a record at their address\n", static_cast<unsigned long long>(program), reads, matched);
     }
 
+    static void consumeForUses(const Resolve::ResolvedDraw& operation) {
+        static const bool consumes = std::getenv("APS5_RECODE_CONSUME_USES") != nullptr;
+        if (!consumes) return;
+        auto& pages = MemoryCore::Get().Pages();
+        for (const auto& use : operation.uses) {
+            if (use.size == 0u || use.write || pages.CleanIn(use.address, use.size)) continue;
+            Shadow::ConsumeNow();
+            inputConsumes().fetch_add(1, std::memory_order_relaxed);
+            return;
+        }
+    }
+
     bool recordDispatch(const Context& context, const Resolve::ResolvedDraw& dispatch, const std::array<std::uint32_t, 3>& groups, std::string& reason) {
         dumpImageReads(context, dispatch);
         writtenRecords.clear();
         stageStorageImages.clear();
+        consumeForUses(dispatch);
         writeBackForReaders(context, dispatch);
         if (hangMarking() && context.recorder != nullptr) markHangPhase(context, *context.recorder, 5u);
         handOverForWriters(context, dispatch);
@@ -4014,6 +4027,7 @@ private:
         writtenRecords.clear();
         stageStorageImages.clear();
         directWrites.clear();
+        consumeForUses(draw);
         auto preMark = std::chrono::steady_clock::now();
         writeBackForReaders(context, draw);
         if (hangMarking() && context.recorder != nullptr) markHangPhase(context, *context.recorder, 5u);
