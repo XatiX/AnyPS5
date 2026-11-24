@@ -6,7 +6,7 @@
 
 namespace AgcDriver::Unified::StageCosts {
 
-enum class Stage : std::uint32_t { Resolve, Order, Record, HostCopy, Count };
+enum class Stage : std::uint32_t { Resolve, Order, Record, HostCopy, Drain, Count };
 
 void Note(Stage stage, std::uint64_t nanoseconds, std::uint64_t operations = 1);
 [[nodiscard]] std::string Line(std::uint64_t frame);

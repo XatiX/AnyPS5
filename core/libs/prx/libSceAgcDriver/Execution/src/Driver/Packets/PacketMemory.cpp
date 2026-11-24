@@ -15,6 +15,7 @@
 #include "prx/libSceAgcDriver/Graphics/include/UnitShadow.hpp"
 #if ANYPS5_UNIFIED
 #include "prx/libSceAgcDriver/Unified/include/DrawRecorder.hpp"
+#include "prx/libSceAgcDriver/Unified/include/StageCosts.hpp"
 #endif
 #include <algorithm>
 #include <bit>
@@ -310,6 +311,12 @@ bool Driver::preparePacketMemory(const Submission& submission, QueueState& queue
         ++DrainEpochCounts().packets[header == FlipPacketHeader ? DrainEpochs::Flip : opcode & 0xffu];
         std::shared_ptr<VulkanDevice> draining;
         std::uint64_t epoch = 0;
+#if ANYPS5_UNIFIED
+        struct DrainTimer {
+            std::chrono::steady_clock::time_point started = std::chrono::steady_clock::now();
+            ~DrainTimer() { Unified::StageCosts::Note(Unified::StageCosts::Stage::Drain, static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - started).count())); }
+        } drainTimer;
+#endif
         {
             GuestMemory::TagGpuLockSite(GuestMemory::GpuLockSite::Flush);
             std::lock_guard gpuLock(GuestMemory::GpuMutex());

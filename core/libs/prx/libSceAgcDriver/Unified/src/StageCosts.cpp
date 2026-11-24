@@ -34,7 +34,7 @@ void Note(Stage stage, std::uint64_t nanoseconds, std::uint64_t operations) {
 }
 
 std::string Line(std::uint64_t frame) {
-    static constexpr std::array<const char*, Stages> names{"resolve", "order wait", "record", "host copy"};
+    static constexpr std::array<const char*, Stages> names{"resolve", "order wait", "record", "host copy", "device drain"};
     auto& costs = ledger();
     std::lock_guard lock(costs.mutex);
     const auto frames = frame > costs.reportedFrame ? frame - costs.reportedFrame : 0u;
