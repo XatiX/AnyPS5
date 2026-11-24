@@ -407,9 +407,6 @@ std::atomic<std::uint64_t> flipsFromOldRecords{0};
 std::atomic<std::uint64_t> flipsWithoutRecords{0};
 std::atomic<std::uint32_t> flipNotes{0};
 std::atomic<std::uint32_t> flipMemoryNotes{0};
-std::atomic<std::uint64_t> mirrorSampleDumps{0};
-std::atomic<std::uint64_t> sampleDumpCopies{0};
-std::atomic<std::uint64_t> sampleDumpCopyMisses{0};
 
 bool argumentCensusOn() {
     static const bool on = std::getenv("APS5_RECODE_ARGUMENT_CENSUS") != nullptr;
@@ -1456,7 +1453,7 @@ public:
             std::snprintf(text, sizeof(text), "; mirror writes %.1f MiB, pages left GPU-owned %.1f MiB, edges landed whole %.1f MiB, edges snapshot %.1f MiB and landed by diff %.1f MiB, indirect arguments from the mirror %llu", static_cast<double>(totals.mirrorWriteBytes) / 1048576.0, static_cast<double>(totals.ownedBytes) / 1048576.0, static_cast<double>(totals.openLandedBytes) / 1048576.0, static_cast<double>(totals.edgeSnapshotBytes) / 1048576.0, static_cast<double>(totals.edgeDiffBytes) / 1048576.0, static_cast<unsigned long long>(totals.mirrorArguments));
             line += text;
         }
-        std::snprintf(text, sizeof(text), "; indirect draw arguments patched on the GPU for a constant rule %llu; mesh draws %llu (%llu empty); depth records written back before a buffer writer %llu; occlusion dumps into the mirror %llu, copied from the import %llu (%llu without a mirror span)", static_cast<unsigned long long>(totals.patchedArguments), static_cast<unsigned long long>(totals.meshDraws), static_cast<unsigned long long>(totals.meshEmpty), static_cast<unsigned long long>(totals.depthWriterHandOvers), static_cast<unsigned long long>(mirrorSampleDumps.load(std::memory_order_relaxed)), static_cast<unsigned long long>(sampleDumpCopies.load(std::memory_order_relaxed)), static_cast<unsigned long long>(sampleDumpCopyMisses.load(std::memory_order_relaxed)));
+        std::snprintf(text, sizeof(text), "; indirect draw arguments patched on the GPU for a constant rule %llu; mesh draws %llu (%llu empty); depth records written back before a buffer writer %llu", static_cast<unsigned long long>(totals.patchedArguments), static_cast<unsigned long long>(totals.meshDraws), static_cast<unsigned long long>(totals.meshEmpty), static_cast<unsigned long long>(totals.depthWriterHandOvers));
         line += text;
         std::snprintf(text, sizeof(text), "; GPU-written chunks %llu switched to their import from the written bitmap (%.1f MiB copied over), %llu from other GPU writes, %llu refused, %llu written pieces already on an import", static_cast<unsigned long long>(totals.importSwitches), static_cast<double>(totals.switchBytes) / 1048576.0, static_cast<unsigned long long>(totals.writtenSwitches), static_cast<unsigned long long>(totals.switchRefused), static_cast<unsigned long long>(totals.writtenOnImports));
         line += text;
@@ -2598,26 +2595,19 @@ private:
                 if (storageWritten) writtenRecords.push_back(std::move(record));
                 continue;
             }
-            Downgrades::RefuseExistingPath(stage.program.codeAddress, "storage image", "storage image from the existing cache");
-            auto texture = Resolve::BindDeferredImage(context, deferred.request, slot, reason);
-            if (texture == nullptr) return false;
-            noteImage(stage, Downgrades::Kind::UpstreamStorage, deferred.index, deferred.request, (deferred.request.flags & Heap::RequestFlag::Written) != 0u ? "written storage cache" : "storage cache");
-            stage.slots[deferred.index] = slot;
-            if (context.recorder != nullptr) context.recorder->Keep(texture);
-            stageStorageImages.emplace_back(texture->Image(), storageWritten);
-            if (storageWritten) written.push_back(std::move(texture));
+            noteImage(stage, Downgrades::Kind::UpstreamStorage, deferred.index, deferred.request, storageWritten ? "written storage image without a record" : "storage image without a record");
+            reason = "storage image without a record";
+            return false;
         }
         const Downgrades::ProgramScope programScope(stage.program.codeAddress);
         for (const auto* deferred : sampled) {
             std::uint32_t slot = 0;
             if (ownsImages() && bindOwnedSampled(context, stage, *deferred)) continue;
             if (Downgrades::Active()) noteStaleRecordRead(stage, *deferred);
-            Downgrades::RefuseExistingPath(stage.program.codeAddress, "sampled image", "sampled texture from the existing cache");
-            auto owner = Resolve::BindDeferredSampled(context, deferred->request, slot, reason);
-            if (owner == nullptr) return false;
-            noteImage(stage, Downgrades::Kind::UpstreamSampled, deferred->index, deferred->request, "sampled cache");
-            stage.slots[deferred->index] = slot;
-            if (context.recorder != nullptr) context.recorder->Keep(std::const_pointer_cast<void>(owner));
+            static_cast<void>(slot);
+            noteImage(stage, Downgrades::Kind::UpstreamSampled, deferred->index, deferred->request, "sampled image without a record");
+            reason = "sampled image without a record";
+            return false;
         }
         return Resolve::PatchSlots(*stage.program.result, stage.slots, stage.program.words, reason);
     }
@@ -3586,21 +3576,8 @@ private:
                     return false;
                 }
                 noteRefusedImage(lastTargetRefusal.empty() ? std::string("colour target: not offered to records") : "colour target: " + lastTargetRefusal);
-                auto resident = Graphics::CachedStorageSurface(context, Graphics::SurfaceForTarget(color));
-                if (resident == nullptr || !resident->Attachable()) {
-                    reason = "color target not resident";
-                    return false;
-                }
-                views.push_back(resident->AttachmentView(color.format, color.mip, color.depthSlice, color.layers, color.arraySlice));
-                Downgrades::RefuseExistingPath(draw.stages.empty() ? 0u : draw.stages.back().program.codeAddress, "colour target", "colour target from the existing surface cache: " + (lastTargetRefusal.empty() ? std::string("not offered to records") : lastTargetRefusal));
-                if (Downgrades::Active()) {
-                    char detail[256];
-                    std::snprintf(detail, sizeof(detail), "colour target 0x%llx mip %u from the existing surface cache: %s", static_cast<unsigned long long>(Graphics::SurfaceForTarget(color).baseAddress), color.mip, lastTargetRefusal.empty() ? "not offered to records" : lastTargetRefusal.c_str());
-                    for (const auto& stage : draw.stages) Downgrades::Note(stage.program.codeAddress, Downgrades::Kind::UpstreamTarget, static_cast<std::uint32_t>(views.size() - 1u), detail);
-                }
-                Images::Targets().Note(resident);
-                owners.push_back(resident);
-                residents.push_back(std::move(resident));
+                reason = "colour target without a record: " + (lastTargetRefusal.empty() ? std::string("not offered to records") : lastTargetRefusal);
+                return false;
             }
             std::shared_ptr<Images::DepthRecord> depthRecord;
             if (state.depth && Images::DepthRecordsOn()) {
@@ -3616,11 +3593,8 @@ private:
                 recorder->Keep(depthRecord);
                 totals.depthRecordDraws++;
             } else if (state.depth) {
-                views.push_back(Graphics::DepthSurfaceViewWithStencilWriteIntent(context, *state.depth, state.depthWrite, state.stencilTest, writesStencil(state)));
-                Downgrades::RefuseExistingPath(draw.stages.empty() ? 0u : draw.stages.back().program.codeAddress, "depth target", "depth target from the existing depth surfaces");
-                if (Downgrades::Active()) {
-                    for (const auto& stage : draw.stages) Downgrades::Note(stage.program.codeAddress, Downgrades::Kind::UpstreamDepth, 8u, "depth target from the existing depth surfaces");
-                }
+                reason = Images::DepthRecordsOn() ? "depth target without a record" : "depth records are off";
+                return false;
             }
         }
         if (!targetRecords.empty()) drainSurfaces(context, *recorder);
@@ -4457,21 +4431,6 @@ std::optional<DisplaySource> DisplayRecord(std::uint64_t address, std::uint64_t 
     return std::nullopt;
 }
 
-bool DumpSamplesToMirror(Graphics::Recorder& recorder, std::uint64_t address, std::uint64_t bytes, std::uint32_t blocks) {
-    static const bool on = std::getenv("APS5_RECODE_MIRROR_SAMPLE_DUMPS") != nullptr;
-    if (!on || !RecordActive() || bytes == 0u) return false;
-    const auto span = ResidencyService::Get().MirrorSpan(address, bytes);
-    if (!span || span->address == 0u) return false;
-    if (!recorder.DumpSamples(span->address, address, blocks)) return false;
-    if (Downgrades::Active() && mirrorSampleDumps.load(std::memory_order_relaxed) < 24u) std::fprintf(stderr, "[recode-sample-dump] 0x%llx+0x%llx blocks 0x%x into the mirror\n", static_cast<unsigned long long>(address), static_cast<unsigned long long>(bytes), blocks);
-    const auto mark = MemoryCore::Get().NoteGpuWrite(address, bytes, recorder.OpenBatchSerial());
-    if (!mark.upload.empty()) ResidencyService::Get().NoteDirty(mark.upload);
-    const std::array written{std::pair{address, address + bytes}};
-    Events::NoteRanges(written);
-    mirrorSampleDumps.fetch_add(1, std::memory_order_relaxed);
-    return true;
-}
-
 void NoteExistingPacket(std::uint32_t header, std::uint32_t queue) {
     if (!RecordActive() || !Downgrades::Active()) return;
     const auto key = (static_cast<std::uint64_t>(queue) << 32u) | (header & 0x0000ff00u);
@@ -4497,28 +4456,8 @@ void NoteSampleDumpBefore(std::uint64_t address) {
     if (total % 20000u == 0u) std::fprintf(stderr, "[recode-sample-values] %llu dumps: block held before the dump: not ready %llu, ready with 0 samples %llu, ready with samples %llu; last 0x%llx = 0x%016llx\n", static_cast<unsigned long long>(total), static_cast<unsigned long long>(notReady.load()), static_cast<unsigned long long>(zero.load()), static_cast<unsigned long long>(counted.load()), static_cast<unsigned long long>(address), static_cast<unsigned long long>(value));
 }
 
-bool SampleDumpsAlsoToMirror() {
-    static const bool on = std::getenv("APS5_RECODE_SAMPLE_DUMP_COPIES") != nullptr && std::getenv("APS5_RECODE_MIRROR_SAMPLE_DUMPS") == nullptr;
-    return on && RecordActive();
-}
-
-void CopySampleDumpToMirror(const Graphics::Context& context, Graphics::Recorder& recorder, VkBuffer import, VkDeviceSize offset, std::uint64_t address, std::uint64_t bytes) {
-    const auto span = ResidencyService::Get().MirrorSpan(address, bytes);
-    if (!span) {
-        sampleDumpCopyMisses.fetch_add(1, std::memory_order_relaxed);
-        return;
-    }
-    const auto commands = recorder.Commands();
-    Graphics::RecordMemoryBarrier(context, commands, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_ACCESS_SHADER_WRITE_BIT | VK_ACCESS_TRANSFER_WRITE_BIT, VK_ACCESS_TRANSFER_READ_BIT | VK_ACCESS_TRANSFER_WRITE_BIT);
-    Graphics::CopyBuffer(context, commands, import, offset, reinterpret_cast<VkBuffer>(static_cast<std::uintptr_t>(span->handle)), span->offset, bytes);
-    Graphics::RecordMemoryBarrier(context, commands, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_ACCESS_TRANSFER_WRITE_BIT, VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT | VK_ACCESS_TRANSFER_READ_BIT | VK_ACCESS_INDIRECT_COMMAND_READ_BIT);
-    const std::vector<std::pair<std::uint64_t, std::uint64_t>> written{{address, address + bytes}};
-    Shadow::NoteGpuWrites(written);
-    sampleDumpCopies.fetch_add(1, std::memory_order_relaxed);
-}
-
 bool PresentsExistingResidents() {
-    static const bool presents = !RecordActive() || std::getenv("APS5_RECODE_EXISTING_PRESENT") != nullptr;
+    static const bool presents = !RecordActive();
     return presents;
 }
 

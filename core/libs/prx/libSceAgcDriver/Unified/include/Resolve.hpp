@@ -68,14 +68,12 @@ void Consume(const Operation& operation, const DecodeState& state);
 [[nodiscard]] PacketTable<ResolvedDraw>& ResolvedDispatches();
 [[nodiscard]] const Heap::VulkanHeapDevice* HeapDevice();
 [[nodiscard]] Images::SurfaceTable* Surfaces();
-[[nodiscard]] std::shared_ptr<Graphics::StorageTexture> BindDeferredImage(const Graphics::Context& context, const Heap::SlotRequest& request, std::uint32_t& slot, std::string& reason);
 [[nodiscard]] std::shared_ptr<Images::Surface> BindDeferredRecord(const Heap::SlotRequest& request, std::uint32_t& slot);
 [[nodiscard]] std::shared_ptr<Images::Surface> BindRecordSlot(const Heap::SlotRequest& request, std::shared_ptr<Images::Surface> record, std::uint32_t& slot, std::uint32_t layer = 0);
 [[nodiscard]] bool StorageRecordShape(const Heap::SlotRequest& request);
 [[nodiscard]] bool SampledRecordsAll();
 [[nodiscard]] bool SampledRecordFor(std::uint64_t address, std::uint64_t bytes);
 [[nodiscard]] bool BindViewSlot(const Heap::SlotRequest& request, std::uint64_t view, std::uint32_t layout, std::shared_ptr<const void> owner, std::uint32_t& slot);
-[[nodiscard]] std::shared_ptr<const void> BindDeferredSampled(const Graphics::Context& context, const Heap::SlotRequest& request, std::uint32_t& slot, std::string& reason);
 
 }
 

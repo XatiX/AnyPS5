@@ -400,6 +400,12 @@ void Driver::dispatch(QueueState& queue, std::span<const std::uint32_t> packet, 
         if (!partialLastGroup && indirectArguments == 0 && (MatchDwordPatternFill(packet, std::span(snapshot.code).subspan(codeOffset), userData, compute) || MatchConstantDwordFill(packet, std::span(snapshot.code).subspan(codeOffset), userData, compute) || MatchClampedGlobalFill(packet, std::span(snapshot.code).subspan(codeOffset), userData, compute) || MatchMemoryValueBufferFill(packet, std::span(snapshot.code).subspan(codeOffset), userData, compute))) return;
         if (!partialLastGroup && indirectArguments == 0 && (matchesCopyKernel(std::span(snapshot.code).subspan(codeOffset), userData, compute) || MatchesStreamCopyKernel(std::span(snapshot.code).subspan(codeOffset), userData, compute) || MatchesIndexedCopyKernel(std::span(snapshot.code).subspan(codeOffset), userData, compute) || MatchesTableCopyKernel(std::span(snapshot.code).subspan(codeOffset), userData, compute) || MatchesWideTableCopyKernel(std::span(snapshot.code).subspan(codeOffset), userData, compute))) return;
     } else {
+#if ANYPS5_UNIFIED
+        const bool recodeOnly = Unified::Record::RecordActive();
+#else
+        constexpr bool recodeOnly = false;
+#endif
+        if (!recodeOnly) {
         if (indirectArguments == 0 && Graphics::MatchMultisampledSingleClear(std::span(snapshot.code).subspan(codeOffset), userData, compute.numThreads)) {
             if (DrawPipeline::Active()) DrawPipeline::Queue0().Drain(DrawPipeline::DrainReason::Packet, 0x15);
             if (Graphics::TakeMultisampledSingleClear(std::span(snapshot.code).subspan(codeOffset), userData, compute.numThreads)) {
@@ -445,6 +451,7 @@ void Driver::dispatch(QueueState& queue, std::span<const std::uint32_t> packet, 
             if (resolvedAhead().empty()) gateOpened() = true;
             return;
         }
+        }
 #if ANYPS5_UNIFIED
         const auto recodeCandidate = [&] {
             if (submission.queue == 0) return pipelineCandidate;
@@ -456,8 +463,7 @@ void Driver::dispatch(QueueState& queue, std::span<const std::uint32_t> packet, 
             auto& resolvedDispatches = Unified::Resolve::ResolvedDispatches();
             const auto packetOffset = currentPacketOffset();
             const auto found = resolvedDispatches.Find(submission.queue, submission.serial, packetOffset, Unified::Resolve::HandoffWait());
-            if (found.offered) resolvedDispatches.Release(submission.queue, submission.serial, packetOffset);
-            std::array<std::uint32_t, 3> recodeGroups{packet[1], packet[2], packet[3]};
+            if (found.offered) resolvedDispatches.Release(submission.queue, submission.serial, packetOffset);            std::array<std::uint32_t, 3> recodeGroups{packet[1], packet[2], packet[3]};
             if ((packet[4] & 0x20u) != 0) {
                 for (std::uint32_t axis = 0; axis < 3; ++axis) recodeGroups[axis] = ThreadDimensionGroups(recodeGroups[axis], std::max(readRegister(queue.shader, 0x207 + axis) & 0xffffu, 1u));
             }
@@ -493,6 +499,24 @@ void Driver::dispatch(QueueState& queue, std::span<const std::uint32_t> packet, 
             else if (recodeReason.empty()) Unified::Record::RefuseUnrecorded("dispatch", address, "resolved for another program, or a pattern fill or storage image clear left to the existing kernels");
         } else if (Unified::Record::RecordActive() && Unified::Resolve::DispatchesRoutedOn(submission.queue)) {
             Unified::Record::RefuseUnrecorded("dispatch", address, htileClearCompletion.has_value() || htileMask.bytes != 0u ? "HTILE clear handled by the existing path" : indirectArguments != 0 && (packet[4] & 0x20u) != 0 ? "indirect dispatch in thread dimensions" : "not a pipeline candidate (resolved ahead, labels pending or dispatch items off)");
+        }
+        if (recodeOnly && Unified::Resolve::Surfaces() == nullptr) {
+            static std::atomic<std::uint32_t> early{0};
+            if (early.fetch_add(1, std::memory_order_relaxed) < 8u) std::fprintf(stderr, "[recode-fatal] dispatch at 0x%llx dropped: it comes before the recode has a device (the windowless startup device is replaced when the window attaches; device replacement is not built)\n", static_cast<unsigned long long>(address));
+            return;
+        }
+        if (recodeOnly) {
+            std::string why = "not recorded on the recode route:";
+            if (!Unified::Resolve::DispatchesRoutedOn(submission.queue)) why += " queue not routed";
+            if (indirectArguments != 0 && (packet[4] & 0x20u) != 0) why += " indirect in thread dimensions";
+            if (resolving) why += " resolving";
+            if (fromAhead) why += " resolved ahead";
+            if (!DispatchItemsEnabled()) why += " dispatch items off";
+            if (!deferredLabels().labels.empty()) why += " labels pending";
+            if (indirectArguments != 0 && !(IndirectItemsEnabled() && submission.queue == 0)) why += " indirect off queue 0";
+            if (!Unified::Record::RecordsHtileClears() && (htileClearCompletion.has_value() || htileMask.bytes != 0u)) why += " HTILE clear";
+            Unified::Record::RefuseUnrecorded("dispatch", address, why);
+            return;
         }
         Unified::Record::NoteExistingDispatch(address, indirectArguments, static_cast<std::uint64_t>(packet[1]) * packet[2] * packet[3]);
 #endif

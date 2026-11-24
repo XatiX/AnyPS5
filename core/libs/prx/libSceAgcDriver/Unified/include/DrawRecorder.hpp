@@ -39,11 +39,8 @@ struct DisplaySource {
 };
 [[nodiscard]] std::optional<DisplaySource> DisplayRecord(std::uint64_t address, std::uint64_t bytes);
 [[nodiscard]] bool PresentsExistingResidents();
-[[nodiscard]] bool DumpSamplesToMirror(Graphics::Recorder& recorder, std::uint64_t address, std::uint64_t bytes, std::uint32_t blocks);
-[[nodiscard]] bool SampleDumpsAlsoToMirror();
 void NoteSampleDumpBefore(std::uint64_t address);
 void NoteExistingPacket(std::uint32_t header, std::uint32_t queue);
-void CopySampleDumpToMirror(const Graphics::Context& context, Graphics::Recorder& recorder, VkBuffer import, VkDeviceSize offset, std::uint64_t address, std::uint64_t bytes);
 [[nodiscard]] bool LandingsPending();
 [[nodiscard]] bool RecordsHtileClears();
 void LandAfterBatch(Graphics::Recorder& recorder, std::function<void()> landing);

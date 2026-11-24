@@ -568,9 +568,7 @@ ExistingPath ExistingPathMode() {
     static const ExistingPath mode = [] {
         const char* value = std::getenv("APS5_RECODE_EXISTING_PATH");
         if (value == nullptr) return ExistingPath::Abort;
-        if (std::strcmp(value, "allow") == 0) return ExistingPath::Allow;
-        if (std::strcmp(value, "log") == 0) return ExistingPath::Log;
-        if (std::strcmp(value, "drop") == 0) return ExistingPath::Drop;
+        if (std::strcmp(value, "drop") == 0 || std::strcmp(value, "log") == 0) return ExistingPath::Drop;
         return ExistingPath::Abort;
     }();
     return mode;
@@ -578,9 +576,8 @@ ExistingPath ExistingPathMode() {
 
 void RefuseExistingPath(std::uint64_t codeAddress, std::string_view work, std::string_view reason) {
     const auto mode = ExistingPathMode();
-    if (mode == ExistingPath::Allow) return;
     const auto hash = codeAddress != 0u ? ProgramHash(codeAddress) : std::uint64_t{0};
-    const bool carriesOn = mode == ExistingPath::Log || mode == ExistingPath::Drop;
+    const bool carriesOn = mode == ExistingPath::Drop;
     if (carriesOn) {
         static std::mutex seenMutex;
         static std::set<std::string> seen;
@@ -591,7 +588,7 @@ void RefuseExistingPath(std::uint64_t codeAddress, std::string_view work, std::s
     }
     std::fprintf(stderr, "[recode-fatal] %.*s of program %016llx (code 0x%llx) cannot be recorded and the recode route has no fallback to the existing path: %.*s\n", static_cast<int>(work.size()), work.data(), static_cast<unsigned long long>(hash), static_cast<unsigned long long>(codeAddress), static_cast<int>(reason.size()), reason.data());
     if (carriesOn) return;
-    std::fprintf(stderr, "[recode-fatal] stopping; APS5_RECODE_EXISTING_PATH=log reports every such case and carries on, =drop also skips the draws instead of running them on the existing path, =allow restores the fallback for comparison runs\n");
+    std::fprintf(stderr, "[recode-fatal] stopping; APS5_RECODE_EXISTING_PATH=drop reports every such case once and skips the work\n");
     if (Active()) Report();
     std::fflush(stderr);
     std::_Exit(87);

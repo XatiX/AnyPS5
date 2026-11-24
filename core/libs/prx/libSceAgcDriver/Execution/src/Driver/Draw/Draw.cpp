@@ -443,7 +443,7 @@ DrawVerdict Driver::draw(QueueState& queue, std::span<const std::uint32_t> packe
             return drawn();
         }
         if (found.value == nullptr) Unified::Record::RefuseUnrecorded("draw", 0, {});
-        if (Unified::Record::DropsUnrecorded()) {
+        {
             if (found.offered) resolvedDraws.Release(submission.queue, submission.serial, packetOffset);
             const auto commitQueue = submission.queue;
             DrawPipeline::Queue0().Enqueue(DrawPipeline::CommitKind::Draw, [this, localDevice, commitQueue] {
@@ -458,6 +458,7 @@ DrawVerdict Driver::draw(QueueState& queue, std::span<const std::uint32_t> packe
         }
     } else if (Unified::Record::RecordActive()) {
         Unified::Record::RefuseUnrecorded("draw", 0, "draw outside the draw pipeline");
+        return drawn();
     }
 #endif
     timing.Mark("device_setup");

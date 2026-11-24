@@ -65,6 +65,7 @@ enum class DispatchRoute : std::uint8_t { None, Graphics, Compute, All };
 
 DispatchRoute dispatchRoute() {
     static const DispatchRoute route = [] {
+        if (Record::RecordActive()) return DispatchRoute::All;
         const auto* value = std::getenv("APS5_RECODE_DISPATCH");
         if (value == nullptr) return DispatchRoute::None;
         const std::string_view text(value);
@@ -94,8 +95,6 @@ bool imagesRouted() {
     return enabled;
 }
 
-enum class SampledBind : std::uint8_t { Ahead, Record, RecordAll };
-
 }
 
 bool SampledRecordsAll() {
@@ -116,17 +115,6 @@ bool SampledRecordFor(std::uint64_t address, std::uint64_t bytes) {
 
 namespace {
 
-SampledBind sampledBind() {
-    static const SampledBind bind = [] {
-        const auto* value = std::getenv("APS5_RECODE_SAMPLED_BIND");
-        if (value == nullptr) return SampledBind::Record;
-        const std::string_view text(value);
-        if (text == "ahead") return SampledBind::Ahead;
-        if (text == "record-all") return SampledBind::RecordAll;
-        return SampledBind::Record;
-    }();
-    return bind;
-}
 
 enum SampledClass : std::size_t { SampledView, SampledCopy, SampledSnapshot, SampledClassCount };
 
@@ -323,52 +311,6 @@ public:
         return std::nullopt;
     }
 
-    std::shared_ptr<const void> BindDeferredSampled(const Graphics::Context& bound, const Heap::SlotRequest& request, std::uint32_t& slot, std::string& reason) {
-        if (table == nullptr) {
-            reason = "no slot table";
-            return nullptr;
-        }
-        auto texture = Graphics::CachedSampledTexture(bound, request.words);
-        if (texture == nullptr || texture->Released()) {
-            reason = "deferred sampled image not cached";
-            return nullptr;
-        }
-        sampledAtRecord[sampledClass(*texture)].fetch_add(1, std::memory_order_relaxed);
-        SampledChoice choice = ChoicePlain;
-        const auto view = sampledView(*texture, request.kind, choice);
-        viewChoices[choice].fetch_add(1, std::memory_order_relaxed);
-        if (choice == ChoiceMismatch) noteViewMismatch(*texture, request);
-        slot = table->ImageSlot(request.kind, {reinterpret_cast<std::uint64_t>(view), static_cast<std::uint32_t>(texture->Layout()), texture});
-        if (slot == Heap::NoSlot) {
-            reason = "image heap full for kind " + std::to_string(request.kind);
-            return nullptr;
-        }
-        return texture;
-    }
-
-    std::shared_ptr<Graphics::StorageTexture> BindDeferred(const Graphics::Context& bound, const Heap::SlotRequest& request, std::uint32_t& slot, std::string& reason) {
-        if (table == nullptr) {
-            reason = "no slot table";
-            return nullptr;
-        }
-        try {
-            const auto resource = Graphics::DecodeTextureResource(request.words);
-            auto [texture, view] = storageView(bound, request, resource, (request.flags & Heap::RequestFlag::Written) != 0u);
-            if (texture == nullptr || view == VK_NULL_HANDLE) {
-                reason = "written storage image without a view";
-                return nullptr;
-            }
-            slot = table->ImageSlot(request.kind, {reinterpret_cast<std::uint64_t>(view), static_cast<std::uint32_t>(VK_IMAGE_LAYOUT_GENERAL), texture});
-            if (slot == Heap::NoSlot) {
-                reason = "image heap full for kind " + std::to_string(request.kind);
-                return nullptr;
-            }
-            return texture;
-        } catch (const std::exception& error) {
-            reason = std::string("written storage image: ") + error.what();
-            return nullptr;
-        }
-    }
 
     std::shared_ptr<Images::Surface> BindDeferredRecord(const Heap::SlotRequest& request, std::uint32_t& slot) {
         if (table == nullptr) return nullptr;
@@ -823,63 +765,8 @@ private:
             bool fallback = false;
             auto resolved = surfaceImage(request, fallback);
             if (!fallback) return resolved;
-            if (sampledBind() != SampledBind::RecordAll) {
-                if (auto target = targetImage(request)) {
-                    std::string detail = "render target from the existing target cache";
-                    try {
-                        const auto resource = Graphics::DecodeTextureResource(request.words);
-                        char where[96];
-                        std::snprintf(where, sizeof(where), " 0x%llx %ux%u fmt %u mips %u", static_cast<unsigned long long>(resource.baseAddress), resource.width, resource.height, static_cast<unsigned>(resource.format), resource.mipCount);
-                        detail += where;
-                        for (const auto& record : surfaces->StaleOverlapping(resource.baseAddress, Graphics::SurfaceGuestBytes(resource))) {
-                            char stale[160];
-                            std::snprintf(stale, sizeof(stale), "existing target cache reads 0x%llx %ux%u over record 0x%llx+0x%llx %ux%u mips %u", static_cast<unsigned long long>(resource.baseAddress), resource.width, resource.height, static_cast<unsigned long long>(record->key.address), static_cast<unsigned long long>(record->key.bytes), record->key.width, record->key.height, record->key.mips);
-                            Downgrades::NoteCurrent(Downgrades::Kind::SampledStaleRecord, request.kind, stale);
-                            break;
-                        }
-                    } catch (const std::exception&) {
-                    }
-                    Downgrades::NoteCurrent(Downgrades::Kind::UpstreamSampled, request.kind, detail);
-                    return target;
-                }
-            }
         }
-        if (sampledBind() != SampledBind::Ahead) return deferredImage(request);
-        std::shared_ptr<Graphics::Texture> texture;
-        {
-            GuestMemory::TagGpuLockSite(GuestMemory::GpuLockSite::Try);
-            std::unique_lock gpuLock(GuestMemory::GpuMutex(), std::try_to_lock);
-            if (!gpuLock.owns_lock()) {
-                totals.lockBusy++;
-                static const bool defersBusy = std::getenv("APS5_RECODE_NO_BUSY_DEFER") == nullptr;
-                if (!defersBusy) return std::nullopt;
-                const auto resource = Graphics::DecodeTextureResource(request.words);
-                Heap::ResolvedImage deferred;
-                deferred.memory = {resource.baseAddress, Graphics::SurfaceGuestBytes(resource)};
-                deferred.deferred = true;
-                return deferred;
-            }
-            texture = Graphics::CachedSampledTexture(*context, request.words);
-        }
-        if (texture == nullptr || texture->Released()) return std::nullopt;
-        const auto resource = Graphics::DecodeTextureResource(request.words);
-        const auto bound = sampledClass(*texture);
-        sampledAhead[bound].fetch_add(1, std::memory_order_relaxed);
-        if (bound == SampledCopy) {
-            Downgrades::NoteCurrent(Downgrades::Kind::SampledAhead, request.kind, "per-use copy refreshed when resolved, ahead of its draw");
-        } else if (bound == SampledSnapshot && Events::GpuWrites().ChangedSince(resource.baseAddress, Graphics::SurfaceGuestBytes(resource), 0u)) {
-            Downgrades::NoteCurrent(Downgrades::Kind::SampledAhead, request.kind, "snapshot of GPU-written memory read when resolved, ahead of its draw");
-        } else {
-            Downgrades::NoteCurrent(Downgrades::Kind::UpstreamSampled, request.kind, "existing sampled texture cache");
-        }
-        SampledChoice choice = ChoicePlain;
-        const auto view = sampledView(*texture, request.kind, choice);
-        viewChoices[choice].fetch_add(1, std::memory_order_relaxed);
-        if (choice == ChoiceMismatch) noteViewMismatch(*texture, request);
-        Heap::ResolvedImage resolved;
-        resolved.image = {reinterpret_cast<std::uint64_t>(view), static_cast<std::uint32_t>(texture->Layout()), texture};
-        resolved.memory = {resource.baseAddress, Graphics::SurfaceGuestBytes(resource)};
-        return resolved;
+        return deferredImage(request);
     }
 
     std::optional<Heap::ResolvedImage> deferredImage(const Heap::SlotRequest& request) {
@@ -991,31 +878,6 @@ private:
         }
     }
 
-    std::optional<Heap::ResolvedImage> targetImage(const Heap::SlotRequest& request) {
-        std::string why;
-        try {
-            const auto resource = Graphics::DecodeTextureResource(request.words);
-            const auto bytes = Graphics::SurfaceGuestBytes(resource);
-            auto texture = Images::Targets().Find(resource.baseAddress, bytes, request.words, why);
-            std::shared_ptr<Images::TargetView> view;
-            if (texture != nullptr) view = targetViews->View(texture, request.words, request.kind, why);
-            if (view == nullptr) {
-                if (texture != nullptr) noteSurfaceReason(why);
-                if (texture == nullptr && missedTargets.size() < 12u && missedTargets.insert(resource.baseAddress).second) {
-                    std::fprintf(stderr, "[recode-resolve] first target miss: address 0x%llx format %u %ux%u tile %u dimension %u mips %u (%s)\n", static_cast<unsigned long long>(resource.baseAddress), resource.format, resource.width, resource.height, static_cast<unsigned>(resource.tileMode), static_cast<unsigned>(resource.dimension), resource.mipCount, why.c_str());
-                }
-                return std::nullopt;
-            }
-            Heap::ResolvedImage resolved;
-            resolved.image = {reinterpret_cast<std::uint64_t>(view->View()), static_cast<std::uint32_t>(VK_IMAGE_LAYOUT_GENERAL), view};
-            resolved.memory = {resource.baseAddress, bytes};
-            return resolved;
-        } catch (const std::exception& error) {
-            noteSurfaceReason(std::string("target: ") + error.what());
-            return std::nullopt;
-        }
-    }
-
     std::optional<Heap::ResolvedImage> surfaceImage(const Heap::SlotRequest& request, bool& fallback) {
         std::string why;
         const auto key = Images::KeyOf(request.words, why);
@@ -1123,7 +985,7 @@ std::string TakeRefusal() {
 }
 
 std::chrono::milliseconds HandoffWait() {
-    return Downgrades::ExistingPathMode() == Downgrades::ExistingPath::Allow ? std::chrono::milliseconds(50) : std::chrono::milliseconds(60000);
+    return std::chrono::milliseconds(60000);
 }
 
 PacketTable<ResolvedDraw>& ResolvedDraws() {
@@ -1150,10 +1012,6 @@ Images::SurfaceTable* Surfaces() {
     return shared().SurfaceTableOf();
 }
 
-std::shared_ptr<Graphics::StorageTexture> BindDeferredImage(const Graphics::Context& context, const Heap::SlotRequest& request, std::uint32_t& slot, std::string& reason) {
-    return shared().BindDeferred(context, request, slot, reason);
-}
-
 std::shared_ptr<Images::Surface> BindDeferredRecord(const Heap::SlotRequest& request, std::uint32_t& slot) {
     return shared().BindDeferredRecord(request, slot);
 }
@@ -1168,10 +1026,6 @@ bool StorageRecordShape(const Heap::SlotRequest& request) {
 
 bool BindViewSlot(const Heap::SlotRequest& request, std::uint64_t view, std::uint32_t layout, std::shared_ptr<const void> owner, std::uint32_t& slot) {
     return shared().BindViewSlot(request, view, layout, std::move(owner), slot);
-}
-
-std::shared_ptr<const void> BindDeferredSampled(const Graphics::Context& context, const Heap::SlotRequest& request, std::uint32_t& slot, std::string& reason) {
-    return shared().BindDeferredSampled(context, request, slot, reason);
 }
 
 }
