@@ -174,6 +174,7 @@ bool BranchesSkipPendingWords() {
 }
 
 std::atomic<ShaderMemory::WaitedMsProvider> waitedMsProvider{nullptr};
+std::atomic<bool> sharedSupplies{false};
 
 double WaitedMs() {
     const auto provider = waitedMsProvider.load(std::memory_order_acquire);
@@ -232,6 +233,10 @@ SharedPagePool<TPage>& sharedPagePool() {
 
 void ShaderMemory::SetWaitedMsProvider(WaitedMsProvider provider) {
     waitedMsProvider.store(provider, std::memory_order_release);
+}
+
+void ShaderMemory::SetSharedSupplies(bool shared) {
+    sharedSupplies.store(shared, std::memory_order_release);
 }
 
 ShaderMemory::ShaderMemory(std::span<const ShaderRecompiler::MemoryRegion> regions, PendingWriteQuery pendingWrite, PendingWriteObserver observe, HookWaitCounter hookWaits, PendingWriteQuery pendingSpan) : pendingWrite(pendingWrite), observe(observe), hookWaits(hookWaits), pendingSpan(pendingSpan != nullptr ? pendingSpan : pendingWrite), spanQuery(pendingSpan != nullptr) {
@@ -849,7 +854,7 @@ bool ShaderMemory::supplyWords(void* context, const std::shared_ptr<const Shader
     const auto fetched = self.pageAtOrAfter(begin & ~static_cast<std::uint64_t>(PageBytes - 1));
     const bool paged = fetched != self.pages.size() && self.pages[fetched].first < end;
     const bool overlapping = std::any_of(self.supplied.begin(), self.supplied.end(), [&](const Supplied& entry) { return entry.begin < end && begin < entry.end && RunsOverlap(entry.words->runs, words->runs); });
-    if (paged || overlapping) {
+    if ((paged || overlapping) && !sharedSupplies.load(std::memory_order_acquire)) {
         for (std::size_t index = self.supplied.size(); index-- > 0;) {
             const auto& entry = self.supplied[index];
             if (entry.begin < end && begin < entry.end && RunsOverlap(entry.words->runs, words->runs)) self.spill(index);

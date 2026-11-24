@@ -20,6 +20,8 @@ struct GuestTextureResource;
 
 namespace AgcDriver::Unified::Images {
 
+inline constexpr std::uint64_t IndexedSurfaceBytes = std::uint64_t{4} << 20u;
+
 struct SurfaceKey {
     std::uint64_t address = 0;
     std::uint64_t bytes = 0;
@@ -166,6 +168,7 @@ private:
     mutable std::mutex mutex;
     std::unordered_map<SurfaceKey, std::shared_ptr<Surface>, KeyHash> surfaces;
     std::multimap<std::uint64_t, std::shared_ptr<Surface>> byAddress;
+    std::vector<std::shared_ptr<Surface>> large;
     std::uint64_t widest = 0;
     std::vector<std::shared_ptr<Surface>> work;
     std::vector<std::shared_ptr<Surface>> newer;

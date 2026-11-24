@@ -340,7 +340,17 @@ bool DecodePrograms(const ProgramInputs& inputs, DriverDetail::DrawDecode& decod
     return true;
 }
 
+void shareSupplies() {
+    static const bool shared = [] {
+        const bool on = std::getenv("APS5_RECODE_COPY_SUPPLIED_WORDS") == nullptr;
+        ShaderMemory::SetSharedSupplies(on);
+        return on;
+    }();
+    static_cast<void>(shared);
+}
+
 bool BuildPrograms(const ProgramInputs& inputs, const DrawFacts& facts, ProgramSet& out, std::string& reason) try {
+    shareSupplies();
     out.stages.clear();
     out.memory.clear();
     out.nanoseconds = {};
@@ -441,6 +451,7 @@ bool BuildPrograms(const ProgramInputs& inputs, const DrawFacts& facts, ProgramS
 }
 
 bool BuildComputeProgram(const ProgramInputs& inputs, const DispatchFacts& facts, ProgramSet& out, std::string& reason) try {
+    shareSupplies();
     out.stages.clear();
     out.memory.clear();
     out.nanoseconds = {};

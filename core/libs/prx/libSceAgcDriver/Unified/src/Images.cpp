@@ -337,11 +337,16 @@ std::string SurfaceTable::ChangeOf(const Surface& surface) const {
 }
 
 void SurfaceTable::indexSurface(const std::shared_ptr<Surface>& surface) {
+    if (surface->key.bytes > IndexedSurfaceBytes) {
+        large.push_back(surface);
+        return;
+    }
     byAddress.emplace(surface->key.address, surface);
     widest = std::max(widest, surface->key.bytes);
 }
 
 void SurfaceTable::unindexSurface(const Surface& surface) {
+    std::erase_if(large, [&](const std::shared_ptr<Surface>& held) { return held.get() == &surface; });
     const auto [first, last] = byAddress.equal_range(surface.key.address);
     for (auto at = first; at != last; ++at) {
         if (at->second.get() != &surface) continue;
@@ -354,6 +359,9 @@ void SurfaceTable::unindexSurface(const Surface& surface) {
 template<typename TVisit>
 bool SurfaceTable::visitOverlapping(std::uint64_t address, std::uint64_t bytes, TVisit&& visit) const {
     const auto end = address + bytes;
+    for (const auto& surface : large) {
+        if (surface->key.address < end && address < surface->key.address + surface->key.bytes && visit(surface)) return true;
+    }
     for (auto at = byAddress.lower_bound(address > widest ? address - widest : 0u); at != byAddress.end() && at->first < end; ++at) {
         const auto& key = at->second->key;
         if (address < key.address + key.bytes && visit(at->second)) return true;

@@ -1,4 +1,5 @@
 #include "prx/libSceAgcDriver/Unified/include/Front.hpp"
+#include "prx/libSceAgcDriver/Execution/include/WorkerSampler.hpp"
 #include <chrono>
 
 namespace AgcDriver::Unified {
@@ -64,7 +65,10 @@ Front::Lane& Front::laneFor(std::uint32_t queue) {
         lane->state.SetResolve(resolve);
         lane->state.SetUses(uses);
         Lane& created = *lane;
-        created.thread = std::thread([this, &created] { run(created); });
+        created.thread = std::thread([this, &created, queue] {
+            StartLaneSampler(queue);
+            run(created);
+        });
     }
     return *lane;
 }
