@@ -54,6 +54,7 @@
 #include <numeric>
 #include <optional>
 #include <set>
+#include <tuple>
 #include <unordered_map>
 #include <thread>
 
@@ -415,6 +416,9 @@ std::atomic<std::uint64_t> flipsWithoutRecords{0};
 std::atomic<std::uint32_t> flipNotes{0};
 std::atomic<std::uint32_t> flipMemoryNotes{0};
 std::atomic<std::uint64_t> sampleDumpsLanded{0};
+std::atomic<std::uint64_t> storesToMirror{0};
+std::atomic<std::uint64_t> storesBesideMirror{0};
+std::atomic<std::uint64_t> storesAtOnce{0};
 
 bool argumentCensusOn() {
     static const bool on = std::getenv("APS5_RECODE_ARGUMENT_CENSUS") != nullptr;
@@ -441,6 +445,9 @@ void printExistingPackets() {
         std::snprintf(text, sizeof(text), " q%llx:0x%02llx %llu", static_cast<unsigned long long>(key >> 32u), static_cast<unsigned long long>((key >> 8u) & 0xffu), static_cast<unsigned long long>(count));
         line += text;
     }
+    char totals[224];
+    std::snprintf(totals, sizeof(totals), "; recode stores into the mirror %llu, outside it %llu, at once (nothing in flight) %llu, occlusion dumps %llu (whole run)", static_cast<unsigned long long>(storesToMirror.load()), static_cast<unsigned long long>(storesBesideMirror.load()), static_cast<unsigned long long>(storesAtOnce.load()), static_cast<unsigned long long>(sampleDumpsLanded.load()));
+    line += totals;
     std::fprintf(stderr, "%s\n", line.c_str());
     existingPackets.clear();
 }
@@ -4538,10 +4545,96 @@ bool DumpSamplesToMirror(const Context& context, Graphics::Recorder& recorder, s
     return true;
 }
 
-void NoteExistingPacket(std::uint32_t header, std::uint32_t queue) {
-    if (!RecordActive() || !Downgrades::Active()) return;
-    const auto key = (static_cast<std::uint64_t>(queue) << 32u) | (header & 0x0000ff00u);
+int StoreToMirror(Graphics::Recorder& recorder, std::uint64_t address, std::span<const std::byte> bytes, std::uint64_t stamp, std::uint32_t queue) {
+    if (recorder.Idle()) {
+        storesAtOnce.fetch_add(1, std::memory_order_relaxed);
+        return 1;
+    }
+    const auto span = ResidencyService::Get().MirrorSpan(address, bytes.size());
+    if (!span || span->handle == 0u) {
+        storesBesideMirror.fetch_add(1, std::memory_order_relaxed);
+        recorder.NoteLabel(address, bytes, stamp, queue);
+        LandAfterBatch(recorder, [address, stored = std::vector<std::byte>(bytes.begin(), bytes.end())] { MemoryCore::Get().LandGpuWrite(address, stored); });
+        return 0;
+    }
+    recorder.RecordStore(reinterpret_cast<VkBuffer>(static_cast<std::uintptr_t>(span->handle)), static_cast<VkDeviceSize>(span->offset), bytes, address);
+    const std::array written{std::pair{address, address + bytes.size()}};
+    Shadow::NoteGpuWrites(written);
+    const auto mark = MemoryCore::Get().NoteGpuWrite(address, bytes.size(), recorder.OpenBatchSerial());
+    if (!mark.upload.empty()) ResidencyService::Get().NoteDirty(mark.upload);
+    Events::NoteRanges(written);
+    recorder.NoteLabel(address, bytes, stamp, queue);
+    LandAfterBatch(recorder, [address, stored = std::vector<std::byte>(bytes.begin(), bytes.end())] { MemoryCore::Get().LandGpuWrite(address, stored); });
+    storesToMirror.fetch_add(1, std::memory_order_relaxed);
+    return 0;
+}
+
+bool StoresToMirror(std::size_t bytes) {
+    static const bool stores = RecordActive() && std::getenv("APS5_RECODE_MIRROR_STORES") != nullptr;
+    static const std::size_t smallest = [] {
+        const char* value = std::getenv("APS5_RECODE_MIRROR_STORES_FROM");
+        return value != nullptr ? static_cast<std::size_t>(std::strtoull(value, nullptr, 0)) : std::size_t{0};
+    }();
+    return stores && bytes >= smallest;
+}
+
+static void censusMemoryPacket(std::span<const std::uint32_t> packet, std::uint32_t queue, std::uint32_t opcode) {
+    static const char* filter = std::getenv("APS5_RECODE_PACKET_CENSUS");
+    if (filter == nullptr) return;
+    std::uint64_t source = 0;
+    std::uint64_t destination = 0;
+    std::uint64_t bytes = 0;
+    std::uint32_t sourceSelect = 0;
+    std::uint32_t destinationSelect = 0;
+    if (opcode == 0x40 && packet.size() >= 6) {
+        sourceSelect = Pm4::CopyDataSource(packet);
+        destinationSelect = Pm4::CopyDataDestination(packet);
+        if (Pm4::CopyDataToRegister(packet)) return;
+        source = packet[2] | (static_cast<std::uint64_t>(packet[3]) << 32u);
+        destination = packet[4] | (static_cast<std::uint64_t>(packet[5]) << 32u);
+        bytes = Pm4::CopyDataBytes(packet);
+    } else if (opcode == 0x37 && packet.size() >= 5) {
+        destinationSelect = (packet[1] >> 8u) & 0xfu;
+        destination = packet[2] | (static_cast<std::uint64_t>(packet[3]) << 32u);
+        bytes = (packet.size() - 4u) * 4u;
+    } else if (opcode == 0x50 && packet.size() >= 7) {
+        sourceSelect = (packet[1] >> 29u) & 3u;
+        destinationSelect = (packet[1] >> 20u) & 3u;
+        source = packet[2] | (static_cast<std::uint64_t>(packet[3]) << 32u);
+        destination = packet[4] | (static_cast<std::uint64_t>(packet[5]) << 32u);
+        bytes = packet[6] & 0x3ffffffu;
+    } else {
+        return;
+    }
+    if (*filter != '\0') {
+        const auto low = std::strtoull(filter, nullptr, 16);
+        const char* colon = std::strchr(filter, ':');
+        const auto high = colon != nullptr ? std::strtoull(colon + 1, nullptr, 16) : low + 0x100000u;
+        const bool touches = (destination < high && destination + bytes > low) || (source != 0 && source < high && source + bytes > low);
+        if (!touches) return;
+    }
+    static std::mutex mutex;
+    static std::map<std::tuple<std::uint32_t, std::uint32_t, std::uint32_t, std::uint64_t, std::uint64_t>, std::uint64_t> seen;
+    static std::uint64_t lines = 0;
+    const auto key = std::tuple{opcode, sourceSelect, destinationSelect, source >> 8u, destination >> 8u};
+    std::lock_guard lock(mutex);
+    if (seen[key]++ != 0 || lines >= 400) return;
+    ++lines;
+    const auto& pages = MemoryCore::Get().Pages();
+    const bool sourceGpu = source != 0 && bytes != 0 && pages.GpuWrittenIn(source, bytes);
+    const bool destinationGpu = destination != 0 && bytes != 0 && pages.GpuWrittenIn(destination, bytes);
+    std::uint64_t sourceValue = 0;
+    if (source != 0 && GuestMemory::Accessible(reinterpret_cast<const void*>(static_cast<std::uintptr_t>(source)), 8, false)) std::memcpy(&sourceValue, reinterpret_cast<const void*>(static_cast<std::uintptr_t>(source)), 8);
+    std::fprintf(stderr, "[recode-packet-census] q%u %s src sel %u 0x%llx (gpu-written %d, guest 0x%016llx) dst sel %u 0x%llx+0x%llx (gpu-written %d) word1 0x%08x data0 0x%08x\n", queue, opcode == 0x40 ? "COPY_DATA" : opcode == 0x37 ? "WRITE_DATA" : "DMA_DATA", sourceSelect, static_cast<unsigned long long>(source), sourceGpu ? 1 : 0, static_cast<unsigned long long>(sourceValue), destinationSelect, static_cast<unsigned long long>(destination), static_cast<unsigned long long>(bytes), destinationGpu ? 1 : 0, packet[1], packet.size() > 4 ? packet[4] : 0u);
+}
+
+void NoteExistingPacket(std::span<const std::uint32_t> packet, std::uint32_t queue) {
+    if (!RecordActive() || packet.empty()) return;
+    const auto header = packet[0];
     const auto opcode = (header >> 8u) & 0xffu;
+    censusMemoryPacket(packet, queue, opcode);
+    if (!Downgrades::Active()) return;
+    const auto key = (static_cast<std::uint64_t>(queue) << 32u) | (header & 0x0000ff00u);
     const char* served = nullptr;
     switch (opcode) {
         case 0x37: served = "WRITE_DATA"; break;
