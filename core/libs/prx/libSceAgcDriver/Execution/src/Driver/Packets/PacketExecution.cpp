@@ -25,6 +25,8 @@
 #include <utility>
 #if ANYPS5_UNIFIED
 #include "prx/libSceAgcDriver/Unified/include/DrawRecorder.hpp"
+#include "prx/libSceAgcDriver/Unified/include/RecordLoop.hpp"
+#include "prx/libSceAgcDriver/Unified/include/RecordQueue.hpp"
 #include "prx/libSceAgcDriver/Unified/include/Releases.hpp"
 #include "prx/libSceAgcDriver/Unified/include/Resolve.hpp"
 #include "prx/libSceAgcDriver/Unified/include/Shadow.hpp"
@@ -134,6 +136,9 @@ bool& drawnSinceSeal() {
 }
 
 void Driver::deliverGuestEopInterrupt(std::uint32_t queue, std::uint32_t context) {
+#if ANYPS5_UNIFIED
+    Unified::Loop::TraceInterrupt(queue, context);
+#endif
     AgcDriverDeliverEopInterrupt(queue, context);
 }
 
@@ -301,6 +306,9 @@ void Driver::execute(Submission& submission) {
         CheckFailure();
         while (nextSegment < submission.indirectSegments.size() && submission.indirectSegments[nextSegment].start <= cursor) {
             if (submission.indirectSegments[nextSegment].start == cursor && refreshIndirectSegment(submission, nextSegment)) {
+#if ANYPS5_UNIFIED
+                Unified::Loop::NoteRefreshedSegment(submission.queue, submission.serial, cursor);
+#endif
                 recent.commands = submission.commands;
                 continue;
             }
@@ -313,6 +321,20 @@ void Driver::execute(Submission& submission) {
         const auto packet = std::span(submission.commands).subspan(cursor, count);
         const auto opcode = (header >> 8u) & 0xffu;
 #if ANYPS5_UNIFIED
+        if (Unified::Loop::OwnsLoop()) {
+            static const bool hooked = [this] {
+                Unified::Loop::SetInterruptHook([](void* owner, std::uint32_t target, std::uint32_t context) { static_cast<Driver*>(owner)->deliverGuestEopInterrupt(target, context); }, this);
+                return true;
+            }();
+            static_cast<void>(hooked);
+            const bool flipHere = submission.flips.contains(cursor);
+            if (!flipHere && header != RenderingWaitPacketHeader && Unified::Loop::Takes(packet, opcode, submission.queue)) {
+                cursor += count;
+                continue;
+            }
+            Unified::Loop::TraceKept(packet, opcode, submission.queue, submission.serial, cursor, flipHere);
+            if (flipHere && !Unified::Loop::WaitPassed(submission.queue, submission.serial, static_cast<std::uint32_t>(cursor), std::chrono::seconds(60))) std::fprintf(stderr, "[recode-loop] flip at submission %llu offset %zu waited 60 s for the record loop\n", static_cast<unsigned long long>(submission.serial), cursor);
+        }
         Unified::Record::NoteExistingPacket(packet, submission.queue);
 #endif
         if (executingPacket != nullptr) executingPacket->store((static_cast<std::uint64_t>(cursor + 1) << 8u) | opcode, std::memory_order_relaxed);

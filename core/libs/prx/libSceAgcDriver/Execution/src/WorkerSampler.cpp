@@ -42,6 +42,7 @@ namespace {
 std::jthread processSamplerThread;
 std::jthread workerSamplerThread;
 std::jthread committerSamplerThread;
+std::jthread laneSamplerThread;
 
 std::optional<std::string> ConfiguredPath(const wchar_t* value) {
     if (value == nullptr) return std::nullopt;
@@ -371,18 +372,29 @@ void StartCommitterSampler() {
     StartCallingThreadSampler(ConfiguredPath(_wgetenv(L"APS5_SAMPLE_COMMITTER")), committerSamplerThread);
 }
 
+void StartLaneSampler(std::uint32_t queue) {
+    static const auto sampledQueue = [] {
+        const char* value = std::getenv("APS5_SAMPLE_WORKER_QUEUE");
+        return value != nullptr ? static_cast<std::uint32_t>(std::strtoul(value, nullptr, 0)) : 0u;
+    }();
+    if (queue == sampledQueue) StartCallingThreadSampler(ConfiguredPath(_wgetenv(L"APS5_SAMPLE_LANE")), laneSamplerThread);
+}
+
 void StopWorkerSampler() {
     processSamplerThread.request_stop();
     workerSamplerThread.request_stop();
     committerSamplerThread.request_stop();
+    laneSamplerThread.request_stop();
     if (processSamplerThread.joinable()) processSamplerThread.join();
     if (workerSamplerThread.joinable()) workerSamplerThread.join();
     if (committerSamplerThread.joinable()) committerSamplerThread.join();
+    if (laneSamplerThread.joinable()) laneSamplerThread.join();
 }
 #else
 bool ReadableStackRegion(std::uint64_t, std::uint64_t&, std::uint64_t&) { return false; }
 void StartWorkerSampler(std::uint32_t) {}
 void StartCommitterSampler() {}
+void StartLaneSampler(std::uint32_t) {}
 void StopWorkerSampler() {}
 #endif
 

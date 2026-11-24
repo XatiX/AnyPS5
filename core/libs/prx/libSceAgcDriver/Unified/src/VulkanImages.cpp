@@ -53,6 +53,28 @@ VkFormat uintStorageView(VkFormat format) {
     }
 }
 
+VkFormat compressedClass(VkFormat format) {
+    switch (format) {
+        case VK_FORMAT_BC1_RGB_SRGB_BLOCK: return VK_FORMAT_BC1_RGB_UNORM_BLOCK;
+        case VK_FORMAT_BC1_RGBA_SRGB_BLOCK: return VK_FORMAT_BC1_RGBA_UNORM_BLOCK;
+        case VK_FORMAT_BC2_SRGB_BLOCK: return VK_FORMAT_BC2_UNORM_BLOCK;
+        case VK_FORMAT_BC3_SRGB_BLOCK: return VK_FORMAT_BC3_UNORM_BLOCK;
+        case VK_FORMAT_BC7_SRGB_BLOCK: return VK_FORMAT_BC7_UNORM_BLOCK;
+        default: return format;
+    }
+}
+
+bool hasCompressedSibling(VkFormat format) {
+    switch (compressedClass(format)) {
+        case VK_FORMAT_BC1_RGB_UNORM_BLOCK:
+        case VK_FORMAT_BC1_RGBA_UNORM_BLOCK:
+        case VK_FORMAT_BC2_UNORM_BLOCK:
+        case VK_FORMAT_BC3_UNORM_BLOCK:
+        case VK_FORMAT_BC7_UNORM_BLOCK: return true;
+        default: return false;
+    }
+}
+
 bool volumeTargets() {
     static const bool targets = std::getenv("APS5_RECODE_NO_VOLUME_TARGETS") == nullptr;
     return targets;
@@ -72,12 +94,19 @@ std::optional<VkComponentSwizzle> swizzleOf(std::uint32_t select) {
 
 }
 
+bool CompressedSiblings(std::uint32_t left, std::uint32_t right) {
+    if (!Graphics::IsBlockCompressed(left) || !Graphics::IsBlockCompressed(right)) return false;
+    const auto leftFormat = Graphics::ResolveTextureFormat(left);
+    const auto rightFormat = Graphics::ResolveTextureFormat(right);
+    return leftFormat != VK_FORMAT_UNDEFINED && hasCompressedSibling(leftFormat) && compressedClass(leftFormat) == compressedClass(rightFormat);
+}
+
 VulkanSurface::VulkanSurface(const Graphics::Context& context, const Graphics::GuestTextureResource& resource, Graphics::SurfaceGeometry geometry, VkFormat format) : context(context), resource(resource), geometry(std::move(geometry)), format(format) {
     const bool volume = resource.dimension == Graphics::TextureDimension::k3D;
     compressed = Graphics::BlockWidth(resource.format) != 1u;
     identity = Graphics::IsConvertedTextureFormat(resource.format) && format != VK_FORMAT_B10G11R11_UFLOAT_PACK32;
     VkImageCreateInfo info{VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO};
-    info.flags = compressed ? 0u : VK_IMAGE_CREATE_MUTABLE_FORMAT_BIT | VK_IMAGE_CREATE_EXTENDED_USAGE_BIT | (volume && volumeTargets() ? VK_IMAGE_CREATE_2D_ARRAY_COMPATIBLE_BIT : 0u);
+    info.flags = compressed ? (hasCompressedSibling(format) ? VK_IMAGE_CREATE_MUTABLE_FORMAT_BIT : 0u) : VK_IMAGE_CREATE_MUTABLE_FORMAT_BIT | VK_IMAGE_CREATE_EXTENDED_USAGE_BIT | (volume && volumeTargets() ? VK_IMAGE_CREATE_2D_ARRAY_COMPATIBLE_BIT : 0u);
     info.imageType = volume ? VK_IMAGE_TYPE_3D : VK_IMAGE_TYPE_2D;
     info.format = format;
     info.extent = {std::max(resource.width, 1u), std::max(resource.height, 1u), volume ? std::max(this->geometry.imageDepth, 1u) : 1u};
@@ -92,16 +121,25 @@ VulkanSurface::VulkanSurface(const Graphics::Context& context, const Graphics::G
     Graphics::Check(context.Function<PFN_vkCreateImage>("vkCreateImage")(context.device, &info, nullptr, &image), "vkCreateImage recode surface");
     VkMemoryRequirements requirements{};
     context.Function<PFN_vkGetImageMemoryRequirements>("vkGetImageMemoryRequirements")(context.device, image, &requirements);
-    VkMemoryAllocateInfo allocation{VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO};
-    allocation.allocationSize = requirements.size;
-    allocation.memoryTypeIndex = context.MemoryType(requirements.memoryTypeBits, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
-    const auto allocated = context.Function<PFN_vkAllocateMemory>("vkAllocateMemory")(context.device, &allocation, nullptr, &memory);
+    const auto memoryType = context.MemoryType(requirements.memoryTypeBits, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
+    VkResult allocated = VK_SUCCESS;
+    if (PoolsImages()) {
+        pool = PoolFor(context);
+        allocated = pool->Allocate(requirements, memoryType, pooled);
+    } else {
+        VkMemoryAllocateInfo allocation{VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO};
+        allocation.allocationSize = requirements.size;
+        allocation.memoryTypeIndex = memoryType;
+        allocated = context.Function<PFN_vkAllocateMemory>("vkAllocateMemory")(context.device, &allocation, nullptr, &memory);
+    }
     if (allocated != VK_SUCCESS) {
         context.Function<PFN_vkDestroyImage>("vkDestroyImage")(context.device, image, nullptr);
         image = VK_NULL_HANDLE;
+        pool.reset();
         Graphics::Check(allocated, "vkAllocateMemory recode surface");
     }
-    Graphics::Check(context.Function<PFN_vkBindImageMemory>("vkBindImageMemory")(context.device, image, memory, 0), "vkBindImageMemory recode surface");
+    const auto bound = pool != nullptr ? context.Function<PFN_vkBindImageMemory>("vkBindImageMemory")(context.device, image, pooled.memory, pooled.offset) : context.Function<PFN_vkBindImageMemory>("vkBindImageMemory")(context.device, image, memory, 0);
+    Graphics::Check(bound, "vkBindImageMemory recode surface");
 }
 
 VulkanSurface::~VulkanSurface() {
@@ -112,6 +150,7 @@ VulkanSurface::~VulkanSurface() {
     for (const auto& [key, view] : attachmentViews) destroyView(context.device, view, nullptr);
     if (image != VK_NULL_HANDLE) context.Function<PFN_vkDestroyImage>("vkDestroyImage")(context.device, image, nullptr);
     if (memory != VK_NULL_HANDLE) context.Function<PFN_vkFreeMemory>("vkFreeMemory")(context.device, memory, nullptr);
+    if (pool != nullptr) pool->Free(pooled);
 }
 
 std::uint64_t VulkanSurface::View(const ViewKey& view, std::uint32_t kind, std::string& reason) {
@@ -138,7 +177,7 @@ std::uint64_t VulkanSurface::View(const ViewKey& view, std::uint32_t kind, std::
     const auto lastLevel = std::clamp(view.lastLevel, baseLevel, levels - 1u);
     const auto baseLayer = volume ? 0u : std::min(view.baseArray, layers - 1u);
     const auto layerCount = type == VK_IMAGE_VIEW_TYPE_2D_ARRAY ? std::max(std::min(view.lastArray, layers - 1u), baseLayer) - baseLayer + 1u : 1u;
-    const auto guestFormat = view.format != 0u && !compressed ? view.format : resource.format;
+    const auto guestFormat = view.format != 0u && (!compressed || (view.format != resource.format && CompressedSiblings(view.format, resource.format) && hasCompressedSibling(format))) ? view.format : resource.format;
     auto viewFormat = format;
     auto viewIdentity = identity;
     if (guestFormat != resource.format) {

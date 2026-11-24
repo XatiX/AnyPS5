@@ -1,0 +1,12 @@
+if(NOT ANYPS5_GPU_BACKEND STREQUAL "unified")
+    return()
+endif()
+add_test_executable(agc_unified_label_table_tests EXCLUDE_FROM_ALL tests/UnifiedLabelTable.cpp Unified/src/LabelTable.cpp)
+target_include_directories(agc_unified_label_table_tests PRIVATE ${LIBS_INCLUDE_DIR})
+target_link_libraries(agc_unified_label_table_tests PRIVATE libc)
+set_target_properties(agc_unified_label_table_tests PROPERTIES CXX_EXTENSIONS OFF)
+configure_windows_unwind(agc_unified_label_table_tests)
+
+if(BUILD_TESTING)
+    agc_add_default_test(agc_unified_label_table_tests)
+endif()

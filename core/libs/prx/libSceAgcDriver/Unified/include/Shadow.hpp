@@ -48,6 +48,8 @@ void LandGpuWrites(GuestRanges ranges);
 bool ResidentDrawInputs();
 void NoteGpuWrites(GuestRanges ranges);
 bool OwnedUploadsPending();
+void ConsumeNow();
+std::size_t ConsumeIn(std::span<const std::pair<std::uint64_t, std::uint64_t>> spans);
 std::size_t RecordOwnedUploads(VkCommandBuffer commands, std::vector<std::shared_ptr<void>>& kept);
 
 }

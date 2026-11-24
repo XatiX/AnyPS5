@@ -441,6 +441,55 @@ std::vector<DirtyRange> PageTable::ConsumeDirty(std::vector<ProtectionChange>& c
     return ranges;
 }
 
+std::vector<DirtyRange> PageTable::ConsumeDirtyIn(std::span<const std::pair<std::uint64_t, std::uint64_t>> spans, std::vector<ProtectionChange>& changes, const WriteCheck& written) {
+    std::lock_guard lock(mutex);
+    drainFaults();
+    std::vector<std::uint64_t> pages;
+    for (const auto& [address, size] : spans) {
+        if (size == 0u) continue;
+        for (auto page = firstPage(address); page < endPage(address, size); ++page) {
+            auto* region = regionOf(page, false);
+            if (region == nullptr) {
+                page = (page / RegionPages + 1u) * RegionPages - 1u;
+                continue;
+            }
+            const auto slot = slotOf(page);
+            if ((region->listed[slot / 64] & (std::uint64_t{1} << (slot % 64))) == 0) {
+                if (region->listed[slot / 64] == 0 && slot % 64 == 0) page += 63u;
+                continue;
+            }
+            if (region->states[slot] == PageState::CpuDirty) pages.push_back(page);
+        }
+    }
+    std::sort(pages.begin(), pages.end());
+    pages.erase(std::unique(pages.begin(), pages.end()), pages.end());
+    std::vector<DirtyRange> ranges;
+    for (const auto page : pages) {
+        auto* region = regionOf(page, false);
+        const auto slot = slotOf(page);
+        const auto address = page * PageBytes;
+        if (const auto bit = std::uint64_t{1} << (slot % 64); (region->unproven[slot / 64].load(std::memory_order_acquire) & bit) != 0) {
+            std::uint64_t now = 0;
+            if (hasher != nullptr && hasher(page, now) && now == region->openHash[slot]) continue;
+        }
+        if (region->busyUntil[slot] != 0) {
+            if (written && !written(page, false)) continue;
+            ranges.push_back({address, PageBytes});
+            ++counts.rangedPages;
+            continue;
+        }
+        unlist(page);
+        region->unproven[slot / 64].fetch_and(~(std::uint64_t{1} << (slot % 64)), std::memory_order_acq_rel);
+        setState(page, PageState::CpuClean);
+        appendChange(changes, page, Protection::ReadOnly);
+        if (!ranges.empty() && ranges.back().address + ranges.back().size == address) ranges.back().size += PageBytes;
+        else ranges.push_back({address, PageBytes});
+        ++counts.rangedPages;
+    }
+    ++counts.rangedConsumes;
+    return ranges;
+}
+
 std::vector<ProtectionChange> PageTable::MarkGpuOwned(std::uint64_t address, std::uint64_t size) {
     std::lock_guard lock(mutex);
     std::vector<ProtectionChange> changes;

@@ -21,8 +21,11 @@ inline constexpr std::uint32_t NoSpan = ~0u;
 
 struct Mirror {
     std::uint64_t id = 0;
+    std::uint64_t lineage = 0;
     std::vector<std::uint32_t> map;
     std::vector<std::shared_ptr<const void>> owners;
+    std::uint32_t slotBase = 0;
+    std::vector<Heap::DeferredImage> deferred;
 };
 
 struct MirrorCounts {
@@ -44,6 +47,21 @@ struct MirrorCounts {
 [[nodiscard]] std::vector<std::pair<std::uint64_t, std::uint64_t>> BoundedSpans(std::span<const std::pair<std::uint64_t, std::uint64_t>> spans, std::size_t limit);
 [[nodiscard]] std::vector<std::pair<std::uint64_t, std::uint64_t>> Outside(std::pair<std::uint64_t, std::uint64_t> span, std::vector<std::pair<std::uint64_t, std::uint64_t>> holes);
 
+class ElementIndex {
+public:
+    void Build(std::span<const Heap::Span> memory);
+    void Changed(const Events::ChangeLog& shared, std::uint64_t sharedStamp, const Events::ChangeLog& images, std::uint64_t imagesStamp, std::vector<std::uint32_t>& elements) const;
+
+private:
+    std::vector<std::pair<std::uint64_t, std::uint64_t>> spans;
+    std::vector<std::uint32_t> spanStarts;
+    std::vector<std::uint32_t> spanElements;
+    std::vector<std::uint32_t> regions;
+    std::vector<std::uint32_t> regionStarts;
+    std::vector<std::uint32_t> regionSpans;
+    std::vector<Heap::Span> memory;
+};
+
 class TableMirror {
 public:
     TableMirror(Heap::Refill& refill, const Events::ChangeLog& shared, const Events::ChangeLog& images) : refill(refill), shared(shared), images(images) {}
@@ -61,6 +79,7 @@ private:
         std::vector<Heap::Span> memory;
         std::vector<std::shared_ptr<const void>> owners;
         std::vector<bool> placeholders;
+        std::vector<bool> deferred;
         std::shared_ptr<const Mirror> mirror;
         std::uint64_t sharedStamp = 0;
         std::uint64_t imagesStamp = 0;
@@ -88,6 +107,7 @@ private:
     [[nodiscard]] bool fill(const Cached* base, Cached& out, std::string& reason);
     void index(Cached& out);
     [[nodiscard]] bool refillInPlace(Cached& entry, const SpanScan& scan, std::string& reason, bool& slotsChanged, std::span<const std::uint32_t> differing = {});
+    [[nodiscard]] std::shared_ptr<Mirror> makeMirror(const Cached& entry, std::span<const std::uint32_t> map, const Mirror* previous);
     [[nodiscard]] std::shared_ptr<const Mirror> publish(Cached& entry, const ShaderRecompiler::ResolvedImageTables& tables, bool slotsChanged, std::vector<Heap::ImageUse>* uses);
     [[nodiscard]] bool inherit(const std::shared_ptr<const ShaderRecompiler::ResolvedImageTables>& tables, std::uint64_t key, std::string& reason, std::shared_ptr<const Mirror>& out, std::vector<Heap::ImageUse>* uses);
     void prune();

@@ -7,6 +7,7 @@ namespace AgcDriver {
 
 void StartWorkerSampler(std::uint32_t queue = 0);
 void StartCommitterSampler();
+void StartLaneSampler(std::uint32_t queue);
 void StopWorkerSampler();
 bool ReadableStackRegion(std::uint64_t address, std::uint64_t& low, std::uint64_t& high);
 

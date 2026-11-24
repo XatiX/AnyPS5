@@ -41,6 +41,14 @@ std::uint8_t touchedBanks(std::span<const std::uint32_t> packet, std::uint32_t o
     }
 }
 
+bool sealsPassWrites(std::span<const std::uint32_t> packet) {
+    if (packet.size() < 2) return false;
+    switch (packet[1] & 0x3fu) {
+        case 0x07: case 0x0f: case 0x10: case 0x16: case 0x2a: case 0x2c: case 0x2e: case 0x31: return true;
+        default: return false;
+    }
+}
+
 bool executesWithoutMemory(std::span<const std::uint32_t> packet, std::uint32_t opcode) {
     switch (opcode) {
         case 0x10: {
@@ -51,6 +59,7 @@ bool executesWithoutMemory(std::span<const std::uint32_t> packet, std::uint32_t 
         case 0x69: case 0x76: case 0x79: case 0x7a: case 0x81:
             return true;
         case 0x37: return packet.size() > 4 && Pm4::CopyDataToRegister(packet);
+        case 0x46: return Pm4::SampleControl(packet);
         default: return false;
     }
 }
@@ -95,12 +104,25 @@ private:
     void decodePacket(std::span<const std::uint32_t> packet, std::size_t cursor) {
         const auto header = packet[0];
         const auto opcode = (header >> 8u) & 0xffu;
-        const bool conditional = cursor < conditionalUntil || (Pm4::Predicated(header) && state.state.predication.operation != 0);
+        const bool predicatedPacket = Pm4::Predicated(header) && state.state.predication.operation != 0;
+        const bool conditional = cursor < conditionalUntil || predicatedPacket;
         current = {cursor, opcode, conditional};
+        if (!ranges.empty()) std::erase_if(ranges, [cursor](const OperationGuard& guard) { return guard.end <= cursor; });
+        state.guards.assign(ranges.begin(), ranges.end());
+        if (predicatedPacket) state.guards.push_back(predicationGuard(cursor, cursor + packet.size()));
 
         if (opcode == 0x3f || opcode == 0x22) {
             const auto end = submission.conditionalEnds.find(cursor);
-            if (end != submission.conditionalEnds.end() && (opcode == 0x22 || conditional)) conditionalUntil = std::max(conditionalUntil, end->second);
+            if (end != submission.conditionalEnds.end() && (opcode == 0x22 || conditional)) {
+                conditionalUntil = std::max(conditionalUntil, end->second);
+                if (opcode == 0x22 && packet.size() == 5u) {
+                    OperationGuard guard{submission.serial, cursor, end->second, true};
+                    std::copy(packet.begin(), packet.end(), guard.words.begin());
+                    ranges.push_back(guard);
+                } else if (opcode == 0x3f && predicatedPacket) {
+                    ranges.push_back(predicationGuard(cursor, end->second));
+                }
+            }
             return;
         }
         if (header == RenderingWaitPacketHeader) {
@@ -140,6 +162,16 @@ private:
                 }
                 break;
             case 0x63: case 0x64: case 0x9f: indirectRegisters(packet, opcode); return;
+            case 0x46:
+                if (Pm4::SampleDump(packet)) {
+                    store(packet, opcode);
+                    return;
+                }
+                if (sealsPassWrites(packet)) emit(OpKind::Marker, 0, 0, 0);
+                break;
+            case 0x58:
+                emit(OpKind::Marker, 0, 0, 0);
+                return;
             default: break;
         }
         if (changesStateFromMemory(packet, opcode)) {
@@ -153,6 +185,13 @@ private:
             ++state.counts.stateErrors;
         }
         markDirty(touchedBanks(packet, opcode));
+    }
+
+    OperationGuard predicationGuard(std::size_t start, std::size_t end) const {
+        OperationGuard guard{submission.serial, start, end, false};
+        guard.predication = state.state.predication;
+        guard.sampleDumpBlocks = state.state.sampleDumpBlocks;
+        return guard;
     }
 
     void markDirty(std::uint8_t banks) {
@@ -333,7 +372,10 @@ private:
             ++state.counts.stateErrors;
             return;
         }
-        if (stores.empty()) return;
+        if (stores.empty()) {
+            if (opcode == 0x50 && packet.size() == 7u && Pm4::DmaDestination(packet) == Pm4::DmaSelectGds && Pm4::DmaBytes(packet) != 0u) emit(OpKind::Copy, Pm4::GdsAddress() + packet[4], Pm4::DmaBytes(packet), 0);
+            return;
+        }
         const auto& first = stores.front();
         if (first.value == Pm4::PacketStore::Value::Pattern) {
             std::uint32_t value = 0;
@@ -376,6 +418,7 @@ private:
     DecodeState& state;
     Sink& sink;
     std::size_t conditionalUntil = 0;
+    std::vector<OperationGuard> ranges;
     Current current;
     std::optional<std::uint64_t> resolvedKey;
     DispatchFacts pendingDispatch;

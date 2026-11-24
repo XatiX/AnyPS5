@@ -666,6 +666,23 @@ void NoteGpuWrites(GuestRanges ranges) {
     }
 }
 
+void ConsumeNow() {
+    if (MemoryActive()) consumeMemory();
+}
+
+std::size_t ConsumeIn(std::span<const std::pair<std::uint64_t, std::uint64_t>> spans) {
+    if (!MemoryActive() || !memoryInstalled() || !Mirror::WritesEnabled()) return 0;
+    const auto ranges = spans.empty() ? MemoryCore::Get().ConsumeDirtyQuick() : MemoryCore::Get().ConsumeDirtyIn(spans);
+    if (ranges.empty()) return 0;
+    const auto upload = MemoryCore::Get().WithoutGpuWritten(ranges);
+    UploadClash::CheckUploads(upload);
+    if (Images::DepthRecordsOn()) {
+        for (const auto& range : upload) Images::Depths().NoteCpuWrites(range.address, range.size);
+    }
+    ResidencyService::Get().NoteDirty(upload);
+    return ranges.size();
+}
+
 bool OwnedUploadsPending() {
     return ServesOwned() && ResidencyService::Get().Pending();
 }
