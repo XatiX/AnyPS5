@@ -4574,8 +4574,19 @@ int StoreToMirror(Graphics::Recorder& recorder, std::uint64_t address, std::span
         LandAfterBatch(recorder, [address, stored = std::vector<std::byte>(bytes.begin(), bytes.end())] { MemoryCore::Get().LandGpuWrite(address, stored); });
         return 0;
     }
-    static const bool traced = std::getenv("APS5_RECODE_TRACE_MIRROR_STORES") != nullptr;
-    if (traced && bytes.size() >= 16u) {
+    static const char* tracing = std::getenv("APS5_RECODE_TRACE_MIRROR_STORES");
+    static const bool traced = tracing != nullptr;
+    static const bool everyAddress = traced && std::strcmp(tracing, "all") == 0;
+    if (everyAddress) {
+        static std::mutex seenMutex;
+        static std::set<std::uint64_t> seen;
+        std::lock_guard seenLock(seenMutex);
+        if (seen.size() < 400u && seen.insert(address).second) {
+            std::uint64_t value = 0;
+            std::memcpy(&value, bytes.data(), std::min<std::size_t>(bytes.size(), sizeof(value)));
+            std::fprintf(stderr, "[recode-mirror-store] %.2f s q%u 0x%llx+0x%llx first value 0x%llx\n", static_cast<double>(elapsed(processStart())) / 1e9, queue, static_cast<unsigned long long>(address), static_cast<unsigned long long>(bytes.size()), static_cast<unsigned long long>(value));
+        }
+    } else if (traced && bytes.size() >= 16u) {
         static std::atomic<std::uint32_t> lines{0};
         if (lines.fetch_add(1, std::memory_order_relaxed) < 300u) {
             std::uint32_t words[4] = {};
