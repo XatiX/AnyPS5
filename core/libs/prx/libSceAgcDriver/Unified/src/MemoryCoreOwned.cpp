@@ -120,6 +120,10 @@ void MemoryCore::NoteLandedGpuWrite(std::uint64_t address, std::uint64_t size, s
     written.Take(address, size, serial);
 }
 
+std::uint64_t MemoryCore::NoteWrittenBytes(std::uint64_t address, std::uint64_t size, std::uint64_t serial) {
+    return written.Note(address, size, serial);
+}
+
 void MemoryCore::ReleaseLandedWrite(std::uint64_t address, std::uint64_t size, std::uint64_t sequence) {
     static_cast<void>(written.TakeNoted(address, size, sequence));
 }

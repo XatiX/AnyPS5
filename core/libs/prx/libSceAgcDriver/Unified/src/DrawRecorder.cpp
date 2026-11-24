@@ -17,6 +17,7 @@
 #include "prx/libSceAgcDriver/Graphics/include/VertexInput.hpp"
 #include "prx/libSceAgcDriver/Unified/include/DataRing.hpp"
 #include "prx/libSceAgcDriver/Unified/include/DepthRecords.hpp"
+#include "prx/libSceAgcDriver/Unified/include/LabelImports.hpp"
 #include "prx/libSceAgcDriver/Unified/include/Downgrades.hpp"
 #include "prx/libSceAgcDriver/Unified/include/Events.hpp"
 #include "prx/libSceAgcDriver/Unified/include/ImageDetile.hpp"
@@ -421,6 +422,7 @@ std::atomic<std::uint64_t> storesBesideMirror{0};
 std::atomic<std::uint64_t> storesAtOnce{0};
 std::atomic<std::uint64_t> copiesInMirror{0};
 std::atomic<std::uint64_t> copiesBesideMirror{0};
+std::atomic<std::uint64_t> storesThroughImports{0};
 std::atomic<std::uint64_t> storeLandings{0};
 std::atomic<std::uint64_t> storeLandingNanoseconds{0};
 std::atomic<std::uint64_t> storeLandingMaxNanoseconds{0};
@@ -453,6 +455,7 @@ void printExistingPackets() {
     char totals[320];
     std::snprintf(totals, sizeof(totals), "; recode stores into the mirror %llu, outside it %llu, at once (nothing in flight) %llu; copies in the mirror %llu, outside it %llu; occlusion dumps %llu (whole run)", static_cast<unsigned long long>(storesToMirror.load()), static_cast<unsigned long long>(storesBesideMirror.load()), static_cast<unsigned long long>(storesAtOnce.load()), static_cast<unsigned long long>(copiesInMirror.load()), static_cast<unsigned long long>(copiesBesideMirror.load()), static_cast<unsigned long long>(sampleDumpsLanded.load()));
     line += totals;
+    line += "; " + LabelImports::Line() + " (" + std::to_string(storesThroughImports.load()) + " stores through them)";
     const auto landed = storeLandings.exchange(0);
     const auto landedNanoseconds = storeLandingNanoseconds.exchange(0);
     const auto landedMax = storeLandingMaxNanoseconds.exchange(0);
@@ -4573,12 +4576,24 @@ bool DumpSamplesToMirror(const Context& context, Graphics::Recorder& recorder, s
     return true;
 }
 
-int StoreToMirror(Graphics::Recorder& recorder, std::uint64_t address, std::span<const std::byte> bytes, std::uint64_t stamp, std::uint32_t queue) {
+int StoreToMirror(const Context& context, Graphics::Recorder& recorder, std::uint64_t address, std::span<const std::byte> bytes, std::uint64_t stamp, std::uint32_t queue) {
     if (recorder.Idle()) {
         storesAtOnce.fetch_add(1, std::memory_order_relaxed);
         return 1;
     }
     const auto span = ResidencyService::Get().MirrorSpan(address, bytes.size());
+    const auto imported = LabelImports::Enabled() ? LabelImports::For(context, address, bytes.size()) : std::nullopt;
+    if (imported) {
+        if (span && span->handle != 0u) {
+            recorder.RecordStore(reinterpret_cast<VkBuffer>(static_cast<std::uintptr_t>(span->handle)), static_cast<VkDeviceSize>(span->offset), bytes, address);
+            const auto sequence = MemoryCore::Get().NoteWrittenBytes(address, bytes.size(), recorder.OpenBatchSerial());
+            LandAfterBatch(recorder, [address, size = bytes.size(), sequence] { MemoryCore::Get().ReleaseLandedWrite(address, size, sequence); });
+        }
+        recorder.RecordStore(imported->buffer, imported->offset, bytes, address);
+        recorder.NoteLabel(address, bytes, stamp, queue);
+        storesThroughImports.fetch_add(1, std::memory_order_relaxed);
+        return 0;
+    }
     if (!span || span->handle == 0u) {
         storesBesideMirror.fetch_add(1, std::memory_order_relaxed);
         recorder.NoteLabel(address, bytes, stamp, queue);

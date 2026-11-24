@@ -3264,7 +3264,7 @@ int VulkanDevice::WriteLabelOnGpu(std::uint64_t address, std::span<const std::by
     static const bool reapAllQueues = std::getenv("APS5_LABEL_REAP_ALL_QUEUES") != nullptr;
     if (reapFirst && (queue == 0 || reapAllQueues) && OpportunisticReap()) recorder.Reap();
 #if ANYPS5_UNIFIED
-    if (Unified::Record::StoresToMirror(bytes.size(), address)) return Unified::Record::StoreToMirror(recorder, address, bytes, stamp, queue);
+    if (Unified::Record::StoresToMirror(bytes.size(), address)) return Unified::Record::StoreToMirror(graphicsContext(), recorder, address, bytes, stamp, queue);
 #endif
     if (recorder.Idle()) return 1;
     static const bool drain = std::getenv("APS5_DRAIN_COMPLETION_LABELS") != nullptr;
