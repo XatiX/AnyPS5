@@ -178,6 +178,7 @@ struct Totals {
     std::uint64_t mirrorWriteBytes = 0;
     std::uint64_t mirrorArguments = 0;
     std::uint64_t patchedArguments = 0;
+    std::uint64_t depthWriterHandOvers = 0;
     std::uint64_t meshDraws = 0;
     std::uint64_t meshEmpty = 0;
     std::uint64_t edgeSnapshotBytes = 0;
@@ -498,6 +499,11 @@ bool bindsGds() {
 bool notesRecordRanges() {
     static const bool notes = std::getenv("APS5_RECODE_NOTE_RECORD_RANGES") != nullptr;
     return notes;
+}
+
+bool depthHandOverForWriters() {
+    static const bool hands = std::getenv("APS5_RECODE_NO_DEPTH_WRITER_HANDOVER") == nullptr;
+    return hands;
 }
 
 bool handsOverForWriters() {
@@ -1396,7 +1402,7 @@ public:
             std::snprintf(text, sizeof(text), "; mirror writes %.1f MiB, pages left GPU-owned %.1f MiB, edges landed whole %.1f MiB, edges snapshot %.1f MiB and landed by diff %.1f MiB, indirect arguments from the mirror %llu", static_cast<double>(totals.mirrorWriteBytes) / 1048576.0, static_cast<double>(totals.ownedBytes) / 1048576.0, static_cast<double>(totals.openLandedBytes) / 1048576.0, static_cast<double>(totals.edgeSnapshotBytes) / 1048576.0, static_cast<double>(totals.edgeDiffBytes) / 1048576.0, static_cast<unsigned long long>(totals.mirrorArguments));
             line += text;
         }
-        std::snprintf(text, sizeof(text), "; indirect draw arguments patched on the GPU for a constant rule %llu; mesh draws %llu (%llu empty)", static_cast<unsigned long long>(totals.patchedArguments), static_cast<unsigned long long>(totals.meshDraws), static_cast<unsigned long long>(totals.meshEmpty));
+        std::snprintf(text, sizeof(text), "; indirect draw arguments patched on the GPU for a constant rule %llu; mesh draws %llu (%llu empty); depth records written back before a buffer writer %llu", static_cast<unsigned long long>(totals.patchedArguments), static_cast<unsigned long long>(totals.meshDraws), static_cast<unsigned long long>(totals.meshEmpty), static_cast<unsigned long long>(totals.depthWriterHandOvers));
         line += text;
         std::snprintf(text, sizeof(text), "; GPU-written chunks %llu switched to their import from the written bitmap (%.1f MiB copied over), %llu from other GPU writes, %llu refused, %llu written pieces already on an import", static_cast<unsigned long long>(totals.importSwitches), static_cast<double>(totals.switchBytes) / 1048576.0, static_cast<unsigned long long>(totals.writtenSwitches), static_cast<unsigned long long>(totals.switchRefused), static_cast<unsigned long long>(totals.writtenOnImports));
         line += text;
@@ -3340,6 +3346,11 @@ private:
         for (std::size_t index = 0; index < work.uses.size() && index < work.imageBegin; ++index) {
             const auto& use = work.uses[index];
             if (!use.write || use.size == 0u || (index >= work.targetBegin && index < work.targetEnd)) continue;
+            if (Images::DepthRecordsOn() && depthHandOverForWriters()) {
+                const auto before = totals.depthWriteBacks;
+                writeBackDepthForReader(context, use.address, use.size);
+                totals.depthWriterHandOvers += totals.depthWriteBacks - before;
+            }
             for (const auto& record : table->Overlapping(use.address, use.size)) {
                 if (!record->seeded || record->retired || !record->gpuNewer) continue;
                 std::string why;
