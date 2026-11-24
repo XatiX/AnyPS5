@@ -164,12 +164,39 @@ void watchHangMarks() {
             if (seen == shown && still == 3u) inputs = hangInputs(marks, seen);
         }
         if (seen == shown) {
-            if (++still == 4u) std::fprintf(stderr, "[recode-hang-mark] the GPU has not passed dispatch %u for 1 s: program %016llx, %llu groups%s\n", seen, static_cast<unsigned long long>(program.first), static_cast<unsigned long long>(program.second), inputs.c_str());
+            if (++still == 4u) {
+                std::uint32_t finished = 0;
+                {
+                    std::lock_guard lock(marks.mutex);
+                    std::memcpy(&finished, marks.buffer->Bytes().data() + 4, sizeof(finished));
+                }
+                std::fprintf(stderr, "[recode-hang-mark] the GPU has not passed dispatch %u for 1 s (%s): program %016llx, %llu groups%s\n", seen, finished == seen ? "that dispatch finished, the stall is in later work" : "that dispatch did not finish", static_cast<unsigned long long>(program.first), static_cast<unsigned long long>(program.second), inputs.c_str());
+            }
             continue;
         }
         shown = seen;
         still = 0;
     }
+}
+
+bool hangMarking() {
+    static const bool marking = std::getenv("APS5_RECODE_HANG_MARKS") != nullptr;
+    return marking;
+}
+
+void finishHangMark(const Context& context, VkCommandBuffer commands) {
+    static const bool marking = std::getenv("APS5_RECODE_HANG_MARKS") != nullptr;
+    if (!marking) return;
+    auto& marks = hangMarks();
+    std::uint32_t sequence = 0;
+    std::shared_ptr<Graphics::Buffer> buffer;
+    {
+        std::lock_guard lock(marks.mutex);
+        sequence = marks.next;
+        buffer = marks.buffer;
+    }
+    if (buffer == nullptr) return;
+    context.Function<PFN_vkCmdFillBuffer>("vkCmdFillBuffer")(commands, buffer->Handle(), 4, 4, sequence);
 }
 
 void markHang(const Context& context, Graphics::Recorder& recorder, VkCommandBuffer commands, std::uint64_t hash, std::uint64_t groups, const Resolve::ResolvedDraw& work) {
@@ -3392,6 +3419,7 @@ private:
         }
         recorder->EndGpuTiming(dispatchTiming);
         Graphics::RecordMemoryBarrier(context, commands, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT | VK_PIPELINE_STAGE_HOST_BIT, VK_ACCESS_SHADER_WRITE_BIT, VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT | VK_ACCESS_UNIFORM_READ_BIT | VK_ACCESS_TRANSFER_READ_BIT | VK_ACCESS_TRANSFER_WRITE_BIT | VK_ACCESS_INDIRECT_COMMAND_READ_BIT | VK_ACCESS_INDEX_READ_BIT | VK_ACCESS_VERTEX_ATTRIBUTE_READ_BIT | VK_ACCESS_COLOR_ATTACHMENT_READ_BIT | VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_READ_BIT | VK_ACCESS_HOST_READ_BIT);
+        finishHangMark(context, commands);
         recordCopyBacks(context, commands, serial);
         if (probed) probeOutputs(context, *recorder, commands, dispatch, stage.program.codeAddress);
 
@@ -4143,6 +4171,11 @@ private:
         const bool forced = !mergesPasses() || !draw.complete || feedback || storesImages || (parameters.indirect && !snapshotArguments) || indirectCount.has_value();
         const bool fenced = state.depth.has_value();
         split(6);
+        if (hangMarking()) {
+            const auto marked = recorder->Commands();
+            Graphics::RecordMemoryBarrier(context, marked, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_ACCESS_MEMORY_WRITE_BIT, VK_ACCESS_TRANSFER_WRITE_BIT);
+            markHang(context, *recorder, marked, draw.stages.empty() ? 0u : Downgrades::ProgramHash(draw.stages.back().program.codeAddress), 0u, draw);
+        }
         const auto start = recorder->StartDrawPass(key, forced, fenced, access);
         split(7);
         if (recorder->OpenBatchSerial() != serial) totals.batchMoves++;
