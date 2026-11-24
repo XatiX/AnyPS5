@@ -240,7 +240,7 @@ std::shared_ptr<Graphics::Buffer> ResidencyService::MirrorTable() const {
 std::vector<PendingUpload> ResidencyService::ReadBack(std::span<const std::pair<std::uint64_t, std::uint64_t>> ranges) {
     std::vector<PendingUpload> pieces;
     if (!Attached() || ranges.empty()) return pieces;
-    std::lock_guard lock(mutex);
+    std::unique_lock lock(mutex);
     std::size_t total = 0;
     for (const auto& [address, bytes] : ranges) {
         const auto end = address + bytes;
@@ -262,7 +262,10 @@ std::vector<PendingUpload> ResidencyService::ReadBack(std::span<const std::pair<
     if (pieces.empty()) return pieces;
     Graphics::Buffer staging(*context, total, VK_BUFFER_USAGE_TRANSFER_DST_BIT);
     if (ReadsOffGpuMutex()) {
-        if (!readOnSettleQueue(pieces, staging.Handle())) {
+        lock.unlock();
+        const bool read = readOnSettleQueue(pieces, staging.Handle());
+        lock.lock();
+        if (!read) {
             ++readBackFailures;
             return {};
         }
