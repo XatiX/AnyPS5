@@ -28,6 +28,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <exception>
+#include <limits>
 #include <map>
 #include <mutex>
 #include <set>
@@ -282,6 +283,12 @@ public:
                 }
             } else {
                 item.words.assign(packet.begin(), packet.end());
+                if (operation.opcode == 0x83u) {
+                    if (const auto dump = Pm4::ResolveStore(packet, state.Live(), std::numeric_limits<std::size_t>::max())) {
+                        const auto bytes = dump->Bytes();
+                        item.payload.assign(bytes.begin(), bytes.end());
+                    }
+                }
             }
         } catch (const std::exception&) {
         }
