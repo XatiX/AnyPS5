@@ -346,8 +346,6 @@ struct Totals {
     std::uint64_t dispatches = 0;
     std::uint64_t dispatchExisting = 0;
     std::uint64_t dispatchNanoseconds = 0;
-    std::uint64_t pipelinesQueued = 0;
-    std::uint64_t pipelinesPrebuilt = 0;
     std::uint64_t pipelineWaits = 0;
     std::uint64_t pipelineWaitNanoseconds = 0;
     std::uint64_t surfaceNanoseconds = 0;
@@ -1650,7 +1648,7 @@ public:
         line += "; draw inputs " + std::to_string(totals.inputsResident) + " resident, " + std::to_string(totals.inputsImported) + " imported, " + std::to_string(totals.inputsWritten) + " after CPU writes (" + std::to_string(totals.inputsCopied) + " copied into the ring), " + std::to_string(totals.inputsGpuWritten) + " GPU-written, " + std::to_string(totals.inputsPending) + " with GPU bytes pending read from the mirror, " + std::to_string(totals.inputsMirrored) + " GPU-written without an import read from the mirror, " + std::to_string(totals.inputsAliased) + " aliased, " + std::to_string(totals.inputsMerged) + " served with an overlapping input";
         std::snprintf(text, sizeof(text), "; draw phases surfaces %.1f ms, targets %.1f ms, pipelines %.1f ms, owned uploads %.1f ms", static_cast<double>(totals.surfaceNanoseconds) / 1e6, static_cast<double>(totals.targetNanoseconds) / 1e6, static_cast<double>(totals.graphicsPipelineNanoseconds) / 1e6, static_cast<double>(totals.uploadNanoseconds) / 1e6);
         line += text;
-        std::snprintf(text, sizeof(text), "; dispatches %llu recorded (%llu indirect, %llu storage images written), %llu to the existing path, %.1f us per dispatch; compute pipelines %zu held, %llu queued (%llu ahead of recording), %llu built in %.1f ms, %zu building, %zu failed", static_cast<unsigned long long>(totals.dispatches), static_cast<unsigned long long>(totals.indirectDispatches), static_cast<unsigned long long>(totals.storageWrites), static_cast<unsigned long long>(totals.dispatchExisting), totals.dispatches == 0 ? 0.0 : static_cast<double>(totals.dispatchNanoseconds) / 1000.0 / static_cast<double>(totals.dispatches), pipelineCounts.held, static_cast<unsigned long long>(totals.pipelinesQueued), static_cast<unsigned long long>(totals.pipelinesPrebuilt), static_cast<unsigned long long>(pipelineCounts.built), static_cast<double>(pipelineCounts.nanoseconds) / 1e6, pipelineCounts.building, pipelineCounts.failed);
+        std::snprintf(text, sizeof(text), "; dispatches %llu recorded (%llu indirect, %llu storage images written), %llu to the existing path, %.1f us per dispatch; compute pipelines %zu held, %llu queued (%llu ahead of recording), %llu built in %.1f ms, %zu building, %zu failed", static_cast<unsigned long long>(totals.dispatches), static_cast<unsigned long long>(totals.indirectDispatches), static_cast<unsigned long long>(totals.storageWrites), static_cast<unsigned long long>(totals.dispatchExisting), totals.dispatches == 0 ? 0.0 : static_cast<double>(totals.dispatchNanoseconds) / 1000.0 / static_cast<double>(totals.dispatches), pipelineCounts.held, static_cast<unsigned long long>(pipelinesQueued.load(std::memory_order_relaxed)), static_cast<unsigned long long>(pipelinesPrebuilt.load(std::memory_order_relaxed)), static_cast<unsigned long long>(pipelineCounts.built), static_cast<double>(pipelineCounts.nanoseconds) / 1e6, pipelineCounts.building, pipelineCounts.failed);
         line += text;
         std::snprintf(text, sizeof(text), "; table maps %llu hits, %llu uploads (%.1f MiB), %llu retired, %zu held (%.1f MiB)", static_cast<unsigned long long>(totals.mapHits), static_cast<unsigned long long>(totals.mapUploads), static_cast<double>(totals.mapUploadBytes) / 1048576.0, static_cast<unsigned long long>(totals.mapRetired), maps.size(), static_cast<double>(mapBytes) / 1048576.0);
         line += text;
@@ -1773,6 +1771,7 @@ public:
         std::lock_guard lock(mutex);
         if (device != replaced) return;
         device = VK_NULL_HANDLE;
+        attachedDevice.store(VK_NULL_HANDLE, std::memory_order_release);
         ring.reset();
         ringAddress = 0;
         space.reset();
@@ -1784,7 +1783,11 @@ public:
         stageStorageImages.clear();
         groupReads.reset();
         argumentReads.reset();
-        layouts.clear();
+        {
+            std::lock_guard layoutLock(layoutMutex);
+            layouts.clear();
+            emptyLayout = VK_NULL_HANDLE;
+        }
         pools.clear();
         spare.clear();
         maps.clear();
@@ -1800,7 +1803,6 @@ public:
         landing.clear();
         landingSerials.clear();
         pendingDiffs.clear();
-        emptyLayout = VK_NULL_HANDLE;
         targetMemo = {};
         std::fprintf(stderr, "[recode-record] detached from the replaced device; the next recorded work attaches to the new one\n");
     }
@@ -1824,6 +1826,7 @@ private:
         std::memset(ring->Bytes().data() + RingBytes, 0, RingZeroBytes);
         ringAddress = addressable != 0u ? ring->DeviceAddress() : 0u;
         space.emplace(RingBytes, alignment);
+        attachedDevice.store(device, std::memory_order_release);
         std::fprintf(stderr, "[recode-record] ring %llu MiB, alignment %llu, %s memory\n", static_cast<unsigned long long>(RingBytes >> 20u), static_cast<unsigned long long>(alignment), (ringMemory & VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT) != 0 ? "device" : "host");
         return true;
     }
@@ -2270,6 +2273,7 @@ private:
     }
 
     VkDescriptorSetLayout setLayout(const Context& context, const Resolve::ResolvedDraw& draw, std::uint32_t set) {
+        std::lock_guard layoutLock(layoutMutex);
         const auto& key = draw.layout.keys[set];
         if (const auto found = layouts.find(key); found != layouts.end()) return found->second;
         std::vector<VkDescriptorSetLayoutBinding> bindings;
@@ -2628,6 +2632,7 @@ private:
     }
 
     VkDescriptorSetLayout emptySetLayout(const Context& context) {
+        std::lock_guard layoutLock(layoutMutex);
         if (emptyLayout != VK_NULL_HANDLE) return emptyLayout;
         VkDescriptorSetLayoutCreateInfo info{VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO};
         Graphics::Check(context.Function<PFN_vkCreateDescriptorSetLayout>("vkCreateDescriptorSetLayout")(context.device, &info, nullptr, &emptyLayout), "vkCreateDescriptorSetLayout recode dispatch");
@@ -2693,12 +2698,11 @@ private:
 public:
     void Prebuild(const Context& context, VulkanDevice& owner, const Resolve::ResolvedDraw& dispatch) {
         std::string reason;
-        std::lock_guard lock(mutex);
-        if (device != context.device || ring == nullptr || dispatch.stages.size() != 1u || dispatch.stages.front().program.result == nullptr || !dispatchPrecheck(dispatch, reason)) return;
+        if (attachedDevice.load(std::memory_order_acquire) != context.device || dispatch.stages.size() != 1u || dispatch.stages.front().program.result == nullptr || !dispatchPrecheck(dispatch, reason)) return;
         const auto key = pipelineKey(dispatch);
         std::lock_guard pipelineLock(pipelineMutex);
         if (computePipelines.contains(key) || buildingPipelines.contains(key) || failedPipelines.contains(key)) return;
-        if (queuePipeline(context, owner, dispatch, key, reason)) totals.pipelinesPrebuilt++;
+        if (queuePipeline(context, owner, dispatch, key, reason)) pipelinesPrebuilt.fetch_add(1, std::memory_order_relaxed);
     }
 
 private:
@@ -2769,7 +2773,7 @@ private:
         }
         buildingPipelines.insert(key);
         pipelineJobs.push_back(std::move(job));
-        totals.pipelinesQueued++;
+        pipelinesQueued.fetch_add(1, std::memory_order_relaxed);
         while (builders.size() < pipelineBuilderCount()) builders.emplace_back([this] { buildPipelines(); });
         jobsReady.notify_one();
         return true;
@@ -4700,6 +4704,10 @@ private:
     std::uint64_t buildNanoseconds = 0;
     std::uint64_t unsavedBuildNanoseconds = 0;
     std::mutex pipelineMutex;
+    std::mutex layoutMutex;
+    std::atomic<VkDevice> attachedDevice{VK_NULL_HANDLE};
+    std::atomic<std::uint64_t> pipelinesQueued{0};
+    std::atomic<std::uint64_t> pipelinesPrebuilt{0};
     std::condition_variable jobsReady;
     std::condition_variable pipelinesDone;
     std::vector<std::thread> builders;
