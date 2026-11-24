@@ -836,20 +836,6 @@ private:
         return storage;
     }
 
-    static std::pair<std::shared_ptr<Graphics::StorageTexture>, VkImageView> storageView(const Graphics::Context& context, const Heap::SlotRequest& request, const Graphics::GuestTextureResource& resource, bool written) {
-        const auto shape = (request.kind - Heap::LastSampledKind - 1u) % StorageShapes;
-        const auto mip = std::min(request.flags >> Heap::RequestFlag::MipShift, resource.mipCount - 1u);
-        Graphics::CompletePendingCpuWrites(context, resource.baseAddress, static_cast<std::size_t>(Graphics::SurfaceGuestBytes(resource)));
-        auto texture = Graphics::CachedStorageImage(context, request.words, resource, mip, written);
-        if (texture == nullptr) return {nullptr, VK_NULL_HANDLE};
-        const bool firstLayer = shape == Image2DShape && resource.dimension == Graphics::TextureDimension::k2DArray;
-        VkImageView view = VK_NULL_HANDLE;
-        if ((request.flags & Heap::RequestFlag::Atomic64) != 0u) view = texture->Atomic64View(mip, firstLayer);
-        else if ((request.flags & Heap::RequestFlag::Atomic) != 0u) view = texture->AtomicView(mip, firstLayer);
-        else view = texture->StorageView(mip, firstLayer, (request.flags & Heap::RequestFlag::UintView) != 0u);
-        return {std::move(texture), view};
-    }
-
     std::optional<Heap::ResolvedImage> storageImage(const Heap::SlotRequest& request) {
         const auto shape = (request.kind - Heap::LastSampledKind - 1u) % StorageShapes;
         if (shape == MultisampleShape || shape == MultisampleArrayShape) {
@@ -863,36 +849,18 @@ private:
                 noteSurfaceReason("storage: multisampled surface");
                 return std::nullopt;
             }
-            {
-                Heap::ResolvedImage deferred;
-                deferred.memory = {resource.baseAddress, Graphics::SurfaceGuestBytes(resource)};
-                deferred.deferred = true;
-                if ((request.flags & Heap::RequestFlag::Written) != 0u) {
-                    const GuestUse use{deferred.memory.address, deferred.memory.bytes, true};
-                    if (const auto record = storageRecordFor(request)) static_cast<void>(Events::GpuWrites().Note(record->key.address, record->key.bytes, Images::OwnerOf(*record)));
-                    else noteTargetWrites(std::span<const GuestUse>(&use, 1));
-                    std::lock_guard lock(storageWrittenMutex);
-                    const std::pair range{deferred.memory.address, deferred.memory.address + deferred.memory.bytes};
-                    if (std::ranges::find(storageWritten, range) == storageWritten.end()) storageWritten.push_back(range);
-                }
-                return deferred;
+            Heap::ResolvedImage deferred;
+            deferred.memory = {resource.baseAddress, Graphics::SurfaceGuestBytes(resource)};
+            deferred.deferred = true;
+            if ((request.flags & Heap::RequestFlag::Written) != 0u) {
+                const GuestUse use{deferred.memory.address, deferred.memory.bytes, true};
+                if (const auto record = storageRecordFor(request)) static_cast<void>(Events::GpuWrites().Note(record->key.address, record->key.bytes, Images::OwnerOf(*record)));
+                else noteTargetWrites(std::span<const GuestUse>(&use, 1));
+                std::lock_guard lock(storageWrittenMutex);
+                const std::pair range{deferred.memory.address, deferred.memory.address + deferred.memory.bytes};
+                if (std::ranges::find(storageWritten, range) == storageWritten.end()) storageWritten.push_back(range);
             }
-            std::shared_ptr<Graphics::StorageTexture> texture;
-            VkImageView view = VK_NULL_HANDLE;
-            {
-                GuestMemory::TagGpuLockSite(GuestMemory::GpuLockSite::Try);
-                std::unique_lock gpuLock(GuestMemory::GpuMutex(), std::try_to_lock);
-                if (!gpuLock.owns_lock()) {
-                    totals.lockBusy++;
-                    return std::nullopt;
-                }
-                std::tie(texture, view) = storageView(*context, request, resource, false);
-            }
-            if (texture == nullptr || view == VK_NULL_HANDLE) return std::nullopt;
-            Heap::ResolvedImage resolved;
-            resolved.image = {reinterpret_cast<std::uint64_t>(view), static_cast<std::uint32_t>(VK_IMAGE_LAYOUT_GENERAL), texture};
-            resolved.memory = {resource.baseAddress, Graphics::SurfaceGuestBytes(resource)};
-            return resolved;
+            return deferred;
         } catch (const std::exception& error) {
             noteSurfaceReason(std::string("storage: ") + error.what());
             return std::nullopt;
