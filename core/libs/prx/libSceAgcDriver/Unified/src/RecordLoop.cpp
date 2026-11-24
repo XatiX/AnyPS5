@@ -151,12 +151,12 @@ private:
         if (recorder->Reap()) totals().idleReaps.fetch_add(1, std::memory_order_relaxed);
     }
 
-    static void trace(const Item& item, const char* stage) {
+    void trace(const Item& item, const char* stage) const {
         static const bool traced = std::getenv("APS5_RECODE_TRACE_LOOP") != nullptr;
         static std::atomic<std::uint32_t> lines{0};
         if (!traced || lines.fetch_add(1, std::memory_order_relaxed) >= 400u) return;
         const auto& operation = item.operation;
-        std::fprintf(stderr, "[recode-loop-trace] %s q%u kind %u submission %llu offset %u opcode 0x%x address 0x%llx size %llu value 0x%llx function %u words %zu\n", stage, operation.queue, static_cast<unsigned>(operation.kind), static_cast<unsigned long long>(operation.submission), operation.packetOffset, operation.opcode, static_cast<unsigned long long>(operation.address), static_cast<unsigned long long>(operation.size), static_cast<unsigned long long>(operation.value), static_cast<unsigned>(operation.function), item.words.size());
+        std::fprintf(stderr, "[recode-loop-trace] %s runner 0x%x q%u kind %u submission %llu offset %u opcode 0x%x address 0x%llx size %llu value 0x%llx function %u words %zu\n", stage, queue, operation.queue, static_cast<unsigned>(operation.kind), static_cast<unsigned long long>(operation.submission), operation.packetOffset, operation.opcode, static_cast<unsigned long long>(operation.address), static_cast<unsigned long long>(operation.size), static_cast<unsigned long long>(operation.value), static_cast<unsigned>(operation.function), item.words.size());
     }
 
     void handle(const Item& item) {
