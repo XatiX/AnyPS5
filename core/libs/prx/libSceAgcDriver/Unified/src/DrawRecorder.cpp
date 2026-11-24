@@ -407,6 +407,7 @@ std::atomic<std::uint64_t> flipsFromOldRecords{0};
 std::atomic<std::uint64_t> flipsWithoutRecords{0};
 std::atomic<std::uint32_t> flipNotes{0};
 std::atomic<std::uint32_t> flipMemoryNotes{0};
+std::atomic<std::uint64_t> sampleDumpsLanded{0};
 
 bool argumentCensusOn() {
     static const bool on = std::getenv("APS5_RECODE_ARGUMENT_CENSUS") != nullptr;
@@ -4431,19 +4432,47 @@ std::optional<DisplaySource> DisplayRecord(std::uint64_t address, std::uint64_t 
     return std::nullopt;
 }
 
-bool DumpSamplesToMirror(Graphics::Recorder& recorder, std::uint64_t address, std::uint64_t bytes, std::uint32_t blocks) {
+struct SampleLandingSlots {
+    static constexpr std::uint64_t SlotBytes = 256;
+    static constexpr std::uint64_t Slots = 4096;
+    std::shared_ptr<Graphics::Buffer> buffer;
+    std::uint64_t next = 0;
+    std::mutex mutex;
+};
+
+SampleLandingSlots& sampleLandingSlots() {
+    static SampleLandingSlots slots;
+    return slots;
+}
+
+bool DumpSamplesToMirror(const Context& context, Graphics::Recorder& recorder, std::uint64_t address, std::uint64_t bytes, std::uint32_t blocks) {
     const auto span = ResidencyService::Get().MirrorSpan(address, bytes);
-    if (!span || span->address == 0u) {
+    if (!span || span->address == 0u || bytes > SampleLandingSlots::SlotBytes || !context.bufferDeviceAddress) {
         static std::atomic<std::uint32_t> missing{0};
-        if (missing.fetch_add(1, std::memory_order_relaxed) < 8u) std::fprintf(stderr, "[recode-fatal] occlusion dump at 0x%llx+0x%llx dropped: no mirror span\n", static_cast<unsigned long long>(address), static_cast<unsigned long long>(bytes));
+        if (missing.fetch_add(1, std::memory_order_relaxed) < 8u) std::fprintf(stderr, "[recode-fatal] occlusion dump at 0x%llx+0x%llx dropped: no mirror span or landing slot\n", static_cast<unsigned long long>(address), static_cast<unsigned long long>(bytes));
         return false;
     }
+    auto& slots = sampleLandingSlots();
+    std::shared_ptr<Graphics::Buffer> buffer;
+    std::uint64_t slot = 0;
+    {
+        std::lock_guard lock(slots.mutex);
+        if (slots.buffer == nullptr) slots.buffer = std::make_shared<Graphics::Buffer>(context, static_cast<std::size_t>(SampleLandingSlots::SlotBytes * SampleLandingSlots::Slots), VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT);
+        buffer = slots.buffer;
+        slot = slots.next++ % SampleLandingSlots::Slots;
+    }
+    const auto offset = slot * SampleLandingSlots::SlotBytes;
     if (!recorder.DumpSamples(span->address, address, blocks)) return false;
+    if (!recorder.DumpSamples(buffer->DeviceAddress() + offset, address, blocks)) return false;
+    recorder.Keep(buffer);
     const std::array written{std::pair{address, address + bytes}};
     Shadow::NoteGpuWrites(written);
-    const auto mark = MemoryCore::Get().NoteGpuWrite(address, bytes, recorder.OpenBatchSerial());
-    if (!mark.upload.empty()) ResidencyService::Get().NoteDirty(mark.upload);
     Events::NoteRanges(written);
+    LandAfterBatch(recorder, [buffer, offset, address, bytes] {
+        buffer->Invalidate();
+        MemoryCore::Get().LandGpuWrite(address, std::span<const std::byte>(buffer->Bytes().data() + offset, static_cast<std::size_t>(bytes)));
+    });
+    sampleDumpsLanded.fetch_add(1, std::memory_order_relaxed);
     return true;
 }
 
@@ -4469,7 +4498,7 @@ void NoteSampleDumpBefore(std::uint64_t address) {
     else if (samples == 0u) zero.fetch_add(1, std::memory_order_relaxed);
     else counted.fetch_add(1, std::memory_order_relaxed);
     const auto total = seen.fetch_add(1, std::memory_order_relaxed) + 1u;
-    if (total % 20000u == 0u) std::fprintf(stderr, "[recode-sample-values] %llu dumps: block held before the dump: not ready %llu, ready with 0 samples %llu, ready with samples %llu; last 0x%llx = 0x%016llx\n", static_cast<unsigned long long>(total), static_cast<unsigned long long>(notReady.load()), static_cast<unsigned long long>(zero.load()), static_cast<unsigned long long>(counted.load()), static_cast<unsigned long long>(address), static_cast<unsigned long long>(value));
+    if (total % 2000u == 0u) std::fprintf(stderr, "[recode-sample-values] %llu dumps: block held before the dump: not ready %llu, ready with 0 samples %llu, ready with samples %llu; last 0x%llx = 0x%016llx\n", static_cast<unsigned long long>(total), static_cast<unsigned long long>(notReady.load()), static_cast<unsigned long long>(zero.load()), static_cast<unsigned long long>(counted.load()), static_cast<unsigned long long>(address), static_cast<unsigned long long>(value));
 }
 
 bool PresentsExistingResidents() {

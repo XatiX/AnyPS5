@@ -3386,7 +3386,7 @@ bool VulkanDevice::DumpSamplesOnGpu(std::uint64_t address, std::uint32_t blocks)
     const auto context = graphicsContext();
 #if ANYPS5_UNIFIED
     Unified::Record::NoteSampleDumpBefore(address);
-    if (Unified::Record::RecordActive()) return Unified::Record::DumpSamplesToMirror(recorder, address, bytes, blocks);
+    if (Unified::Record::RecordActive()) return Unified::Record::DumpSamplesToMirror(context, recorder, address, bytes, blocks);
 #endif
     Graphics::StorageTexture::FlushPending(address, bytes, nullptr, "occlusion counter dump", Graphics::PublishScope::PartialUnits);
     const auto* import = Graphics::HostImportFor(context, address, bytes);
