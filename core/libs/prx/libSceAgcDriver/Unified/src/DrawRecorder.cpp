@@ -4479,6 +4479,20 @@ bool DumpSamplesToMirror(const Context& context, Graphics::Recorder& recorder, s
 void NoteExistingPacket(std::uint32_t header, std::uint32_t queue) {
     if (!RecordActive() || !Downgrades::Active()) return;
     const auto key = (static_cast<std::uint64_t>(queue) << 32u) | (header & 0x0000ff00u);
+    const auto opcode = (header >> 8u) & 0xffu;
+    const char* served = nullptr;
+    switch (opcode) {
+        case 0x37: served = "WRITE_DATA"; break;
+        case 0x3c: served = "WAIT_REG_MEM"; break;
+        case 0x40: served = "COPY_DATA"; break;
+        case 0x46: served = "EVENT_WRITE"; break;
+        case 0x49: served = "RELEASE_MEM"; break;
+        case 0x50: served = "DMA_DATA"; break;
+        case 0x58: served = "ACQUIRE_MEM"; break;
+        case 0x93: served = "WAIT_REG_MEM_64"; break;
+        default: break;
+    }
+    if (served != nullptr) Downgrades::NoteHashed(0u, Downgrades::Kind::ExistingPacket, opcode | (queue << 8u), served);
     std::lock_guard lock(existingPacketMutex);
     existingPackets[key]++;
 }

@@ -37,6 +37,7 @@ enum class Kind : std::uint32_t {
     DepthSeedRefused,
     MetadataClearRefused,
     HtileClearRefused,
+    ExistingPacket,
     Count,
 };
 

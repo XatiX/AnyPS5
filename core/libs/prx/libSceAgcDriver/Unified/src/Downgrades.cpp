@@ -107,6 +107,7 @@ std::string_view KindName(Kind kind) {
         case Kind::DepthSeedRefused: return "depth-seed-refused";
         case Kind::MetadataClearRefused: return "metadata-clear-refused";
         case Kind::HtileClearRefused: return "htile-clear-refused";
+        case Kind::ExistingPacket: return "existing-packet";
         default: return "unknown";
     }
 }
@@ -127,6 +128,7 @@ Severity SeverityOf(Kind kind) {
         case Kind::DepthSeedRefused:
         case Kind::MetadataClearRefused:
         case Kind::HtileClearRefused: return Severity::Severe;
+        case Kind::ExistingPacket: return Severity::Fallback;
         case Kind::ExistingPath:
         case Kind::StorageRecordMissing:
         case Kind::UpstreamSampled:
