@@ -39,6 +39,7 @@ struct DisplaySource {
 };
 [[nodiscard]] std::optional<DisplaySource> DisplayRecord(std::uint64_t address, std::uint64_t bytes);
 [[nodiscard]] bool PresentsExistingResidents();
+[[nodiscard]] bool DumpSamplesToMirror(Graphics::Recorder& recorder, std::uint64_t address, std::uint64_t bytes, std::uint32_t blocks);
 [[nodiscard]] bool LandingsPending();
 [[nodiscard]] bool RecordsHtileClears();
 void LandAfterBatch(Graphics::Recorder& recorder, std::function<void()> landing);

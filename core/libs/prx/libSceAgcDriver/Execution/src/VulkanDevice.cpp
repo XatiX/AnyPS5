@@ -3384,6 +3384,9 @@ bool VulkanDevice::DumpSamplesOnGpu(std::uint64_t address, std::uint32_t blocks)
     if (OpportunisticReap()) recorder.Reap();
     if (state->CopiedWriterOverlaps(address, bytes) || (Graphics::Recorder::PendingCompletionLabels() != 0 && recorder.CompletionLabelIn(address, bytes))) return false;
     const auto context = graphicsContext();
+#if ANYPS5_UNIFIED
+    if (Unified::Record::DumpSamplesToMirror(recorder, address, bytes, blocks)) return true;
+#endif
     Graphics::StorageTexture::FlushPending(address, bytes, nullptr, "occlusion counter dump", Graphics::PublishScope::PartialUnits);
     const auto* import = Graphics::HostImportFor(context, address, bytes);
     if (import == nullptr || import->address == 0) return false;

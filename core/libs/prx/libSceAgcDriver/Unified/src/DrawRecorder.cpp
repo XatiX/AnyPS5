@@ -407,6 +407,40 @@ std::atomic<std::uint64_t> flipsFromOldRecords{0};
 std::atomic<std::uint64_t> flipsWithoutRecords{0};
 std::atomic<std::uint32_t> flipNotes{0};
 std::atomic<std::uint32_t> flipMemoryNotes{0};
+std::atomic<std::uint64_t> mirrorSampleDumps{0};
+
+bool argumentCensusOn() {
+    static const bool on = std::getenv("APS5_RECODE_ARGUMENT_CENSUS") != nullptr;
+    return on;
+}
+
+struct ArgumentTally {
+    std::uint64_t draws = 0;
+    std::uint64_t noCount = 0;
+    std::uint64_t noElements = 0;
+    std::uint64_t noInstances = 0;
+    std::uint64_t elements = 0;
+};
+
+std::mutex argumentCensusMutex;
+std::map<std::uint64_t, ArgumentTally> argumentCensus;
+
+void noteArgumentCensus(std::uint64_t codeAddress, std::uint32_t elements, std::uint32_t instances, std::uint32_t count) {
+    std::lock_guard lock(argumentCensusMutex);
+    auto& tally = argumentCensus[codeAddress];
+    tally.draws++;
+    if (count == 0u) tally.noCount++;
+    else if (elements == 0u) tally.noElements++;
+    else if (instances == 0u) tally.noInstances++;
+    else tally.elements += static_cast<std::uint64_t>(elements) * instances;
+}
+
+void printArgumentCensus() {
+    if (!argumentCensusOn()) return;
+    std::lock_guard lock(argumentCensusMutex);
+    for (const auto& [code, tally] : argumentCensus) std::fprintf(stderr, "[recode-argument-census] %016llx indirect draws %llu: no count %llu, no elements %llu, no instances %llu, drawn elements x instances %llu\n", static_cast<unsigned long long>(Downgrades::ProgramHash(code)), static_cast<unsigned long long>(tally.draws), static_cast<unsigned long long>(tally.noCount), static_cast<unsigned long long>(tally.noElements), static_cast<unsigned long long>(tally.noInstances), static_cast<unsigned long long>(tally.elements));
+    argumentCensus.clear();
+}
 std::atomic<std::uint64_t> flipsPresentedFromRecords{0};
 
 struct BatchLandings {
@@ -1351,6 +1385,7 @@ public:
 
     std::string Line() {
         std::lock_guard lock(mutex);
+        printArgumentCensus();
         const auto pipelineCounts = takePipelineCounts();
         char text[384];
         const auto draws = totals.recorded + totals.refused;
@@ -1402,7 +1437,7 @@ public:
             std::snprintf(text, sizeof(text), "; mirror writes %.1f MiB, pages left GPU-owned %.1f MiB, edges landed whole %.1f MiB, edges snapshot %.1f MiB and landed by diff %.1f MiB, indirect arguments from the mirror %llu", static_cast<double>(totals.mirrorWriteBytes) / 1048576.0, static_cast<double>(totals.ownedBytes) / 1048576.0, static_cast<double>(totals.openLandedBytes) / 1048576.0, static_cast<double>(totals.edgeSnapshotBytes) / 1048576.0, static_cast<double>(totals.edgeDiffBytes) / 1048576.0, static_cast<unsigned long long>(totals.mirrorArguments));
             line += text;
         }
-        std::snprintf(text, sizeof(text), "; indirect draw arguments patched on the GPU for a constant rule %llu; mesh draws %llu (%llu empty); depth records written back before a buffer writer %llu", static_cast<unsigned long long>(totals.patchedArguments), static_cast<unsigned long long>(totals.meshDraws), static_cast<unsigned long long>(totals.meshEmpty), static_cast<unsigned long long>(totals.depthWriterHandOvers));
+        std::snprintf(text, sizeof(text), "; indirect draw arguments patched on the GPU for a constant rule %llu; mesh draws %llu (%llu empty); depth records written back before a buffer writer %llu; occlusion dumps into the mirror %llu", static_cast<unsigned long long>(totals.patchedArguments), static_cast<unsigned long long>(totals.meshDraws), static_cast<unsigned long long>(totals.meshEmpty), static_cast<unsigned long long>(totals.depthWriterHandOvers), static_cast<unsigned long long>(mirrorSampleDumps.load(std::memory_order_relaxed)));
         line += text;
         std::snprintf(text, sizeof(text), "; GPU-written chunks %llu switched to their import from the written bitmap (%.1f MiB copied over), %llu from other GPU writes, %llu refused, %llu written pieces already on an import", static_cast<unsigned long long>(totals.importSwitches), static_cast<double>(totals.switchBytes) / 1048576.0, static_cast<unsigned long long>(totals.writtenSwitches), static_cast<unsigned long long>(totals.switchRefused), static_cast<unsigned long long>(totals.writtenOnImports));
         line += text;
@@ -2102,7 +2137,8 @@ private:
         constexpr VkDeviceSize CountOffset = 24;
         if (!Downgrades::Active() || args.count == 0u || args.recordBytes > CountOffset) return;
         const auto seen = ++argumentProbes[codeAddress];
-        if (seen > 2u && seen % 200u != 0u) return;
+        const bool census = argumentCensusOn();
+        if (!census && seen > 2u && seen % 200u != 0u) return;
         if (argumentReads == nullptr) argumentReads = std::make_shared<Graphics::Buffer>(context, Slots * SlotBytes, VK_BUFFER_USAGE_TRANSFER_DST_BIT);
         const auto slot = nextArgumentRead++ % Slots;
         Graphics::RecordMemoryBarrier(context, commands, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_ACCESS_SHADER_WRITE_BIT | VK_ACCESS_TRANSFER_WRITE_BIT, VK_ACCESS_TRANSFER_READ_BIT);
@@ -2110,9 +2146,11 @@ private:
         if (count) Graphics::CopyBuffer(context, commands, count->buffer, count->offset, argumentReads->Handle(), slot * SlotBytes + CountOffset, sizeof(std::uint32_t));
         Graphics::RecordMemoryBarrier(context, commands, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_HOST_BIT, VK_ACCESS_TRANSFER_WRITE_BIT, VK_ACCESS_HOST_READ_BIT);
         recorder.Keep(argumentReads);
-        recorder.OnComplete([buffer = argumentReads, slot, codeAddress, indexed, source, seen, records = args.count, guest = args.arguments, counted = count.has_value()] {
+        recorder.OnComplete([buffer = argumentReads, slot, codeAddress, indexed, source, seen, records = args.count, guest = args.arguments, counted = count.has_value(), census] {
             std::uint32_t words[8] = {};
             std::memcpy(words, buffer->Bytes().data() + slot * SlotBytes, sizeof(words));
+            if (census) noteArgumentCensus(codeAddress, words[0], words[1], counted ? words[6] : 1u);
+            if (census && seen > 2u && seen % 200u != 0u) return;
             char counter[48] = "";
             if (counted) std::snprintf(counter, sizeof(counter), ", count buffer holds %u", words[6]);
             if (indexed) std::fprintf(stderr, "[recode-arguments] %016llx indirect draw %u (%s, %u records at 0x%llx%s): first record indices %u instances %u first index %u vertex offset %d first instance %u\n", static_cast<unsigned long long>(Downgrades::ProgramHash(codeAddress)), seen, source, records, static_cast<unsigned long long>(guest), counter, words[0], words[1], words[2], static_cast<std::int32_t>(words[3]), words[4]);
@@ -3654,6 +3692,13 @@ private:
                     const auto base = static_cast<std::size_t>(record) * args.stride;
                     if (args.vertexRule == Rule::Constant) std::memcpy(copy.data() + base + args.VertexDwordOffset(), &args.vertexConstant, 4);
                     if (args.instanceRule == Rule::Constant) std::memcpy(copy.data() + base + args.InstanceDwordOffset(), &args.instanceConstant, 4);
+                    if (argumentCensusOn() && Downgrades::Active() && base + 8u <= copy.size()) {
+                        std::uint32_t elements = 0;
+                        std::uint32_t instances = 0;
+                        std::memcpy(&elements, copy.data() + base, 4);
+                        std::memcpy(&instances, copy.data() + base + 4, 4);
+                        noteArgumentCensus(draw.stages.empty() ? 0u : draw.stages.back().program.codeAddress, elements, instances, 1u);
+                    }
                 }
                 const auto offset = ringWrite(copy, serial, completed);
                 if (!offset.has_value()) {
@@ -4391,6 +4436,20 @@ std::optional<DisplaySource> DisplayRecord(std::uint64_t address, std::uint64_t 
         return DisplaySource{vulkan->Image(), vulkan->Format(), vulkan->Resource(), record};
     }
     return std::nullopt;
+}
+
+bool DumpSamplesToMirror(Graphics::Recorder& recorder, std::uint64_t address, std::uint64_t bytes, std::uint32_t blocks) {
+    static const bool on = std::getenv("APS5_RECODE_MIRROR_SAMPLE_DUMPS") != nullptr;
+    if (!on || !RecordActive() || bytes == 0u) return false;
+    const auto span = ResidencyService::Get().MirrorSpan(address, bytes);
+    if (!span || span->address == 0u) return false;
+    if (!recorder.DumpSamples(span->address, address, blocks)) return false;
+    const auto mark = MemoryCore::Get().NoteGpuWrite(address, bytes, recorder.OpenBatchSerial());
+    if (!mark.upload.empty()) ResidencyService::Get().NoteDirty(mark.upload);
+    const std::array written{std::pair{address, address + bytes}};
+    Events::NoteRanges(written);
+    mirrorSampleDumps.fetch_add(1, std::memory_order_relaxed);
+    return true;
 }
 
 bool PresentsExistingResidents() {
