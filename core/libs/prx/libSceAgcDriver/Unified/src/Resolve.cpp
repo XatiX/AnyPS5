@@ -1,5 +1,6 @@
 #include "prx/libSceAgcDriver/Unified/include/Resolve.hpp"
 #include "prx/libSceAgcDriver/Unified/include/MemoryCore.hpp"
+#include "prx/libSceAgcDriver/Unified/include/RecordQueue.hpp"
 #include "prx/libSceAgcDriver/Unified/include/Downgrades.hpp"
 #include "prx/libSceAgcDriver/Unified/include/DrawRecorder.hpp"
 #include "prx/libSceAgcDriver/Execution/include/GuestMemory.hpp"
@@ -271,14 +272,25 @@ public:
                 bound = context.get();
             }
             if (dispatch != nullptr && device != nullptr && bound != nullptr) Record::PrebuildDispatch(*bound, *device, *dispatch);
+            if (Loop::OwnsLoop()) {
+                Loop::QueueFor(operation.queue).Push({operation, std::move(dispatch), state.Held()});
+                return;
+            }
             dispatchHandoff.Offer(operation.queue, operation.submission, operation.packetOffset, std::move(dispatch));
             return;
         }
-        if (!IsDraw(operation.kind)) return;
+        if (!IsDraw(operation.kind)) {
+            if (Loop::OwnsLoop() && operation.kind != OpKind::Marker) Loop::QueueFor(operation.queue).Push({operation, nullptr, state.Held()});
+            return;
+        }
         std::shared_ptr<const ResolvedDraw> draw;
         if (operation.resolved) {
             std::lock_guard lock(mutex);
             draw = resolve(operation, state);
+        }
+        if (Loop::OwnsLoop()) {
+            Loop::QueueFor(operation.queue).Push({operation, std::move(draw), state.Held()});
+            return;
         }
         handoff.Offer(operation.queue, operation.submission, operation.packetOffset, std::move(draw));
     }
@@ -290,7 +302,8 @@ public:
             lastRefusal = reason;
             if (thrown.insert(reason.substr(0, 80)).second) std::fprintf(stderr, "[recode-resolve] first exception while resolving: %s\n", what);
         }
-        if (IsDispatch(operation.kind)) dispatchHandoff.Offer(operation.queue, operation.submission, operation.packetOffset, nullptr);
+        if (Loop::OwnsLoop()) Loop::QueueFor(operation.queue).Push({operation, nullptr, nullptr});
+        else if (IsDispatch(operation.kind)) dispatchHandoff.Offer(operation.queue, operation.submission, operation.packetOffset, nullptr);
         else if (IsDraw(operation.kind)) handoff.Offer(operation.queue, operation.submission, operation.packetOffset, nullptr);
     }
 

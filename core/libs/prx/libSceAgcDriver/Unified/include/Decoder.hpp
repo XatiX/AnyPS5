@@ -78,6 +78,8 @@ public:
     [[nodiscard]] std::uint64_t Sequence() const { return sequence; }
     [[nodiscard]] const QueueState& Live() const { return state; }
     [[nodiscard]] const DriverDetail::Submission* CurrentSubmission() const { return submission; }
+    void Hold(std::shared_ptr<const DriverDetail::Submission> current) { held = std::move(current); }
+    [[nodiscard]] const std::shared_ptr<const DriverDetail::Submission>& Held() const { return held; }
 
 private:
     friend class Decoder;
@@ -85,6 +87,7 @@ private:
 
     std::uint32_t queueId;
     const DriverDetail::Submission* submission = nullptr;
+    std::shared_ptr<const DriverDetail::Submission> held;
     QueueState state;
     SnapshotRing<Registers, SnapshotSlots> context;
     SnapshotRing<Registers, SnapshotSlots> userConfig;
