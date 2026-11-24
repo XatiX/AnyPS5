@@ -32,6 +32,7 @@ struct Item {
     std::array<std::uint32_t, 3> groups{};
     std::vector<std::uint32_t> words;
     std::vector<OperationGuard> guards;
+    std::uint32_t sampleDumpBlocks = 0;
 };
 
 struct QueueCounts {

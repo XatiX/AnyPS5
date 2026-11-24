@@ -47,6 +47,7 @@ struct Totals {
     std::atomic<std::uint64_t> idleReaps{0};
     std::atomic<std::uint64_t> runTimeStores{0};
     std::atomic<std::uint64_t> runTimeRefused{0};
+    std::atomic<std::uint64_t> sampleDumps{0};
     std::atomic<std::uint64_t> guarded{0};
     std::atomic<std::uint64_t> skipped{0};
     std::atomic<std::uint64_t> conditionsRead{0};
@@ -63,6 +64,11 @@ struct Progress {
     std::uint64_t submission = 0;
     std::uint32_t offset = 0;
     bool any = false;
+    std::atomic<std::int64_t> busySince{0};
+    std::atomic<std::uint64_t> busySubmission{0};
+    std::atomic<std::uint32_t> busyOffset{0};
+    std::atomic<std::uint32_t> busyOpcode{0};
+    std::atomic<const char*> stage{"idle"};
 };
 
 struct Hook {
@@ -82,6 +88,24 @@ Progress& progressFor(std::uint32_t queue) {
     return *held;
 }
 
+std::int64_t nowNanoseconds() {
+    return std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now().time_since_epoch()).count();
+}
+
+std::string stuckLine() {
+    std::string line;
+    const auto now = nowNanoseconds();
+    std::lock_guard lock(progressMutex);
+    for (const auto& [queue, progress] : progresses) {
+        const auto since = progress->busySince.load(std::memory_order_acquire);
+        if (since == 0 || now - since < 5'000'000'000ll) continue;
+        char text[256];
+        std::snprintf(text, sizeof(text), "\n[recode-loop] queue 0x%x stuck %.1f s in %s on submission %llu offset %u opcode 0x%x", queue, static_cast<double>(now - since) / 1e9, progress->stage.load(std::memory_order_relaxed), static_cast<unsigned long long>(progress->busySubmission.load(std::memory_order_relaxed)), progress->busyOffset.load(std::memory_order_relaxed), progress->busyOpcode.load(std::memory_order_relaxed));
+        line += text;
+    }
+    return line;
+}
+
 bool reached(const Progress& progress, std::uint64_t submission, std::uint32_t offset) {
     return progress.any && (progress.submission > submission || (progress.submission == submission && progress.offset >= offset));
 }
@@ -99,18 +123,25 @@ public:
 
     void Run() {
         auto& items = QueueFor(queue);
+        auto& progress = progressFor(queue);
+        busy = &progress;
         auto reported = std::chrono::steady_clock::now();
         for (;;) {
             auto item = items.Pop(std::chrono::milliseconds(1));
             if (std::chrono::steady_clock::now() - reported > std::chrono::seconds(10)) {
                 reported = std::chrono::steady_clock::now();
-                std::fprintf(stderr, "[recode-loop] queue 0x%x: %s\n", queue, Line().c_str());
+                std::fprintf(stderr, "[recode-loop] queue 0x%x: %s%s\n", queue, Line().c_str(), stuckLine().c_str());
             }
             if (!item) {
                 settleIdle();
                 continue;
             }
             lastWork = std::chrono::steady_clock::now();
+            progress.busySubmission.store(item->operation.submission, std::memory_order_relaxed);
+            progress.busyOffset.store(item->operation.packetOffset, std::memory_order_relaxed);
+            progress.busyOpcode.store(item->operation.opcode, std::memory_order_relaxed);
+            progress.stage.store("operation", std::memory_order_relaxed);
+            progress.busySince.store(nowNanoseconds(), std::memory_order_release);
             try {
                 if (item->guards.empty() || guardsPass(*item)) handle(*item);
                 else trace(*item, "skip");
@@ -118,7 +149,7 @@ public:
                 Record::RefuseUnrecorded("loop operation", 0, std::string("record loop threw: ") + error.what());
                 totals().refused.fetch_add(1, std::memory_order_relaxed);
             }
-            auto& progress = progressFor(queue);
+            progress.busySince.store(0, std::memory_order_release);
             {
                 std::lock_guard lock(progress.mutex);
                 progress.submission = item->operation.submission;
@@ -181,12 +212,21 @@ private:
         }
         switch (item.operation.kind) {
             case OpKind::Draw:
-            case OpKind::DrawIndirect: draw(*device, item); return;
+            case OpKind::DrawIndirect:
+                stage("recording a draw");
+                draw(*device, item);
+                return;
             case OpKind::Dispatch:
-            case OpKind::DispatchIndirect: dispatch(*device, item); return;
+            case OpKind::DispatchIndirect:
+                stage("recording a dispatch");
+                dispatch(*device, item);
+                return;
             case OpKind::LabelStore:
             case OpKind::Copy:
-            case OpKind::Fill: store(*device, item); return;
+            case OpKind::Fill:
+                stage("storing");
+                store(*device, item);
+                return;
             case OpKind::Wait: wait(*device, item); return;
             case OpKind::Flip: totals().flips.fetch_add(1, std::memory_order_relaxed); return;
             case OpKind::Marker: return;
@@ -215,6 +255,7 @@ private:
     }
 
     void settle(VulkanDevice& device) {
+        stage("settling recorded work");
         for (;;) {
             {
                 GuestMemory::TagGpuLockSite(GuestMemory::GpuLockSite::Wait);
@@ -232,16 +273,30 @@ private:
     bool evaluate(const OperationGuard& guard) {
         totals().conditionsRead.fetch_add(1, std::memory_order_relaxed);
         if (const auto device = Resolve::AttachedDevice()) settle(*device);
+        stage("reading a condition");
         if (guard.condition) {
             const auto address = static_cast<std::uint64_t>(guard.words[1]) | (static_cast<std::uint64_t>(guard.words[2]) << 32u);
             MemoryCore::Get().FlushGpuWrites(address, 4u);
-            return Pm4::ReadCondition(guard.words) != 0u;
+            const auto value = Pm4::ReadCondition(guard.words);
+            traceGuard(guard, address, value, value != 0u);
+            return value != 0u;
         }
         thread_local QueueState probe;
         probe.predication = guard.predication;
         probe.sampleDumpBlocks = guard.sampleDumpBlocks;
         MemoryCore::Get().FlushGpuWrites(guard.predication.address, Pm4::PredicationBytes(guard.predication));
-        return Pm4::PredicationPasses(probe);
+        const bool passes = Pm4::PredicationPasses(probe);
+        std::uint64_t first = 0;
+        if (GuestMemory::Accessible(reinterpret_cast<const void*>(static_cast<std::uintptr_t>(guard.predication.address)), 16u)) std::memcpy(&first, reinterpret_cast<const void*>(static_cast<std::uintptr_t>(guard.predication.address + 8u)), 8u);
+        traceGuard(guard, guard.predication.address, first, passes);
+        return passes;
+    }
+
+    void traceGuard(const OperationGuard& guard, std::uint64_t address, std::uint64_t value, bool passes) const {
+        static const bool traced = std::getenv("APS5_RECODE_TRACE_LOOP") != nullptr;
+        static std::atomic<std::uint32_t> lines{0};
+        if (!traced || lines.fetch_add(1, std::memory_order_relaxed) >= 300u) return;
+        std::fprintf(stderr, "[recode-loop-trace] guard q%u submission %llu range %zu-%zu %s operation %u blocks 0x%x when-set %d at 0x%llx value 0x%llx: %s\n", queue, static_cast<unsigned long long>(guard.submission), guard.start, guard.end, guard.condition ? "COND_EXEC" : "predication", guard.predication.operation, guard.sampleDumpBlocks, guard.predication.executeWhenSet ? 1 : 0, static_cast<unsigned long long>(address), static_cast<unsigned long long>(value), passes ? "runs" : "skips");
     }
 
     static std::uint64_t codeOf(const Item& item) {
@@ -317,20 +372,26 @@ private:
         return Pm4::MemoryCopy{from, to, bytes};
     }
 
-    static void landRunTime(const Graphics::Context& context, const std::vector<std::uint32_t>& words) {
-        totals().runTimeStores.fetch_add(1, std::memory_order_relaxed);
-        const auto land = [words] {
-            static const QueueState unwritten{};
-            const auto resolved = Pm4::ResolveStore(words, unwritten, std::numeric_limits<std::size_t>::max());
-            if (!resolved) {
-                totals().runTimeRefused.fetch_add(1, std::memory_order_relaxed);
-                Record::RefuseUnrecorded("loop store", 0, "a store computed at run time has no CPU form (opcode 0x" + std::to_string((words[0] >> 8u) & 0xffu) + ")");
-                return;
-            }
+    void landNow(VulkanDevice& device, std::span<const std::uint32_t> words) {
+        if (const auto copy = memoryCopyOf(words)) {
+            settle(device);
+            stage("landing a copy source");
+            MemoryCore::Get().FlushGpuWrites(copy->source, copy->bytes);
+            stage("copying on the CPU");
+            std::vector<std::byte> bytes(copy->bytes);
+            GuestMemory::Read(copy->source, bytes, 1);
+            GuestMemory::Write(copy->destination, bytes, 1);
+            return;
+        }
+        stage("run-time store on the CPU");
+        static const QueueState unwritten{};
+        if (const auto resolved = Pm4::ResolveStore(words, unwritten, std::numeric_limits<std::size_t>::max())) {
             const auto bytes = resolved->Bytes();
             if (!bytes.empty()) GuestMemory::Write(resolved->address, bytes, 1);
-        };
-        if (!context.recorder->AfterRecordedWork(land)) land();
+            return;
+        }
+        totals().runTimeRefused.fetch_add(1, std::memory_order_relaxed);
+        Record::RefuseUnrecorded("loop store", 0, "a store computed at run time has no CPU form (opcode 0x" + std::to_string((words[0] >> 8u) & 0xffu) + ")");
     }
 
     void store(VulkanDevice& device, const Item& item) {
@@ -338,7 +399,7 @@ private:
         const auto opcode = (item.words[0] >> 8u) & 0xffu;
         if (opcode == 0x83u) return;
         GuestMemory::TagGpuLockSite(GuestMemory::GpuLockSite::Label);
-        std::lock_guard lock(GuestMemory::GpuMutex());
+        std::unique_lock lock(GuestMemory::GpuMutex());
         const auto context = device.graphicsContext();
         if (opcode == 0x37u || opcode == 0x49u) {
             if (const auto label = Pm4::DecodeLabelWrite(item.words)) {
@@ -355,8 +416,16 @@ private:
             }
             return;
         }
-        const auto stores = Pm4::DecodeStores(item.words);
-        for (const auto& piece : stores) {
+        if (opcode == 0x46u) {
+            if (!Pm4::SampleDump(item.words)) return;
+            totals().sampleDumps.fetch_add(1, std::memory_order_relaxed);
+            if (Record::DumpSamplesToMirror(context, *context.recorder, Pm4::SampleDumpAddress(item.words), Pm4::SampleDumpBytes, item.sampleDumpBlocks)) return;
+            totals().refused.fetch_add(1, std::memory_order_relaxed);
+            Record::RefuseUnrecorded("loop sample dump", 0, "the occlusion counter dump was not recorded");
+            return;
+        }
+        bool onCpu = false;
+        for (const auto& piece : Pm4::DecodeStores(item.words)) {
             if (piece.value == Pm4::PacketStore::Value::Bytes) {
                 storeBytes(context, piece.address, piece.data);
                 continue;
@@ -368,28 +437,24 @@ private:
                 continue;
             }
             const auto copy = memoryCopyOf(item.words);
-            if (!copy) {
-                landRunTime(context, item.words);
-                continue;
+            if (copy) {
+                totals().copies.fetch_add(1, std::memory_order_relaxed);
+                if (Record::StoresToMirror(copy->bytes, copy->destination) && Record::CopyInMirror(context, *context.recorder, *copy)) continue;
+                totals().copiesOnCpu.fetch_add(1, std::memory_order_relaxed);
+            } else {
+                totals().runTimeStores.fetch_add(1, std::memory_order_relaxed);
             }
-            totals().copies.fetch_add(1, std::memory_order_relaxed);
-            if (Record::StoresToMirror(copy->bytes, copy->destination) && Record::CopyInMirror(context, *context.recorder, *copy)) continue;
-            totals().copiesOnCpu.fetch_add(1, std::memory_order_relaxed);
-            const auto moved = *copy;
-            const auto land = [moved] {
-                MemoryCore::Get().FlushGpuWrites(moved.source, moved.bytes);
-                std::vector<std::byte> bytes(moved.bytes);
-                std::memcpy(bytes.data(), reinterpret_cast<const void*>(static_cast<std::uintptr_t>(moved.source)), moved.bytes);
-                GuestMemory::Write(moved.destination, bytes, 1);
-            };
-            if (!context.recorder->AfterRecordedWork(land)) land();
+            onCpu = true;
         }
+        lock.unlock();
+        if (onCpu) landNow(device, item.words);
     }
 
     void wait(VulkanDevice& device, const Item& item) {
         const auto& operation = item.operation;
         if (operation.address == 0u || (operation.size != 4u && operation.size != 8u) || operation.function == 0u) return;
         totals().waits.fetch_add(1, std::memory_order_relaxed);
+        stage("waiting on memory");
         const auto compares = [&](std::uint64_t value) { return Pm4::WaitCompares(operation.function, operation.value, operation.mask, value); };
         const auto started = std::chrono::steady_clock::now();
         auto warned = started;
@@ -426,7 +491,12 @@ private:
         std::uint64_t value = 0;
     };
 
+    void stage(const char* name) const {
+        if (busy != nullptr) busy->stage.store(name, std::memory_order_relaxed);
+    }
+
     std::uint32_t queue;
+    Progress* busy = nullptr;
     std::array<Decided, 8> decided{};
     std::size_t decidedNext = 0;
     std::array<Stored, 6> recent{};
@@ -485,6 +555,7 @@ bool Takes(std::span<const std::uint32_t> packet, std::uint32_t opcode, std::uin
                 if (packet.size() >= 6u && Pm4::CopyDataToRegister(packet)) return false;
                 return !Pm4::DecodeStores(packet).empty();
             case 0x50: return !Pm4::DecodeStores(packet).empty();
+            case 0x46: return Pm4::SampleDump(packet);
             default: return false;
         }
     } catch (const std::exception&) {
@@ -512,8 +583,8 @@ LoopCounts Counts() {
 std::string Line() {
     const auto counts = Counts();
     char text[512];
-    std::snprintf(text, sizeof(text), "draws %llu, dispatches %llu, refused %llu; label stores %llu (%llu at once on the CPU), interrupts %llu; waits %llu (%llu from the label table, %llu from guest memory, %llu polls); copies %llu (%llu on the CPU after their batch); run-time stores %llu (%llu refused); flips %llu; guarded operations %llu (%llu skipped, %llu conditions read); predicated operations with no guard %llu; idle reaps %llu",
-                  static_cast<unsigned long long>(counts.draws), static_cast<unsigned long long>(counts.dispatches), static_cast<unsigned long long>(counts.refused), static_cast<unsigned long long>(counts.labels), static_cast<unsigned long long>(counts.labelsAtOnce), static_cast<unsigned long long>(counts.interrupts), static_cast<unsigned long long>(counts.waits), static_cast<unsigned long long>(counts.waitsFromTable), static_cast<unsigned long long>(counts.waitsFromGuest), static_cast<unsigned long long>(counts.waitPolls), static_cast<unsigned long long>(counts.copies), static_cast<unsigned long long>(counts.copiesOnCpu), static_cast<unsigned long long>(totals().runTimeStores.load()), static_cast<unsigned long long>(totals().runTimeRefused.load()), static_cast<unsigned long long>(counts.flips), static_cast<unsigned long long>(totals().guarded.load()), static_cast<unsigned long long>(totals().skipped.load()), static_cast<unsigned long long>(totals().conditionsRead.load()), static_cast<unsigned long long>(totals().predicated.load()), static_cast<unsigned long long>(totals().idleReaps.load()));
+    std::snprintf(text, sizeof(text), "draws %llu, dispatches %llu, refused %llu; label stores %llu (%llu at once on the CPU), interrupts %llu; waits %llu (%llu from the label table, %llu from guest memory, %llu polls); copies %llu (%llu on the CPU in stream order); run-time stores %llu (%llu refused); occlusion dumps %llu; flips %llu; guarded operations %llu (%llu skipped, %llu conditions read); predicated operations with no guard %llu; idle reaps %llu",
+                  static_cast<unsigned long long>(counts.draws), static_cast<unsigned long long>(counts.dispatches), static_cast<unsigned long long>(counts.refused), static_cast<unsigned long long>(counts.labels), static_cast<unsigned long long>(counts.labelsAtOnce), static_cast<unsigned long long>(counts.interrupts), static_cast<unsigned long long>(counts.waits), static_cast<unsigned long long>(counts.waitsFromTable), static_cast<unsigned long long>(counts.waitsFromGuest), static_cast<unsigned long long>(counts.waitPolls), static_cast<unsigned long long>(counts.copies), static_cast<unsigned long long>(counts.copiesOnCpu), static_cast<unsigned long long>(totals().runTimeStores.load()), static_cast<unsigned long long>(totals().runTimeRefused.load()), static_cast<unsigned long long>(totals().sampleDumps.load()), static_cast<unsigned long long>(counts.flips), static_cast<unsigned long long>(totals().guarded.load()), static_cast<unsigned long long>(totals().skipped.load()), static_cast<unsigned long long>(totals().conditionsRead.load()), static_cast<unsigned long long>(totals().predicated.load()), static_cast<unsigned long long>(totals().idleReaps.load()));
     return text;
 }
 

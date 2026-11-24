@@ -264,7 +264,7 @@ public:
 
     static Loop::Item loopItem(const Operation& operation, std::shared_ptr<const ResolvedDraw> resolved, const DecodeState& state) {
         Loop::Ensure(operation.queue);
-        Loop::Item item{operation, std::move(resolved), state.Held(), std::nullopt, {}, {}, state.Guards()};
+        Loop::Item item{operation, std::move(resolved), state.Held(), std::nullopt, {}, {}, state.Guards(), state.Live().sampleDumpBlocks};
         const auto* submission = state.CurrentSubmission();
         if (submission == nullptr || operation.packetOffset >= submission->commands.size()) return item;
         const auto header = submission->commands[operation.packetOffset];

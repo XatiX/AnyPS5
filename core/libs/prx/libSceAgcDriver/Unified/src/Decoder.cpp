@@ -51,6 +51,7 @@ bool executesWithoutMemory(std::span<const std::uint32_t> packet, std::uint32_t 
         case 0x69: case 0x76: case 0x79: case 0x7a: case 0x81:
             return true;
         case 0x37: return packet.size() > 4 && Pm4::CopyDataToRegister(packet);
+        case 0x46: return Pm4::SampleControl(packet);
         default: return false;
     }
 }
@@ -153,6 +154,12 @@ private:
                 }
                 break;
             case 0x63: case 0x64: case 0x9f: indirectRegisters(packet, opcode); return;
+            case 0x46:
+                if (Pm4::SampleDump(packet)) {
+                    store(packet, opcode);
+                    return;
+                }
+                break;
             default: break;
         }
         if (changesStateFromMemory(packet, opcode)) {
