@@ -36,6 +36,7 @@ add_library(libkernel SHARED EXCLUDE_FROM_ALL
         ${CMAKE_CURRENT_SOURCE_DIR}/DirectMemory/MemoryPoolExport.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/Pthread/src/Mutex.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/Pthread/src/LibcxxMutexForwards.cpp
+        ${CMAKE_CURRENT_SOURCE_DIR}/Pthread/src/LibcxxThreadForwards.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/Pthread/src/Cond.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/Pthread/src/Attr.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/Pthread/src/Thread.cpp
@@ -3481,8 +3482,12 @@ if(BUILD_TESTING)
     endfunction()
     add_host_performance_process_test(exit "begin called.release ran at exit" exit)
     add_host_performance_process_test(exit_without_handlers "begin called.release ran at exit" exit-without-handlers)
-    add_host_performance_process_test(refused "begin called" refused)
-    set_tests_properties(host_performance_process_refused PROPERTIES FAIL_REGULAR_EXPRESSION "release ran")
+    add_test(NAME host_performance_process_refused COMMAND host_performance_process_tests refused)
+    set_tests_properties(host_performance_process_refused PROPERTIES TIMEOUT 20 FAIL_REGULAR_EXPRESSION "release ran")
+    if(WIN32)
+        set_tests_properties(host_performance_process_refused PROPERTIES ENVIRONMENT_MODIFICATION
+            "PATH=path_list_prepend:$<TARGET_FILE_DIR:libc>")
+    endif()
     add_host_performance_process_test(off "off left the backend alone" off)
     set_tests_properties(host_performance_process_off PROPERTIES FAIL_REGULAR_EXPRESSION "begin called")
     add_host_performance_process_test(twice "second session refused" twice)
