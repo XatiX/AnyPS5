@@ -7,7 +7,10 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <mutex>
+#include <set>
 #include <string_view>
+#include <utility>
 
 namespace AgcDriver::Unified {
 
@@ -312,6 +315,13 @@ bool MemoryCore::resolveOwnedFault(std::uint64_t address, bool write) {
     const auto page = pageOf(address);
     auto* current = host.load(std::memory_order_acquire);
     if (current == nullptr) return false;
+    if (static const bool traced = std::getenv("APS5_RECODE_TRACE_OWNED_FAULTS") != nullptr; traced) {
+        static std::mutex traceMutex;
+        static std::set<std::pair<std::uintptr_t, std::uint64_t>> seenSites;
+        const auto site = FaultSites::PendingSite();
+        std::lock_guard traceLock(traceMutex);
+        if (seenSites.size() < 400u && seenSites.emplace(site, page).second) std::fprintf(stderr, "[recode-owned-fault] %s at 0x%llx from %s\n", write ? "write" : "read", static_cast<unsigned long long>(address), FaultSites::Describe(site).c_str());
+    }
     if (current->ImagePage(page)) (write ? imageWriteFaults : imageFaults).fetch_add(1, std::memory_order_relaxed);
     if (current->Bypass() || std::this_thread::get_id() == resolverThread) {
         if (std::this_thread::get_id() != resolverThread && written.Pending(page, PageBytes) <= current->Completed()) {

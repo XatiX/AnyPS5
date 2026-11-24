@@ -408,6 +408,8 @@ std::atomic<std::uint64_t> flipsWithoutRecords{0};
 std::atomic<std::uint32_t> flipNotes{0};
 std::atomic<std::uint32_t> flipMemoryNotes{0};
 std::atomic<std::uint64_t> mirrorSampleDumps{0};
+std::atomic<std::uint64_t> sampleDumpCopies{0};
+std::atomic<std::uint64_t> sampleDumpCopyMisses{0};
 
 bool argumentCensusOn() {
     static const bool on = std::getenv("APS5_RECODE_ARGUMENT_CENSUS") != nullptr;
@@ -1437,7 +1439,7 @@ public:
             std::snprintf(text, sizeof(text), "; mirror writes %.1f MiB, pages left GPU-owned %.1f MiB, edges landed whole %.1f MiB, edges snapshot %.1f MiB and landed by diff %.1f MiB, indirect arguments from the mirror %llu", static_cast<double>(totals.mirrorWriteBytes) / 1048576.0, static_cast<double>(totals.ownedBytes) / 1048576.0, static_cast<double>(totals.openLandedBytes) / 1048576.0, static_cast<double>(totals.edgeSnapshotBytes) / 1048576.0, static_cast<double>(totals.edgeDiffBytes) / 1048576.0, static_cast<unsigned long long>(totals.mirrorArguments));
             line += text;
         }
-        std::snprintf(text, sizeof(text), "; indirect draw arguments patched on the GPU for a constant rule %llu; mesh draws %llu (%llu empty); depth records written back before a buffer writer %llu; occlusion dumps into the mirror %llu", static_cast<unsigned long long>(totals.patchedArguments), static_cast<unsigned long long>(totals.meshDraws), static_cast<unsigned long long>(totals.meshEmpty), static_cast<unsigned long long>(totals.depthWriterHandOvers), static_cast<unsigned long long>(mirrorSampleDumps.load(std::memory_order_relaxed)));
+        std::snprintf(text, sizeof(text), "; indirect draw arguments patched on the GPU for a constant rule %llu; mesh draws %llu (%llu empty); depth records written back before a buffer writer %llu; occlusion dumps into the mirror %llu, copied from the import %llu (%llu without a mirror span)", static_cast<unsigned long long>(totals.patchedArguments), static_cast<unsigned long long>(totals.meshDraws), static_cast<unsigned long long>(totals.meshEmpty), static_cast<unsigned long long>(totals.depthWriterHandOvers), static_cast<unsigned long long>(mirrorSampleDumps.load(std::memory_order_relaxed)), static_cast<unsigned long long>(sampleDumpCopies.load(std::memory_order_relaxed)), static_cast<unsigned long long>(sampleDumpCopyMisses.load(std::memory_order_relaxed)));
         line += text;
         std::snprintf(text, sizeof(text), "; GPU-written chunks %llu switched to their import from the written bitmap (%.1f MiB copied over), %llu from other GPU writes, %llu refused, %llu written pieces already on an import", static_cast<unsigned long long>(totals.importSwitches), static_cast<double>(totals.switchBytes) / 1048576.0, static_cast<unsigned long long>(totals.writtenSwitches), static_cast<unsigned long long>(totals.switchRefused), static_cast<unsigned long long>(totals.writtenOnImports));
         line += text;
@@ -4444,12 +4446,33 @@ bool DumpSamplesToMirror(Graphics::Recorder& recorder, std::uint64_t address, st
     const auto span = ResidencyService::Get().MirrorSpan(address, bytes);
     if (!span || span->address == 0u) return false;
     if (!recorder.DumpSamples(span->address, address, blocks)) return false;
+    if (Downgrades::Active() && mirrorSampleDumps.load(std::memory_order_relaxed) < 24u) std::fprintf(stderr, "[recode-sample-dump] 0x%llx+0x%llx blocks 0x%x into the mirror\n", static_cast<unsigned long long>(address), static_cast<unsigned long long>(bytes), blocks);
     const auto mark = MemoryCore::Get().NoteGpuWrite(address, bytes, recorder.OpenBatchSerial());
     if (!mark.upload.empty()) ResidencyService::Get().NoteDirty(mark.upload);
     const std::array written{std::pair{address, address + bytes}};
     Events::NoteRanges(written);
     mirrorSampleDumps.fetch_add(1, std::memory_order_relaxed);
     return true;
+}
+
+bool SampleDumpsAlsoToMirror() {
+    static const bool on = std::getenv("APS5_RECODE_SAMPLE_DUMP_COPIES") != nullptr && std::getenv("APS5_RECODE_MIRROR_SAMPLE_DUMPS") == nullptr;
+    return on && RecordActive();
+}
+
+void CopySampleDumpToMirror(const Graphics::Context& context, Graphics::Recorder& recorder, VkBuffer import, VkDeviceSize offset, std::uint64_t address, std::uint64_t bytes) {
+    const auto span = ResidencyService::Get().MirrorSpan(address, bytes);
+    if (!span) {
+        sampleDumpCopyMisses.fetch_add(1, std::memory_order_relaxed);
+        return;
+    }
+    const auto commands = recorder.Commands();
+    Graphics::RecordMemoryBarrier(context, commands, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_ACCESS_SHADER_WRITE_BIT | VK_ACCESS_TRANSFER_WRITE_BIT, VK_ACCESS_TRANSFER_READ_BIT | VK_ACCESS_TRANSFER_WRITE_BIT);
+    Graphics::CopyBuffer(context, commands, import, offset, reinterpret_cast<VkBuffer>(static_cast<std::uintptr_t>(span->handle)), span->offset, bytes);
+    Graphics::RecordMemoryBarrier(context, commands, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_ACCESS_TRANSFER_WRITE_BIT, VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT | VK_ACCESS_TRANSFER_READ_BIT | VK_ACCESS_INDIRECT_COMMAND_READ_BIT);
+    const std::vector<std::pair<std::uint64_t, std::uint64_t>> written{{address, address + bytes}};
+    Shadow::NoteGpuWrites(written);
+    sampleDumpCopies.fetch_add(1, std::memory_order_relaxed);
 }
 
 bool PresentsExistingResidents() {

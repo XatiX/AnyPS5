@@ -3393,7 +3393,15 @@ bool VulkanDevice::DumpSamplesOnGpu(std::uint64_t address, std::uint32_t blocks)
     if (Graphics::AnyShadowedOverlaps(address, bytes)) Graphics::PublishShadow(address, bytes, Graphics::PublishScope::PartialUnits, Graphics::PublishReason::Label);
     if (!recorder.QueuesSampleDumps()) recorder.FlushStoresOverlapping(address, bytes);
     recorder.FlushKeyStoresOverlapping(address, bytes);
-    if (!recorder.DumpSamples(import->address + (address - import->base), address, blocks)) return false;
+#if ANYPS5_UNIFIED
+    const bool alsoMirror = Unified::Record::SampleDumpsAlsoToMirror();
+#else
+    const bool alsoMirror = false;
+#endif
+    if (!recorder.DumpSamples(import->address + (address - import->base), alsoMirror ? 0u : address, blocks)) return false;
+#if ANYPS5_UNIFIED
+    if (alsoMirror) Unified::Record::CopySampleDumpToMirror(context, recorder, import->buffer, address - import->base, address, bytes);
+#endif
     recorder.NotePendingWrite(address, bytes);
     GuestMemory::MarkWritten(address, bytes);
     return true;
