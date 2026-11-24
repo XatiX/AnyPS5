@@ -17,6 +17,7 @@
 #include "prx/libSceAgcDriver/Unified/include/Targets.hpp"
 #include "prx/libSceAgcDriver/Unified/include/VulkanImages.hpp"
 #include "prx/libSceAgcDriver/Unified/include/VulkanHeap.hpp"
+#include "prx/libSceAgcDriver/Unified/include/StageCosts.hpp"
 #include "Optimization/ShaderStageInputInfo.hpp"
 #include <atomic>
 #include <chrono>
@@ -423,11 +424,11 @@ private:
             TargetUses(state.Live(), targets);
             noteTargetWrites(targets);
             refuse(totals, reason);
-            totals.programNanoseconds += elapsed(started);
+            noteProgram(totals.programNanoseconds, started);
             return nullptr;
         }
         const auto slotsStarted = std::chrono::steady_clock::now();
-        totals.programNanoseconds += elapsed(started);
+        noteProgram(totals.programNanoseconds, started);
         if (!firstBuilt) {
             firstBuilt = true;
             std::fprintf(stderr, "[recode-resolve] first program set: %zu stages\n", programs.stages.size());
@@ -467,7 +468,7 @@ private:
         inputs.computeWave64 = &computeWave64;
         const bool built = BuildComputeProgram(inputs, operation.dispatch, programs, reason);
         for (std::size_t phase = 0; phase < PhaseCount; ++phase) dispatchTotals.phases[phase] += programs.nanoseconds[phase];
-        dispatchTotals.programNanoseconds += elapsed(started);
+        noteProgram(dispatchTotals.programNanoseconds, started);
         if (!built) {
             refuse(dispatchTotals, reason);
             return nullptr;
@@ -502,7 +503,7 @@ private:
                 Heap::SlotStatistics statistics;
                 if (!Heap::BuildSlotRequests(stage.variant->info, stage.capture->snapshot, requests, statistics, reason, storageDispatches() && (&counts == &dispatchTotals || storageDraws()))) {
                     refuse(counts, reason);
-                    counts.slotNanoseconds += elapsed(slotsStarted);
+                    noteSlots(counts, slotsStarted);
                     return nullptr;
                 }
             }
@@ -533,7 +534,7 @@ private:
             ResolvedStage resolved{std::move(stage), {}};
             if (!refill->Fill(requests, resolved.slots, reason, &imageUses, &resolved.owners, &resolved.deferredImages) ||!PatchSlots(*resolved.program.result, resolved.slots, resolved.program.words, reason)) {
                 refuse(counts, reason);
-                counts.slotNanoseconds += elapsed(slotsStarted);
+                noteSlots(counts, slotsStarted);
                 return nullptr;
             }
             counts.fillNanoseconds += elapsed(partStarted);
@@ -541,7 +542,7 @@ private:
             if (std::ranges::any_of(resolved.program.result->bindings, [](const ShaderRecompiler::DescriptorBinding& binding) { return binding.role == ShaderRecompiler::DescriptorRole::ImageTableMap; })) {
                 if (!resolved.program.result->directHeap) {
                     refuse(counts, "image tables outside heap mode");
-                    counts.slotNanoseconds += elapsed(slotsStarted);
+                    noteSlots(counts, slotsStarted);
                     return nullptr;
                 }
                 std::shared_ptr<const ShaderRecompiler::ResolvedImageTables> tables;
@@ -573,7 +574,7 @@ private:
                 else if (mirrorsAfter.inPlace != mirrorsBefore.inPlace) counts.mirrorInPlaceNanoseconds += mirrorSpent;
                 if (resolved.tableMap == nullptr) {
                     refuse(counts, reason);
-                    counts.slotNanoseconds += elapsed(slotsStarted);
+                    noteSlots(counts, slotsStarted);
                     return nullptr;
                 }
                 tablePlaceholdersHere += refill->Counts().placeholders - tablePlaceholders;
@@ -599,7 +600,7 @@ private:
         for (const auto& stage : draw.stages) inputsOfLayout.push_back({stage.program.stage, stage.program.result.get()});
         if (!Bindings::Describe(inputsOfLayout, draw.layout, reason)) {
             refuse(counts, reason);
-            counts.slotNanoseconds += elapsed(slotsStarted);
+            noteSlots(counts, slotsStarted);
             return nullptr;
         }
         Bindings::CountSources(draw.layout, counts.sources);
@@ -611,7 +612,7 @@ private:
             counts.placeholderDraws++;
         }
         counts.layoutNanoseconds += elapsed(layoutStarted);
-        counts.slotNanoseconds += elapsed(slotsStarted);
+        noteSlots(counts, slotsStarted);
         counts.stages += draw.stages.size();
         counts.uses += draw.uses.size();
         if (!draw.complete) counts.incomplete++;
@@ -738,6 +739,19 @@ private:
 
     static std::uint64_t elapsed(std::chrono::steady_clock::time_point from) {
         return static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - from).count());
+    }
+
+    static void noteProgram(std::uint64_t& total, std::chrono::steady_clock::time_point from) {
+        const auto spent = elapsed(from);
+        total += spent;
+        StageCosts::Note(StageCosts::Stage::Resolve, spent, 1u);
+    }
+
+    template <typename Counts>
+    static void noteSlots(Counts& counts, std::chrono::steady_clock::time_point from) {
+        const auto spent = elapsed(from);
+        counts.slotNanoseconds += spent;
+        StageCosts::Note(StageCosts::Stage::Resolve, spent, 0u);
     }
 
     void noteRefusal(const std::string& reason) {

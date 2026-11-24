@@ -18,6 +18,7 @@
 #include "prx/libSceAgcDriver/Unified/include/DataRing.hpp"
 #include "prx/libSceAgcDriver/Unified/include/DepthRecords.hpp"
 #include "prx/libSceAgcDriver/Unified/include/LabelImports.hpp"
+#include "prx/libSceAgcDriver/Unified/include/StageCosts.hpp"
 #include "prx/libSceAgcDriver/Unified/include/Downgrades.hpp"
 #include "prx/libSceAgcDriver/Unified/include/Events.hpp"
 #include "prx/libSceAgcDriver/Unified/include/ImageDetile.hpp"
@@ -1440,7 +1441,9 @@ public:
         } catch (const std::exception& error) {
             reason = std::string("record failed: ") + error.what();
         }
-        totals.nanoseconds += elapsed(started);
+        const auto recordSpent = elapsed(started);
+        totals.nanoseconds += recordSpent;
+        StageCosts::Note(StageCosts::Stage::Record, recordSpent);
         if (recorded) {
             totals.recorded++;
             noteExtent(draw);
@@ -1610,6 +1613,7 @@ public:
         std::lock_guard lock(mutex);
         printArgumentCensus();
         printExistingPackets();
+        std::fprintf(stderr, "%s\n", StageCosts::Line(ResidencyService::Get().Frame()).c_str());
         if (!totals.sampledCreations.empty()) {
             std::vector<std::pair<std::uint64_t, std::string>> top;
             for (const auto& [shape, count] : totals.sampledCreations) top.emplace_back(count, shape);
@@ -4100,7 +4104,9 @@ private:
             if (Shadow::RecordOwnedUploads(uploadCommands, kept) != 0u) totals.residencyLands++;
             recorder->EndGpuTiming(uploadTiming);
             for (auto& object : kept) recorder->Keep(std::move(object));
-            totals.uploadNanoseconds += elapsed(phase);
+            const auto uploadSpent = elapsed(phase);
+            totals.uploadNanoseconds += uploadSpent;
+            StageCosts::Note(StageCosts::Stage::HostCopy, uploadSpent);
         }
         split(5);
         const auto key = Graphics::DrawRenderPassKey(context, state, views);
@@ -4740,11 +4746,13 @@ void LandAfterBatch(Graphics::Recorder& recorder, std::function<void()> landing)
     landings.pending.fetch_add(1, std::memory_order_acq_rel);
     landings.scheduled.fetch_add(1, std::memory_order_relaxed);
     recorder.OnComplete([landing = std::move(landing)] {
+        const auto started = std::chrono::steady_clock::now();
         try {
             landing();
         } catch (const std::exception& error) {
             std::fprintf(stderr, "[recode-landings] a landing after its batch failed: %s\n", error.what());
         }
+        StageCosts::Note(StageCosts::Stage::HostCopy, elapsed(started));
         batchLandings().pending.fetch_sub(1, std::memory_order_acq_rel);
     });
 }
@@ -5163,7 +5171,10 @@ bool RecordDispatchPrecheck(const Context& context, VulkanDevice& owner, const R
 }
 
 bool RecordDispatch(const Context& context, const Resolve::ResolvedDraw& dispatch, const std::array<std::uint32_t, 3>& groups, std::string& reason) {
-    return shared().RecordDispatch(context, dispatch, groups, reason);
+    const auto started = std::chrono::steady_clock::now();
+    const bool recorded = shared().RecordDispatch(context, dispatch, groups, reason);
+    StageCosts::Note(StageCosts::Stage::Record, elapsed(started));
+    return recorded;
 }
 
 void PrebuildDispatch(const Context& context, VulkanDevice& owner, const Resolve::ResolvedDraw& dispatch) {

@@ -1,6 +1,7 @@
 #ifndef CORE_LIBS_PRX_LIBSCEAGCDRIVER_UNIFIED_INCLUDE_PACKETTABLE_HPP
 #define CORE_LIBS_PRX_LIBSCEAGCDRIVER_UNIFIED_INCLUDE_PACKETTABLE_HPP
 
+#include "prx/libSceAgcDriver/Unified/include/StageCosts.hpp"
 #include <algorithm>
 #include <chrono>
 #include <condition_variable>
@@ -67,7 +68,9 @@ public:
                 return {};
             }
             ++counts.waited;
+            const auto waitStarted = std::chrono::steady_clock::now();
             offeredSignal.wait_for(lock, wait, [&] { return (found = entries.find(key)) != entries.end() || queues[queueId].offered > position; });
+            StageCosts::Note(StageCosts::Stage::Order, static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - waitStarted).count()));
         }
         if (found == entries.end()) {
             ++counts.missed;

@@ -1,7 +1,7 @@
 if(NOT ANYPS5_GPU_BACKEND STREQUAL "unified")
     return()
 endif()
-add_test_executable(agc_unified_packet_table_tests EXCLUDE_FROM_ALL tests/UnifiedPacketTable.cpp)
+add_test_executable(agc_unified_packet_table_tests EXCLUDE_FROM_ALL tests/UnifiedPacketTable.cpp Unified/src/StageCosts.cpp)
 target_include_directories(agc_unified_packet_table_tests PRIVATE ${LIBS_INCLUDE_DIR})
 target_link_libraries(agc_unified_packet_table_tests PRIVATE libc)
 set_target_properties(agc_unified_packet_table_tests PROPERTIES CXX_EXTENSIONS OFF)
