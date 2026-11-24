@@ -424,6 +424,22 @@ struct ArgumentTally {
     std::uint64_t elements = 0;
 };
 
+std::mutex existingPacketMutex;
+std::map<std::uint64_t, std::uint64_t> existingPackets;
+
+void printExistingPackets() {
+    std::lock_guard lock(existingPacketMutex);
+    if (existingPackets.empty()) return;
+    std::string line = "[recode-packets] packets through the existing packet loop since the last line:";
+    for (const auto& [key, count] : existingPackets) {
+        char text[64];
+        std::snprintf(text, sizeof(text), " q%llx:0x%02llx %llu", static_cast<unsigned long long>(key >> 32u), static_cast<unsigned long long>((key >> 8u) & 0xffu), static_cast<unsigned long long>(count));
+        line += text;
+    }
+    std::fprintf(stderr, "%s\n", line.c_str());
+    existingPackets.clear();
+}
+
 std::mutex argumentCensusMutex;
 std::map<std::uint64_t, ArgumentTally> argumentCensus;
 
@@ -1388,6 +1404,7 @@ public:
     std::string Line() {
         std::lock_guard lock(mutex);
         printArgumentCensus();
+        printExistingPackets();
         const auto pipelineCounts = takePipelineCounts();
         char text[384];
         const auto draws = totals.recorded + totals.refused;
@@ -4453,6 +4470,31 @@ bool DumpSamplesToMirror(Graphics::Recorder& recorder, std::uint64_t address, st
     Events::NoteRanges(written);
     mirrorSampleDumps.fetch_add(1, std::memory_order_relaxed);
     return true;
+}
+
+void NoteExistingPacket(std::uint32_t header, std::uint32_t queue) {
+    if (!RecordActive() || !Downgrades::Active()) return;
+    const auto key = (static_cast<std::uint64_t>(queue) << 32u) | (header & 0x0000ff00u);
+    std::lock_guard lock(existingPacketMutex);
+    existingPackets[key]++;
+}
+
+void NoteSampleDumpBefore(std::uint64_t address) {
+    static const bool traced = std::getenv("APS5_RECODE_TRACE_SAMPLE_DUMPS") != nullptr;
+    if (!traced) return;
+    static std::atomic<std::uint64_t> seen{0};
+    static std::atomic<std::uint64_t> zero{0};
+    static std::atomic<std::uint64_t> notReady{0};
+    static std::atomic<std::uint64_t> counted{0};
+    std::uint64_t value = 0;
+    if (!GuestMemory::Accessible(reinterpret_cast<const void*>(static_cast<std::uintptr_t>(address)), sizeof(value), false)) return;
+    std::memcpy(&value, reinterpret_cast<const void*>(static_cast<std::uintptr_t>(address)), sizeof(value));
+    const auto samples = value & ~(1ull << 63u);
+    if ((value >> 63u) == 0u) notReady.fetch_add(1, std::memory_order_relaxed);
+    else if (samples == 0u) zero.fetch_add(1, std::memory_order_relaxed);
+    else counted.fetch_add(1, std::memory_order_relaxed);
+    const auto total = seen.fetch_add(1, std::memory_order_relaxed) + 1u;
+    if (total % 20000u == 0u) std::fprintf(stderr, "[recode-sample-values] %llu dumps: block held before the dump: not ready %llu, ready with 0 samples %llu, ready with samples %llu; last 0x%llx = 0x%016llx\n", static_cast<unsigned long long>(total), static_cast<unsigned long long>(notReady.load()), static_cast<unsigned long long>(zero.load()), static_cast<unsigned long long>(counted.load()), static_cast<unsigned long long>(address), static_cast<unsigned long long>(value));
 }
 
 bool SampleDumpsAlsoToMirror() {
