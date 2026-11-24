@@ -4098,7 +4098,9 @@ private:
                 InputSource source = InputSource::Imported;
                 const auto input = drawInput(context, begin, end - begin, source);
                 if (!input) {
-                    reason = "vertex buffer not imported";
+                    char range[96];
+                    std::snprintf(range, sizeof(range), " 0x%llx+0x%llx", static_cast<unsigned long long>(begin), static_cast<unsigned long long>(end - begin));
+                    reason = std::string("vertex buffer not imported") + range;
                     if (Downgrades::Active() && inputRefusalLines.fetch_add(1, std::memory_order_relaxed) < 16u) std::fprintf(stderr, "[recode-input] vertex buffer 0x%llx+0x%llx not imported: source %d, gpu pending %d, GPU-owned pages %zu, aliased %d, program %016llx\n", static_cast<unsigned long long>(begin), static_cast<unsigned long long>(end - begin), static_cast<int>(source), gpuPending(begin, end - begin) ? 1 : 0, MemoryCore::Get().Pages().GpuOwnedIn(begin, end - begin).size(), DirectMemoryAliased_nid_postfix(static_cast<std::uintptr_t>(begin), static_cast<std::size_t>(end - begin)) ? 1 : 0, static_cast<unsigned long long>(Downgrades::ProgramHash(draw.stages.back().program.codeAddress)));
                     return false;
                 }
