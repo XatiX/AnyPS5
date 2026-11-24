@@ -372,7 +372,10 @@ private:
             ++state.counts.stateErrors;
             return;
         }
-        if (stores.empty()) return;
+        if (stores.empty()) {
+            if (opcode == 0x50 && packet.size() == 7u && Pm4::DmaDestination(packet) == Pm4::DmaSelectGds && Pm4::DmaBytes(packet) != 0u) emit(OpKind::Copy, Pm4::GdsAddress() + packet[4], Pm4::DmaBytes(packet), 0);
+            return;
+        }
         const auto& first = stores.front();
         if (first.value == Pm4::PacketStore::Value::Pattern) {
             std::uint32_t value = 0;

@@ -437,8 +437,10 @@ private:
             Record::RefuseUnrecorded("loop sample dump", 0, "the occlusion counter dump was not recorded");
             return;
         }
-        bool onCpu = false;
-        for (const auto& piece : Pm4::DecodeStores(item.words)) {
+        const auto pieces = Pm4::DecodeStores(item.words);
+        bool onCpu = pieces.empty() && opcode == 0x50u && item.words.size() == 7u && Pm4::DmaDestination(item.words) == Pm4::DmaSelectGds;
+        if (onCpu) totals().runTimeStores.fetch_add(1, std::memory_order_relaxed);
+        for (const auto& piece : pieces) {
             if (piece.value == Pm4::PacketStore::Value::Bytes) {
                 storeBytes(context, piece.address, piece.data);
                 continue;
@@ -568,7 +570,7 @@ bool Takes(std::span<const std::uint32_t> packet, std::uint32_t opcode, std::uin
             case 0x40:
                 if (packet.size() >= 6u && Pm4::CopyDataToRegister(packet)) return false;
                 return !Pm4::DecodeStores(packet).empty();
-            case 0x50: return !Pm4::DecodeStores(packet).empty();
+            case 0x50: return true;
             case 0x46: case 0x58: return true;
             default: return false;
         }
