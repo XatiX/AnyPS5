@@ -170,7 +170,50 @@ std::vector<DirtyRange> MemoryCore::ConsumeDirty() {
         Downgrades::WatchTouch("a CPU change found on consume", range.address, range.size);
         Events::Shared().Note(range.address, range.size);
     }
-    return ranges;
+    if (sharedPreImages.empty()) return ranges;
+    std::vector<DirtyRange> narrowed;
+    for (const auto& range : ranges) {
+        const auto end = range.address + range.size;
+        for (auto at = range.address; at < end;) {
+            const std::uint64_t page = at & ~(PageBytes - 1u);
+            const auto stop = std::min(end, page + PageBytes);
+            const auto found = sharedPreImages.find(page);
+            if (found == sharedPreImages.end() || !Protector::Readable(page)) {
+                narrowed.push_back({at, stop - at});
+                at = stop;
+                continue;
+            }
+            const auto* now = reinterpret_cast<const std::byte*>(static_cast<std::uintptr_t>(page));
+            const auto& before = found->second;
+            for (auto offset = at - page; offset < stop - page;) {
+                if (now[offset] == before[offset]) {
+                    ++offset;
+                    continue;
+                }
+                auto last = offset + 1u;
+                while (last < stop - page && now[last] != before[last]) ++last;
+                narrowed.push_back({page + offset, last - offset});
+                sharedNarrowedBytes.fetch_add(last - offset, std::memory_order_relaxed);
+                offset = last;
+            }
+            sharedPreImages.erase(found);
+            at = stop;
+        }
+    }
+    return narrowed;
+}
+
+void MemoryCore::TrackGpuShared(std::uint64_t address, std::uint64_t size) {
+    if (size == 0) return;
+    std::lock_guard lock(mutex);
+    for (std::uint64_t page = address & ~(PageBytes - 1u); page < address + size; page += PageBytes) sharedPages.insert(page);
+}
+
+void MemoryCore::keepSharedPreImage(std::uint64_t page) {
+    if (!sharedPages.contains(page) || sharedPreImages.contains(page) || !Protector::Readable(page)) return;
+    auto& image = sharedPreImages[page];
+    image.resize(PageBytes);
+    std::memcpy(image.data(), reinterpret_cast<const void*>(static_cast<std::uintptr_t>(page)), PageBytes);
 }
 
 void MemoryCore::MarkGpuOwned(std::uint64_t address, std::uint64_t size) {
@@ -227,6 +270,11 @@ bool MemoryCore::HandleFault(std::uint64_t address, bool write) {
     Downgrades::WatchTouch("a CPU write fault", address & ~(PageBytes - 1), PageBytes);
     Events::Shared().Note(address & ~(PageBytes - 1), PageBytes);
     faultTableNanoseconds.fetch_add(since(tableStart), std::memory_order_relaxed);
+    if (!sharedPages.empty()) {
+        for (const auto& change : changes) {
+            for (auto page = change.address; page < change.address + change.size; page += PageBytes) keepSharedPreImage(page);
+        }
+    }
     bool held = false;
     const auto protectStart = std::chrono::steady_clock::now();
     protector.Apply(changes, &held);
@@ -251,6 +299,11 @@ void MemoryCore::PrepareHostWrite(std::uint64_t address, std::uint64_t size) {
         }
         if (state != PageState::CpuClean) continue;
         if (pages.HandleWrite(page, changes)) hostWritesOpened.fetch_add(1, std::memory_order_relaxed);
+    }
+    if (!sharedPages.empty()) {
+        for (const auto& change : changes) {
+            for (auto at = change.address; at < change.address + change.size; at += PageBytes) keepSharedPreImage(at);
+        }
     }
     protector.Apply(changes);
 }

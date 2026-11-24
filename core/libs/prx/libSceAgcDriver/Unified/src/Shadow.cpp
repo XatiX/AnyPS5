@@ -662,7 +662,7 @@ void NoteGpuWrites(GuestRanges ranges) {
         marked.emplace(begin, end);
         MemoryCore::Get().Pages().NoteGpuWritten(begin, end - begin);
         static const bool tracks = std::getenv("APS5_RECODE_NO_GPU_WRITE_TRACKING") == nullptr;
-        if (tracks) static_cast<void>(registerRange(begin, end));
+        if (tracks && registerRange(begin, end)) MemoryCore::Get().TrackGpuShared(begin, end - begin);
     }
 }
 

@@ -14,6 +14,7 @@
 #include <span>
 #include <thread>
 #include <unordered_map>
+#include <unordered_set>
 #include <vector>
 
 namespace AgcDriver::Unified {
@@ -123,6 +124,7 @@ public:
     std::uint64_t NoteWrittenBytes(std::uint64_t address, std::uint64_t size, std::uint64_t serial);
     std::uint64_t NoteStoredBytes(std::uint64_t address, std::span<const std::byte> before, std::uint64_t serial);
     void ReleaseStoredBytes(std::uint64_t address, std::uint64_t size, std::uint64_t sequence);
+    void TrackGpuShared(std::uint64_t address, std::uint64_t size);
     void LandDiff(std::uint64_t address, std::span<const std::byte> before, std::span<const std::byte> after, std::uint64_t serial);
     void FlushGpuWrites(std::uint64_t address, std::uint64_t size);
     void LandAhead();
@@ -154,6 +156,7 @@ private:
     void leaveUnviewed(GpuWriteMark& mark, std::uint64_t address, std::uint64_t size, MemoryHost* current);
     void landDiffThrough(std::byte* view, std::uint64_t address, std::span<const std::byte> before, std::span<const std::byte> after, std::uint64_t serial, MemoryHost& current);
     void openWithPreImage(std::uint64_t page);
+    void keepSharedPreImage(std::uint64_t page);
     std::uint64_t landOpenPieces(std::uint64_t page, std::uint64_t completed, std::uint64_t begin, std::uint64_t end);
     void noteHot(std::uint64_t page);
     void resolverLoop();
@@ -173,6 +176,9 @@ private:
         std::vector<std::byte> bytes;
         std::uint64_t sequence = 0;
     };
+    std::unordered_set<std::uint64_t> sharedPages;
+    std::unordered_map<std::uint64_t, std::vector<std::byte>> sharedPreImages;
+    std::atomic<std::uint64_t> sharedNarrowedBytes{0};
     mutable std::mutex storedMutex;
     std::map<std::uint64_t, StoredBefore> storedBefore;
     std::uint64_t landedDiffBytes = 0;
