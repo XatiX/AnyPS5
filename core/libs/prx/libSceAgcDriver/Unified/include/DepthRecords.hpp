@@ -130,6 +130,10 @@ public:
         std::lock_guard lock(mutex);
         return counts;
     }
+    void Clear() {
+        std::lock_guard lock(mutex);
+        records.clear();
+    }
     [[nodiscard]] std::size_t Size() const {
         std::lock_guard lock(mutex);
         return records.size();

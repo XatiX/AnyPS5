@@ -1733,6 +1733,75 @@ private:
         return line + part;
     }
 
+public:
+    std::uint64_t WriteBackAll(const Context& context, Graphics::Recorder& recorder) {
+        std::lock_guard lock(mutex);
+        std::uint64_t written = 0;
+        if (surfaceDetiler == nullptr) surfaceDetiler = std::make_unique<Images::SurfaceDetiler>(context);
+        if (auto* table = Resolve::Surfaces(); table != nullptr && ownsImages()) {
+            for (const auto& record : table->StaleOverlapping(0u, MirrorWindow())) {
+                if (record->retired || table->ChangedSinceWrite(*record)) continue;
+                std::string reason;
+                if (!surfaceDetiler->WriteBack(recorder, record, reason)) continue;
+                noteWrittenBack(recorder, record->key.address, record->key.bytes);
+                table->MarkWrittenBack(*record);
+                ++written;
+            }
+        }
+        if (Images::DepthRecordsOn()) {
+            for (const auto& record : Images::Depths().Overlapping(0u, MirrorWindow())) {
+                if (!record->Initialized() || !record->TakeDrawn()) continue;
+                std::vector<std::pair<std::uint64_t, std::uint64_t>> planes;
+                std::string reason;
+                if (!surfaceDetiler->WriteBackDepth(recorder, record, planes, reason)) continue;
+                for (const auto& [begin, size] : planes) noteWrittenBack(recorder, begin, size);
+                ++written;
+            }
+        }
+        return written;
+    }
+
+    void Detach(VkDevice replaced) {
+        {
+            std::unique_lock jobs(pipelineMutex);
+            pipelinesDone.wait(jobs, [&] { return pipelineJobs.empty() && buildingPipelines.empty(); });
+        }
+        std::lock_guard lock(mutex);
+        if (device != replaced) return;
+        device = VK_NULL_HANDLE;
+        ring.reset();
+        ringAddress = 0;
+        space.reset();
+        faults.clear();
+        spareFaults.clear();
+        knownWrites.clear();
+        copyBacks.clear();
+        writtenRecords.clear();
+        stageStorageImages.clear();
+        groupReads.reset();
+        argumentReads.reset();
+        layouts.clear();
+        pools.clear();
+        spare.clear();
+        maps.clear();
+        mapBytes = 0;
+        surfaceDetiler.reset();
+        metadataClears.reset();
+        htileClears.reset();
+        {
+            std::lock_guard jobs(pipelineMutex);
+            computePipelines.clear();
+            failedPipelines.clear();
+        }
+        landing.clear();
+        landingSerials.clear();
+        pendingDiffs.clear();
+        emptyLayout = VK_NULL_HANDLE;
+        targetMemo = {};
+        std::fprintf(stderr, "[recode-record] detached from the replaced device; the next recorded work attaches to the new one\n");
+    }
+
+private:
     bool attach(const Context& context, std::string& reason) {
         if (device == context.device && ring != nullptr) return true;
         if (device != VK_NULL_HANDLE) {
@@ -4750,6 +4819,22 @@ bool DumpSamplesToMirror(const Context& context, Graphics::Recorder& recorder, s
     });
     sampleDumpsLanded.fetch_add(1, std::memory_order_relaxed);
     return true;
+}
+
+void DeviceReplaced(const Context& context, Graphics::Recorder& recorder) {
+    if (!RecordActive()) return;
+    const auto written = shared().WriteBackAll(context, recorder);
+    recorder.Sync();
+    auto& core = MemoryCore::Get();
+    std::uint64_t landed = 0;
+    for (const auto& piece : core.Written().In(0u, MirrorWindow())) {
+        core.FlushGpuWrites(piece.begin, piece.end - piece.begin);
+        landed += piece.end - piece.begin;
+    }
+    shared().Detach(context.device);
+    Images::Depths().Clear();
+    ResidencyService::Get().Detach();
+    std::fprintf(stderr, "[recode-device] replaced: %llu records written back, %llu GPU-written bytes landed\n", static_cast<unsigned long long>(written), static_cast<unsigned long long>(landed));
 }
 
 int StoreToMirror(const Context& context, Graphics::Recorder& recorder, std::uint64_t address, std::span<const std::byte> bytes, std::uint64_t stamp, std::uint32_t queue) {

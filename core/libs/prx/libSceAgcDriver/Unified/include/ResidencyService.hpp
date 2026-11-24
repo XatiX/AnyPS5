@@ -31,6 +31,7 @@ public:
 
     bool Attach(const Graphics::Context& context);
     [[nodiscard]] bool Attached() const;
+    void Detach();
     void Add(std::uint64_t address, std::uint64_t size);
     void NoteDirty(std::span<const DirtyRange> ranges);
     bool Prepare(std::uint64_t address, std::uint64_t size);
@@ -101,6 +102,7 @@ private:
     std::atomic<std::uint64_t> frame{1};
     std::atomic<bool> attached{false};
     std::atomic<bool> refused{false};
+    std::atomic<std::uint64_t> detaches{0};
     std::uint64_t recordedUploads = 0;
     std::uint64_t recordedBytes = 0;
     std::vector<std::shared_ptr<Graphics::Buffer>> stagingPool;

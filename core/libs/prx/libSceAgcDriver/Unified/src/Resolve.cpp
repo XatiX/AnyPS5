@@ -208,6 +208,13 @@ public:
         if (device == nullptr || device.get() == attachedDevice.load(std::memory_order_acquire)) return;
         std::lock_guard lock(mutex);
         if (device.get() == attached.get()) return;
+        if (attached != nullptr && surfaces != nullptr) {
+            publishedSurfaces.store(nullptr, std::memory_order_release);
+            targetViews.reset();
+            surfaces.reset();
+            surfaceDevice.reset();
+            std::fprintf(stderr, "[recode-resolve] device replaced: image records dropped, they refill from guest memory\n");
+        }
         attached = device;
         attachedDevice.store(device.get(), std::memory_order_release);
         context = std::make_unique<Graphics::Context>(device->graphicsContext());

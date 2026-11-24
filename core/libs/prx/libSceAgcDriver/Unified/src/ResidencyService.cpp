@@ -96,6 +96,24 @@ bool ResidencyService::Attach(const Graphics::Context& graphics) {
     return true;
 }
 
+void ResidencyService::Detach() {
+    std::lock_guard lock(mutex);
+    if (!attached.load(std::memory_order_acquire)) return;
+    if (ledger != nullptr) {
+        for (const auto& span : ledger->Covering(0u, MirrorWindow())) queued.emplace_back(span.address, span.size);
+    }
+    uploads.reset();
+    ledger.reset();
+    device.reset();
+    mirrorTable.reset();
+    served.clear();
+    importSpaces.clear();
+    context.reset();
+    detaches.fetch_add(1, std::memory_order_relaxed);
+    attached.store(false, std::memory_order_release);
+    std::fprintf(stderr, "[recode-residency] detached from the replaced device; %zu ranges queued for the next device\n", queued.size());
+}
+
 bool ResidencyService::Attached() const {
     return attached.load(std::memory_order_acquire);
 }
@@ -495,9 +513,10 @@ void ResidencyService::SetKeep(Residency::Keep next) {
 }
 
 std::uint64_t ResidencyService::Removals() const {
-    if (!Attached()) return 0;
+    const auto offset = detaches.load(std::memory_order_relaxed) << 40u;
+    if (!Attached()) return offset;
     std::lock_guard lock(mutex);
-    return ledger->Removals();
+    return offset + ledger->Removals();
 }
 
 std::uint64_t ResidencyService::ReadBackBytes() const {

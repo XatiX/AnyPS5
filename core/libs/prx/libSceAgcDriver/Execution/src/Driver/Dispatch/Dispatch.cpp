@@ -28,6 +28,7 @@
 #if ANYPS5_UNIFIED
 #include "prx/libSceAgcDriver/Execution/include/VulkanDevice.hpp"
 #include "prx/libSceAgcDriver/Unified/include/DrawRecorder.hpp"
+#include "prx/libSceAgcDriver/Unified/include/Shadow.hpp"
 #endif
 
 namespace AgcDriver::DriverDetail {
@@ -349,6 +350,9 @@ void Driver::dispatch(QueueState& queue, std::span<const std::uint32_t> packet, 
         if (device == nullptr) device = std::make_shared<VulkanDevice>();
         localDevice = device;
     }
+#if ANYPS5_UNIFIED
+    if (Unified::Record::RecordActive()) Unified::Shadow::NoteDevice(localDevice);
+#endif
     const auto codeOffset = static_cast<std::size_t>((address - snapshot.codeAddress) / sizeof(std::uint32_t));
     std::array<std::uint32_t, 5> resolved{};
     ResolvedDispatch ahead;

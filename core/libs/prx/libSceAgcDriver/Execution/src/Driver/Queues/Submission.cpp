@@ -16,6 +16,8 @@
 #include "ThreadOwned.hpp"
 #include "prx/libc/include/HostThreadLocal.hpp"
 #if ANYPS5_UNIFIED
+#include "prx/libSceAgcDriver/Execution/include/VulkanDevice.hpp"
+#include "prx/libSceAgcDriver/Unified/include/DrawRecorder.hpp"
 #include "prx/libSceAgcDriver/Unified/include/Shadow.hpp"
 #endif
 #include <algorithm>
@@ -1052,7 +1054,19 @@ void Driver::noteWaitBlocked(std::uint32_t queue, std::uint64_t awaited, bool bl
 
 void Driver::enqueue(Submission submission) {
 #if ANYPS5_UNIFIED
-    if (Unified::Shadow::Teeing()) Unified::Shadow::Tee(submission);
+    if (Unified::Shadow::Teeing()) {
+        if (Unified::Record::RecordActive() && !submission.commands.empty()) {
+            auto local = device.Load();
+            if (local == nullptr) {
+                GuestMemory::TagGpuLockSite(GuestMemory::GpuLockSite::Dispatch);
+                std::lock_guard gpuLock(GuestMemory::GpuMutex());
+                if (device == nullptr) device = std::make_shared<VulkanDevice>();
+                local = device;
+            }
+            Unified::Shadow::NoteDevice(local);
+        }
+        Unified::Shadow::Tee(submission);
+    }
 #endif
     const auto queue = submission.queue;
     submission.waitFree = waitFree(submission);

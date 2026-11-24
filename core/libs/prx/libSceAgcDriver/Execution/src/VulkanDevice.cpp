@@ -3126,6 +3126,10 @@ void VulkanDevice::PrepareForReplacement() {
     Graphics::FlushCachedTextures(state->device);
     Graphics::PublishAllShadows(state->context, Graphics::PublishReason::Teardown);
     WaitIdle();
+#if ANYPS5_UNIFIED
+    Unified::Record::DeviceReplaced(graphicsContext(), *state->recorder);
+    WaitIdle();
+#endif
     Graphics::DestroyShadows(state->device);
     // The replacement's draws never find this device's pipelines (the store keys on the device), and
     // the device lives on until the driver stops: destroy them now rather than then.
