@@ -10,6 +10,7 @@
 #include "prx/libSceAgcDriver/Graphics/include/Shaders.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/State.hpp"
 #include "Optimization/ShaderStageInputInfo.hpp"
+#include "RdnaDecoder/RdnaInstructionDecoder.hpp"
 #include <algorithm>
 #include <array>
 #include <atomic>
@@ -116,6 +117,61 @@ void reportModuleFork(std::uint64_t codeAddress, const ShaderRecompiler::ResultT
     entry.last = snapshot;
 }
 
+void scalarCensus(std::uint64_t codeAddress, std::span<const std::uint32_t> code) {
+    static const bool counts = std::getenv("APS5_RECODE_SCALAR_CENSUS") != nullptr;
+    if (!counts) return;
+    static std::mutex mutex;
+    static std::unordered_map<std::uint64_t, std::uint64_t> seen;
+    static auto reported = std::chrono::steady_clock::now();
+    {
+        std::lock_guard lock(mutex);
+        const bool fresh = seen[codeAddress]++ == 0u;
+        if (std::chrono::steady_clock::now() - reported > std::chrono::seconds(20)) {
+            reported = std::chrono::steady_clock::now();
+            std::vector<std::pair<std::uint64_t, std::uint64_t>> top;
+            for (const auto& [address, uses] : seen) top.emplace_back(uses, address);
+            std::sort(top.rbegin(), top.rend());
+            std::string line;
+            for (std::size_t index = 0; index < top.size() && index < 16u; ++index) {
+                char text[48];
+                std::snprintf(text, sizeof(text), " %016llx:%llu", static_cast<unsigned long long>(Downgrades::ProgramHash(top[index].second)), static_cast<unsigned long long>(top[index].first));
+                line += text;
+            }
+            std::fprintf(stderr, "[recode-scalar-uses] most resolved programs:%s\n", line.c_str());
+        }
+        if (!fresh) return;
+    }
+    try {
+        std::uint32_t bufferLoads = 0;
+        std::uint32_t bufferDwords = 0;
+        std::uint32_t addressLoads = 0;
+        std::uint32_t addressDwords = 0;
+        std::uint32_t vectorLoads = 0;
+        std::size_t instructions = 0;
+        for (std::uint32_t word = 0; word < code.size();) {
+            const auto instruction = ShaderRecompiler::DecodeRdnaInstruction(word * 4u, code, word);
+            word += std::max(instruction.wordCount, 1u);
+            instructions++;
+            if (instruction.op == ShaderRecompiler::RdnaOpcode::SEndpgm) break;
+            if (instruction.family == ShaderRecompiler::RdnaInstructionFamily::MUBUF || instruction.family == ShaderRecompiler::RdnaInstructionFamily::MTBUF || instruction.family == ShaderRecompiler::RdnaInstructionFamily::FLAT) vectorLoads++;
+            if (instruction.family != ShaderRecompiler::RdnaInstructionFamily::SMEM) continue;
+            const auto op = instruction.op;
+            const bool buffer = op >= ShaderRecompiler::RdnaOpcode::SBufferLoadDword && op <= ShaderRecompiler::RdnaOpcode::SBufferLoadDwordx16;
+            const bool address = op >= ShaderRecompiler::RdnaOpcode::SLoadDword && op <= ShaderRecompiler::RdnaOpcode::SLoadDwordx16;
+            if (buffer) {
+                bufferLoads++;
+                bufferDwords += instruction.dataDwordCount;
+            } else if (address) {
+                addressLoads++;
+                addressDwords += instruction.dataDwordCount;
+            }
+        }
+        std::fprintf(stderr, "[recode-scalar-loads] %016llx: %zu instructions, s_buffer_load %u (%u dwords), s_load %u (%u dwords), vector memory %u\n", static_cast<unsigned long long>(Downgrades::ProgramHash(codeAddress)), instructions,bufferLoads, bufferDwords, addressLoads, addressDwords, vectorLoads);
+    } catch (const std::exception& error) {
+        std::fprintf(stderr, "[recode-scalar-loads] %016llx: not decoded: %s\n", static_cast<unsigned long long>(Downgrades::ProgramHash(codeAddress)), error.what());
+    }
+}
+
 bool usesSamplerTables(const ShaderRecompiler::ShaderInfo& info) {
     return std::ranges::any_of(info.samplers, [](const auto& sampler) { return sampler.table != ShaderRecompiler::NoTable; });
 }
@@ -167,6 +223,7 @@ bool materializeStage(const ProgramInputs& inputs, ShaderRecompiler::RecompileRe
         reason = "image tables";
         return false;
     }
+    scalarCensus(snapshot.codeAddress + codeOffset * sizeof(std::uint32_t), std::span(snapshot.code).subspan(codeOffset));
     auto invocation = DriverDetail::InvocationFor(snapshot, codeOffset, request, false);
     lap(PhasePrepare);
     const auto capture = DriverDetail::CaptureInvocation(shaderMemory, snapshot, codeOffset, request, invocation);
