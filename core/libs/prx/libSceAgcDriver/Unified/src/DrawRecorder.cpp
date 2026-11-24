@@ -184,6 +184,7 @@ struct Totals {
     std::uint64_t drawLandingNanoseconds = 0;
     std::array<std::uint64_t, 9> recordSplit{};
     std::array<std::uint64_t, 3> preSplit{};
+    std::map<std::string, std::uint64_t> sampledCreations;
     std::uint64_t meshDraws = 0;
     std::uint64_t meshEmpty = 0;
     std::uint64_t edgeSnapshotBytes = 0;
@@ -1413,6 +1414,15 @@ public:
         std::lock_guard lock(mutex);
         printArgumentCensus();
         printExistingPackets();
+        if (!totals.sampledCreations.empty()) {
+            std::vector<std::pair<std::uint64_t, std::string>> top;
+            for (const auto& [shape, count] : totals.sampledCreations) top.emplace_back(count, shape);
+            std::ranges::sort(top, std::greater<>());
+            std::string line = "[recode-sampled-creations] records made from memory for a sampled read, most repeated:";
+            for (std::size_t index = 0; index < top.size() && index < 6u; ++index) line += " [" + std::to_string(top[index].first) + "x " + top[index].second + "]";
+            std::fprintf(stderr, "%s; %zu shapes\n", line.c_str(), top.size());
+            totals.sampledCreations.clear();
+        }
         if (Downgrades::Active()) std::fprintf(stderr, "[recode-record-split] ms: write-backs for readers %.1f, hand-overs for writers %.1f, deferred images %.1f; inputs %.1f, targets and pipeline %.1f, open batch %.1f, input copies and sets %.1f, push and draw inputs %.1f, uploads and stores %.1f, pass access %.1f, start pass %.1f, binds and draw %.1f\n", totals.preSplit[0] / 1e6, totals.preSplit[1] / 1e6, totals.preSplit[2] / 1e6, totals.recordSplit[0] / 1e6, totals.recordSplit[1] / 1e6, totals.recordSplit[2] / 1e6, totals.recordSplit[3] / 1e6, totals.recordSplit[4] / 1e6, totals.recordSplit[5] / 1e6, totals.recordSplit[6] / 1e6, totals.recordSplit[7] / 1e6, totals.recordSplit[8] / 1e6);
         const auto pipelineCounts = takePipelineCounts();
         char text[384];
@@ -4263,6 +4273,11 @@ private:
                 if (context.recorder != nullptr) drainSurfaces(context, *context.recorder);
                 absorbLayers(context, *table, record, absorbed);
                 totals.sampledRecordsCreated++;
+                if (Downgrades::Active()) {
+                    char shape[128];
+                    std::snprintf(shape, sizeof(shape), "0x%llx+0x%llx %ux%u mips %u format %u dimension %u", static_cast<unsigned long long>(surface.address), static_cast<unsigned long long>(surface.bytes), surface.width, surface.height, surface.mips, surface.format, surface.dimension);
+                    totals.sampledCreations[shape]++;
+                }
                 MemoryCore::Get().OpenWhole(surface.address, surface.bytes);
                 Downgrades::WatchTouch("a record made from memory for a sampled read", surface.address, surface.bytes);
             }
