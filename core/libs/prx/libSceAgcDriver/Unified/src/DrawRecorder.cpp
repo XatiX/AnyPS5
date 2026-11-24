@@ -423,6 +423,7 @@ std::atomic<std::uint64_t> storesAtOnce{0};
 std::atomic<std::uint64_t> copiesInMirror{0};
 std::atomic<std::uint64_t> copiesBesideMirror{0};
 std::atomic<std::uint64_t> storesThroughImports{0};
+std::atomic<std::uint64_t> storesRewrittenByCpu{0};
 std::atomic<std::uint64_t> storeLandings{0};
 std::atomic<std::uint64_t> storeLandingNanoseconds{0};
 std::atomic<std::uint64_t> storeLandingMaxNanoseconds{0};
@@ -455,7 +456,7 @@ void printExistingPackets() {
     char totals[320];
     std::snprintf(totals, sizeof(totals), "; recode stores into the mirror %llu, outside it %llu, at once (nothing in flight) %llu; copies in the mirror %llu, outside it %llu; occlusion dumps %llu (whole run)", static_cast<unsigned long long>(storesToMirror.load()), static_cast<unsigned long long>(storesBesideMirror.load()), static_cast<unsigned long long>(storesAtOnce.load()), static_cast<unsigned long long>(copiesInMirror.load()), static_cast<unsigned long long>(copiesBesideMirror.load()), static_cast<unsigned long long>(sampleDumpsLanded.load()));
     line += totals;
-    line += "; " + LabelImports::Line() + " (" + std::to_string(storesThroughImports.load()) + " stores through them)";
+    line += "; " + LabelImports::Line() + " (" + std::to_string(storesThroughImports.load()) + " stores through them, " + std::to_string(storesRewrittenByCpu.load()) + " rewritten by the CPU before their batch landed)";
     const auto landed = storeLandings.exchange(0);
     const auto landedNanoseconds = storeLandingNanoseconds.exchange(0);
     const auto landedMax = storeLandingMaxNanoseconds.exchange(0);
@@ -4587,7 +4588,14 @@ int StoreToMirror(const Context& context, Graphics::Recorder& recorder, std::uin
         if (span && span->handle != 0u) {
             recorder.RecordStore(reinterpret_cast<VkBuffer>(static_cast<std::uintptr_t>(span->handle)), static_cast<VkDeviceSize>(span->offset), bytes, address);
             const auto sequence = MemoryCore::Get().NoteWrittenBytes(address, bytes.size(), recorder.OpenBatchSerial());
-            LandAfterBatch(recorder, [address, size = bytes.size(), sequence] { MemoryCore::Get().ReleaseLandedWrite(address, size, sequence); });
+            LandAfterBatch(recorder, [address, sequence, stored = std::vector<std::byte>(bytes.begin(), bytes.end())] {
+                MemoryCore::Get().ReleaseLandedWrite(address, stored.size(), sequence);
+                if (!GuestMemory::Accessible(reinterpret_cast<const void*>(static_cast<std::uintptr_t>(address)), stored.size(), false)) return;
+                if (std::memcmp(reinterpret_cast<const void*>(static_cast<std::uintptr_t>(address)), stored.data(), stored.size()) == 0) return;
+                const std::array changed{DirtyRange{address, stored.size()}};
+                ResidencyService::Get().NoteDirty(changed);
+                storesRewrittenByCpu.fetch_add(1, std::memory_order_relaxed);
+            });
         }
         recorder.RecordStore(imported->buffer, imported->offset, bytes, address);
         recorder.NoteLabel(address, bytes, stamp, queue);
@@ -4607,7 +4615,7 @@ int StoreToMirror(const Context& context, Graphics::Recorder& recorder, std::uin
         static std::mutex seenMutex;
         static std::set<std::uint64_t> seen;
         std::lock_guard seenLock(seenMutex);
-        if (seen.size() < 400u && seen.insert(address).second) {
+        if (seen.size() < 50000u && seen.insert(address).second) {
             std::uint64_t value = 0;
             std::memcpy(&value, bytes.data(), std::min<std::size_t>(bytes.size(), sizeof(value)));
             std::fprintf(stderr, "[recode-mirror-store] %.2f s q%u 0x%llx+0x%llx first value 0x%llx\n", static_cast<double>(elapsed(processStart())) / 1e9, queue, static_cast<unsigned long long>(address), static_cast<unsigned long long>(bytes.size()), static_cast<unsigned long long>(value));
