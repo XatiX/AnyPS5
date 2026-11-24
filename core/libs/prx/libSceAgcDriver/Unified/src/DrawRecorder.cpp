@@ -114,6 +114,7 @@ struct HangMarks {
     std::uint64_t detileRecords = 0;
     std::uint64_t detilePixels = 0;
     std::uint64_t detileAddress = 0;
+    std::string detileKey;
     std::uint32_t next = 0;
 };
 
@@ -179,18 +180,20 @@ void watchHangMarks() {
                     std::memcpy(&finished, marks.buffer->Bytes().data() + 4, sizeof(finished));
                     std::memcpy(&phase, marks.buffer->Bytes().data() + 8, sizeof(phase));
                 }
-                static constexpr std::array<const char*, 9> phases{"none", "before the store flush", "before the owned uploads", "after the stores following a dispatch", "at the next item's start (before its write-backs and hand-overs)", "after the next item's write-backs for readers", "after the next item's hand-overs for writers", "before a detile batch of new records", "after a detile batch of new records"};
+                static constexpr std::array<const char*, 10> phases{"none", "before the store flush", "before the owned uploads", "after the stores following a dispatch", "at the next item's start (before its write-backs and hand-overs)", "after the next item's write-backs for readers", "after the next item's hand-overs for writers", "before a detile batch of new records", "after a detile batch of new records", "after the owned uploads before a detile batch"};
                 std::uint64_t detileRecords = 0;
                 std::uint64_t detilePixels = 0;
                 std::uint64_t detileAddress = 0;
+                std::string detileKey;
                 {
                     std::lock_guard lock(marks.mutex);
                     detileRecords = marks.detileRecords;
                     detilePixels = marks.detilePixels;
                     detileAddress = marks.detileAddress;
+                    detileKey = marks.detileKey;
                 }
-                std::fprintf(stderr, "[recode-hang-mark] batch %llu, GPU completed through batch %llu (%s); last detile batch: %llu records, %llu pixels, first at 0x%llx\n", static_cast<unsigned long long>(batch), static_cast<unsigned long long>(completed), completed >= batch ? "that batch finished: the GPU waits at a later batch's start" : "that batch did not finish: the stall is inside it", static_cast<unsigned long long>(detileRecords), static_cast<unsigned long long>(detilePixels), static_cast<unsigned long long>(detileAddress));
-                std::fprintf(stderr, "[recode-hang-mark] the GPU has not passed dispatch %u for 1 s (%s; last phase mark: item %u %s): program %016llx, %llu groups%s\n", seen, finished == seen ? "that dispatch finished, the stall is in later work" : "that dispatch did not finish", phase >> 4u, phases[std::min<std::uint32_t>(phase & 15u, 8u)], static_cast<unsigned long long>(program.first), static_cast<unsigned long long>(program.second), inputs.c_str());
+                std::fprintf(stderr, "[recode-hang-mark] batch %llu, GPU completed through batch %llu (%s); last detile batch: %llu records, %llu pixels, first at 0x%llx%s\n", static_cast<unsigned long long>(batch), static_cast<unsigned long long>(completed), completed >= batch ? "that batch finished: the GPU waits at a later batch's start" : "that batch did not finish: the stall is inside it", static_cast<unsigned long long>(detileRecords), static_cast<unsigned long long>(detilePixels), static_cast<unsigned long long>(detileAddress), detileKey.c_str());
+                std::fprintf(stderr, "[recode-hang-mark] the GPU has not passed dispatch %u for 1 s (%s; last phase mark: item %u %s): program %016llx, %llu groups%s\n", seen, finished == seen ? "that dispatch finished, the stall is in later work" : "that dispatch did not finish", phase >> 4u, phases[std::min<std::uint32_t>(phase & 15u, 9u)], static_cast<unsigned long long>(program.first), static_cast<unsigned long long>(program.second), inputs.c_str());
             }
             continue;
         }
@@ -210,6 +213,12 @@ void noteDetileWork(std::uint64_t records, std::uint64_t pixels, std::uint64_t a
     marks.detileRecords = records;
     marks.detilePixels = pixels;
     marks.detileAddress = address;
+}
+
+void noteDetileKey(const char* key) {
+    auto& marks = hangMarks();
+    std::lock_guard lock(marks.mutex);
+    marks.detileKey = key;
 }
 
 void markHangPhase(const Context& context, Graphics::Recorder& recorder, std::uint32_t phase) {
@@ -1920,6 +1929,12 @@ private:
         if (work.empty()) return;
         if (surfaceDetiler == nullptr) surfaceDetiler = std::make_unique<Images::SurfaceDetiler>(context);
         markHangPhase(context, recorder, 7u);
+        if (hangMarking() && Shadow::OwnedUploadsPending()) {
+            std::vector<std::shared_ptr<void>> kept;
+            static_cast<void>(Shadow::RecordOwnedUploads(recorder.Commands(), kept));
+            for (auto& object : kept) recorder.Keep(std::move(object));
+            markHangPhase(context, recorder, 9u);
+        }
         surfaceDetiler->Record(recorder, *table, work, [&](const std::string& why) {
             totals.surfaceFailures++;
             auto key = "surface: " + why.substr(0, 50);
@@ -1931,6 +1946,12 @@ private:
             std::uint64_t pixels = 0;
             for (const auto& surface : work) pixels += static_cast<std::uint64_t>(surface->key.width) * surface->key.height;
             noteDetileWork(work.size(), pixels, work.empty() ? 0u : work.front()->key.address);
+            if (!work.empty()) {
+                const auto& key = work.front()->key;
+                char text[200];
+                std::snprintf(text, sizeof(text), "+0x%llx %ux%ux%u format %u tile %u dimension %u mips %u pitch %u xor %u", static_cast<unsigned long long>(key.bytes), key.width, key.height, key.depth, key.format, key.tileMode, key.dimension, key.mips, key.pitch, key.pipeBankXor);
+                noteDetileKey(text);
+            }
         }
     }
 
