@@ -1176,9 +1176,20 @@ bool copiesInputs() {
     return copies;
 }
 
+bool shadowInputs() {
+    static const bool shadow = std::getenv("APS5_RECODE_MIRROR_INPUTS") == nullptr;
+    return shadow;
+}
+
 std::optional<DrawInput> drawInput(const Context& context, std::uint64_t address, std::uint64_t bytes, InputSource& source) {
     source = InputSource::Imported;
     auto& pages = MemoryCore::Get().Pages();
+    if (!shadowInputs() && mirrorMode() && !DirectMemoryAliased_nid_postfix(static_cast<std::uintptr_t>(address), static_cast<std::size_t>(bytes))) {
+        if (auto input = mirrorInput(address, bytes)) {
+            source = InputSource::Mirrored;
+            return input;
+        }
+    }
     if (!Shadow::ResidentDrawInputs()) return importedInput(context, address, bytes);
     if (pages.GpuWrittenIn(address, bytes) || !pages.GpuOwnedIn(address, bytes).empty() || gpuPending(address, bytes)) {
         source = InputSource::GpuWritten;
