@@ -89,6 +89,7 @@ bool OwnsClass(std::string_view name) {
 }
 
 bool SameBacking(const SurfaceKey& left, const SurfaceKey& right) {
+    if (left == right) return true;
     if (left.address != right.address || left.bytes != right.bytes || left.tileMode != right.tileMode || left.width != right.width || left.height != right.height || left.mips != right.mips || left.pipeBankXor != right.pipeBankXor || left.pitch != right.pitch) return false;
     const auto flat = [](std::uint32_t dimension) { return dimension == static_cast<std::uint32_t>(Graphics::TextureDimension::k2D) || dimension == static_cast<std::uint32_t>(Graphics::TextureDimension::k2DArray); };
     if (left.dimension != right.dimension && !(flat(left.dimension) && flat(right.dimension) && left.depth == right.depth)) return false;
