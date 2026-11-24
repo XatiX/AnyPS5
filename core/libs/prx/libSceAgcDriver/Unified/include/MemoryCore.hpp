@@ -9,6 +9,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <deque>
+#include <map>
 #include <mutex>
 #include <span>
 #include <thread>
@@ -120,6 +121,8 @@ public:
     void NoteLandedGpuWrite(std::uint64_t address, std::uint64_t size, std::uint64_t serial);
     void ReleaseLandedWrite(std::uint64_t address, std::uint64_t size, std::uint64_t sequence);
     std::uint64_t NoteWrittenBytes(std::uint64_t address, std::uint64_t size, std::uint64_t serial);
+    std::uint64_t NoteStoredBytes(std::uint64_t address, std::span<const std::byte> before, std::uint64_t serial);
+    void ReleaseStoredBytes(std::uint64_t address, std::uint64_t size, std::uint64_t sequence);
     void LandDiff(std::uint64_t address, std::span<const std::byte> before, std::span<const std::byte> after, std::uint64_t serial);
     void FlushGpuWrites(std::uint64_t address, std::uint64_t size);
     void LandAhead();
@@ -166,6 +169,12 @@ private:
     std::atomic<MemoryHost*> host{nullptr};
     std::unordered_map<std::uint64_t, std::vector<std::byte>> preImages;
     std::unordered_map<std::uint64_t, std::vector<std::byte>> landedDiffs;
+    struct StoredBefore {
+        std::vector<std::byte> bytes;
+        std::uint64_t sequence = 0;
+    };
+    mutable std::mutex storedMutex;
+    std::map<std::uint64_t, StoredBefore> storedBefore;
     std::uint64_t landedDiffBytes = 0;
     std::vector<Hot> hot;
     std::mutex parkMutex;

@@ -124,6 +124,20 @@ std::uint64_t MemoryCore::NoteWrittenBytes(std::uint64_t address, std::uint64_t 
     return written.Note(address, size, serial);
 }
 
+std::uint64_t MemoryCore::NoteStoredBytes(std::uint64_t address, std::span<const std::byte> before, std::uint64_t serial) {
+    const auto sequence = written.Note(address, before.size(), serial);
+    std::lock_guard lock(storedMutex);
+    storedBefore[address] = StoredBefore{std::vector<std::byte>(before.begin(), before.end()), sequence};
+    return sequence;
+}
+
+void MemoryCore::ReleaseStoredBytes(std::uint64_t address, std::uint64_t size, std::uint64_t sequence) {
+    written.TakeNoted(address, size, sequence);
+    std::lock_guard lock(storedMutex);
+    const auto found = storedBefore.find(address);
+    if (found != storedBefore.end() && found->second.sequence == sequence) storedBefore.erase(found);
+}
+
 void MemoryCore::ReleaseLandedWrite(std::uint64_t address, std::uint64_t size, std::uint64_t sequence) {
     static_cast<void>(written.TakeNoted(address, size, sequence));
 }
@@ -457,6 +471,18 @@ std::vector<DirtyRange> MemoryCore::WithoutGpuWritten(std::span<const DirtyRange
             cursor = std::max(cursor, piece.end);
         }
         if (cursor < end) kept.push_back({cursor, end - cursor});
+        std::lock_guard lock(storedMutex);
+        if (storedBefore.empty()) continue;
+        auto it = storedBefore.lower_bound(range.address >= 64u ? range.address - 64u : 0u);
+        for (; it != storedBefore.end() && it->first < end; ++it) {
+            const auto from = it->first;
+            const auto to = from + it->second.bytes.size();
+            if (to <= range.address || !Protector::Readable(from) || !Protector::Readable(to - 1u)) continue;
+            if (std::memcmp(reinterpret_cast<const void*>(static_cast<std::uintptr_t>(from)), it->second.bytes.data(), it->second.bytes.size()) == 0) continue;
+            const auto begin = std::max(from, range.address);
+            const auto stop = std::min(to, end);
+            if (begin < stop) kept.push_back({begin, stop - begin});
+        }
     }
     return kept;
 }

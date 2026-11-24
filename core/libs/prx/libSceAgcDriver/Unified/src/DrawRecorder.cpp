@@ -4587,9 +4587,12 @@ int StoreToMirror(const Context& context, Graphics::Recorder& recorder, std::uin
     if (imported) {
         if (span && span->handle != 0u) {
             recorder.RecordStore(reinterpret_cast<VkBuffer>(static_cast<std::uintptr_t>(span->handle)), static_cast<VkDeviceSize>(span->offset), bytes, address);
-            const auto sequence = MemoryCore::Get().NoteWrittenBytes(address, bytes.size(), recorder.OpenBatchSerial());
+            std::vector<std::byte> before(bytes.size());
+            const bool readable = Protector::Readable(address) && Protector::Readable(address + bytes.size() - 1u);
+            if (readable) std::memcpy(before.data(), reinterpret_cast<const void*>(static_cast<std::uintptr_t>(address)), bytes.size());
+            const auto sequence = readable ? MemoryCore::Get().NoteStoredBytes(address, before, recorder.OpenBatchSerial()) : MemoryCore::Get().NoteWrittenBytes(address, bytes.size(), recorder.OpenBatchSerial());
             LandAfterBatch(recorder, [address, sequence, stored = std::vector<std::byte>(bytes.begin(), bytes.end())] {
-                MemoryCore::Get().ReleaseLandedWrite(address, stored.size(), sequence);
+                MemoryCore::Get().ReleaseStoredBytes(address, stored.size(), sequence);
                 if (!GuestMemory::Accessible(reinterpret_cast<const void*>(static_cast<std::uintptr_t>(address)), stored.size(), false)) return;
                 if (std::memcmp(reinterpret_cast<const void*>(static_cast<std::uintptr_t>(address)), stored.data(), stored.size()) == 0) return;
                 const std::array changed{DirtyRange{address, stored.size()}};
