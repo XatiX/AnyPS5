@@ -361,7 +361,7 @@ struct TableImages {
     std::uint64_t depths = 0;
     std::uint64_t sharedStamp = 0;
     std::uint64_t imagesStamp = 0;
-    std::vector<std::uint32_t> regions;
+    Tables::ElementIndex index;
     std::vector<Heap::DeferredImage> elements;
     std::vector<std::uint32_t> slots;
     std::vector<Heap::Span> memory;
@@ -3069,12 +3069,12 @@ private:
         const bool rebased = !fresh && entry.base.lock() != base;
         std::vector<bool> stale(fresh ? 0u : entry.elements.size(), false);
         bool anyStale = false;
-        if (!fresh && (Events::Shared().RegionsChangedSince(entry.regions, entry.sharedStamp) || Events::Images().RegionsChangedSince(entry.regions, entry.imagesStamp))) {
+        std::vector<std::uint32_t> touched;
+        if (!fresh) entry.index.Changed(Events::Shared(), entry.sharedStamp, Events::Images(), entry.imagesStamp, touched);
+        if (!touched.empty()) {
             auto* table = Resolve::Surfaces();
             bool refreshed = false;
-            for (std::size_t position = 0; position < entry.elements.size(); ++position) {
-                const auto& memory = entry.memory[position];
-                if (memory.bytes != 0u && !Events::Shared().ChangedSince(memory.address, memory.bytes, entry.sharedStamp) && !Events::Images().ChangedSince(memory.address, memory.bytes, entry.imagesStamp)) continue;
+            for (const auto position : touched) {
                 const auto& record = entry.records[position];
                 if (record == nullptr && entry.owners[position] != nullptr) {
                     totals.tableImageDepthKept++;
@@ -3164,15 +3164,7 @@ private:
         for (const auto& owner : entry.owners) {
             if (owner != nullptr) bound->owners.push_back(owner);
         }
-        if (fresh || rebased) {
-            std::vector<Heap::ImageUse> uses;
-            uses.reserve(entry.memory.size());
-            for (const auto& memory : entry.memory) uses.push_back({memory, false});
-            entry.regions.clear();
-            for (const auto& [begin, end] : Tables::CoalescedSpans(uses)) Events::ChangeLog::AppendRegions(begin, end - begin, entry.regions);
-            std::sort(entry.regions.begin(), entry.regions.end());
-            entry.regions.erase(std::unique(entry.regions.begin(), entry.regions.end()), entry.regions.end());
-        }
+        if (fresh || rebased) entry.index.Build(entry.memory);
         entry.depths = Images::DepthRecordsOn() ? Images::Depths().Generation() : std::uint64_t{0};
         entry.bound = bound;
         stage.tableMap = std::move(bound);

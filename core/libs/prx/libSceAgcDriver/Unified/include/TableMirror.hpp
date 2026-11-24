@@ -47,6 +47,21 @@ struct MirrorCounts {
 [[nodiscard]] std::vector<std::pair<std::uint64_t, std::uint64_t>> BoundedSpans(std::span<const std::pair<std::uint64_t, std::uint64_t>> spans, std::size_t limit);
 [[nodiscard]] std::vector<std::pair<std::uint64_t, std::uint64_t>> Outside(std::pair<std::uint64_t, std::uint64_t> span, std::vector<std::pair<std::uint64_t, std::uint64_t>> holes);
 
+class ElementIndex {
+public:
+    void Build(std::span<const Heap::Span> memory);
+    void Changed(const Events::ChangeLog& shared, std::uint64_t sharedStamp, const Events::ChangeLog& images, std::uint64_t imagesStamp, std::vector<std::uint32_t>& elements) const;
+
+private:
+    std::vector<std::pair<std::uint64_t, std::uint64_t>> spans;
+    std::vector<std::uint32_t> spanStarts;
+    std::vector<std::uint32_t> spanElements;
+    std::vector<std::uint32_t> regions;
+    std::vector<std::uint32_t> regionStarts;
+    std::vector<std::uint32_t> regionSpans;
+    std::vector<Heap::Span> memory;
+};
+
 class TableMirror {
 public:
     TableMirror(Heap::Refill& refill, const Events::ChangeLog& shared, const Events::ChangeLog& images) : refill(refill), shared(shared), images(images) {}

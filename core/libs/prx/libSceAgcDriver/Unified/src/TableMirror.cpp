@@ -94,6 +94,69 @@ std::vector<std::pair<std::uint64_t, std::uint64_t>> Outside(std::pair<std::uint
     return pieces;
 }
 
+void ElementIndex::Build(std::span<const Heap::Span> elementMemory) {
+    memory.assign(elementMemory.begin(), elementMemory.end());
+    std::vector<Heap::ImageUse> uses;
+    uses.reserve(memory.size());
+    for (const auto& span : memory) uses.push_back({span, false});
+    spans = CoalescedSpans(uses);
+    std::vector<std::uint32_t> spanOf(memory.size(), NoSpan);
+    spanStarts.assign(spans.size() + 1u, 0u);
+    for (std::size_t element = 0; element < memory.size(); ++element) {
+        if (memory[element].bytes == 0u) continue;
+        const auto next = std::upper_bound(spans.begin(), spans.end(), memory[element].address, [](std::uint64_t address, const auto& span) { return address < span.first; });
+        if (next == spans.begin()) continue;
+        spanOf[element] = static_cast<std::uint32_t>(std::prev(next) - spans.begin());
+        spanStarts[spanOf[element] + 1u]++;
+    }
+    for (std::size_t span = 0; span < spans.size(); ++span) spanStarts[span + 1u] += spanStarts[span];
+    spanElements.assign(spanStarts.back(), 0u);
+    auto cursor = spanStarts;
+    for (std::size_t element = 0; element < memory.size(); ++element) {
+        if (spanOf[element] != NoSpan) spanElements[cursor[spanOf[element]]++] = static_cast<std::uint32_t>(element);
+    }
+    std::vector<std::pair<std::uint32_t, std::uint32_t>> regionSpan;
+    std::vector<std::uint32_t> touched;
+    for (std::size_t span = 0; span < spans.size(); ++span) {
+        touched.clear();
+        Events::ChangeLog::AppendRegions(spans[span].first, spans[span].second - spans[span].first, touched);
+        for (const auto region : touched) regionSpan.emplace_back(region, static_cast<std::uint32_t>(span));
+    }
+    std::sort(regionSpan.begin(), regionSpan.end());
+    regionSpan.erase(std::unique(regionSpan.begin(), regionSpan.end()), regionSpan.end());
+    regions.clear();
+    regionStarts.clear();
+    regionSpans.clear();
+    for (const auto& [region, span] : regionSpan) {
+        if (regions.empty() || regions.back() != region) {
+            regions.push_back(region);
+            regionStarts.push_back(static_cast<std::uint32_t>(regionSpans.size()));
+        }
+        regionSpans.push_back(span);
+    }
+    regionStarts.push_back(static_cast<std::uint32_t>(regionSpans.size()));
+}
+
+void ElementIndex::Changed(const Events::ChangeLog& shared, std::uint64_t sharedStamp, const Events::ChangeLog& images, std::uint64_t imagesStamp, std::vector<std::uint32_t>& elements) const {
+    std::vector<std::uint32_t> candidates;
+    for (std::size_t position = 0; position < regions.size(); ++position) {
+        if (!shared.RegionChangedSince(regions[position], sharedStamp) && !images.RegionChangedSince(regions[position], imagesStamp)) continue;
+        candidates.insert(candidates.end(), regionSpans.begin() + regionStarts[position], regionSpans.begin() + regionStarts[position + 1u]);
+    }
+    if (candidates.empty()) return;
+    std::sort(candidates.begin(), candidates.end());
+    candidates.erase(std::unique(candidates.begin(), candidates.end()), candidates.end());
+    for (const auto span : candidates) {
+        const auto& [begin, end] = spans[span];
+        if (!shared.ChangedSince(begin, end - begin, sharedStamp) && !images.ChangedSince(begin, end - begin, imagesStamp)) continue;
+        for (auto at = spanStarts[span]; at < spanStarts[span + 1u]; ++at) {
+            const auto element = spanElements[at];
+            const auto& piece = memory[element];
+            if (shared.ChangedSince(piece.address, piece.bytes, sharedStamp) || images.ChangedSince(piece.address, piece.bytes, imagesStamp)) elements.push_back(element);
+        }
+    }
+}
+
 namespace {
 
 std::uint64_t mapKey(std::span<const std::uint32_t> map) {
