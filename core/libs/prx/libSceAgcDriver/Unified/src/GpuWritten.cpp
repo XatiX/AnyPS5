@@ -26,20 +26,20 @@ GpuWritten::Pieces::const_iterator GpuWritten::firstOverlapping(std::uint64_t be
     return it;
 }
 
-std::uint64_t GpuWritten::carve(std::uint64_t begin, std::uint64_t end, std::uint64_t completed, std::vector<WrittenRange>* removed) {
+std::uint64_t GpuWritten::carve(std::uint64_t begin, std::uint64_t end, std::uint64_t completed, std::vector<WrittenRange>* removed, std::uint64_t onlySequence) {
     std::uint64_t bytes = 0;
     for (auto it = firstOverlapping(begin); it != pieces.end() && it->first < end;) {
         const auto pieceBegin = it->first;
         const auto piece = it->second;
-        if (piece.serial > completed) {
+        if (piece.serial > completed || (onlySequence != 0 && piece.sequence != onlySequence)) {
             ++it;
             continue;
         }
         const auto from = std::max(pieceBegin, begin);
         const auto to = std::min(piece.end, end);
         it = pieces.erase(it);
-        if (pieceBegin < from) pieces.emplace(pieceBegin, Piece{from, piece.serial});
-        if (to < piece.end) it = pieces.emplace(to, Piece{piece.end, piece.serial}).first;
+        if (pieceBegin < from) pieces.emplace(pieceBegin, Piece{from, piece.serial, piece.sequence});
+        if (to < piece.end) it = pieces.emplace(to, Piece{piece.end, piece.serial, piece.sequence}).first;
         if (removed != nullptr) removed->push_back({from, to, piece.serial});
         bytes += to - from;
     }
@@ -47,10 +47,11 @@ std::uint64_t GpuWritten::carve(std::uint64_t begin, std::uint64_t end, std::uin
     return bytes;
 }
 
-void GpuWritten::Note(std::uint64_t address, std::uint64_t size, std::uint64_t serial) {
-    if (size == 0) return;
+std::uint64_t GpuWritten::Note(std::uint64_t address, std::uint64_t size, std::uint64_t serial) {
+    if (size == 0) return 0;
     const auto end = endOf(address, size);
     std::lock_guard lock(mutex);
+    auto sequence = ++nextSequence;
     carve(address, end, Never, nullptr);
     auto begin = address;
     auto last = end;
@@ -60,16 +61,28 @@ void GpuWritten::Note(std::uint64_t address, std::uint64_t size, std::uint64_t s
         if (previous->second.end == begin && previous->second.serial == serial) {
             begin = previous->first;
             pieces.erase(previous);
+            sequence = 0;
         }
     }
     if (next != pieces.end() && next->first == last && next->second.serial == serial) {
         last = next->second.end;
         pieces.erase(next);
+        sequence = 0;
     }
-    pieces.emplace(begin, Piece{last, serial});
+    pieces.emplace(begin, Piece{last, serial, sequence});
     heldBytes += end - address;
     ++counts.noted;
     counts.notedBytes += end - address;
+    return sequence;
+}
+
+std::uint64_t GpuWritten::TakeNoted(std::uint64_t address, std::uint64_t size, std::uint64_t sequence) {
+    if (size == 0 || sequence == 0) return 0;
+    std::lock_guard lock(mutex);
+    const auto bytes = carve(address, endOf(address, size), Never, nullptr, sequence);
+    ++counts.taken;
+    counts.takenBytes += bytes;
+    return bytes;
 }
 
 std::uint64_t GpuWritten::Pending(std::uint64_t address, std::uint64_t size) const {

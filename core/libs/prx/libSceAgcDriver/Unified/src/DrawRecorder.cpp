@@ -4586,18 +4586,19 @@ int StoreToMirror(Graphics::Recorder& recorder, std::uint64_t address, std::span
     recorder.RecordStore(reinterpret_cast<VkBuffer>(static_cast<std::uintptr_t>(span->handle)), static_cast<VkDeviceSize>(span->offset), bytes, address);
     const std::array written{std::pair{address, address + bytes.size()}};
     static const bool unmarked = std::getenv("APS5_RECODE_MIRROR_STORES_UNMARKED") != nullptr;
-    const auto serial = recorder.OpenBatchSerial();
+    std::uint64_t sequence = 0;
     if (!unmarked) {
         Shadow::NoteGpuWrites(written);
-        const auto mark = MemoryCore::Get().NoteGpuWrite(address, bytes.size(), serial);
+        const auto mark = MemoryCore::Get().NoteGpuWrite(address, bytes.size(), recorder.OpenBatchSerial());
         if (!mark.upload.empty()) ResidencyService::Get().NoteDirty(mark.upload);
+        sequence = mark.sequence;
     }
     Events::NoteRanges(written);
     recorder.NoteLabel(address, bytes, stamp, queue);
-    LandAfterBatch(recorder, [address, serial, stored = std::vector<std::byte>(bytes.begin(), bytes.end())] {
+    LandAfterBatch(recorder, [address, sequence, stored = std::vector<std::byte>(bytes.begin(), bytes.end())] {
         auto& core = MemoryCore::Get();
         core.LandGpuWrite(address, stored);
-        core.NoteLandedGpuWrite(address, stored.size(), serial);
+        core.ReleaseLandedWrite(address, stored.size(), sequence);
     });
     storesToMirror.fetch_add(1, std::memory_order_relaxed);
     return 0;
@@ -4649,15 +4650,14 @@ bool CopyInMirror(const Context& context, Graphics::Recorder& recorder, const Pm
     recorder.Keep(landing);
     const std::array written{std::pair{copy.destination, copy.destination + copy.bytes}};
     Shadow::NoteGpuWrites(written);
-    const auto serial = recorder.OpenBatchSerial();
-    const auto mark = MemoryCore::Get().NoteGpuWrite(copy.destination, copy.bytes, serial);
+    const auto mark = MemoryCore::Get().NoteGpuWrite(copy.destination, copy.bytes, recorder.OpenBatchSerial());
     if (!mark.upload.empty()) ResidencyService::Get().NoteDirty(mark.upload);
     Events::NoteRanges(written);
-    LandAfterBatch(recorder, [landing, serial, address = copy.destination, bytes = copy.bytes] {
+    LandAfterBatch(recorder, [landing, sequence = mark.sequence, address = copy.destination, bytes = copy.bytes] {
         landing->Invalidate();
         auto& core = MemoryCore::Get();
         core.LandGpuWrite(address, std::span<const std::byte>(landing->Bytes().data(), bytes));
-        core.NoteLandedGpuWrite(address, bytes, serial);
+        core.ReleaseLandedWrite(address, bytes, sequence);
     });
     copiesInMirror.fetch_add(1, std::memory_order_relaxed);
     return true;
@@ -4675,7 +4675,14 @@ bool StoresToMirror(std::size_t bytes, std::uint64_t address) {
         const char* colon = std::strchr(value, ':');
         return std::pair<std::uint64_t, std::uint64_t>{std::strtoull(value, nullptr, 16), colon != nullptr ? std::strtoull(colon + 1, nullptr, 16) : ~0ull};
     }();
-    return stores && bytes >= smallest && (address == 0u || (address >= range.first && address < range.second));
+    static const std::pair<std::uint64_t, std::uint64_t> skipped = [] {
+        const char* value = std::getenv("APS5_RECODE_MIRROR_STORES_SKIP");
+        if (value == nullptr) return std::pair<std::uint64_t, std::uint64_t>{0u, 0u};
+        const char* colon = std::strchr(value, ':');
+        return std::pair<std::uint64_t, std::uint64_t>{std::strtoull(value, nullptr, 16), colon != nullptr ? std::strtoull(colon + 1, nullptr, 16) : ~0ull};
+    }();
+    const bool skip = address != 0u && address >= skipped.first && address < skipped.second;
+    return stores && !skip && bytes >= smallest && (address == 0u || (address >= range.first && address < range.second));
 }
 
 static void censusMemoryPacket(std::span<const std::uint32_t> packet, std::uint32_t queue, std::uint32_t opcode) {

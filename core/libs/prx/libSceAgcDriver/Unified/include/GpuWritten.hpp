@@ -28,7 +28,8 @@ struct GpuWrittenCounts {
 
 class GpuWritten {
 public:
-    void Note(std::uint64_t address, std::uint64_t size, std::uint64_t serial);
+    std::uint64_t Note(std::uint64_t address, std::uint64_t size, std::uint64_t serial);
+    std::uint64_t TakeNoted(std::uint64_t address, std::uint64_t size, std::uint64_t sequence);
     [[nodiscard]] std::uint64_t Pending(std::uint64_t address, std::uint64_t size) const;
     [[nodiscard]] bool Any(std::uint64_t address, std::uint64_t size) const;
     [[nodiscard]] std::vector<WrittenRange> In(std::uint64_t address, std::uint64_t size) const;
@@ -40,15 +41,17 @@ private:
     struct Piece {
         std::uint64_t end = 0;
         std::uint64_t serial = 0;
+        std::uint64_t sequence = 0;
     };
     using Pieces = std::map<std::uint64_t, Piece>;
 
     Pieces::iterator firstOverlapping(std::uint64_t begin);
     Pieces::const_iterator firstOverlapping(std::uint64_t begin) const;
-    std::uint64_t carve(std::uint64_t begin, std::uint64_t end, std::uint64_t completed, std::vector<WrittenRange>* removed);
+    std::uint64_t carve(std::uint64_t begin, std::uint64_t end, std::uint64_t completed, std::vector<WrittenRange>* removed, std::uint64_t onlySequence = 0);
 
     mutable std::mutex mutex;
     Pieces pieces;
+    std::uint64_t nextSequence = 0;
     std::uint64_t heldBytes = 0;
     GpuWrittenCounts counts;
 };
