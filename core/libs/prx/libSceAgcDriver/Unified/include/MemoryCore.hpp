@@ -118,6 +118,10 @@ public:
     void CollectWrites(std::uint64_t address, std::uint64_t size, PageTable::WrittenRun written, void* context);
     void NoteDriverWrite(std::uint64_t address, std::uint64_t size);
     void SetHost(MemoryHost* next);
+    [[nodiscard]] std::uint64_t CompletedSerial() const {
+        auto* current = host.load(std::memory_order_acquire);
+        return current != nullptr ? current->Completed() : 0u;
+    }
     GpuWriteMark NoteGpuWrite(std::uint64_t address, std::uint64_t size, std::uint64_t serial, bool takeDirty = true);
     void NoteLandedGpuWrite(std::uint64_t address, std::uint64_t size, std::uint64_t serial);
     void ReleaseLandedWrite(std::uint64_t address, std::uint64_t size, std::uint64_t sequence);

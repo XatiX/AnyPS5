@@ -109,7 +109,11 @@ struct HangMarks {
     std::shared_ptr<Graphics::Buffer> buffer;
     std::shared_ptr<Graphics::Buffer> mirrorCopies;
     std::array<std::pair<std::uint64_t, std::uint64_t>, Slots> programs{};
+    std::array<std::uint64_t, Slots> batches{};
     std::array<Snapshot, Snapshots> snapshots{};
+    std::uint64_t detileRecords = 0;
+    std::uint64_t detilePixels = 0;
+    std::uint64_t detileAddress = 0;
     std::uint32_t next = 0;
 };
 
@@ -167,13 +171,26 @@ void watchHangMarks() {
             if (++still == 4u) {
                 std::uint32_t finished = 0;
                 std::uint32_t phase = 0;
+                std::uint64_t batch = 0;
+                const auto completed = MemoryCore::Get().CompletedSerial();
                 {
                     std::lock_guard lock(marks.mutex);
+                    batch = marks.batches[seen % HangMarks::Slots];
                     std::memcpy(&finished, marks.buffer->Bytes().data() + 4, sizeof(finished));
                     std::memcpy(&phase, marks.buffer->Bytes().data() + 8, sizeof(phase));
                 }
-                static constexpr std::array<const char*, 3> phases{"none", "before the store flush", "before the owned uploads"};
-                std::fprintf(stderr, "[recode-hang-mark] the GPU has not passed dispatch %u for 1 s (%s; last phase mark: item %u %s): program %016llx, %llu groups%s\n", seen, finished == seen ? "that dispatch finished, the stall is in later work" : "that dispatch did not finish", phase >> 4u, phases[std::min<std::uint32_t>(phase & 15u, 2u)], static_cast<unsigned long long>(program.first), static_cast<unsigned long long>(program.second), inputs.c_str());
+                static constexpr std::array<const char*, 9> phases{"none", "before the store flush", "before the owned uploads", "after the stores following a dispatch", "at the next item's start (before its write-backs and hand-overs)", "after the next item's write-backs for readers", "after the next item's hand-overs for writers", "before a detile batch of new records", "after a detile batch of new records"};
+                std::uint64_t detileRecords = 0;
+                std::uint64_t detilePixels = 0;
+                std::uint64_t detileAddress = 0;
+                {
+                    std::lock_guard lock(marks.mutex);
+                    detileRecords = marks.detileRecords;
+                    detilePixels = marks.detilePixels;
+                    detileAddress = marks.detileAddress;
+                }
+                std::fprintf(stderr, "[recode-hang-mark] batch %llu, GPU completed through batch %llu (%s); last detile batch: %llu records, %llu pixels, first at 0x%llx\n", static_cast<unsigned long long>(batch), static_cast<unsigned long long>(completed), completed >= batch ? "that batch finished: the GPU waits at a later batch's start" : "that batch did not finish: the stall is inside it", static_cast<unsigned long long>(detileRecords), static_cast<unsigned long long>(detilePixels), static_cast<unsigned long long>(detileAddress));
+                std::fprintf(stderr, "[recode-hang-mark] the GPU has not passed dispatch %u for 1 s (%s; last phase mark: item %u %s): program %016llx, %llu groups%s\n", seen, finished == seen ? "that dispatch finished, the stall is in later work" : "that dispatch did not finish", phase >> 4u, phases[std::min<std::uint32_t>(phase & 15u, 8u)], static_cast<unsigned long long>(program.first), static_cast<unsigned long long>(program.second), inputs.c_str());
             }
             continue;
         }
@@ -185,6 +202,14 @@ void watchHangMarks() {
 bool hangMarking() {
     static const bool marking = std::getenv("APS5_RECODE_HANG_MARKS") != nullptr;
     return marking;
+}
+
+void noteDetileWork(std::uint64_t records, std::uint64_t pixels, std::uint64_t address) {
+    auto& marks = hangMarks();
+    std::lock_guard lock(marks.mutex);
+    marks.detileRecords = records;
+    marks.detilePixels = pixels;
+    marks.detileAddress = address;
 }
 
 void markHangPhase(const Context& context, Graphics::Recorder& recorder, std::uint32_t phase) {
@@ -236,6 +261,7 @@ void markHang(const Context& context, Graphics::Recorder& recorder, VkCommandBuf
         }
         sequence = ++marks.next;
         marks.programs[sequence % HangMarks::Slots] = {hash, groups};
+        marks.batches[sequence % HangMarks::Slots] = recorder.OpenBatchSerial();
         auto& snapshot = marks.snapshots[sequence % HangMarks::Snapshots];
         snapshot = {};
         snapshot.known = std::move(knownPaths);
@@ -1475,6 +1501,7 @@ public:
         std::lock_guard lock(mutex);
         const auto started = std::chrono::steady_clock::now();
         totals.drawLockNanoseconds += elapsed(waitStarted) - elapsed(started);
+        if (hangMarking() && context.recorder != nullptr) markHangPhase(context, *context.recorder, 4u);
         bool recorded = false;
         try {
             recorded = record(context, draw, parameters, reason);
@@ -1528,6 +1555,7 @@ public:
     bool RecordDispatch(const Context& context, const Resolve::ResolvedDraw& dispatch, const std::array<std::uint32_t, 3>& groups, std::string& reason) {
         std::lock_guard lock(mutex);
         const auto started = std::chrono::steady_clock::now();
+        if (hangMarking() && context.recorder != nullptr) markHangPhase(context, *context.recorder, 4u);
         bool recorded = false;
         try {
             recorded = recordDispatch(context, dispatch, groups, reason);
@@ -1891,12 +1919,19 @@ private:
         auto work = table->TakeWork();
         if (work.empty()) return;
         if (surfaceDetiler == nullptr) surfaceDetiler = std::make_unique<Images::SurfaceDetiler>(context);
+        markHangPhase(context, recorder, 7u);
         surfaceDetiler->Record(recorder, *table, work, [&](const std::string& why) {
             totals.surfaceFailures++;
             auto key = "surface: " + why.substr(0, 50);
             if (seen.insert(key).second) std::fprintf(stderr, "[recode-record] first surface failure: %s\n", why.c_str());
             if (totals.reasons.size() < 24u || totals.reasons.contains(key)) totals.reasons[key]++;
         });
+        markHangPhase(context, recorder, 8u);
+        if (hangMarking()) {
+            std::uint64_t pixels = 0;
+            for (const auto& surface : work) pixels += static_cast<std::uint64_t>(surface->key.width) * surface->key.height;
+            noteDetileWork(work.size(), pixels, work.empty() ? 0u : work.front()->key.address);
+        }
     }
 
     void scheduleLandings(const Context& context) {
@@ -2923,7 +2958,9 @@ private:
         writtenRecords.clear();
         stageStorageImages.clear();
         writeBackForReaders(context, dispatch);
+        if (hangMarking() && context.recorder != nullptr) markHangPhase(context, *context.recorder, 5u);
         handOverForWriters(context, dispatch);
+        if (hangMarking() && context.recorder != nullptr) markHangPhase(context, *context.recorder, 6u);
         if (dispatch.stages.size() != 1u || dispatch.stages.front().deferredImages.empty()) return recordBound(context, dispatch, groups, {}, reason);
         auto bound = dispatch;
         std::vector<std::shared_ptr<Graphics::StorageTexture>> written;
@@ -3442,6 +3479,11 @@ private:
         Graphics::RecordMemoryBarrier(context, commands, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT | VK_PIPELINE_STAGE_HOST_BIT, VK_ACCESS_SHADER_WRITE_BIT, VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT | VK_ACCESS_UNIFORM_READ_BIT | VK_ACCESS_TRANSFER_READ_BIT | VK_ACCESS_TRANSFER_WRITE_BIT | VK_ACCESS_INDIRECT_COMMAND_READ_BIT | VK_ACCESS_INDEX_READ_BIT | VK_ACCESS_VERTEX_ATTRIBUTE_READ_BIT | VK_ACCESS_COLOR_ATTACHMENT_READ_BIT | VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_READ_BIT | VK_ACCESS_HOST_READ_BIT);
         finishHangMark(context, commands);
         recordCopyBacks(context, commands, serial);
+        if (hangMarking()) {
+            if (recorder->HasQueuedKeyStores()) recorder->FlushKeyStores();
+            if (recorder->HasQueuedStores()) recorder->FlushStores();
+            markHangPhase(context, *recorder, 3u);
+        }
         if (probed) probeOutputs(context, *recorder, commands, dispatch, stage.program.codeAddress);
 
         recorder->Keep(pipeline);
@@ -3775,9 +3817,11 @@ private:
         directWrites.clear();
         auto preMark = std::chrono::steady_clock::now();
         writeBackForReaders(context, draw);
+        if (hangMarking() && context.recorder != nullptr) markHangPhase(context, *context.recorder, 5u);
         totals.preSplit[0] += elapsed(preMark);
         preMark = std::chrono::steady_clock::now();
         handOverForWriters(context, draw);
+        if (hangMarking() && context.recorder != nullptr) markHangPhase(context, *context.recorder, 6u);
         totals.preSplit[1] += elapsed(preMark);
         if (std::ranges::all_of(draw.stages, [](const Resolve::ResolvedStage& stage) { return stage.deferredImages.empty(); })) return recordWithSlots(context, draw, parameters, reason);
         preMark = std::chrono::steady_clock::now();
