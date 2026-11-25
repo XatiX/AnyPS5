@@ -208,6 +208,100 @@ bool hangMarking() {
     return marking;
 }
 
+struct BatchWork {
+    std::string item;
+    const std::byte* arguments = nullptr;
+    std::shared_ptr<const void> keep;
+};
+
+struct OpenBatch {
+    std::chrono::steady_clock::time_point opened;
+    std::vector<BatchWork> work;
+    bool shown = false;
+};
+
+struct BatchPrograms {
+    std::mutex mutex;
+    std::map<std::uint64_t, OpenBatch> open;
+    std::array<std::pair<std::uint64_t, std::string>, 4096> recent;
+    std::size_t recentNext = 0;
+    bool historyShown = false;
+};
+
+BatchPrograms& batchPrograms() {
+    static BatchPrograms programs;
+    return programs;
+}
+
+bool watchesBatchPrograms() {
+    static const bool watching = std::getenv("APS5_RECODE_HANG_PROGRAMS") != nullptr;
+    return watching;
+}
+
+void watchOpenBatches() {
+    for (;;) {
+        std::this_thread::sleep_for(std::chrono::seconds(1));
+        auto& programs = batchPrograms();
+        std::lock_guard lock(programs.mutex);
+        const auto now = std::chrono::steady_clock::now();
+        for (auto& [serial, batch] : programs.open) {
+            if (batch.shown || now - batch.opened < std::chrono::seconds(5)) continue;
+            batch.shown = true;
+            std::string list;
+            for (const auto& work : batch.work) {
+                list += " " + work.item;
+                if (work.arguments == nullptr) continue;
+                std::uint32_t counts[3] = {};
+                std::memcpy(counts, work.arguments, sizeof(counts));
+                list += "(" + std::to_string(counts[0]) + "x" + std::to_string(counts[1]) + "x" + std::to_string(counts[2]) + ")";
+            }
+            std::fprintf(stderr, "[recode-hang-batch] batch %llu not finished %lld s after its first recorded work; %zu items:%s\n", static_cast<unsigned long long>(serial), static_cast<long long>(std::chrono::duration_cast<std::chrono::seconds>(now - batch.opened).count()), batch.work.size(), list.c_str());
+            if (!programs.historyShown) {
+                programs.historyShown = true;
+                static const std::uint64_t window = [] {
+                    const char* value = std::getenv("APS5_RECODE_HANG_HISTORY_BATCHES");
+                    return value != nullptr ? std::strtoull(value, nullptr, 10) : 3ull;
+                }();
+                for (std::size_t index = 0; index < programs.recent.size(); ++index) {
+                    const auto& [batchSerial, line] = programs.recent[(programs.recentNext + index) % programs.recent.size()];
+                    if (!line.empty() && batchSerial + window >= serial && batchSerial <= serial) std::fprintf(stderr, "[recode-hang-history] %s\n", line.c_str());
+                }
+            }
+        }
+    }
+}
+
+void noteBatchWork(Graphics::Recorder& recorder, std::uint64_t serial, const char* kind, std::uint64_t program, std::uint64_t groups, const std::byte* arguments = nullptr, std::shared_ptr<const void> keep = nullptr, std::uint32_t queue = 0, std::uint64_t submission = 0) {
+    if (!watchesBatchPrograms()) return;
+    static std::once_flag started;
+    std::call_once(started, [] { std::thread(watchOpenBatches).detach(); });
+    auto& programs = batchPrograms();
+    bool first = false;
+    {
+        std::lock_guard lock(programs.mutex);
+        auto [found, inserted] = programs.open.try_emplace(serial);
+        if (inserted) {
+            found->second.opened = std::chrono::steady_clock::now();
+            first = true;
+        }
+        if (found->second.work.size() < 512u) {
+            char item[256];
+            std::snprintf(item, sizeof(item), "%s:%016llx/%llu", kind, static_cast<unsigned long long>(program), static_cast<unsigned long long>(groups));
+            found->second.work.push_back({item, arguments, std::move(keep)});
+        }
+        {
+            char line[320];
+            std::snprintf(line, sizeof(line), "batch %llu queue 0x%x submission %llu %s:%016llx/%llu", static_cast<unsigned long long>(serial), queue, static_cast<unsigned long long>(submission), kind, static_cast<unsigned long long>(program), static_cast<unsigned long long>(groups));
+            programs.recent[programs.recentNext++ % programs.recent.size()] = {serial, line};
+        }
+    }
+    if (first) recorder.OnComplete([serial] {
+        auto& programs = batchPrograms();
+        std::lock_guard lock(programs.mutex);
+        programs.open.erase(serial);
+    });
+}
+
 void noteDetileWork(std::uint64_t records, std::uint64_t pixels, std::uint64_t address) {
     auto& marks = hangMarks();
     std::lock_guard lock(marks.mutex);
@@ -1156,6 +1250,11 @@ bool mirrorPart(const char* part) {
     return mirrorMode() && std::strstr(parts, part) != nullptr;
 }
 
+bool argumentsFromMirror() {
+    static const bool fromMirror = std::getenv("APS5_RECODE_ARGS_SNAPSHOT") == nullptr;
+    return fromMirror;
+}
+
 bool gpuPending(std::uint64_t address, std::uint64_t bytes) {
     return mirrorMode() && MemoryCore::Get().Written().Any(address, bytes);
 }
@@ -1597,8 +1696,10 @@ public:
         totals.drawLockNanoseconds += elapsed(waitStarted) - elapsed(started);
         if (hangMarking() && context.recorder != nullptr) markHangPhase(context, *context.recorder, 4u);
         bool recorded = false;
+        const auto openSerial = context.recorder != nullptr ? context.recorder->OpenSerial() : 0u;
         try {
             recorded = record(context, draw, parameters, reason);
+            if (recorded && context.recorder != nullptr && !draw.stages.empty()) noteBatchWork(*context.recorder, openSerial, "draw", Downgrades::ProgramHash(draw.stages.back().program.codeAddress), 0u, nullptr, nullptr, draw.operation.queue, draw.operation.submission);
             const auto landStarted = std::chrono::steady_clock::now();
             totals.drawBodyNanoseconds += elapsed(started) - elapsed(landStarted);
             landWrites();
@@ -1651,8 +1752,16 @@ public:
         const auto started = std::chrono::steady_clock::now();
         if (hangMarking() && context.recorder != nullptr) markHangPhase(context, *context.recorder, 4u);
         bool recorded = false;
+        const auto openSerial = context.recorder != nullptr ? context.recorder->OpenSerial() : 0u;
+        lastHangArguments = nullptr;
         try {
             recorded = recordDispatch(context, dispatch, groups, reason);
+            if (recorded && context.recorder != nullptr && !dispatch.stages.empty()) {
+                char kind[160];
+                if (dispatch.operation.dispatch.indirect) std::snprintf(kind, sizeof(kind), "indirect@%llx[record %08x %08x %08x %08x %08x %08x %08x %08x%s]", static_cast<unsigned long long>(lastArgumentsAddress), lastArgumentsCpu[0], lastArgumentsCpu[1], lastArgumentsCpu[2], lastArgumentsCpu[3], lastArgumentsCpu[4], lastArgumentsCpu[5], lastArgumentsCpu[6], lastArgumentsCpu[7], lastArgumentsGpu ? " gpu" : "");
+                else std::snprintf(kind, sizeof(kind), "dispatch");
+                noteBatchWork(*context.recorder, openSerial, kind, Downgrades::ProgramHash(dispatch.stages.front().program.codeAddress), static_cast<std::uint64_t>(groups[0]) * groups[1] * groups[2], lastHangArguments, lastHangArguments != nullptr ? hangArguments : nullptr, dispatch.operation.queue, dispatch.operation.submission);
+            }
             landWrites();
             scheduleLandings(context);
         } catch (const std::exception& error) {
@@ -3671,6 +3780,21 @@ private:
     bool placeDispatchArguments(const Context& context, Graphics::Recorder& recorder, std::uint64_t address, std::uint64_t serial, std::uint64_t completed, VkBuffer& buffer, VkDeviceSize& offset, std::string& reason) {
         constexpr std::size_t bytes = 3u * sizeof(std::uint32_t);
         const auto* source = reinterpret_cast<const std::byte*>(address);
+        if (watchesBatchPrograms()) {
+            lastArgumentsAddress = address;
+            lastArgumentsCpu = {};
+            const auto* record = reinterpret_cast<const std::byte*>(address & ~std::uint64_t{31});
+            if (GuestMemory::Accessible(record, 32u, false)) std::memcpy(lastArgumentsCpu.data(), record, 32u);
+            lastArgumentsGpu = MemoryCore::Get().Pages().GpuWrittenIn(address, bytes) || gpuPending(address, bytes);
+        }
+        if (mirrorPart("args") && argumentsFromMirror()) {
+            if (const auto input = mirrorInput(address, bytes)) {
+                buffer = input->buffer;
+                offset = input->offset;
+                totals.mirrorArguments++;
+                return true;
+            }
+        }
         if (!Graphics::Recorder::SnapshotWriteOverlaps(address, bytes) && recorder.PendingLeaseSerial(address, bytes) == 0u && !MemoryCore::Get().Pages().GpuWrittenIn(address, bytes) && !gpuPending(address, bytes) && MemoryCore::Get().Pages().GpuOwnedIn(address, bytes).empty() && GuestMemory::Accessible(source, bytes, false)) {
             const auto placed = ringWrite(std::span(source, bytes), serial, completed);
             if (!placed.has_value()) {
@@ -3780,6 +3904,18 @@ private:
         if (probed && indirect) probeArguments(context, *recorder, commands, dispatch.operation.dispatch.indirectAddress, argumentBuffer, argumentOffset, stage.program.codeAddress);
         const auto dispatchTiming = recorder->BeginGpuTiming(DispatchTimingKey);
         if (indirect) {
+            if (watchesBatchPrograms()) {
+                constexpr std::uint32_t Slots = 4096;
+                constexpr VkDeviceSize SlotBytes = 16;
+                if (hangArguments == nullptr) hangArguments = std::make_shared<Graphics::Buffer>(context, Slots * SlotBytes, VK_BUFFER_USAGE_TRANSFER_DST_BIT);
+                const auto slot = nextHangArgument++ % Slots;
+                const VkBufferCopy region{argumentOffset, slot * SlotBytes, 3u * sizeof(std::uint32_t)};
+                Graphics::RecordMemoryBarrier(context, commands, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_ACCESS_SHADER_WRITE_BIT | VK_ACCESS_TRANSFER_WRITE_BIT, VK_ACCESS_TRANSFER_READ_BIT);
+                context.Function<PFN_vkCmdCopyBuffer>("vkCmdCopyBuffer")(commands, argumentBuffer, hangArguments->Handle(), 1, &region);
+                Graphics::RecordMemoryBarrier(context, commands, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT | VK_PIPELINE_STAGE_DRAW_INDIRECT_BIT, VK_ACCESS_TRANSFER_WRITE_BIT, VK_ACCESS_INDIRECT_COMMAND_READ_BIT);
+                recorder->Keep(hangArguments);
+                lastHangArguments = hangArguments->Bytes().data() + slot * SlotBytes;
+            }
             context.Resolved(&Graphics::DeviceFunctions::cmdDispatchIndirect, "vkCmdDispatchIndirect")(commands, argumentBuffer, argumentOffset);
             totals.indirectDispatches++;
             readIndirectGroups(context, *recorder, commands, argumentBuffer, argumentOffset, stage.program.codeAddress);
@@ -5128,6 +5264,12 @@ private:
     std::uint64_t mapBytes = 0;
     std::unordered_map<std::uint64_t, TableImages> tableImages;
     std::uint64_t tableRetirements = 0;
+    std::shared_ptr<Graphics::Buffer> hangArguments;
+    std::uint32_t nextHangArgument = 0;
+    const std::byte* lastHangArguments = nullptr;
+    std::uint64_t lastArgumentsAddress = 0;
+    std::array<std::uint32_t, 8> lastArgumentsCpu{};
+    bool lastArgumentsGpu = false;
     std::uint64_t nextTableImagesId = std::uint64_t{1} << 62u;
     std::set<std::string> seen;
     std::chrono::steady_clock::time_point dumpClock = processStart();

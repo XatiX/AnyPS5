@@ -371,7 +371,9 @@ private:
         totals().conditionsRead.fetch_add(1, std::memory_order_relaxed);
         const auto conditionAddress = guard.condition ? (static_cast<std::uint64_t>(guard.words[1]) | (static_cast<std::uint64_t>(guard.words[2]) << 32u)) : guard.predication.address;
         const auto conditionBytes = guard.condition ? 4u : Pm4::PredicationBytes(guard.predication);
-        if (const auto device = Resolve::AttachedDevice(); device != nullptr && (guard.predication.operation == 1u || MemoryCore::Get().GpuWritesPending(conditionAddress, conditionBytes) || LabelsPending(conditionAddress, conditionBytes))) settle(*device, guard.predication.operation == 1u ? "settling for a Z-pass condition" : MemoryCore::Get().GpuWritesPending(conditionAddress, conditionBytes) ? "settling for a GPU-written condition" : "settling for a label condition");
+        static const bool settlesEveryCondition = std::getenv("APS5_RECODE_SETTLE_CONDITIONS") != nullptr;
+        if (const auto device = Resolve::AttachedDevice(); device != nullptr && settlesEveryCondition) settle(*device, "settling for every condition");
+        else if (const auto device = Resolve::AttachedDevice(); device != nullptr && (guard.predication.operation == 1u || MemoryCore::Get().GpuWritesPending(conditionAddress, conditionBytes) || LabelsPending(conditionAddress, conditionBytes))) settle(*device, guard.predication.operation == 1u ? "settling for a Z-pass condition" : MemoryCore::Get().GpuWritesPending(conditionAddress, conditionBytes) ? "settling for a GPU-written condition" : "settling for a label condition");
         stage("reading a condition");
         if (guard.condition) {
             const auto address = static_cast<std::uint64_t>(guard.words[1]) | (static_cast<std::uint64_t>(guard.words[2]) << 32u);
