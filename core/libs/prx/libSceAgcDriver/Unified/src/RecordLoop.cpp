@@ -438,6 +438,8 @@ private:
             totals().refused.fetch_add(1, std::memory_order_relaxed);
             return;
         }
+        stage("building a draw pipeline");
+        Record::PrebuildDraw(device.graphicsContext(), *item.resolved);
         stage("GPU mutex wait");
         GuestMemory::TagGpuLockSite(GuestMemory::GpuLockSite::Draw);
         std::lock_guard lock(GuestMemory::GpuMutex());

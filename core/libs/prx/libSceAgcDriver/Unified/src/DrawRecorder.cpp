@@ -1557,6 +1557,37 @@ public:
         return false;
     }
 
+    void PrebuildDraw(const Context& context, const Resolve::ResolvedDraw& draw) {
+        const auto* heap = Resolve::HeapDevice();
+        if (heap == nullptr || draw.state == nullptr || draw.stages.empty()) return;
+        std::vector<Graphics::CompiledShader> shaders;
+        for (const auto& stage : draw.stages) {
+            if (stage.program.result == nullptr) return;
+            shaders.push_back({stage.program.stage, stage.program.result.get(), stage.program.pushOffset});
+        }
+        Graphics::VertexInputLayout vertexInput;
+        const auto& attributes = draw.stages.front().program.vertexAttributes;
+        if (!attributes.empty()) {
+            vertexInput = Graphics::BuildVertexInputLayout(context, attributes);
+            for (std::size_t index = 0; index < attributes.size(); ++index) {
+                if (vertexInput.attributes[index].format != Graphics::DecodeVertexFormat(attributes[index]).format) return;
+            }
+        }
+        Graphics::PipelineSetLayouts sets;
+        {
+            std::lock_guard lock(mutex);
+            sets.main = setLayout(context, draw, 0);
+            sets.split = draw.layout.split;
+            if (sets.split) sets.fragment = setLayout(context, draw, 1);
+        }
+        sets.mainKey = draw.layout.keys[0];
+        sets.fragmentKey = draw.layout.keys[1];
+        sets.heap = heap->Layout();
+        const auto started = std::chrono::steady_clock::now();
+        static_cast<void>(Graphics::CachedPipeline(context, *draw.state, vertexInput, sets, shaders, VK_IMAGE_LAYOUT_GENERAL));
+        drawPrebuildNanoseconds.fetch_add(elapsed(started), std::memory_order_relaxed);
+    }
+
     bool Record(const Context& context, const Resolve::ResolvedDraw& draw, const Pm4::DrawParameters& parameters, std::string& reason) {
         const auto waitStarted = std::chrono::steady_clock::now();
         std::lock_guard lock(mutex);
@@ -5007,6 +5038,7 @@ private:
     }
 
     std::mutex mutex;
+    std::atomic<std::uint64_t> drawPrebuildNanoseconds{0};
     VkDevice device = VK_NULL_HANDLE;
     std::uint64_t alignment = 16;
     std::shared_ptr<Graphics::Buffer> ring;
@@ -5626,6 +5658,11 @@ bool RecordPrecheck(const Resolve::ResolvedDraw& draw, const Pm4::DrawParameters
 
 bool RecordResolved(const Context& context, const Resolve::ResolvedDraw& draw, const Pm4::DrawParameters& parameters, std::string& reason) {
     return shared().Record(context, draw, parameters, reason);
+}
+
+void PrebuildDraw(const Context& context, const Resolve::ResolvedDraw& draw) {
+    if (!RecordActive()) return;
+    shared().PrebuildDraw(context, draw);
 }
 
 bool RecordDispatchPrecheck(const Context& context, VulkanDevice& owner, const Resolve::ResolvedDraw& dispatch, std::string& reason) {
