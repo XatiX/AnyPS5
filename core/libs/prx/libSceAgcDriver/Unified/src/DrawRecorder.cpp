@@ -1292,7 +1292,9 @@ bool shadowInputs() {
 std::optional<DrawInput> drawInput(const Context& context, std::uint64_t address, std::uint64_t bytes, InputSource& source) {
     source = InputSource::Imported;
     auto& pages = MemoryCore::Get().Pages();
-    if (!shadowInputs() && mirrorMode() && !DirectMemoryAliased_nid_postfix(static_cast<std::uintptr_t>(address), static_cast<std::size_t>(bytes))) {
+    static const bool landedFromImports = std::getenv("APS5_RECODE_MIRROR_INPUTS_LANDED_IMPORTS") != nullptr;
+    const bool landedGpu = landedFromImports && !gpuPending(address, bytes) && pages.GpuOwnedIn(address, bytes).empty() && pages.GpuWrittenIn(address, bytes);
+    if (!shadowInputs() && mirrorMode() && !landedGpu && !DirectMemoryAliased_nid_postfix(static_cast<std::uintptr_t>(address), static_cast<std::size_t>(bytes))) {
         if (auto input = mirrorInput(address, bytes)) {
             const bool gpu = pages.GpuWrittenIn(address, bytes) || !pages.GpuOwnedIn(address, bytes).empty() || gpuPending(address, bytes);
             static const bool consumes = std::getenv("APS5_RECODE_NO_INPUT_CONSUME") == nullptr;
