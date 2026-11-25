@@ -213,8 +213,10 @@ public:
             progress.busyOpcode.store(item->operation.opcode, std::memory_order_relaxed);
             progress.busySince.store(nowNanoseconds(), std::memory_order_release);
             try {
+                if (!item->guards.empty()) stage("checking guards");
                 if (item->guards.empty() || guardsPass(*item)) handle(*item);
                 else trace(*item, "skip");
+                stage("finishing an operation");
             } catch (const std::exception& error) {
                 Record::RefuseUnrecorded("loop operation", 0, std::string("record loop threw: ") + error.what());
                 totals().refused.fetch_add(1, std::memory_order_relaxed);
@@ -301,9 +303,13 @@ private:
                 stage("storing");
                 store(*device, item);
                 return;
-            case OpKind::Wait: wait(*device, item); return;
+            case OpKind::Wait:
+                stage("waiting on memory");
+                wait(*device, item);
+                return;
             case OpKind::Flip: return;
             case OpKind::Marker:
+                stage("sealing pass writes");
                 sealPassWrites(*device);
                 return;
         }
@@ -403,7 +409,7 @@ private:
 
     void draw(VulkanDevice& device, const Item& item) {
         if (item.resolved == nullptr || !item.parameters) {
-            Record::RefuseUnrecorded("draw", codeOf(item), item.resolved == nullptr ? "not resolved" : "draw parameters not decoded");
+            Record::RefuseUnrecorded("draw", codeOf(item), item.resolved == nullptr ? "" : "draw parameters not decoded");
             totals().refused.fetch_add(1, std::memory_order_relaxed);
             return;
         }
@@ -433,7 +439,7 @@ private:
 
     void dispatch(VulkanDevice& device, const Item& item) {
         if (item.resolved == nullptr) {
-            Record::RefuseUnrecorded("dispatch", 0, "not resolved");
+            Record::RefuseUnrecorded("dispatch", 0, "");
             totals().refused.fetch_add(1, std::memory_order_relaxed);
             return;
         }
