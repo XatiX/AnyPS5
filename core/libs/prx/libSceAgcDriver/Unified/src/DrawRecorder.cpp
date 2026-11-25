@@ -5396,6 +5396,19 @@ std::optional<Pm4::MemoryCopy> MirrorCopyOf(std::span<const std::uint32_t> packe
     return copy;
 }
 
+std::shared_ptr<Graphics::Buffer> ReadMirrorAfterBatch(const Context& context, Graphics::Recorder& recorder, std::uint64_t address, std::uint64_t bytes) {
+    const auto from = ResidencyService::Get().MirrorSpan(address, bytes);
+    if (!from || from->handle == 0u) return nullptr;
+    auto landing = std::make_shared<Graphics::Buffer>(context, bytes, VK_BUFFER_USAGE_TRANSFER_DST_BIT);
+    const auto commands = recorder.Commands();
+    Graphics::RecordMemoryBarrier(context, commands, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_ACCESS_SHADER_WRITE_BIT | VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT | VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT | VK_ACCESS_TRANSFER_WRITE_BIT, VK_ACCESS_TRANSFER_READ_BIT);
+    const VkBufferCopy region{from->offset, 0, bytes};
+    context.Function<PFN_vkCmdCopyBuffer>("vkCmdCopyBuffer")(commands, reinterpret_cast<VkBuffer>(static_cast<std::uintptr_t>(from->handle)), landing->Handle(), 1, &region);
+    Graphics::RecordMemoryBarrier(context, commands, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_HOST_BIT, VK_ACCESS_TRANSFER_WRITE_BIT, VK_ACCESS_HOST_READ_BIT);
+    recorder.Keep(landing);
+    return landing;
+}
+
 bool CopyInMirror(const Context& context, Graphics::Recorder& recorder, const Pm4::MemoryCopy& copy) {
     auto& residency = ResidencyService::Get();
     const auto from = residency.MirrorSpan(copy.source, copy.bytes);

@@ -11,6 +11,7 @@
 #include "prx/libSceAgcDriver/Execution/include/VulkanDevice.hpp"
 #include "prx/libSceAgcDriver/Execution/include/WorkerSampler.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/Recorder.hpp"
+#include "prx/libSceAgcDriver/Graphics/include/Resources.hpp"
 #include <algorithm>
 #include <atomic>
 #include <condition_variable>
@@ -59,6 +60,7 @@ struct Totals {
     std::atomic<std::uint64_t> flipsReleased{0};
     std::atomic<std::uint64_t> copiedBytes{0};
     std::atomic<std::uint64_t> copiesOnGpu{0};
+    std::atomic<std::uint64_t> copiesFromMirror{0};
     std::atomic<std::uint64_t> flipsReleasedByWorker{0};
     std::atomic<std::uint64_t> guarded{0};
     std::atomic<std::uint64_t> skipped{0};
@@ -498,6 +500,15 @@ private:
         return Pm4::MemoryCopy{from, to, bytes};
     }
 
+    static void writeCopy(std::uint64_t destination, std::span<const std::byte> bytes) {
+        if (GuestMemory::Accessible(reinterpret_cast<const void*>(static_cast<std::uintptr_t>(destination)), bytes.size(), true)) {
+            std::memcpy(reinterpret_cast<void*>(static_cast<std::uintptr_t>(destination)), bytes.data(), bytes.size());
+            Shadow::NoteDriverStore(destination, bytes.size());
+            return;
+        }
+        GuestMemory::Write(destination, bytes, 1);
+    }
+
     void landNow(VulkanDevice& device, std::span<const std::uint32_t> words) {
         auto copy = memoryCopyOf(words);
         if (!copy && words.size() == 7u && ((words[0] >> 8u) & 0xffu) == 0x50u) {
@@ -511,6 +522,23 @@ private:
             const auto bytes = Pm4::DmaBytes(words);
             if (from && to && bytes != 0u && (*from + bytes <= *to || *to + bytes <= *from)) copy = Pm4::MemoryCopy{*from, *to, bytes};
         }
+        if (copy && copy->bytes <= GpuStoreLimit && MemoryCore::Get().GpuWritesPending(copy->source, copy->bytes)) {
+            const std::array source{DirtyRange{copy->source, copy->bytes}};
+            std::shared_ptr<Graphics::Buffer> landing;
+            if (MemoryCore::Get().WithoutGpuWritten(source).empty()) {
+                GuestMemory::TagGpuLockSite(GuestMemory::GpuLockSite::Label);
+                std::lock_guard lock(GuestMemory::GpuMutex());
+                if (auto* recorder = device.graphicsContext().recorder) landing = Record::ReadMirrorAfterBatch(device.graphicsContext(), *recorder, copy->source, copy->bytes);
+            }
+            if (landing != nullptr) {
+                settle(device, "settling for a copy read from the mirror");
+                stage("writing a copy destination");
+                landing->Invalidate();
+                writeCopy(copy->destination, std::span<const std::byte>(landing->Bytes().data(), static_cast<std::size_t>(copy->bytes)));
+                totals().copiesFromMirror.fetch_add(1, std::memory_order_relaxed);
+                return;
+            }
+        }
         if (copy) {
             if (MemoryCore::Get().GpuWritesPending(copy->source, copy->bytes)) settle(device, "settling for a copy source");
             stage("landing a copy source");
@@ -521,12 +549,7 @@ private:
             if (GuestMemory::Accessible(reinterpret_cast<const void*>(static_cast<std::uintptr_t>(copy->source)), bytes.size())) std::memcpy(bytes.data(), reinterpret_cast<const void*>(static_cast<std::uintptr_t>(copy->source)), bytes.size());
             else GuestMemory::Read(copy->source, bytes, 1);
             stage("writing a copy destination");
-            if (GuestMemory::Accessible(reinterpret_cast<const void*>(static_cast<std::uintptr_t>(copy->destination)), bytes.size(), true)) {
-                std::memcpy(reinterpret_cast<void*>(static_cast<std::uintptr_t>(copy->destination)), bytes.data(), bytes.size());
-                Shadow::NoteDriverStore(copy->destination, bytes.size());
-            } else {
-                GuestMemory::Write(copy->destination, bytes, 1);
-            }
+            writeCopy(copy->destination, bytes);
             return;
         }
         const auto storeOpcode = (words[0] >> 8u) & 0xffu;
@@ -792,8 +815,8 @@ LoopCounts Counts() {
 std::string Line() {
     const auto counts = Counts();
     char text[1024];
-    std::snprintf(text, sizeof(text), "draws %llu, dispatches %llu, refused %llu; label stores %llu (%llu at once on the CPU), interrupts %llu; waits %llu (%llu from the label table, %llu from guest memory, %llu polls); copies %llu (%llu on the CPU in stream order, %.1f MiB; %llu in the mirror); run-time stores %llu (%llu refused); occlusion dumps %llu; constant RAM dumps %llu; indirect buffers changed after decode %llu; pass write seals %llu; flips %llu (%llu released by the loop, %llu by the worker); guarded operations %llu (%llu skipped, %llu conditions read); predicated operations with no guard %llu; idle reaps %llu",
-                  static_cast<unsigned long long>(counts.draws), static_cast<unsigned long long>(counts.dispatches), static_cast<unsigned long long>(counts.refused), static_cast<unsigned long long>(counts.labels), static_cast<unsigned long long>(counts.labelsAtOnce), static_cast<unsigned long long>(counts.interrupts), static_cast<unsigned long long>(counts.waits), static_cast<unsigned long long>(counts.waitsFromTable), static_cast<unsigned long long>(counts.waitsFromGuest), static_cast<unsigned long long>(counts.waitPolls), static_cast<unsigned long long>(counts.copies), static_cast<unsigned long long>(counts.copiesOnCpu), static_cast<double>(totals().copiedBytes.load()) / 1048576.0, static_cast<unsigned long long>(totals().copiesOnGpu.load()), static_cast<unsigned long long>(totals().runTimeStores.load()), static_cast<unsigned long long>(totals().runTimeRefused.load()), static_cast<unsigned long long>(totals().sampleDumps.load()), static_cast<unsigned long long>(totals().constantRamDumps.load()), static_cast<unsigned long long>(totals().refreshedSegments.load()), static_cast<unsigned long long>(totals().seals.load()), static_cast<unsigned long long>(counts.flips), static_cast<unsigned long long>(totals().flipsReleased.load()), static_cast<unsigned long long>(totals().flipsReleasedByWorker.load()), static_cast<unsigned long long>(totals().guarded.load()), static_cast<unsigned long long>(totals().skipped.load()), static_cast<unsigned long long>(totals().conditionsRead.load()), static_cast<unsigned long long>(totals().predicated.load()), static_cast<unsigned long long>(totals().idleReaps.load()));
+    std::snprintf(text, sizeof(text), "draws %llu, dispatches %llu, refused %llu; label stores %llu (%llu at once on the CPU), interrupts %llu; waits %llu (%llu from the label table, %llu from guest memory, %llu polls); copies %llu (%llu on the CPU in stream order, %.1f MiB; %llu in the mirror; %llu read from the mirror after their batch); run-time stores %llu (%llu refused); occlusion dumps %llu; constant RAM dumps %llu; indirect buffers changed after decode %llu; pass write seals %llu; flips %llu (%llu released by the loop, %llu by the worker); guarded operations %llu (%llu skipped, %llu conditions read); predicated operations with no guard %llu; idle reaps %llu",
+                  static_cast<unsigned long long>(counts.draws), static_cast<unsigned long long>(counts.dispatches), static_cast<unsigned long long>(counts.refused), static_cast<unsigned long long>(counts.labels), static_cast<unsigned long long>(counts.labelsAtOnce), static_cast<unsigned long long>(counts.interrupts), static_cast<unsigned long long>(counts.waits), static_cast<unsigned long long>(counts.waitsFromTable), static_cast<unsigned long long>(counts.waitsFromGuest), static_cast<unsigned long long>(counts.waitPolls), static_cast<unsigned long long>(counts.copies), static_cast<unsigned long long>(counts.copiesOnCpu), static_cast<double>(totals().copiedBytes.load()) / 1048576.0, static_cast<unsigned long long>(totals().copiesOnGpu.load()), static_cast<unsigned long long>(totals().copiesFromMirror.load()),static_cast<unsigned long long>(totals().runTimeStores.load()), static_cast<unsigned long long>(totals().runTimeRefused.load()), static_cast<unsigned long long>(totals().sampleDumps.load()), static_cast<unsigned long long>(totals().constantRamDumps.load()), static_cast<unsigned long long>(totals().refreshedSegments.load()), static_cast<unsigned long long>(totals().seals.load()), static_cast<unsigned long long>(counts.flips), static_cast<unsigned long long>(totals().flipsReleased.load()), static_cast<unsigned long long>(totals().flipsReleasedByWorker.load()), static_cast<unsigned long long>(totals().guarded.load()), static_cast<unsigned long long>(totals().skipped.load()), static_cast<unsigned long long>(totals().conditionsRead.load()), static_cast<unsigned long long>(totals().predicated.load()), static_cast<unsigned long long>(totals().idleReaps.load()));
     return text;
 }
 

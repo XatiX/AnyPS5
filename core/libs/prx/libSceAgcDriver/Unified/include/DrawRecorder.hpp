@@ -20,6 +20,7 @@ class VulkanDevice;
 }
 
 namespace AgcDriver::Graphics {
+class Buffer;
 class Recorder;
 }
 
@@ -44,6 +45,7 @@ void NoteSampleDumpBefore(std::uint64_t address);
 void DeviceReplaced(const Graphics::Context& context, Graphics::Recorder& recorder);
 [[nodiscard]] bool StoresToMirror(std::size_t bytes, std::uint64_t address);
 [[nodiscard]] std::optional<Pm4::MemoryCopy> MirrorCopyOf(std::span<const std::uint32_t> packet);
+[[nodiscard]] std::shared_ptr<Graphics::Buffer> ReadMirrorAfterBatch(const Graphics::Context& context, Graphics::Recorder& recorder, std::uint64_t address, std::uint64_t bytes);
 [[nodiscard]] bool CopyInMirror(const Graphics::Context& context, Graphics::Recorder& recorder, const Pm4::MemoryCopy& copy);
 [[nodiscard]] int StoreToMirror(const Graphics::Context& context, Graphics::Recorder& recorder, std::uint64_t address, std::span<const std::byte> bytes, std::uint64_t stamp, std::uint32_t queue);
 void NoteExistingPacket(std::span<const std::uint32_t> packet, std::uint32_t queue);
