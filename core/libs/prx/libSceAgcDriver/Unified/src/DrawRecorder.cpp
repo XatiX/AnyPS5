@@ -3376,7 +3376,12 @@ private:
         static const char* const mode = std::getenv("APS5_RECODE_CONSUME_USES");
         static const bool global = mode != nullptr && std::string_view(mode) == "global";
         static const bool quick = mode != nullptr && std::string_view(mode) == "quick";
+        static const bool every = mode != nullptr && std::string_view(mode) == "every";
         if (mode == nullptr || std::string_view(mode) == "0") return;
+        if (every) {
+            if (Shadow::ConsumeIn({}) != 0u) inputConsumes().fetch_add(1, std::memory_order_relaxed);
+            return;
+        }
         if (quick) {
             for (const auto& use : operation.uses) {
                 if (use.size == 0u || use.write || MemoryCore::Get().Pages().CleanIn(use.address, use.size)) continue;
