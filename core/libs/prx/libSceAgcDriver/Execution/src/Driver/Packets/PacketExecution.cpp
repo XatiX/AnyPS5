@@ -332,8 +332,12 @@ void Driver::execute(Submission& submission) {
                 cursor += count;
                 continue;
             }
+            if (flipHere) {
+                handFlipToRecode(submission, cursor, std::exchange(flipHold.held, false), std::exchange(flipHold.working, false));
+                cursor += count;
+                continue;
+            }
             Unified::Loop::TraceKept(packet, opcode, submission.queue, submission.serial, cursor, flipHere);
-            if (flipHere && !Unified::Loop::WaitPassed(submission.queue, submission.serial, static_cast<std::uint32_t>(cursor), std::chrono::seconds(60))) std::fprintf(stderr, "[recode-loop] flip at submission %llu offset %zu waited 60 s for the record loop\n", static_cast<unsigned long long>(submission.serial), cursor);
         }
         Unified::Record::NoteExistingPacket(packet, submission.queue);
 #endif

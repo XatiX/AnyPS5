@@ -18,6 +18,8 @@
 #include <limits>
 #include <map>
 #include <optional>
+#include <set>
+#include <tuple>
 #include <mutex>
 #include <thread>
 #include <utility>
@@ -52,6 +54,8 @@ struct Totals {
     std::atomic<std::uint64_t> seals{0};
     std::atomic<std::uint64_t> constantRamDumps{0};
     std::atomic<std::uint64_t> refreshedSegments{0};
+    std::atomic<std::uint64_t> flipsReleased{0};
+    std::atomic<std::uint64_t> flipsReleasedByWorker{0};
     std::atomic<std::uint64_t> guarded{0};
     std::atomic<std::uint64_t> skipped{0};
     std::atomic<std::uint64_t> conditionsRead{0};
@@ -112,6 +116,27 @@ std::string stuckLine() {
 
 bool reached(const Progress& progress, std::uint64_t submission, std::uint32_t offset) {
     return progress.any && (progress.submission > submission || (progress.submission == submission && progress.offset >= offset));
+}
+
+using FlipKey = std::tuple<std::uint32_t, std::uint64_t, std::uint32_t>;
+
+struct FlipHandOver {
+    std::mutex mutex;
+    std::map<FlipKey, std::function<void()>> handed;
+    std::set<FlipKey> reached;
+};
+
+FlipHandOver& flipHandOver() {
+    static FlipHandOver held;
+    return held;
+}
+
+void runFlipRelease(const std::function<void()>& release) {
+    try {
+        release();
+    } catch (const std::exception& error) {
+        Record::RefuseUnrecorded("loop flip", 0, std::string("the flip release threw: ") + error.what());
+    }
 }
 
 void deliverInterrupt(std::uint32_t queue, std::uint32_t context) {
@@ -209,6 +234,10 @@ private:
     void handle(const Item& item) {
         trace(item, "take");
         if (item.operation.predicated && item.guards.empty()) totals().predicated.fetch_add(1, std::memory_order_relaxed);
+        if (item.operation.kind == OpKind::Flip) {
+            releaseFlip(item);
+            return;
+        }
         const auto device = Resolve::AttachedDevice();
         if (device == nullptr) {
             if (item.operation.kind != OpKind::Wait && item.operation.kind != OpKind::Flip && item.operation.kind != OpKind::Marker) Record::RefuseUnrecorded("loop operation", 0, "the recode has no device yet");
@@ -232,7 +261,7 @@ private:
                 store(*device, item);
                 return;
             case OpKind::Wait: wait(*device, item); return;
-            case OpKind::Flip: totals().flips.fetch_add(1, std::memory_order_relaxed); return;
+            case OpKind::Flip: return;
             case OpKind::Marker:
                 sealPassWrites(*device);
                 return;
@@ -303,6 +332,26 @@ private:
         static std::atomic<std::uint32_t> lines{0};
         if (!traced || lines.fetch_add(1, std::memory_order_relaxed) >= 300u) return;
         std::fprintf(stderr, "[recode-loop-trace] guard q%u submission %llu range %zu-%zu %s operation %u blocks 0x%x when-set %d at 0x%llx value 0x%llx: %s\n", queue, static_cast<unsigned long long>(guard.submission), guard.start, guard.end, guard.condition ? "COND_EXEC" : "predication", guard.predication.operation, guard.sampleDumpBlocks, guard.predication.executeWhenSet ? 1 : 0, static_cast<unsigned long long>(address), static_cast<unsigned long long>(value), passes ? "runs" : "skips");
+    }
+
+    void releaseFlip(const Item& item) {
+        stage("releasing a flip");
+        totals().flips.fetch_add(1, std::memory_order_relaxed);
+        auto& shared = flipHandOver();
+        const FlipKey key{item.operation.queue, item.operation.submission, item.operation.packetOffset};
+        std::function<void()> release;
+        {
+            std::lock_guard lock(shared.mutex);
+            const auto found = shared.handed.find(key);
+            if (found == shared.handed.end()) {
+                shared.reached.insert(key);
+                return;
+            }
+            release = std::move(found->second);
+            shared.handed.erase(found);
+        }
+        totals().flipsReleased.fetch_add(1, std::memory_order_relaxed);
+        runFlipRelease(release);
     }
 
     static std::uint64_t codeOf(const Item& item) {
@@ -560,6 +609,20 @@ void TraceInterrupt(std::uint32_t queue, std::uint32_t context) {
     if (traced) std::fprintf(stderr, "[recode-loop-trace] interrupt queue 0x%x context 0x%x at %.3f s\n", queue, context, std::chrono::duration<double>(std::chrono::steady_clock::now() - started).count());
 }
 
+void HandFlip(std::uint32_t queue, std::uint64_t submission, std::uint32_t packetOffset, std::function<void()> release) {
+    auto& shared = flipHandOver();
+    const FlipKey key{queue, submission, packetOffset};
+    {
+        std::lock_guard lock(shared.mutex);
+        if (shared.reached.erase(key) == 0u) {
+            shared.handed.emplace(key, std::move(release));
+            return;
+        }
+    }
+    totals().flipsReleasedByWorker.fetch_add(1, std::memory_order_relaxed);
+    runFlipRelease(release);
+}
+
 void NoteRefreshedSegment(std::uint32_t queue, std::uint64_t submission, std::size_t offset) {
     const auto seen = totals().refreshedSegments.fetch_add(1, std::memory_order_relaxed);
     if (seen < 8u) std::fprintf(stderr, "[recode-segments] queue 0x%x submission %llu: the indirect buffer at offset %zu changed after its submission was copied and is read again where it runs%s\n", queue, static_cast<unsigned long long>(submission), offset, OwnsLoop() ? "; the record loop ran the copy decoded at submission" : "");
@@ -616,9 +679,9 @@ LoopCounts Counts() {
 
 std::string Line() {
     const auto counts = Counts();
-    char text[512];
-    std::snprintf(text, sizeof(text), "draws %llu, dispatches %llu, refused %llu; label stores %llu (%llu at once on the CPU), interrupts %llu; waits %llu (%llu from the label table, %llu from guest memory, %llu polls); copies %llu (%llu on the CPU in stream order); run-time stores %llu (%llu refused); occlusion dumps %llu; constant RAM dumps %llu; indirect buffers changed after decode %llu; pass write seals %llu; flips %llu; guarded operations %llu (%llu skipped, %llu conditions read); predicated operations with no guard %llu; idle reaps %llu",
-                  static_cast<unsigned long long>(counts.draws), static_cast<unsigned long long>(counts.dispatches), static_cast<unsigned long long>(counts.refused), static_cast<unsigned long long>(counts.labels), static_cast<unsigned long long>(counts.labelsAtOnce), static_cast<unsigned long long>(counts.interrupts), static_cast<unsigned long long>(counts.waits), static_cast<unsigned long long>(counts.waitsFromTable), static_cast<unsigned long long>(counts.waitsFromGuest), static_cast<unsigned long long>(counts.waitPolls), static_cast<unsigned long long>(counts.copies), static_cast<unsigned long long>(counts.copiesOnCpu), static_cast<unsigned long long>(totals().runTimeStores.load()), static_cast<unsigned long long>(totals().runTimeRefused.load()), static_cast<unsigned long long>(totals().sampleDumps.load()), static_cast<unsigned long long>(totals().constantRamDumps.load()), static_cast<unsigned long long>(totals().refreshedSegments.load()), static_cast<unsigned long long>(totals().seals.load()), static_cast<unsigned long long>(counts.flips), static_cast<unsigned long long>(totals().guarded.load()), static_cast<unsigned long long>(totals().skipped.load()), static_cast<unsigned long long>(totals().conditionsRead.load()), static_cast<unsigned long long>(totals().predicated.load()), static_cast<unsigned long long>(totals().idleReaps.load()));
+    char text[1024];
+    std::snprintf(text, sizeof(text), "draws %llu, dispatches %llu, refused %llu; label stores %llu (%llu at once on the CPU), interrupts %llu; waits %llu (%llu from the label table, %llu from guest memory, %llu polls); copies %llu (%llu on the CPU in stream order); run-time stores %llu (%llu refused); occlusion dumps %llu; constant RAM dumps %llu; indirect buffers changed after decode %llu; pass write seals %llu; flips %llu (%llu released by the loop, %llu by the worker); guarded operations %llu (%llu skipped, %llu conditions read); predicated operations with no guard %llu; idle reaps %llu",
+                  static_cast<unsigned long long>(counts.draws), static_cast<unsigned long long>(counts.dispatches), static_cast<unsigned long long>(counts.refused), static_cast<unsigned long long>(counts.labels), static_cast<unsigned long long>(counts.labelsAtOnce), static_cast<unsigned long long>(counts.interrupts), static_cast<unsigned long long>(counts.waits), static_cast<unsigned long long>(counts.waitsFromTable), static_cast<unsigned long long>(counts.waitsFromGuest), static_cast<unsigned long long>(counts.waitPolls), static_cast<unsigned long long>(counts.copies), static_cast<unsigned long long>(counts.copiesOnCpu), static_cast<unsigned long long>(totals().runTimeStores.load()), static_cast<unsigned long long>(totals().runTimeRefused.load()), static_cast<unsigned long long>(totals().sampleDumps.load()), static_cast<unsigned long long>(totals().constantRamDumps.load()), static_cast<unsigned long long>(totals().refreshedSegments.load()), static_cast<unsigned long long>(totals().seals.load()), static_cast<unsigned long long>(counts.flips), static_cast<unsigned long long>(totals().flipsReleased.load()), static_cast<unsigned long long>(totals().flipsReleasedByWorker.load()), static_cast<unsigned long long>(totals().guarded.load()), static_cast<unsigned long long>(totals().skipped.load()), static_cast<unsigned long long>(totals().conditionsRead.load()), static_cast<unsigned long long>(totals().predicated.load()), static_cast<unsigned long long>(totals().idleReaps.load()));
     return text;
 }
 

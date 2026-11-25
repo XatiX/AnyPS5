@@ -437,6 +437,9 @@ private:
     FrameTiming* includeTimingSubmission(const Submission& submission, bool firstSegment);
     void execute(Submission& submission);
     void deliverGuestEopInterrupt(std::uint32_t queue, std::uint32_t context);
+#if ANYPS5_UNIFIED
+    void handFlipToRecode(const Submission& submission, std::size_t cursor, bool holds, bool working);
+#endif
     static std::optional<std::uint32_t> releaseInterrupt(std::span<const std::uint32_t> packet, std::uint32_t opcode, bool carriesFlip);
     void markCompleted(std::uint64_t serial);
     static const std::atomic<std::uint64_t>*& workerQueued();
