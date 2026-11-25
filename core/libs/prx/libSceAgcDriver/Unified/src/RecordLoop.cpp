@@ -388,10 +388,23 @@ private:
             if (known == decided.end()) decided[decidedNext++ % decided.size()] = {guard.submission, guard.start, guard.condition, passes};
             if (!passes) {
                 totals().skipped.fetch_add(1, std::memory_order_relaxed);
+                noteGuard(item, guard, false);
                 return false;
             }
         }
+        if (!item.guards.empty()) noteGuard(item, item.guards.front(), true);
         return true;
+    }
+
+    void noteGuard(const Item& item, const OperationGuard& guard, bool passes) const {
+        static const bool noted = std::getenv("APS5_RECODE_HANG_PROGRAMS") != nullptr;
+        if (!noted) return;
+        static const auto origin = std::chrono::steady_clock::now();
+        const auto address = guard.condition ? (static_cast<std::uint64_t>(guard.words[1]) | (static_cast<std::uint64_t>(guard.words[2]) << 32u)) : guard.predication.address;
+        auto& history = waitHistory();
+        std::lock_guard lock(history.mutex);
+        auto& [ring, next] = history.rings[queue];
+        ring[next++ % ring.size()] = {item.operation.submission, static_cast<std::uint32_t>(item.operation.packetOffset), address, static_cast<std::uint64_t>(item.operation.opcode), 0u, guard.condition ? 100u : 101u, 0u, passes ? 'r' : 's', 0.0, std::chrono::duration<double>(std::chrono::steady_clock::now() - origin).count()};
     }
 
     void settle(VulkanDevice& device, const char* why = "settling recorded work") {
@@ -729,7 +742,8 @@ private:
                 noteWait(operation, 'g', Pm4::LoadLabel(operation.address, static_cast<std::size_t>(operation.size)), started);
                 return;
             }
-            if (Labels::Table().IssuedAfter(operation.address, static_cast<std::size_t>(operation.size), 0u, compares)) {
+            static const bool guestOnly = std::getenv("APS5_RECODE_WAITS_FROM_GUEST") != nullptr;
+            if (!guestOnly && Labels::Table().IssuedAfter(operation.address, static_cast<std::size_t>(operation.size), 0u, compares)) {
                 totals().waitsFromTable.fetch_add(1, std::memory_order_relaxed);
                 noteWait(operation, 't', readable() ? Pm4::LoadLabel(operation.address, static_cast<std::size_t>(operation.size)) : 0u, started);
                 return;
@@ -916,6 +930,10 @@ void PrintRecentWaits() {
         for (std::size_t index = 0; index < ring.size(); ++index) {
             const auto& note = ring[(next + index) % ring.size()];
             if (note.address == 0u) continue;
+            if (note.source == 'r' || note.source == 's') {
+                std::fprintf(stderr, "[recode-hang-guard] %.3f s queue 0x%x submission %llu offset %u opcode 0x%llx %s at 0x%llx: %s\n", note.at, queue, static_cast<unsigned long long>(note.submission), note.offset, static_cast<unsigned long long>(note.reference), note.function == 100u ? "COND_EXEC" : "predication", static_cast<unsigned long long>(note.address), note.source == 'r' ? "runs" : "skipped");
+                continue;
+            }
             std::fprintf(stderr, "[recode-hang-wait] %.3f s queue 0x%x submission %llu offset %u at 0x%llx function %u ref 0x%llx mask 0x%llx passed by %s (guest 0x%llx) after %.3f s\n", note.at, queue, static_cast<unsigned long long>(note.submission), note.offset, static_cast<unsigned long long>(note.address), note.function, static_cast<unsigned long long>(note.reference), static_cast<unsigned long long>(note.mask), note.source == 'g' ? "guest memory" : "the label table", static_cast<unsigned long long>(note.guest), note.seconds);
         }
     }
