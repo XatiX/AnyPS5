@@ -343,17 +343,21 @@ private:
     void settle(VulkanDevice& device, const char* why = "settling recorded work") {
         stage(why);
         for (;;) {
+            bool idle = true;
             {
                 GuestMemory::TagGpuLockSite(GuestMemory::GpuLockSite::Wait);
                 std::lock_guard lock(GuestMemory::GpuMutex());
                 auto* recorder = device.graphicsContext().recorder;
-                if (recorder == nullptr || recorder->Idle()) return;
-                recorder->Submit();
-                static_cast<void>(recorder->Reap());
-                if (recorder->Idle()) return;
+                if (recorder != nullptr && !recorder->Idle()) {
+                    recorder->Submit();
+                    static_cast<void>(recorder->Reap());
+                    idle = recorder->Idle();
+                }
             }
+            if (idle) break;
             std::this_thread::sleep_for(std::chrono::microseconds(50));
         }
+        Record::DrainHostCopies();
     }
 
     bool evaluate(const OperationGuard& guard) {
@@ -480,8 +484,10 @@ private:
         std::vector<std::byte> held(bytes.begin(), bytes.end());
         notePendingLabel(address, bytes.size());
         if (context.recorder->AfterRecordedWork([address, held] {
-                GuestMemory::Write(address, held, 1);
-                dropPendingLabel(address, held.size());
+                Record::AfterLandings([address, held] {
+                    GuestMemory::Write(address, held, 1);
+                    dropPendingLabel(address, held.size());
+                });
             })) return;
         dropPendingLabel(address, bytes.size());
         GuestMemory::Write(address, bytes, 1);
@@ -581,7 +587,7 @@ private:
                 if (select != 0u && select != 3u) {
                     const auto interrupt = item.words[7] & 0x0fffffffu;
                     const auto target = queue;
-                    if (!context.recorder->AfterRecordedWork([target, interrupt] { deliverInterrupt(target, interrupt); })) deliverInterrupt(target, interrupt);
+                    if (!context.recorder->AfterRecordedWork([target, interrupt] { Record::AfterLandings([target, interrupt] { deliverInterrupt(target, interrupt); }); })) deliverInterrupt(target, interrupt);
                 }
             }
             return;

@@ -5141,7 +5141,10 @@ HostCopies& hostCopies() {
 }
 
 bool usesHostCopyThread() {
-    static const bool uses = std::getenv("APS5_RECODE_HOST_COPY_THREAD") != nullptr;
+    static const bool uses = [] {
+        const char* value = std::getenv("APS5_RECODE_HOST_COPY_THREAD");
+        return value != nullptr ? std::string_view(value) != "0" : RecordActive();
+    }();
     return uses;
 }
 
@@ -5172,6 +5175,15 @@ void queueHostCopy(std::function<void()> landing) {
         }
     }
     copies.wake.notify_one();
+}
+
+void AfterLandings(std::function<void()> action) {
+    if (!usesHostCopyThread()) {
+        action();
+        return;
+    }
+    batchLandings().pending.fetch_add(1, std::memory_order_acq_rel);
+    queueHostCopy(std::move(action));
 }
 
 void DrainHostCopies() {

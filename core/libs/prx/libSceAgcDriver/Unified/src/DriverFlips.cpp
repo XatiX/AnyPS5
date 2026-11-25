@@ -2,6 +2,7 @@
 #include "prx/libSceAgcDriver/Execution/include/GuestMemory.hpp"
 #include "prx/libSceAgcDriver/Execution/include/PerformanceTimer.hpp"
 #include "prx/libSceAgcDriver/Execution/include/VulkanDevice.hpp"
+#include "prx/libSceAgcDriver/Unified/include/DrawRecorder.hpp"
 #include "prx/libSceAgcDriver/Unified/include/RecordLoop.hpp"
 #include "prx/libSceAgcDriver/Unified/include/Releases.hpp"
 #include <memory>
@@ -32,9 +33,11 @@ void Driver::handFlipToRecode(const Submission& submission, std::size_t cursor, 
             std::lock_guard gpuLock(GuestMemory::GpuMutex());
             const auto localDevice = device.Load();
             queued = localDevice != nullptr && localDevice->AfterRecordedWork([this, flip, frame, handle] {
-                Unified::Releases::Queue([this, flip, frame, handle] {
-                    flip->GpuReady(frame);
-                    endFlipReady(handle);
+                Unified::Record::AfterLandings([this, flip, frame, handle] {
+                    Unified::Releases::Queue([this, flip, frame, handle] {
+                        flip->GpuReady(frame);
+                        endFlipReady(handle);
+                    });
                 });
             }, false);
         }

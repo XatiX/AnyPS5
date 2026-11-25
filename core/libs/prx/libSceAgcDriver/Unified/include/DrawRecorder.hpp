@@ -52,6 +52,8 @@ void NoteExistingPacket(std::span<const std::uint32_t> packet, std::uint32_t que
 [[nodiscard]] bool LandingsPending();
 [[nodiscard]] bool RecordsHtileClears();
 void LandAfterBatch(Graphics::Recorder& recorder, std::function<void()> landing);
+void AfterLandings(std::function<void()> action);
+void DrainHostCopies();
 [[nodiscard]] bool IdleStores();
 bool RecordPrecheck(const Resolve::ResolvedDraw& draw, const Pm4::DrawParameters& parameters, std::vector<std::pair<std::uint64_t, std::uint64_t>>& reads, std::string& reason);
 bool RecordResolved(const Graphics::Context& context, const Resolve::ResolvedDraw& draw, const Pm4::DrawParameters& parameters, std::string& reason);

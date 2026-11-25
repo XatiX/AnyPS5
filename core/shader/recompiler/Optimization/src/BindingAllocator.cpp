@@ -68,7 +68,7 @@ bool usesGds(const IrProgram& program) {
 
 }
 
-BindingAllocationResult BindingAllocator::Allocate(IrProgram& program, const BindingLayout& layout, bool registrationModules, bool stencilReplay) const {
+BindingAllocationResult BindingAllocator::Allocate(IrProgram& program, const BindingLayout& layout, bool registrationModules, bool stencilReplay, bool metadataOutOfPush) const {
     IrProgramMetadata& metadata = program.Metadata();
     if (!metadata.shaderInfoComplete || metadata.bindingLayoutComplete) {
         fail(metadata.shaderInfoComplete ? "shader binding layout failed: binding layout already allocated"
@@ -115,7 +115,7 @@ BindingAllocationResult BindingAllocator::Allocate(IrProgram& program, const Bin
     }
     const auto pushSize = layout.pushConstantSizeBytes / 4u;
     const auto dataSize = stencilReplay && pushSize != 0u ? pushSize - 1u : pushSize;
-    next.pushDataStartDword = next.ShaderDataDwords() != 0u && next.ShaderDataDwords() <= dataSize ? layout.pushConstantOffsetBytes / 4u : PushData::NoStart;
+    next.pushDataStartDword = (!metadataOutOfPush || next.runtimeImageCount == 0u) && next.ShaderDataDwords() != 0u && next.ShaderDataDwords() <= dataSize ? layout.pushConstantOffsetBytes / 4u : PushData::NoStart;
     if (stencilReplay) {
         const auto offset = next.UsesPushData() ? next.ShaderDataDwords() : 0u;
         if (offset >= pushSize) fail("stencil replay requires an unused push constant dword");
