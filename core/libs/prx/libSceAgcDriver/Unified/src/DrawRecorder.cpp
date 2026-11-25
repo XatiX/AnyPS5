@@ -1296,7 +1296,7 @@ void countInput(Totals& totals, InputSource source) {
     }
 }
 
-constexpr std::uint64_t KnownBufferLimitBytes = 256ull << 20u;
+constexpr std::uint64_t KnownBufferLimitBytes = 1024ull << 20u;
 constexpr std::uint64_t KnownCopyLimitBytes = 64ull << 10u;
 constexpr std::uint64_t KnownWriteLimitBytes = 1ull << 20u;
 constexpr std::size_t ExtentsShown = 3;
