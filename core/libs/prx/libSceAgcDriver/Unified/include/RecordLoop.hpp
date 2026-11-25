@@ -38,6 +38,9 @@ void Ensure(std::uint32_t queue);
 bool WaitPassed(std::uint32_t queue, std::uint64_t submission, std::uint32_t packetOffset, std::chrono::milliseconds limit);
 [[nodiscard]] LoopCounts Counts();
 [[nodiscard]] std::string Line();
+void PrintRecentWaits();
+void RequestSubmit(std::uint64_t serial);
+[[nodiscard]] bool KeepsRecorder();
 
 }
 

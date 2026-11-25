@@ -34,6 +34,8 @@
 #include <span>
 #include <utility>
 #include <string>
+#include <string_view>
+#include <array>
 
 namespace AgcDriver::Unified::Shadow {
 
@@ -235,11 +237,12 @@ std::string footprintLine() {
         ++gpuRanges;
     }
     const auto* surfaces = Resolve::Surfaces();
+    const auto retired = surfaces != nullptr ? surfaces->RetiredAlive() : std::pair<std::uint64_t, std::uint64_t>{};
     char line[512];
-    std::snprintf(line, sizeof(line), "[recode-footprint] GPU-visible guest memory %llu MiB in %llu ranges; registered %llu MiB; mirror bound %llu MiB; image records %llu MiB in %llu records; depth records %llu\n",
+    std::snprintf(line, sizeof(line), "[recode-footprint] GPU-visible guest memory %llu MiB in %llu ranges; registered %llu MiB; mirror bound %llu MiB; image records %llu MiB in %llu records, retired but alive %llu MiB in %llu; depth records %llu\n",
         static_cast<unsigned long long>(gpuVisible >> 20), static_cast<unsigned long long>(gpuRanges), static_cast<unsigned long long>(memoryTotals().registeredBytes.load(std::memory_order_relaxed) >> 20),
         static_cast<unsigned long long>(ResidencyService::Get().BoundBytes() >> 20), static_cast<unsigned long long>(surfaces != nullptr ? surfaces->HeldBytes() >> 20 : 0u), static_cast<unsigned long long>(surfaces != nullptr ? surfaces->Size() : 0u),
-        static_cast<unsigned long long>(Images::Depths().Size()));
+        static_cast<unsigned long long>(retired.second >> 20), static_cast<unsigned long long>(retired.first), static_cast<unsigned long long>(Images::Depths().Size()));
     return line;
 }
 
@@ -628,6 +631,11 @@ void NoteDriverStore(std::uint64_t address, std::uint64_t bytes) {
         NoteGpuWrites(written);
     }
     coreNoteWritten(static_cast<std::uintptr_t>(address), static_cast<std::size_t>(bytes));
+    static const bool uploads = std::getenv("APS5_RECODE_DRIVER_STORE_UPLOADS") == nullptr || std::string_view(std::getenv("APS5_RECODE_DRIVER_STORE_UPLOADS")) != "0";
+    if (uploads && Mirror::WritesEnabled()) {
+        const std::array stored{DirtyRange{address, bytes}};
+        ResidencyService::Get().NoteDirty(stored);
+    }
 }
 
 bool ResidentDrawInputs() {

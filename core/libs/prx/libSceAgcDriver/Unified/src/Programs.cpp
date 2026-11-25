@@ -216,7 +216,7 @@ bool materializeStage(const ProgramInputs& inputs, ShaderRecompiler::RecompileRe
         reason = "compiled variant not reachable";
         return false;
     }
-    if (usesSamplerTables(source->artifact->info.info)) {
+    if (!tablesRouted() && usesSamplerTables(source->artifact->info.info)) {
         reason = "sampler tables";
         return false;
     }
@@ -234,7 +234,9 @@ bool materializeStage(const ProgramInputs& inputs, ShaderRecompiler::RecompileRe
     std::shared_ptr<const ShaderRecompiler::RecompileResult> result;
     std::shared_ptr<const ShaderRecompiler::ResultTemplate> shape;
     ShaderRecompiler::TemplateWords words;
-    if (inputs.templates != nullptr && !probe.Active()) {
+    static const char* const untemplated = std::getenv("APS5_RECODE_NO_TEMPLATES");
+    const bool templateRefused = untemplated != nullptr && *untemplated != '\0' && Downgrades::ListedHash(untemplated, Downgrades::ProgramHash(snapshot.codeAddress + codeOffset * sizeof(std::uint32_t)));
+    if (inputs.templates != nullptr && !probe.Active() && !templateRefused) {
         const auto key = invocation.TemplateKey(*capture);
         shape = inputs.templates->Find(key);
         const bool stale = shape != nullptr && !shape->refillable && shape->snapshotKey != invocation.SnapshotKey(*capture);
@@ -264,6 +266,10 @@ bool materializeStage(const ProgramInputs& inputs, ShaderRecompiler::RecompileRe
         }
     } else {
         result = invocation.Materialize(*capture);
+        if (result != nullptr) {
+            words.pushConstants = result->pushConstants;
+            words.poisonedSrtReads = result->poisonedSrtReads;
+        }
     }
     lap(PhaseMaterialize);
     if (result == nullptr) {
@@ -283,6 +289,10 @@ bool materializeStage(const ProgramInputs& inputs, ShaderRecompiler::RecompileRe
     stage.variant = source->artifact;
     stage.shape = std::move(shape);
     stage.words = std::move(words);
+    stage.targetMerges.clear();
+    if (request.context.pixel && std::ranges::any_of(source->artifact->info.info.images, [](const ShaderRecompiler::ImageResource& image) { return image.targetMerge; })) {
+        for (const auto& merge : request.context.pixel->targetMerges) stage.targetMerges.push_back(merge.descriptor);
+    }
     return true;
 }
 

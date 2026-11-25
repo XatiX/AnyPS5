@@ -3629,6 +3629,21 @@ void SetGpuUnlockHook(void (*hook)()) {
     gpuUnlockHook.store(hook, std::memory_order_release);
 }
 
+namespace {
+std::atomic<GpuSectionRunner> gpuSectionRunner{nullptr};
+}
+
+void SetGpuSectionRunner(GpuSectionRunner runner) {
+    gpuSectionRunner.store(runner, std::memory_order_release);
+}
+
+void RunGpuSection(GpuLockSite site, void (*section)(void*), void* context) {
+    if (auto* runner = gpuSectionRunner.load(std::memory_order_acquire); runner != nullptr && runner(section, context)) return;
+    TagGpuLockSite(site);
+    std::lock_guard lock(GpuMutex());
+    section(context);
+}
+
 std::uint64_t GpuHoldSerial() {
     return gpuHoldSerial.load(std::memory_order_relaxed);
 }

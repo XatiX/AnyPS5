@@ -67,6 +67,7 @@ private:
     VkCommandBuffer depthCommands(Graphics::Recorder& recorder);
     void recordOne(Graphics::Recorder& recorder, VkCommandBuffer commands, SurfaceTable& table, Surface& surface, VulkanSurface& vulkan, VkBuffer buffer, std::uint64_t base, std::uint64_t stamp, std::uint64_t imageStamp);
     bool recordThroughBuffer(Graphics::Recorder& recorder, VkCommandBuffer commands, VulkanSurface& surface, VkBuffer source, std::uint64_t base, std::uint32_t layers, std::string& reason);
+    void writeBackLine(Graphics::Recorder& recorder, VkCommandBuffer commands, VulkanSurface& surface, VkBuffer destination, std::uint64_t base, std::uint32_t layers);
 
     const Graphics::Context context;
     std::unique_ptr<Graphics::TextureDetiler> detiler;

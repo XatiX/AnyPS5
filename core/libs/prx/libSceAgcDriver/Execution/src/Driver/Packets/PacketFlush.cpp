@@ -5,10 +5,16 @@
 #include "prx/libSceAgcDriver/Execution/include/Driver/Synchronization/DeferredLabels.hpp"
 #include "prx/libSceAgcDriver/Execution/include/GuestMemory.hpp"
 #include <cstdlib>
+#if ANYPS5_UNIFIED
+#include "prx/libSceAgcDriver/Unified/include/RecordLoop.hpp"
+#endif
 
 namespace AgcDriver::DriverDetail {
 
 void Driver::flushBetweenPackets(std::uint32_t queue, std::uint32_t header, bool labelPacket) {
+#if ANYPS5_UNIFIED
+    if (Unified::Loop::KeepsRecorder() && deferredLabels().labels.empty()) return;
+#endif
     static const bool packetFlush = !LabelBatchSubmit() && std::getenv("APS5_NO_LABEL_PACKET_FLUSH") == nullptr;
     static const bool ownLock = std::getenv("APS5_LABEL_OWN_LOCK") != nullptr;
     static std::atomic<std::uint64_t> packetFlushes{0}, deadlineFlushes{0}, capFlushes{0}, boundaryReaps{0}, overdueLocks{0};

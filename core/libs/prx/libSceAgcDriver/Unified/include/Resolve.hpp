@@ -54,7 +54,11 @@ struct ResolvedDraw {
     std::size_t imageBegin = 0;
     Bindings::Layout layout;
     std::shared_ptr<const Graphics::State> state;
+    mutable std::vector<std::uint64_t> readHashes;
 };
+
+[[nodiscard]] std::uint64_t HashGuestRange(std::uint64_t address, std::uint64_t bytes);
+[[nodiscard]] bool ChecksReads(std::uint64_t codeAddress);
 
 [[nodiscard]] bool Active();
 [[nodiscard]] bool DispatchesActive();

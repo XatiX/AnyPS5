@@ -97,3 +97,26 @@ A link to a Markdown file with a `#fragment` must name a heading of that file, a
 - `tools/rebase_verify.py <old> <new> [--onto BRANCH] [--repo REPO]` checks that a rebased branch kept its added and deleted lines, file modes, authors and commits. `--onto` names the branch the new commits sit on; by default it is `upstream/main`, then `origin/main`.
 - `tools/pr_labels.py (--pr N | --all) [--dry-run] [--json]` labels pull requests from their title and template fields. `--dry-run` prints the planned changes and writes nothing.
 - `tools/pr_unchanged.py [--dry-run]` labels open pull requests whose merge would not change `main`. `--dry-run` prints the planned changes and writes nothing.
+
+## Recode core (`unified` backend)
+
+The recode is a new GPU core, selected with `-DANYPS5_GPU_BACKEND=unified`. Its code is in [core/libs/prx/libSceAgcDriver/Unified](core/libs/prx/libSceAgcDriver/Unified). The default backend (`anyps5`) must stay identical to `main`; a recode change keeps it so.
+
+- The recode uses no other code base or tree. Ideas from elsewhere are written down and built here, not copied in.
+- The recode route does not use the existing driver for anything: no draw, dispatch, image, packet, memory or presentation. A piece the existing driver still serves is a gap; add it as a build step and build it.
+- Every quiet fallback or degraded binding gets a downgrade kind in `Unified/src/Downgrades.cpp`. Work the recode cannot record stops the game with a `[recode-fatal]` line instead of being dropped quietly.
+- New code lives in its own directory. A shared file outside it gets at most a hook into it.
+- Build the core in the order of the build steps, then the work with the largest effect on frame time. Measurements choose the next piece and catch regressions; no phase gate holds the next piece.
+
+Testing a recode change:
+
+- Unit tests and focused `ctest` selections come first, then a game run.
+- Run only the title the change targets, plus at most one title with a similar bottleneck. Run one game at a time, with no other heavy job on the machine.
+- Compare with the same scene and length of run, alternate the order of the two sides and use several runs per side. Never judge from one run.
+- Use `APS5_RECODE_DOWNGRADES` and `APS5_RECODE_STRICT` ([environment switches](docs/dev/ENVIRONMENT.md)). A port step is done for a piece when its programs show no `FALLBACK` or `SEVERE` rows for it.
+
+Branches: `recode/main` is the recode branch of this fork. A fix for upstream goes on its own `fix/<name>` branch from `upstream/main`; a workaround kept in the fork goes on `local/<name>`. Merge upstream into a recode branch; do not rebase one that has been pushed.
+
+Status (2026-11-25): the front end, memory core, mirror, draw and dispatch path, image records, flip and packets run on the recode route. Open: the stage threads (C12), the full route with draw inputs from the mirror (C13, including a GPU hang on Ghost of Yōtei), and picture faults on LEGO, FF Resonance, Ghost of Yōtei and Age of Mythology. Best frame so far is 48 to 246 ms per title, against targets of 10 ms (100 fps) for LEGO, Age of Mythology and FF Resonance and 16.7 ms (60 fps) for 007 and Ghost of Yōtei.
+
+The design guide is [docs/recode/RECODE.md](docs/recode/RECODE.md) (build steps, design, measurements). The status and to-do list, with the performance and picture items, is [docs/recode/STATUS.md](docs/recode/STATUS.md). Both are snapshots from 2026-11-25; the design guide and status are kept current in the maintainer's local copies, so check the date before relying on them.

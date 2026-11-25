@@ -603,7 +603,14 @@ void DefineDescriptors(SpirvEmitterState& state) {
             break;
         case DescriptorBindingKind::SamplerTable:
             RequireTableIndexing(state);
-            state.tableSamplerVariable = Define(state.module.Type(spv::OpTypeRuntimeArray, state.module.Type(spv::OpTypeSampler)), "table_samplers", spv::StorageClassUniformConstant);
+            if (!direct) {
+                state.tableSamplerVariable = Define(state.module.Type(spv::OpTypeRuntimeArray, state.module.Type(spv::OpTypeSampler)), "table_samplers", spv::StorageClassUniformConstant);
+            } else {
+                state.tableSamplerVariable = state.module.DefineGlobalVariable(TypePointer(state, spv::StorageClassUniformConstant, state.module.Type(spv::OpTypeRuntimeArray, state.module.Type(spv::OpTypeSampler))), spv::StorageClassUniformConstant);
+                state.module.AddName(state.tableSamplerVariable, "table_samplers");
+                state.module.AddAnnotation(spv::OpDecorate, state.tableSamplerVariable, spv::DecorationDescriptorSet, RuntimeAbi::DirectHeapSet);
+                state.module.AddAnnotation(spv::OpDecorate, state.tableSamplerVariable, spv::DecorationBinding, RuntimeAbi::DirectHeapBindingBase + static_cast<std::uint32_t>(DescriptorBindingKind::Samplers));
+            }
             break;
         case DescriptorBindingKind::ImageTableMap:
             state.tableMapVariable = Define(StorageBufferBlockType(state), "table_map");

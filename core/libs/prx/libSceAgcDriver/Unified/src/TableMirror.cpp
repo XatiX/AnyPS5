@@ -1,5 +1,6 @@
 #include "prx/libSceAgcDriver/Unified/include/TableMirror.hpp"
 #include "ImageTableAbi.hpp"
+#include "RuntimeAbi.hpp"
 #include <algorithm>
 #include <cstdlib>
 #include <unordered_set>
@@ -8,27 +9,39 @@ namespace AgcDriver::Unified::Tables {
 
 bool ElementRequests(const ShaderRecompiler::ResolvedImageTables& tables, std::vector<Heap::SlotRequest>& requests, std::string& reason) {
     requests.clear();
-    if (!tables.samplers.empty()) {
-        reason = "sampler tables";
-        return false;
-    }
     if (tables.map.size() < ShaderRecompiler::ImageTableAbi::HeaderWords) {
         reason = "image table map without a header";
         return false;
     }
-    requests.reserve(tables.elements.size());
+    if (tables.map[ShaderRecompiler::ImageTableAbi::HeaderElementCount] != tables.elements.size() || tables.map[ShaderRecompiler::ImageTableAbi::HeaderSamplerCount] != tables.samplers.size()) {
+        reason = "image table header disagrees with its elements";
+        return false;
+    }
+    requests.reserve(tables.elements.size() + tables.samplers.size());
     for (const auto& element : tables.elements) {
         const auto kind = static_cast<std::uint32_t>(element.kind);
         if (kind < Heap::FirstImageKind || kind > Heap::LastStorageKind) {
             reason = "image table element without an image kind";
             return false;
         }
-        if (kind > Heap::LastSampledKind) {
-            reason = "storage image tables";
-            return false;
-        }
         Heap::SlotRequest request{kind, 0u, element.words};
+        if (kind > Heap::LastSampledKind) {
+            request.flags = Heap::RequestFlag::Storage | Heap::RequestFlag::Written | (((element.words[3] >> 12u) & 0xfu) << Heap::RequestFlag::MipShift);
+            if (element.atomic64) request.flags |= Heap::RequestFlag::Atomic64;
+            else if (element.atomic) request.flags |= Heap::RequestFlag::Atomic;
+            if (ShaderRecompiler::RuntimeAbi::UintStorageImageBinding(kind)) request.flags |= Heap::RequestFlag::UintView;
+        }
         if (element.words[0] == 0u && (element.words[1] & 0xffu) == 0u) request.flags = Heap::RequestFlag::Inactive;
+        requests.push_back(request);
+    }
+    for (const auto& sampler : tables.samplers) {
+        Heap::SlotRequest request{static_cast<std::uint32_t>(ShaderRecompiler::DescriptorBindingKind::Samplers), Heap::RequestFlag::Sampler, {}};
+        std::copy_n(sampler.words.begin(), 4u, request.words.begin());
+        if (sampler.compare) request.flags |= Heap::RequestFlag::Compare;
+        if (sampler.point) {
+            request.words[2] = Heap::PointFilterWord(request.words[2]);
+            request.flags |= Heap::RequestFlag::Point;
+        }
         requests.push_back(request);
     }
     return true;
@@ -264,6 +277,11 @@ void TableMirror::index(Cached& out) {
     out.regions.erase(std::unique(out.regions.begin(), out.regions.end()), out.regions.end());
     out.uses.clear();
     for (const auto& [begin, end] : boundsUses() ? BoundedSpans(out.spans, TableUseSpans) : out.spans) out.uses.push_back({{begin, end - begin}, false});
+    std::vector<Heap::ImageUse> written;
+    for (std::size_t element = 0; element < count; ++element) {
+        if (out.memory[element].bytes != 0u && (out.requests[element].flags & Heap::RequestFlag::Written) != 0u) written.push_back({out.memory[element], true});
+    }
+    for (const auto& [begin, end] : CoalescedSpans(written)) out.uses.push_back({{begin, end - begin}, true});
     std::vector<std::uint32_t> spanOf(count, NoSpan);
     out.spanStarts.assign(out.spans.size() + 1u, 0u);
     out.pending.clear();

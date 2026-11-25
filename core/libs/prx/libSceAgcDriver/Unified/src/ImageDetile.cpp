@@ -108,7 +108,7 @@ void SurfaceDetiler::recordOne(Graphics::Recorder& recorder, VkCommandBuffer com
     const auto& geometry = vulkan.Geometry();
     const auto elementBytes = Graphics::BytesPerElement(resource.format);
     const auto layers = copyLayers(geometry);
-    if (vulkan.Compressed() || geometry.thick || geometry.imageDepth > 1u) {
+    if (vulkan.Compressed() || vulkan.Line() || geometry.thick || geometry.imageDepth > 1u) {
         std::string reason;
         if (!recordThroughBuffer(recorder, commands, vulkan, buffer, base, layers, reason)) throw std::runtime_error(reason);
     } else {
@@ -128,6 +128,45 @@ void SurfaceDetiler::recordOne(Graphics::Recorder& recorder, VkCommandBuffer com
     table.MarkReady(surface, stamp, imageStamp);
     counts.surfaces++;
     counts.bytes += surface.key.bytes;
+}
+
+void SurfaceDetiler::writeBackLine(Graphics::Recorder& recorder, VkCommandBuffer commands, VulkanSurface& surface, VkBuffer destination, std::uint64_t base, std::uint32_t layers) {
+    const auto& resource = surface.Resource();
+    const auto& geometry = surface.Geometry();
+    const auto elementBytes = Graphics::BytesPerElement(resource.format);
+    Graphics::DetileWindow window;
+    window.pipeBankXor = resource.pipeBankXor;
+    std::uint64_t total = 0;
+    for (const auto& mip : geometry.mips) total = std::max(total, mip.linearOffset + mip.linearSize);
+    const auto layerBytes = std::max<std::uint64_t>(geometry.sliceLinearBytes, total);
+    std::vector<VkBufferImageCopy> regions;
+    std::vector<std::pair<std::uint32_t, std::uint32_t>> parts;
+    for (std::uint32_t level = 0; level < geometry.mips.size(); ++level) {
+        const auto& mip = geometry.mips[level];
+        if (mip.pitchBytes == 0u || mip.pitchBytes % elementBytes != 0u) throw std::runtime_error("linear mip pitch");
+        for (std::uint32_t layer = 0; layer < layers; ++layer) {
+            if (!geometry.HasLayer(level, layer)) continue;
+            VkBufferImageCopy region{};
+            region.bufferOffset = static_cast<std::uint64_t>(layer) * layerBytes + mip.linearOffset;
+            region.bufferRowLength = mip.pitchBytes / elementBytes;
+            region.imageSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, level, geometry.CopyLayer(layer), 1u};
+            region.imageExtent = {std::max(resource.width >> level, 1u), 1u, 1u};
+            regions.push_back(region);
+            parts.emplace_back(level, layer);
+        }
+    }
+    if (regions.empty()) return;
+    auto scratch = std::make_shared<Graphics::DeviceBuffer>(context, static_cast<std::size_t>(layerBytes * layers), VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT);
+    imageBarrier(context, commands, surface.Image(), VK_IMAGE_LAYOUT_GENERAL, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_ACCESS_SHADER_WRITE_BIT | VK_ACCESS_TRANSFER_WRITE_BIT, VK_ACCESS_TRANSFER_READ_BIT);
+    context.Function<PFN_vkCmdCopyImageToBuffer>("vkCmdCopyImageToBuffer")(commands, surface.Image(), VK_IMAGE_LAYOUT_GENERAL, scratch->Handle(), static_cast<std::uint32_t>(regions.size()), regions.data());
+    Graphics::RecordMemoryBarrier(context, commands, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_ACCESS_TRANSFER_WRITE_BIT, VK_ACCESS_SHADER_READ_BIT);
+    for (std::size_t index = 0; index < regions.size(); ++index) {
+        const auto [level, layer] = parts[index];
+        const auto& mip = geometry.mips[level];
+        detiler->Dispatch(commands, resource.tileMode, elementBytes, scratch->Handle(), regions[index].bufferOffset, destination, base + geometry.GuestOffset(layer, mip), mip, true, layer, geometry.thick, window);
+        counts.writeBackDispatches++;
+    }
+    recorder.Keep(scratch);
 }
 
 bool SurfaceDetiler::recordThroughBuffer(Graphics::Recorder& recorder, VkCommandBuffer commands, VulkanSurface& surface, VkBuffer source, std::uint64_t base, std::uint32_t layers, std::string& reason) {
@@ -156,7 +195,7 @@ bool SurfaceDetiler::recordThroughBuffer(Graphics::Recorder& recorder, VkCommand
             region.bufferImageHeight = 0u;
             region.imageSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, level, geometry.CopyLayer(layer), 1u};
             region.imageOffset = {0, 0, geometry.CopyDepth(layer)};
-            region.imageExtent = {std::max(resource.width >> level, 1u), std::max(resource.height >> level, 1u), 1u};
+            region.imageExtent = {std::max(resource.width >> level, 1u), surface.Line() ? 1u : std::max(resource.height >> level, 1u), 1u};
             regions.push_back(region);
         }
     }
@@ -226,7 +265,8 @@ bool SurfaceDetiler::WriteBack(Graphics::Recorder& recorder, const std::shared_p
     Graphics::DetileWindow window;
     window.pipeBankXor = resource.pipeBankXor;
     try {
-        for (std::uint32_t level = 0; level < geometry.mips.size(); ++level) {
+        if (vulkan->Line()) writeBackLine(recorder, commands, *vulkan, buffer, base, layers);
+        for (std::uint32_t level = 0; level < geometry.mips.size() && !vulkan->Line(); ++level) {
             const auto& mip = geometry.mips[level];
             for (std::uint32_t layer = 0; layer < layers; ++layer) {
                 if (!geometry.HasLayer(level, layer)) continue;

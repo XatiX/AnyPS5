@@ -43,6 +43,12 @@ std::size_t RecordQueue::Size() const {
     return items.size();
 }
 
+std::optional<std::uint64_t> RecordQueue::FrontSubmission() const {
+    std::lock_guard lock(mutex);
+    if (items.empty()) return std::nullopt;
+    return items.front().operation.submission;
+}
+
 std::uint64_t RecordQueue::Popped() const {
     std::lock_guard lock(mutex);
     return counts.popped;

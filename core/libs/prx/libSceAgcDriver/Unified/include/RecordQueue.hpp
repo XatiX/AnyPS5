@@ -49,6 +49,7 @@ public:
     [[nodiscard]] std::optional<Item> Pop(std::chrono::milliseconds wait);
     void Close();
     [[nodiscard]] std::size_t Size() const;
+    [[nodiscard]] std::optional<std::uint64_t> FrontSubmission() const;
     [[nodiscard]] std::uint64_t Popped() const;
     [[nodiscard]] QueueCounts Counts() const;
 

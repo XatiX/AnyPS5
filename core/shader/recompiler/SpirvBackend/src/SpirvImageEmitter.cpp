@@ -2556,6 +2556,10 @@ TableAccessResult EmitTableAccess(SpirvValueEmitContext& ctx, const IrValue& ins
         EmitTableFault(ctx, inst, word, driverFault, both(both(exec, live), driverRejected));
         result.valid = both(result.valid, both(checked, negate(driverRejected)));
         state.tableAccess.samplerElement = element;
+        if (state.program.Metadata().directResources) {
+            const auto slots = Binary(state, spv::OpIAdd, u32, LoadTableMap(state, ConstantU32(state, ImageTableAbi::HeaderElementBase)), LoadTableMap(state, ConstantU32(state, ImageTableAbi::HeaderElementCount)));
+            state.tableAccess.samplerElement = Select(state, u32, checked, Binary(state, spv::OpIAdd, u32, slots, element), ConstantU32(state, 0u));
+        }
         DecorateTableNonUniform(state, state.tableAccess.samplerElement);
     }
     state.tableAccess.active = true;

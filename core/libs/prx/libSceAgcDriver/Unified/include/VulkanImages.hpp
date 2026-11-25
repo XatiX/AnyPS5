@@ -13,7 +13,7 @@
 
 namespace AgcDriver::Unified::Images {
 
-enum class StorageShape : std::uint32_t { Flat, Array, Volume };
+enum class StorageShape : std::uint32_t { Flat, Array, Volume, Line, LineArray };
 
 class VulkanSurface final : public DeviceSurface {
 public:
@@ -28,6 +28,7 @@ public:
     [[nodiscard]] VkImageView SlicesStorageView(std::uint32_t level, std::uint32_t elementBytes);
     [[nodiscard]] std::uint32_t Slices(std::uint32_t level) const;
     [[nodiscard]] bool Volume() const { return resource.dimension == Graphics::TextureDimension::k3D; }
+    [[nodiscard]] bool Line() const { return resource.dimension == Graphics::TextureDimension::k1D || resource.dimension == Graphics::TextureDimension::k1DArray; }
     [[nodiscard]] VkImageView ShapedStorageView(std::uint32_t level, StorageShape shape, bool uintView, bool atomic, std::string& reason, std::uint32_t layer = 0);
     [[nodiscard]] VkImageView AttachmentView(VkFormat viewFormat, std::uint32_t level, std::uint32_t layer, std::uint32_t layers, std::string& reason);
     [[nodiscard]] bool Attachable() const { return attachable; }

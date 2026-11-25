@@ -3,6 +3,7 @@
 
 #include "prx/libSceAgcDriver/Unified/include/Events.hpp"
 #include <array>
+#include <atomic>
 #include <cstdint>
 #include <map>
 #include <memory>
@@ -145,6 +146,8 @@ public:
     [[nodiscard]] TableCounts TakeCounts();
     [[nodiscard]] std::size_t Size() const;
     [[nodiscard]] std::uint64_t HeldBytes() const;
+    [[nodiscard]] std::pair<std::uint64_t, std::uint64_t> RetiredAlive() const;
+    [[nodiscard]] std::uint64_t Retirements() const { return retirements.load(std::memory_order_acquire); }
 
 private:
     struct KeyHash {
@@ -172,6 +175,8 @@ private:
     std::uint64_t widest = 0;
     std::vector<std::shared_ptr<Surface>> work;
     std::vector<std::shared_ptr<Surface>> newer;
+    mutable std::vector<std::weak_ptr<Surface>> retiredSurfaces;
+    std::atomic<std::uint64_t> retirements{0};
     std::vector<std::pair<std::string, std::uint64_t>> refusals;
     std::uint64_t refusedImages = 0;
     mutable std::mutex staleMutex;

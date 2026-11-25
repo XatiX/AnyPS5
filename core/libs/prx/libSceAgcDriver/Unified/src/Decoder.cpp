@@ -3,6 +3,9 @@
 #include "prx/libSceAgcDriver/Execution/include/VideoOutput.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/Draw/DrawRegisterKey.hpp"
 #include <algorithm>
+#include <atomic>
+#include <cstdio>
+#include <cstdlib>
 #include <optional>
 #include <cstring>
 #include <exception>
@@ -131,7 +134,7 @@ private:
             return;
         }
         if (submission.flips.contains(cursor)) {
-            if (opcode == 0x49) labelStore(packet);
+            if (opcode == 0x49) labelStore(packet, true);
             ++state.counts.flips;
             emit(OpKind::Flip, 0, 0, submission.flipHandles.contains(cursor) ? submission.flipHandles.at(cursor) : 0);
             return;
@@ -313,6 +316,14 @@ private:
             } catch (const std::exception&) {
                 ++state.counts.stateErrors;
             }
+            static const std::uint32_t traced = [] {
+                const char* value = std::getenv("APS5_RECODE_TRACE_INDIRECT");
+                return value != nullptr ? static_cast<std::uint32_t>(std::strtoul(value, nullptr, 10)) : 0u;
+            }();
+            static std::atomic<std::uint32_t> tracedLines{0};
+            if (traced != 0u && tracedLines.fetch_add(1, std::memory_order_relaxed) < traced) {
+                std::fprintf(stderr, "[recode-indirect] queue 0x%x submission %llu: %zu words, header %08x word1 %08x word2 %08x, dispatch base 0x%llx, draw base 0x%llx -> arguments at 0x%llx\n", submission.queue, static_cast<unsigned long long>(submission.serial), packet.size(), packet[0], packet.size() > 1 ? packet[1] : 0u, packet.size() > 2 ? packet[2] : 0u, static_cast<unsigned long long>(state.state.dispatchIndirectBase), static_cast<unsigned long long>(state.state.drawIndirectBase), static_cast<unsigned long long>(address));
+            }
         }
         const auto ids = snapshot();
         pendingDispatch = {};
@@ -354,14 +365,19 @@ private:
         }
     }
 
-    void labelStore(std::span<const std::uint32_t> packet) {
+    void labelStore(std::span<const std::uint32_t> packet, bool carriesFlip = false) {
         const auto label = Pm4::DecodeLabelWrite(packet);
-        if (!label.has_value()) return;
+        const std::uint8_t flipCarrier = carriesFlip ? 1u : 0u;
+        if (!label.has_value()) {
+            const bool interrupts = !carriesFlip && ((packet[0] >> 8u) & 0xffu) == 0x49u && packet.size() >= 8u && ((packet[2] >> 24u) & 7u) != 0u && ((packet[2] >> 24u) & 7u) != 3u;
+            if (interrupts) emit(OpKind::LabelStore, 0, 0, 0);
+            return;
+        }
         const auto bytes = label->Bytes();
         std::uint64_t value = 0;
         std::memcpy(&value, bytes.data(), std::min(bytes.size(), sizeof(value)));
         ++state.counts.labelStores;
-        emit(OpKind::LabelStore, label->address, bytes.size(), value);
+        emit(OpKind::LabelStore, label->address, bytes.size(), value, {}, ~std::uint64_t{0}, flipCarrier);
     }
 
     void store(std::span<const std::uint32_t> packet, std::uint32_t opcode) {

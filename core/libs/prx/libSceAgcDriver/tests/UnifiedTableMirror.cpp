@@ -4,6 +4,7 @@
 #include <cstdio>
 #include <map>
 #include <memory>
+#include <set>
 #include <vector>
 
 using namespace AgcDriver::Unified;
@@ -33,13 +34,17 @@ struct Fixture {
     Events::ChangeLog imageLog;
     Memo memo{shared, imageLog};
     std::map<std::uint32_t, std::shared_ptr<const void>> textures;
+    std::shared_ptr<const void> samplerOwner = std::make_shared<int>(0);
     Refill refill{table, memo,
                   [this](const SlotRequest& request) -> std::optional<ResolvedImage> {
                       auto& owner = textures[request.words[0]];
                       if (owner == nullptr) owner = std::make_shared<int>(0);
                       return ResolvedImage{{0x1000u + request.words[0], 1u, owner}, {0x300000000ull + request.words[0] * Events::RegionBytes, 0x1000}};
                   },
-                  [](const SlotRequest&) -> std::optional<ResolvedSampler> { return std::nullopt; }};
+                  [this](const SlotRequest& request) -> std::optional<ResolvedSampler> {
+                      if (request.words[0] == 0u) return std::nullopt;
+                      return ResolvedSampler{0x9000u + request.words[0] + ((request.flags & RequestFlag::Point) != 0u ? 0x100u : 0u) + ((request.flags & RequestFlag::Compare) != 0u ? 0x200u : 0u), samplerOwner};
+                  }};
     Tables::TableMirror mirror{refill, shared, imageLog};
 };
 
@@ -57,6 +62,7 @@ std::shared_ptr<ShaderRecompiler::ResolvedImageTables> Tables(std::vector<std::u
     tables->map[Abi::HeaderElementBase] = 0u;
     for (const auto word : words) tables->elements.push_back(Element(word));
     tables->map[Abi::HeaderElementCount] = static_cast<std::uint32_t>(tables->elements.size());
+    tables->map[Abi::HeaderSamplerCount] = 0u;
     return tables;
 }
 
@@ -135,6 +141,7 @@ void testUsesAreCoalescedSpans() {
     const auto tables = Tables({1u, 2u});
     tables->elements.push_back(Element(1u));
     tables->elements.back().words[1] = 2u;
+    tables->map[Abi::HeaderElementCount] = static_cast<std::uint32_t>(tables->elements.size());
     std::string reason;
     std::vector<ImageUse> uses;
     static_cast<void>(fixture.mirror.Build(tables, reason, &uses));
@@ -217,16 +224,47 @@ void testOutsideCutsHoles() {
     Expect(Tables::Outside({0x1000u, 0x2000u}, {}).size() == 1u, "a span without holes is kept whole");
 }
 
-void testMirrorRefusesStorageAndSamplers() {
+void testMirrorRefusesStorage() {
     Fixture fixture;
     std::string reason;
-    auto storage = Tables({1u});
+    auto storage = Tables({1u, 2u});
     storage->elements[0].kind = static_cast<ShaderRecompiler::DescriptorBindingKind>(LastSampledKind + 1u);
-    Expect(fixture.mirror.Build(storage, reason) == nullptr && reason == "storage image tables", "storage tables are refused");
-    auto samplers = Tables({1u});
-    samplers->samplers.push_back({});
-    Expect(fixture.mirror.Build(samplers, reason) == nullptr && reason == "sampler tables", "sampler tables are refused");
+    std::vector<ImageUse> uses;
+    Expect(fixture.mirror.Build(storage, reason, &uses) != nullptr, "storage tables mirror");
+    Expect(std::ranges::count_if(uses, [](const ImageUse& use) { return use.write && use.memory.address == 0x300000000ull + Events::RegionBytes; }) == 1, "a storage element reports its memory as written");
+    Expect(std::ranges::none_of(uses, [](const ImageUse& use) { return use.write && use.memory.address == 0x300000000ull + 2u * Events::RegionBytes; }), "a sampled element is not reported written");
+    auto miscounted = Tables({1u});
+    miscounted->samplers.push_back({});
+    Expect(fixture.mirror.Build(miscounted, reason) == nullptr && reason == "image table header disagrees with its elements", "a header that does not count the samplers is refused");
     Expect(fixture.mirror.Build(nullptr, reason) == nullptr, "missing tables are refused");
+}
+
+void testMirrorAppendsSamplerSlots() {
+    Fixture fixture;
+    auto tables = Tables({1u, 2u});
+    for (std::uint32_t variant = 0; variant < 4u; ++variant) {
+        ShaderRecompiler::ImageTableSamplerElement sampler;
+        sampler.words[0] = 5u;
+        sampler.compare = variant >= 2u;
+        sampler.point = (variant & 1u) != 0u;
+        tables->samplers.push_back(sampler);
+    }
+    tables->map[Abi::HeaderSamplerCount] = 4u;
+    std::string reason;
+    const auto mirror = fixture.mirror.Build(tables, reason);
+    Expect(mirror != nullptr, "a table with samplers mirrors");
+    if (mirror == nullptr) return;
+    const auto base = mirror->map[Abi::HeaderElementBase];
+    Expect(mirror->map.size() == tables->map.size() + 6u, "one slot word per image element and per sampler variant");
+    Expect(mirror->map[base] == 1u && mirror->map[base + 1u] == 2u, "image slots come first");
+    const auto samplers = base + mirror->map[Abi::HeaderElementCount];
+    std::set<std::uint32_t> distinct;
+    for (std::uint32_t variant = 0; variant < 4u; ++variant) distinct.insert(mirror->map[samplers + variant]);
+    Expect(distinct.size() == 4u, "each sampler variant reads its own heap slot after the image slots");
+    auto failing = Tables({1u});
+    failing->samplers.push_back({});
+    failing->map[Abi::HeaderSamplerCount] = 1u;
+    Expect(fixture.mirror.Build(failing, reason) == nullptr && reason == "sampler lookup failed", "a sampler that cannot be created refuses the table");
 }
 
 void testReleasedTablesAreDropped() {
@@ -262,7 +300,8 @@ int main() {
     testSpansCoalesce();
     testUsesAreCoalescedSpans();
     testOutsideCutsHoles();
-    testMirrorRefusesStorageAndSamplers();
+    testMirrorRefusesStorage();
+    testMirrorAppendsSamplerSlots();
     if (failures != 0) return 1;
     std::printf("unified table mirror tests passed\n");
     return 0;

@@ -1,4 +1,6 @@
 #include "prx/libSceAgcDriver/Unified/include/DrawRecorder.hpp"
+#include "prx/libSceAgcDriver/Unified/include/RecordLoop.hpp"
+#include "prx/libc/include/GuestAllocations.hpp"
 #include "prx/libSceAgcDriver/Unified/include/RouteDefaults.hpp"
 #include "prx/libkernel/include/Api.hpp"
 #include "prx/libSceAgcDriver/Execution/include/GuestMemory.hpp"
@@ -208,6 +210,113 @@ bool hangMarking() {
     return marking;
 }
 
+struct BatchWork {
+    std::string item;
+    const std::byte* arguments = nullptr;
+    std::shared_ptr<const void> keep;
+};
+
+struct OpenBatch {
+    std::chrono::steady_clock::time_point opened;
+    std::vector<BatchWork> work;
+    bool shown = false;
+};
+
+struct BatchPrograms {
+    std::mutex mutex;
+    std::map<std::uint64_t, OpenBatch> open;
+    std::array<std::pair<std::uint64_t, std::string>, 4096> recent;
+    std::size_t recentNext = 0;
+    bool historyShown = false;
+    Graphics::Recorder* recorder = nullptr;
+};
+
+BatchPrograms& batchPrograms() {
+    static BatchPrograms programs;
+    return programs;
+}
+
+bool watchesBatchPrograms() {
+    static const bool watching = std::getenv("APS5_RECODE_HANG_PROGRAMS") != nullptr || std::getenv("APS5_RECODE_HANG_EXIT") != nullptr;
+    return watching;
+}
+
+void watchOpenBatches() {
+    static const long long exitAfter = [] {
+        const char* value = std::getenv("APS5_RECODE_HANG_EXIT");
+        return value != nullptr ? std::strtoll(value, nullptr, 10) : 0ll;
+    }();
+    for (;;) {
+        std::this_thread::sleep_for(std::chrono::seconds(1));
+        auto& programs = batchPrograms();
+        std::lock_guard lock(programs.mutex);
+        const auto now = std::chrono::steady_clock::now();
+        if (exitAfter > 0 && !programs.open.empty() && now - programs.open.begin()->second.opened > std::chrono::seconds(exitAfter)) {
+            std::fprintf(stderr, "[recode-hang-batch] batch %llu still not finished after %lld s: ending the process (APS5_RECODE_HANG_EXIT)\n", static_cast<unsigned long long>(programs.open.begin()->first), exitAfter);
+            std::fflush(stderr);
+            std::_Exit(3);
+        }
+        for (auto& [serial, batch] : programs.open) {
+            if (batch.shown || now - batch.opened < std::chrono::seconds(5)) continue;
+            batch.shown = true;
+            std::string list;
+            for (const auto& work : batch.work) {
+                list += " " + work.item;
+                if (work.arguments == nullptr) continue;
+                std::uint32_t counts[3] = {};
+                std::memcpy(counts, work.arguments, sizeof(counts));
+                list += "(" + std::to_string(counts[0]) + "x" + std::to_string(counts[1]) + "x" + std::to_string(counts[2]) + ")";
+            }
+            std::fprintf(stderr, "[recode-hang-batch] batch %llu not finished %lld s after its first recorded work; %zu items:%s\n", static_cast<unsigned long long>(serial), static_cast<long long>(std::chrono::duration_cast<std::chrono::seconds>(now - batch.opened).count()), batch.work.size(), list.c_str());
+            if (programs.recorder != nullptr) std::fprintf(stderr, "[recode-hang-stamps] batch %llu, end stamps in order:%s\n", static_cast<unsigned long long>(serial), programs.recorder->StampProgress(serial).c_str());
+            if (!programs.historyShown) {
+                programs.historyShown = true;
+                static const std::uint64_t window = [] {
+                    const char* value = std::getenv("APS5_RECODE_HANG_HISTORY_BATCHES");
+                    return value != nullptr ? std::strtoull(value, nullptr, 10) : 3ull;
+                }();
+                for (std::size_t index = 0; index < programs.recent.size(); ++index) {
+                    const auto& [batchSerial, line] = programs.recent[(programs.recentNext + index) % programs.recent.size()];
+                    if (!line.empty() && batchSerial + window >= serial && batchSerial <= serial) std::fprintf(stderr, "[recode-hang-history] %s\n", line.c_str());
+                }
+                Loop::PrintRecentWaits();
+            }
+        }
+    }
+}
+
+void noteBatchWork(Graphics::Recorder& recorder, std::uint64_t serial, const char* kind, std::uint64_t program, std::uint64_t groups, const std::byte* arguments = nullptr, std::shared_ptr<const void> keep = nullptr, std::uint32_t queue = 0, std::uint64_t submission = 0) {
+    if (!watchesBatchPrograms()) return;
+    static std::once_flag started;
+    std::call_once(started, [] { std::thread(watchOpenBatches).detach(); });
+    auto& programs = batchPrograms();
+    bool first = false;
+    {
+        std::lock_guard lock(programs.mutex);
+        programs.recorder = &recorder;
+        auto [found, inserted] = programs.open.try_emplace(serial);
+        if (inserted) {
+            found->second.opened = std::chrono::steady_clock::now();
+            first = true;
+        }
+        if (found->second.work.size() < 512u) {
+            char item[256];
+            std::snprintf(item, sizeof(item), "%s:%016llx/%llu", kind, static_cast<unsigned long long>(program), static_cast<unsigned long long>(groups));
+            found->second.work.push_back({item, arguments, std::move(keep)});
+        }
+        {
+            char line[320];
+            std::snprintf(line, sizeof(line), "batch %llu queue 0x%x submission %llu %s:%016llx/%llu", static_cast<unsigned long long>(serial), queue, static_cast<unsigned long long>(submission), kind, static_cast<unsigned long long>(program), static_cast<unsigned long long>(groups));
+            programs.recent[programs.recentNext++ % programs.recent.size()] = {serial, line};
+        }
+    }
+    if (first) recorder.OnComplete([serial] {
+        auto& programs = batchPrograms();
+        std::lock_guard lock(programs.mutex);
+        programs.open.erase(serial);
+    });
+}
+
 void noteDetileWork(std::uint64_t records, std::uint64_t pixels, std::uint64_t address) {
     auto& marks = hangMarks();
     std::lock_guard lock(marks.mutex);
@@ -407,6 +516,7 @@ struct Totals {
     std::uint64_t tableImageRefreshes = 0;
     std::uint64_t tableImageDepthKept = 0;
     std::uint64_t tableImageRetired = 0;
+    std::uint64_t tableImageEntriesDropped = 0;
     std::uint64_t compressedAliases = 0;
     std::uint64_t surfaceFailures = 0;
     std::uint64_t faultReads = 0;
@@ -1155,6 +1265,11 @@ bool mirrorPart(const char* part) {
     return mirrorMode() && std::strstr(parts, part) != nullptr;
 }
 
+bool argumentsFromMirror() {
+    static const bool fromMirror = std::getenv("APS5_RECODE_ARGS_SNAPSHOT") == nullptr;
+    return fromMirror;
+}
+
 bool gpuPending(std::uint64_t address, std::uint64_t bytes) {
     return mirrorMode() && MemoryCore::Get().Written().Any(address, bytes);
 }
@@ -1165,6 +1280,11 @@ bool pendingInputsFromMirror() {
 }
 
 std::optional<DrawInput> mirrorInput(std::uint64_t address, std::uint64_t bytes) {
+    static const std::uint64_t margin = [] {
+        const char* value = std::getenv("APS5_RECODE_MIRROR_INPUTS_MARGIN");
+        return value != nullptr ? std::strtoull(value, nullptr, 16) : 0ull;
+    }();
+    if (margin != 0u) static_cast<void>(ResidencyService::Get().MirrorSpan(address, bytes + margin));
     const auto span = ResidencyService::Get().MirrorSpan(address, bytes);
     if (!span) return std::nullopt;
     return DrawInput{reinterpret_cast<VkBuffer>(static_cast<std::uintptr_t>(span->handle)), static_cast<VkDeviceSize>(span->offset)};
@@ -1183,19 +1303,47 @@ std::atomic<std::uint64_t>& inputConsumes() {
 }
 
 bool shadowInputs() {
-    static const bool shadow = std::getenv("APS5_RECODE_MIRROR_INPUTS") == nullptr;
+    static const bool shadow = [] {
+        const char* value = RouteValue("APS5_RECODE_MIRROR_INPUTS");
+        return value == nullptr || std::string_view(value) == "0";
+    }();
     return shadow;
 }
 
 std::optional<DrawInput> drawInput(const Context& context, std::uint64_t address, std::uint64_t bytes, InputSource& source) {
     source = InputSource::Imported;
     auto& pages = MemoryCore::Get().Pages();
-    if (!shadowInputs() && mirrorMode() && !DirectMemoryAliased_nid_postfix(static_cast<std::uintptr_t>(address), static_cast<std::size_t>(bytes))) {
+    static const bool landedFromImports = std::getenv("APS5_RECODE_MIRROR_INPUTS_LANDED_IMPORTS") != nullptr;
+    const bool landedGpu = landedFromImports && !gpuPending(address, bytes) && pages.GpuOwnedIn(address, bytes).empty() && pages.GpuWrittenIn(address, bytes);
+    static const std::pair<std::uint64_t, std::uint64_t> oldRange = [] {
+        const char* value = std::getenv("APS5_RECODE_MIRROR_INPUTS_OLD_RANGE");
+        if (value == nullptr) return std::pair<std::uint64_t, std::uint64_t>{0u, 0u};
+        const char* dash = std::strchr(value, '-');
+        return std::pair<std::uint64_t, std::uint64_t>{std::strtoull(value, nullptr, 16), dash != nullptr ? std::strtoull(dash + 1, nullptr, 16) : 0u};
+    }();
+    const bool inOldRange = address >= oldRange.first && address < oldRange.second;
+    if (!shadowInputs() && mirrorMode() && !landedGpu && !inOldRange && !DirectMemoryAliased_nid_postfix(static_cast<std::uintptr_t>(address), static_cast<std::size_t>(bytes))) {
+        static const bool servesOwned = std::getenv("APS5_RECODE_MIRROR_INPUTS_SERVE_OWNED") == nullptr || std::string_view(std::getenv("APS5_RECODE_MIRROR_INPUTS_SERVE_OWNED")) != "0";
+        if (servesOwned) {
+            Shadow::OwnedSpan span;
+            static_cast<void>(Shadow::ServeOwned(context, address, bytes, &span));
+        }
         if (auto input = mirrorInput(address, bytes)) {
             const bool gpu = pages.GpuWrittenIn(address, bytes) || !pages.GpuOwnedIn(address, bytes).empty() || gpuPending(address, bytes);
             static const bool consumes = std::getenv("APS5_RECODE_NO_INPUT_CONSUME") == nullptr;
+            static const bool globalConsume = std::getenv("APS5_RECODE_INPUT_CONSUME") != nullptr && std::string_view(std::getenv("APS5_RECODE_INPUT_CONSUME")) == "global";
+            static const bool copiesSmall = std::getenv("APS5_RECODE_MIRROR_INPUTS_COPY_SMALL") != nullptr;
+            if (consumes && !gpu && (copiesSmall || !pages.CleanIn(address, bytes)) && copiesInputs() && bytes <= InputCopyLimitBytes && !globalConsume) {
+                source = InputSource::Written;
+                return input;
+            }
             if (consumes && !gpu && !pages.CleanIn(address, bytes)) {
-                Shadow::ConsumeNow();
+                if (globalConsume) {
+                    Shadow::ConsumeNow();
+                } else {
+                    const std::array range{std::pair<std::uint64_t, std::uint64_t>{address, bytes}};
+                    static_cast<void>(Shadow::ConsumeIn(range));
+                }
                 inputConsumes().fetch_add(1, std::memory_order_relaxed);
             }
             source = InputSource::Mirrored;
@@ -1258,6 +1406,17 @@ struct InputRange {
     std::size_t merged = 0;
 };
 
+std::uint64_t unclampedInputEnd(const ShaderRecompiler::VertexAttribute& attribute, std::uint64_t address, std::uint64_t end) {
+    constexpr std::uint64_t Cap = 64ull << 20u;
+    static const bool extends = std::getenv("APS5_RECODE_NO_UNCLAMPED_INPUT_RANGES") == nullptr;
+    if (!extends || shadowInputs() || !mirrorMode() || Graphics::NullVertexDescriptor(attribute)) return end;
+    const auto stride = (attribute.resource.fields[1] >> 16u) & 0x3fffu;
+    if (stride == 0u || Graphics::VertexBufferOutOfBoundsSelect(attribute) > 1u) return end;
+    const auto found = GuestAllocations::GuestAllocationsLookup_nid_postfix(static_cast<std::uintptr_t>(address), false);
+    if (!found || found->bytes == 0u || found->address > address) return end;
+    return std::max(end, std::min<std::uint64_t>(found->address + found->bytes, address + Cap));
+}
+
 bool mergesInputs() {
     static const bool merges = std::getenv("APS5_RECODE_NO_INPUT_MERGE") == nullptr;
     return merges;
@@ -1296,8 +1455,9 @@ void countInput(Totals& totals, InputSource source) {
     }
 }
 
-constexpr std::uint64_t KnownBufferLimitBytes = 256ull << 20u;
+constexpr std::uint64_t KnownBufferLimitBytes = 1024ull << 20u;
 constexpr std::uint64_t KnownCopyLimitBytes = 64ull << 10u;
+constexpr std::uint64_t LargeKnownBytes = 16ull << 20u;
 constexpr std::uint64_t KnownWriteLimitBytes = 1ull << 20u;
 constexpr std::size_t ExtentsShown = 3;
 std::uint32_t coldSmallWrites() {
@@ -1557,6 +1717,37 @@ public:
         return false;
     }
 
+    void PrebuildDraw(const Context& context, const Resolve::ResolvedDraw& draw) {
+        const auto* heap = Resolve::HeapDevice();
+        if (heap == nullptr || draw.state == nullptr || draw.stages.empty()) return;
+        std::vector<Graphics::CompiledShader> shaders;
+        for (const auto& stage : draw.stages) {
+            if (stage.program.result == nullptr) return;
+            shaders.push_back({stage.program.stage, stage.program.result.get(), stage.program.pushOffset});
+        }
+        Graphics::VertexInputLayout vertexInput;
+        const auto& attributes = draw.stages.front().program.vertexAttributes;
+        if (!attributes.empty()) {
+            vertexInput = Graphics::BuildVertexInputLayout(context, attributes);
+            for (std::size_t index = 0; index < attributes.size(); ++index) {
+                if (vertexInput.attributes[index].format != Graphics::DecodeVertexFormat(attributes[index]).format) return;
+            }
+        }
+        Graphics::PipelineSetLayouts sets;
+        {
+            std::lock_guard lock(mutex);
+            sets.main = setLayout(context, draw, 0);
+            sets.split = draw.layout.split;
+            if (sets.split) sets.fragment = setLayout(context, draw, 1);
+        }
+        sets.mainKey = draw.layout.keys[0];
+        sets.fragmentKey = draw.layout.keys[1];
+        sets.heap = heap->Layout();
+        const auto started = std::chrono::steady_clock::now();
+        static_cast<void>(Graphics::CachedPipeline(context, *draw.state, vertexInput, sets, shaders, VK_IMAGE_LAYOUT_GENERAL));
+        drawPrebuildNanoseconds.fetch_add(elapsed(started), std::memory_order_relaxed);
+    }
+
     bool Record(const Context& context, const Resolve::ResolvedDraw& draw, const Pm4::DrawParameters& parameters, std::string& reason) {
         const auto waitStarted = std::chrono::steady_clock::now();
         std::lock_guard lock(mutex);
@@ -1564,8 +1755,10 @@ public:
         totals.drawLockNanoseconds += elapsed(waitStarted) - elapsed(started);
         if (hangMarking() && context.recorder != nullptr) markHangPhase(context, *context.recorder, 4u);
         bool recorded = false;
+        const auto openSerial = context.recorder != nullptr ? context.recorder->OpenSerial() : 0u;
         try {
             recorded = record(context, draw, parameters, reason);
+            if (recorded && context.recorder != nullptr && !draw.stages.empty()) noteBatchWork(*context.recorder, openSerial, "draw", Downgrades::ProgramHash(draw.stages.back().program.codeAddress), 0u, nullptr, nullptr, draw.operation.queue, draw.operation.submission);
             const auto landStarted = std::chrono::steady_clock::now();
             totals.drawBodyNanoseconds += elapsed(started) - elapsed(landStarted);
             landWrites();
@@ -1618,8 +1811,16 @@ public:
         const auto started = std::chrono::steady_clock::now();
         if (hangMarking() && context.recorder != nullptr) markHangPhase(context, *context.recorder, 4u);
         bool recorded = false;
+        const auto openSerial = context.recorder != nullptr ? context.recorder->OpenSerial() : 0u;
+        lastHangArguments = nullptr;
         try {
             recorded = recordDispatch(context, dispatch, groups, reason);
+            if (recorded && context.recorder != nullptr && !dispatch.stages.empty()) {
+                char kind[160];
+                if (dispatch.operation.dispatch.indirect) std::snprintf(kind, sizeof(kind), "indirect@%llx[record %08x %08x %08x %08x %08x %08x %08x %08x%s]", static_cast<unsigned long long>(lastArgumentsAddress), lastArgumentsCpu[0], lastArgumentsCpu[1], lastArgumentsCpu[2], lastArgumentsCpu[3], lastArgumentsCpu[4], lastArgumentsCpu[5], lastArgumentsCpu[6], lastArgumentsCpu[7], lastArgumentsGpu ? " gpu" : "");
+                else std::snprintf(kind, sizeof(kind), "dispatch");
+                noteBatchWork(*context.recorder, openSerial, kind, Downgrades::ProgramHash(dispatch.stages.front().program.codeAddress), static_cast<std::uint64_t>(groups[0]) * groups[1] * groups[2], lastHangArguments, lastHangArguments != nullptr ? hangArguments : nullptr, dispatch.operation.queue, dispatch.operation.submission);
+            }
             landWrites();
             scheduleLandings(context);
         } catch (const std::exception& error) {
@@ -1788,6 +1989,7 @@ public:
         line += text;
         std::snprintf(text, sizeof(text), "; table maps %llu hits, %llu uploads (%.1f MiB), %llu retired, %zu held (%.1f MiB); table images %llu reused, %llu bound (%llu whole), %llu elements bound, %llu checked for a refresh, %llu depth kept, %llu retired, %zu held; compressed records beside another format %llu; consumes for CPU-written mirror inputs %llu",static_cast<unsigned long long>(totals.mapHits), static_cast<unsigned long long>(totals.mapUploads), static_cast<double>(totals.mapUploadBytes) / 1048576.0, static_cast<unsigned long long>(totals.mapRetired), maps.size(), static_cast<double>(mapBytes) / 1048576.0, static_cast<unsigned long long>(totals.tableImageHits), static_cast<unsigned long long>(totals.tableImageBuilds), static_cast<unsigned long long>(totals.tableImageWhole), static_cast<unsigned long long>(totals.tableImageBinds), static_cast<unsigned long long>(totals.tableImageRefreshes), static_cast<unsigned long long>(totals.tableImageDepthKept), static_cast<unsigned long long>(totals.tableImageRetired), tableImages.size(), static_cast<unsigned long long>(totals.compressedAliases), static_cast<unsigned long long>(inputConsumes().load(std::memory_order_relaxed)));
         line += text;
+        line += "; table image entries dropped for retired records " + std::to_string(totals.tableImageEntriesDropped);
         line += "; record ranges noted GPU-written for the memory core " + std::to_string(totals.recordRangesNoted) + "; records made for a sampled shape after a hand-over " + std::to_string(totals.sampledRecordsCreated) + ", new storage records started from their memory " + std::to_string(totals.storageRecordsSeeded) + "; new chains zeroed " + std::to_string(totals.zeroedChains) + ", new records poisoned " + std::to_string(totals.poisonedRecords);
         if (metadataClears != nullptr) {
             const auto metadata = metadataClears->TakeCounts();
@@ -2525,15 +2727,24 @@ private:
                 continue;
             }
             if (index < infos.size() && infos[index].written && mirrorPart("writes")) {
-                const auto mapped = mirrorKnownWrite(address, bytes, serial);
-                noteKnownPath(mapped != 0u ? "write-mirror" : "write-refused", address, bytes);
+                auto served = bytes;
+                auto mapped = mirrorKnownWrite(address, bytes, serial);
+                if (mapped == 0u) {
+                    const auto committed = GuestMemory::CommittedRanges(address, static_cast<std::size_t>(bytes));
+                    if (!committed.empty() && committed.front().first == address && committed.front().second > address && committed.front().second - address < bytes) {
+                        served = committed.front().second - address;
+                        mapped = mirrorKnownWrite(address, served, serial);
+                    }
+                }
+                noteKnownPath(mapped != 0u ? "write-mirror" : "write-refused", address, served);
                 if (mapped != 0u) {
                     totals.knownWritten++;
+                    if (served < bytes) noteKnown(stage, Downgrades::Kind::KnownPrefix, index, address, bytes, served);
                 } else {
                     totals.knownWriteLookups++;
                     noteKnown(stage, Downgrades::Kind::KnownWriteRefused, index, address, bytes, 0u);
                 }
-                write(mapped, mapped != 0u ? bytes : 0u);
+                write(mapped, mapped != 0u ? served : 0u);
                 continue;
             }
             if (index < infos.size() && infos[index].written) {
@@ -2559,6 +2770,16 @@ private:
                 write(copied, bytes);
                 continue;
             }
+            const bool large = bytes >= LargeKnownBytes;
+            const auto removals = large ? ResidencyService::Get().Removals() : 0u;
+            if (large) {
+                if (const auto found = largeKnown.find(address); found != largeKnown.end() && found->second.bytes == bytes && found->second.removals == removals) {
+                    totals.knownMapped++;
+                    noteKnownPath("mapped", address, bytes);
+                    write(found->second.mapped, bytes);
+                    continue;
+                }
+            }
             const auto reach = std::max(bytes, KnownReadableBytes);
             Shadow::OwnedSpan span;
             if (bytes <= KnownBufferLimitBytes && !MemoryCore::Get().Pages().GpuWrittenIn(address, reach) && ((reach != bytes && Shadow::ServeOwned(context, address, reach, &span)) || Shadow::ServeOwned(context, address, bytes, &span)) && span.address != 0u) {
@@ -2579,6 +2800,7 @@ private:
             if (mapped != 0u) {
                 totals.knownMapped++;
                 noteKnownPath("mapped", address, bytes);
+                if (large) largeKnown[address] = {bytes, mapped, removals};
                 write(mapped, bytes);
                 continue;
             }
@@ -2594,6 +2816,131 @@ private:
             noteKnown(stage, Downgrades::Kind::KnownRefused, index, address, bytes, 0u);
             write(zero, 0u);
         }
+    }
+
+    struct GpuWatch {
+        std::mutex mutex;
+        std::vector<std::byte> last;
+        std::uint32_t lines = 0;
+    };
+
+    static GpuWatch& gpuWatch() {
+        static GpuWatch watch;
+        return watch;
+    }
+
+    void watchOnGpu(const Context& context, Graphics::Recorder& recorder, VkCommandBuffer commands, std::uint64_t program, std::uint32_t queue, std::uint64_t submission) {
+        static const std::pair<std::uint64_t, std::uint64_t> range = [] {
+            const char* value = std::getenv("APS5_RECODE_GPU_WATCH");
+            if (value == nullptr) return std::pair<std::uint64_t, std::uint64_t>{0u, 0u};
+            const char* plus = std::strchr(value, '+');
+            return std::pair<std::uint64_t, std::uint64_t>{std::strtoull(value, nullptr, 16), plus != nullptr ? std::min<std::uint64_t>(std::strtoull(plus + 1, nullptr, 16), 65536u) : 0u};
+        }();
+        constexpr std::uint32_t Slots = 256;
+        if (range.second == 0u) return;
+        const auto span = ResidencyService::Get().Translate(range.first, range.second);
+        if (!span || span->handle == 0u) return;
+        if (gpuWatchBuffer == nullptr) gpuWatchBuffer = std::make_shared<Graphics::Buffer>(context, Slots * range.second, VK_BUFFER_USAGE_TRANSFER_DST_BIT);
+        const auto slot = nextGpuWatch++ % Slots;
+        Graphics::RecordMemoryBarrier(context, commands, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_ACCESS_SHADER_WRITE_BIT | VK_ACCESS_TRANSFER_WRITE_BIT, VK_ACCESS_TRANSFER_READ_BIT);
+        const VkBufferCopy region{span->offset, slot * range.second, range.second};
+        context.Function<PFN_vkCmdCopyBuffer>("vkCmdCopyBuffer")(commands, reinterpret_cast<VkBuffer>(static_cast<std::uintptr_t>(span->handle)), gpuWatchBuffer->Handle(), 1, &region);
+        Graphics::RecordMemoryBarrier(context, commands, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_HOST_BIT | VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_ACCESS_TRANSFER_WRITE_BIT, VK_ACCESS_HOST_READ_BIT);
+        recorder.Keep(gpuWatchBuffer);
+        recorder.OnComplete([buffer = gpuWatchBuffer, slot, bytes = range.second, base = range.first, program, queue, submission] {
+            const auto* now = buffer->Bytes().data() + slot * bytes;
+            auto& watch = gpuWatch();
+            std::lock_guard lock(watch.mutex);
+            if (watch.last.size() != bytes) {
+                watch.last.assign(now, now + bytes);
+                return;
+            }
+            std::uint64_t first = bytes;
+            std::uint64_t lastChanged = 0;
+            std::uint64_t changed = 0;
+            for (std::uint64_t index = 0; index < bytes; ++index) {
+                if (now[index] == watch.last[index]) continue;
+                if (first == bytes) first = index;
+                lastChanged = index;
+                ++changed;
+            }
+            if (changed != 0u && watch.lines < 400u) {
+                ++watch.lines;
+                const auto at = first & ~std::uint64_t{3};
+                std::uint32_t before = 0;
+                std::uint32_t after = 0;
+                std::memcpy(&before, watch.last.data() + at, 4u);
+                std::memcpy(&after, now + at, 4u);
+                std::fprintf(stderr, "[recode-gpu-watch] queue 0x%x submission %llu program %016llx changed %llu bytes, first at 0x%llx: %08x -> %08x, last at 0x%llx\n", queue, static_cast<unsigned long long>(submission), static_cast<unsigned long long>(program), static_cast<unsigned long long>(changed), static_cast<unsigned long long>(base + first), before, after, static_cast<unsigned long long>(base + lastChanged));
+            }
+            watch.last.assign(now, now + bytes);
+        });
+    }
+
+    struct InputCompareTotals {
+        std::mutex mutex;
+        std::map<std::pair<std::uint64_t, int>, std::pair<std::uint64_t, std::uint64_t>> counts;
+        std::uint64_t compared = 0;
+        std::uint32_t lines = 0;
+    };
+
+    static InputCompareTotals& inputCompareTotals() {
+        static InputCompareTotals totals;
+        return totals;
+    }
+
+    void compareInput(const Context& context, Graphics::Recorder& recorder, std::uint64_t address, std::uint64_t bytes, const DrawInput& input) {
+        static const std::uint64_t every = [] {
+            const char* value = std::getenv("APS5_RECODE_INPUT_COMPARE");
+            return value != nullptr ? std::max<std::uint64_t>(1u, std::strtoull(value, nullptr, 10)) : 0u;
+        }();
+        constexpr std::uint32_t Slots = 512;
+        constexpr VkDeviceSize SlotBytes = 65536;
+        if (every == 0u || bytes == 0u || ++inputCompareTick % every != 0u) return;
+        bytes = std::min<std::uint64_t>(bytes, SlotBytes);
+        const auto* guest = reinterpret_cast<const std::byte*>(static_cast<std::uintptr_t>(address));
+        if (!GuestMemory::Accessible(guest, static_cast<std::size_t>(bytes), false)) return;
+        auto& pages = MemoryCore::Get().Pages();
+        const int state = gpuPending(address, bytes) ? 3 : !pages.GpuOwnedIn(address, bytes).empty() ? 2 : pages.GpuWrittenIn(address, bytes) ? 1 : pages.CleanIn(address, bytes) ? 0 : 4;
+        std::vector<std::byte> before(guest, guest + bytes);
+        if (inputCompares == nullptr) inputCompares = std::make_shared<Graphics::Buffer>(context, Slots * SlotBytes, VK_BUFFER_USAGE_TRANSFER_DST_BIT);
+        const auto slot = nextInputCompare++ % Slots;
+        const auto commands = recorder.Commands();
+        Graphics::RecordMemoryBarrier(context, commands, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_ACCESS_SHADER_WRITE_BIT | VK_ACCESS_TRANSFER_WRITE_BIT | VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT, VK_ACCESS_TRANSFER_READ_BIT);
+        const VkBufferCopy region{input.offset, slot * SlotBytes, bytes};
+        context.Function<PFN_vkCmdCopyBuffer>("vkCmdCopyBuffer")(commands, input.buffer, inputCompares->Handle(), 1, &region);
+        Graphics::RecordMemoryBarrier(context, commands, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_HOST_BIT | VK_PIPELINE_STAGE_VERTEX_INPUT_BIT, VK_ACCESS_TRANSFER_WRITE_BIT, VK_ACCESS_HOST_READ_BIT);
+        recorder.Keep(inputCompares);
+        recorder.OnComplete([buffer = inputCompares, slot, address, bytes, state, before = std::move(before)] {
+            const auto* mirrored = buffer->Bytes().data() + slot * SlotBytes;
+            std::uint64_t differing = 0;
+            for (std::uint64_t index = 0; index < bytes; ++index) {
+                if (mirrored[index] != before[index]) ++differing;
+            }
+            auto& totals = inputCompareTotals();
+            std::lock_guard lock(totals.mutex);
+            auto& entry = totals.counts[{address >> 28u, state}];
+            ++entry.first;
+            if (differing != 0u) ++entry.second;
+            static const char* const states[] = {"clean", "gpu-written", "gpu-owned", "gpu-pending", "cpu-dirty"};
+            if (differing != 0u && totals.lines < 60u) {
+                ++totals.lines;
+                std::uint32_t mirrorWord = 0;
+                std::uint32_t guestWord = 0;
+                std::memcpy(&mirrorWord, mirrored, std::min<std::size_t>(4u, static_cast<std::size_t>(bytes)));
+                std::memcpy(&guestWord, before.data(), std::min<std::size_t>(4u, static_cast<std::size_t>(bytes)));
+                std::fprintf(stderr, "[recode-input-compare] 0x%llx+0x%llx %s: %llu bytes differ (mirror %08x, guest at record %08x)\n", static_cast<unsigned long long>(address), static_cast<unsigned long long>(bytes), states[state], static_cast<unsigned long long>(differing), mirrorWord, guestWord);
+            }
+            if (++totals.compared % 5000u == 0u) {
+                std::string line;
+                for (const auto& [key, value] : totals.counts) {
+                    char region[32];
+                    std::snprintf(region, sizeof(region), " 0x%llx", static_cast<unsigned long long>(key.first << 28u));
+                    line += region + std::string("/") + states[key.second] + " " + std::to_string(value.second) + "/" + std::to_string(value.first);
+                }
+                std::fprintf(stderr, "[recode-input-compare] %llu compared; differing/compared by 256 MiB region and page state:%s\n", static_cast<unsigned long long>(totals.compared), line.c_str());
+            }
+        });
     }
 
     void readIndirectGroups(const Context& context, Graphics::Recorder& recorder, VkCommandBuffer commands, VkBuffer arguments, VkDeviceSize offset, std::uint64_t codeAddress) {
@@ -2643,7 +2990,7 @@ private:
 
     static void noteImage(const Resolve::ResolvedStage& stage, Downgrades::Kind kind, std::uint32_t index, const Heap::SlotRequest& request, const char* what) {
         if (!Downgrades::Active()) return;
-        char text[96];
+        char text[256];
         try {
             const auto resource = Graphics::DecodeTextureResource(request.words);
             std::snprintf(text, sizeof(text), "%s 0x%llx %ux%u fmt %u mips %u", what, static_cast<unsigned long long>(resource.baseAddress), resource.width, resource.height, resource.format, resource.mipCount);
@@ -3032,7 +3379,12 @@ private:
         static const char* const mode = std::getenv("APS5_RECODE_CONSUME_USES");
         static const bool global = mode != nullptr && std::string_view(mode) == "global";
         static const bool quick = mode != nullptr && std::string_view(mode) == "quick";
+        static const bool every = mode != nullptr && std::string_view(mode) == "every";
         if (mode == nullptr || std::string_view(mode) == "0") return;
+        if (every) {
+            if (Shadow::ConsumeIn({}) != 0u) inputConsumes().fetch_add(1, std::memory_order_relaxed);
+            return;
+        }
         if (quick) {
             for (const auto& use : operation.uses) {
                 if (use.size == 0u || use.write || MemoryCore::Get().Pages().CleanIn(use.address, use.size)) continue;
@@ -3103,11 +3455,11 @@ private:
         }
         const Downgrades::ProgramScope programScope(stage.program.codeAddress);
         for (const auto* deferred : sampled) {
-            std::uint32_t slot = 0;
+            lastRefusedImage().clear();
             if (ownsImages() && bindOwnedSampled(context, stage, *deferred)) continue;
             if (Downgrades::Active()) noteStaleRecordRead(stage, *deferred);
-            static_cast<void>(slot);
-            noteImage(stage, Downgrades::Kind::UpstreamSampled, deferred->index, deferred->request, "sampled image without a record");
+            const auto why = "sampled image without a record (" + (lastRefusedImage().empty() ? std::string(Resolve::Surfaces() == nullptr ? "no surface table" : "not held") : lastRefusedImage()) + ")";
+            noteImage(stage, Downgrades::Kind::UpstreamSampled, deferred->index, deferred->request, why.c_str());
             reason = "sampled image without a record";
             return false;
         }
@@ -3125,11 +3477,33 @@ private:
         const auto imagesStamp = Events::Images().Serial();
         const auto depthGeneration = Images::DepthRecordsOn() ? Images::Depths().Generation() : std::uint64_t{0};
         if (tableImages.size() >= TableImagesBound) std::erase_if(tableImages, [](const auto& held) { return held.second.base.expired(); });
+        if (const auto* surfaces = Resolve::Surfaces(); surfaces != nullptr && surfaces->Retirements() != tableRetirements) {
+            tableRetirements = surfaces->Retirements();
+            for (auto& [lineage, held] : tableImages) {
+                bool released = false;
+                for (std::size_t position = 0; position < held.records.size(); ++position) {
+                    if (held.records[position] == nullptr || !held.records[position]->retired) continue;
+                    held.records[position].reset();
+                    if (position < held.owners.size()) held.owners[position].reset();
+                    released = true;
+                }
+                if (!released) continue;
+                held.bound.reset();
+                totals.tableImageEntriesDropped++;
+            }
+        }
         auto& entry = tableImages[base->lineage];
-        const bool fresh = entry.bound == nullptr || entry.depths != depthGeneration;
+        const bool fresh = (entry.bound == nullptr && entry.elements.empty()) || entry.depths != depthGeneration;
         const bool rebased = !fresh && entry.base.lock() != base;
         std::vector<bool> stale(fresh ? 0u : entry.elements.size(), false);
         bool anyStale = false;
+        if (!fresh && entry.bound == nullptr) {
+            for (std::size_t position = 0; position < stale.size() && position < entry.records.size() && position < entry.owners.size(); ++position) {
+                if (entry.records[position] != nullptr || entry.owners[position] != nullptr) continue;
+                stale[position] = true;
+            }
+            anyStale = true;
+        }
         std::vector<std::uint32_t> touched;
         if (!fresh) entry.index.Changed(Events::Shared(), entry.sharedStamp, Events::Images(), entry.imagesStamp, touched);
         if (!touched.empty()) {
@@ -3160,6 +3534,7 @@ private:
         if (!fresh && !rebased && !anyStale) {
             totals.tableImageHits++;
             stage.tableMap = entry.bound;
+            noteTableStorage(context, entry);
             return true;
         }
         std::vector<std::size_t> rebind;
@@ -3201,6 +3576,20 @@ private:
         for (const auto position : rebind) {
             const auto& deferred = entry.elements[position];
             lastRefusedImage().clear();
+            if ((deferred.request.flags & Heap::RequestFlag::Storage) != 0u) {
+                auto record = ownedStorage(context, deferred.request, entry.slots[position], stage.program.codeAddress);
+                if (record == nullptr) {
+                    entry.bound.reset();
+                    const auto why = "table storage image without a record (" + (lastRefusedImage().empty() ? std::string("not held") : lastRefusedImage()) + ")";
+                    noteImage(stage, Downgrades::Kind::UpstreamStorage, deferred.index, deferred.request, why.c_str());
+                    reason = why;
+                    return false;
+                }
+                entry.memory[position] = {record->key.address, record->key.bytes};
+                entry.owners[position] = record;
+                entry.records[position] = std::move(record);
+                continue;
+            }
             if (!ownedSampledSlot(context, stage.program, deferred, entry.slots[position], &entry.owners[position], &entry.records[position])) {
                 entry.bound.reset();
                 const auto why = "table image without a record (" + (lastRefusedImage().empty() ? std::string(Resolve::Surfaces() == nullptr ? "no surface table" : "not held") : lastRefusedImage()) + ")";
@@ -3231,7 +3620,20 @@ private:
         stage.tableMap = std::move(bound);
         totals.tableImageBuilds++;
         totals.tableImageBinds += rebind.size();
+        noteTableStorage(context, entry);
         return true;
+    }
+
+    void noteTableStorage(const Context& context, const TableImages& entry) {
+        for (std::size_t position = 0; position < entry.elements.size() && position < entry.records.size(); ++position) {
+            const auto& request = entry.elements[position].request;
+            const auto& record = entry.records[position];
+            if ((request.flags & Heap::RequestFlag::Storage) == 0u || record == nullptr) continue;
+            const bool written = (request.flags & Heap::RequestFlag::Written) != 0u;
+            if (context.recorder != nullptr) context.recorder->Keep(record);
+            if (const auto* vulkan = dynamic_cast<const Images::VulkanSurface*>(record->device.get())) stageStorageImages.emplace_back(vulkan->Image(), written);
+            if (written) writtenRecords.push_back(record);
+        }
     }
 
     static bool sameRequest(const Heap::SlotRequest& left, const Heap::SlotRequest& right) {
@@ -3589,9 +3991,41 @@ private:
     }
 
 
-    bool placeDispatchArguments(const Context& context, Graphics::Recorder& recorder, std::uint64_t address, std::uint64_t serial, std::uint64_t completed, VkBuffer& buffer, VkDeviceSize& offset, std::string& reason) {
+    bool checkDispatchArguments(Graphics::Recorder& recorder, VkCommandBuffer commands, std::uint64_t serial, std::uint64_t completed, VkDeviceAddress source, VkBuffer& buffer, VkDeviceSize& offset) {
+        static const bool unchecked = std::getenv("APS5_RECODE_UNCHECKED_DISPATCH_ARGUMENTS") != nullptr;
+        if (unchecked || ringAddress == 0u || source == 0u) return false;
+        constexpr std::array<std::byte, 3u * sizeof(std::uint32_t)> cleared{};
+        const auto placed = ringWrite(std::span<const std::byte>(cleared), serial, completed);
+        if (!placed.has_value() || !recorder.RecordDispatchArguments(commands, source, ringAddress + *placed)) return false;
+        buffer = ring->Handle();
+        offset = *placed;
+        return true;
+    }
+
+    bool placeDispatchArguments(const Context& context, Graphics::Recorder& recorder, std::uint64_t address, std::uint64_t serial, std::uint64_t completed, VkBuffer& buffer, VkDeviceSize& offset, VkDeviceAddress& device, std::string& reason) {
         constexpr std::size_t bytes = 3u * sizeof(std::uint32_t);
         const auto* source = reinterpret_cast<const std::byte*>(address);
+        device = 0u;
+        const auto mirrorDevice = [&] {
+            const auto span = ResidencyService::Get().MirrorSpan(address, bytes);
+            return span.has_value() && span->handle == reinterpret_cast<std::uintptr_t>(buffer) && span->offset == offset ? span->address : 0u;
+        };
+        if (watchesBatchPrograms()) {
+            lastArgumentsAddress = address;
+            lastArgumentsCpu = {};
+            const auto* record = reinterpret_cast<const std::byte*>(address & ~std::uint64_t{31});
+            if (GuestMemory::Accessible(record, 32u, false)) std::memcpy(lastArgumentsCpu.data(), record, 32u);
+            lastArgumentsGpu = MemoryCore::Get().Pages().GpuWrittenIn(address, bytes) || gpuPending(address, bytes);
+        }
+        if (mirrorPart("args") && argumentsFromMirror()) {
+            if (const auto input = mirrorInput(address, bytes)) {
+                buffer = input->buffer;
+                offset = input->offset;
+                device = mirrorDevice();
+                totals.mirrorArguments++;
+                return true;
+            }
+        }
         if (!Graphics::Recorder::SnapshotWriteOverlaps(address, bytes) && recorder.PendingLeaseSerial(address, bytes) == 0u && !MemoryCore::Get().Pages().GpuWrittenIn(address, bytes) && !gpuPending(address, bytes) && MemoryCore::Get().Pages().GpuOwnedIn(address, bytes).empty() && GuestMemory::Accessible(source, bytes, false)) {
             const auto placed = ringWrite(std::span(source, bytes), serial, completed);
             if (!placed.has_value()) {
@@ -3600,6 +4034,7 @@ private:
             }
             buffer = ring->Handle();
             offset = *placed;
+            device = ringAddress != 0u ? ringAddress + *placed : 0u;
             totals.snapshotArguments++;
             return true;
         }
@@ -3607,6 +4042,7 @@ private:
             if (const auto input = mirrorInput(address, bytes)) {
                 buffer = input->buffer;
                 offset = input->offset;
+                device = mirrorDevice();
                 totals.mirrorArguments++;
                 return true;
             }
@@ -3623,6 +4059,7 @@ private:
         recorder.NotePendingRead(address, bytes, Graphics::Recorder::ReadKind::Indirect);
         buffer = import->buffer;
         offset = Graphics::HostImportOffset(*import, address);
+        device = import->address != 0u ? import->address + (address - import->base) : 0u;
         return true;
     }
 
@@ -3672,7 +4109,8 @@ private:
         }
         VkBuffer argumentBuffer = VK_NULL_HANDLE;
         VkDeviceSize argumentOffset = 0;
-        if (indirect && !placeDispatchArguments(context, *recorder, dispatch.operation.dispatch.indirectAddress, serial, completed, argumentBuffer, argumentOffset, reason)) {
+        VkDeviceAddress argumentDevice = 0u;
+        if (indirect && !placeDispatchArguments(context, *recorder, dispatch.operation.dispatch.indirectAddress, serial, completed, argumentBuffer, argumentOffset, argumentDevice, reason)) {
             copyBacks.clear();
             return false;
         }
@@ -3688,6 +4126,7 @@ private:
         }
         const auto commands = recorder->Commands();
         Graphics::RecordMemoryBarrier(context, commands, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT | VK_PIPELINE_STAGE_HOST_BIT, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT | (indirect ? VK_PIPELINE_STAGE_DRAW_INDIRECT_BIT : 0u), VK_ACCESS_SHADER_WRITE_BIT | VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT | VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT | VK_ACCESS_TRANSFER_WRITE_BIT | VK_ACCESS_HOST_WRITE_BIT, VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT | (indirect ? VK_ACCESS_INDIRECT_COMMAND_READ_BIT : 0u));
+        if (indirect) static_cast<void>(checkDispatchArguments(*recorder, commands, serial, completed, argumentDevice, argumentBuffer, argumentOffset));
         markHang(context, *recorder, commands, Downgrades::ProgramHash(stage.program.codeAddress), groups[0] * groups[1] * groups[2], dispatch);
         context.BindComputePipeline(commands, pipeline->pipeline);
         Downgrades::NotePipeline(reinterpret_cast<std::uint64_t>(pipeline->pipeline), stage.program.codeAddress, stage.program.result != nullptr ? stage.program.result->spirv.ContentHash().low : 0u);
@@ -3701,6 +4140,18 @@ private:
         if (probed && indirect) probeArguments(context, *recorder, commands, dispatch.operation.dispatch.indirectAddress, argumentBuffer, argumentOffset, stage.program.codeAddress);
         const auto dispatchTiming = recorder->BeginGpuTiming(DispatchTimingKey);
         if (indirect) {
+            if (watchesBatchPrograms()) {
+                constexpr std::uint32_t Slots = 4096;
+                constexpr VkDeviceSize SlotBytes = 16;
+                if (hangArguments == nullptr) hangArguments = std::make_shared<Graphics::Buffer>(context, Slots * SlotBytes, VK_BUFFER_USAGE_TRANSFER_DST_BIT);
+                const auto slot = nextHangArgument++ % Slots;
+                const VkBufferCopy region{argumentOffset, slot * SlotBytes, 3u * sizeof(std::uint32_t)};
+                Graphics::RecordMemoryBarrier(context, commands, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_ACCESS_SHADER_WRITE_BIT | VK_ACCESS_TRANSFER_WRITE_BIT, VK_ACCESS_TRANSFER_READ_BIT);
+                context.Function<PFN_vkCmdCopyBuffer>("vkCmdCopyBuffer")(commands, argumentBuffer, hangArguments->Handle(), 1, &region);
+                Graphics::RecordMemoryBarrier(context, commands, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT | VK_PIPELINE_STAGE_DRAW_INDIRECT_BIT, VK_ACCESS_TRANSFER_WRITE_BIT, VK_ACCESS_INDIRECT_COMMAND_READ_BIT);
+                recorder->Keep(hangArguments);
+                lastHangArguments = hangArguments->Bytes().data() + slot * SlotBytes;
+            }
             context.Resolved(&Graphics::DeviceFunctions::cmdDispatchIndirect, "vkCmdDispatchIndirect")(commands, argumentBuffer, argumentOffset);
             totals.indirectDispatches++;
             readIndirectGroups(context, *recorder, commands, argumentBuffer, argumentOffset, stage.program.codeAddress);
@@ -3708,6 +4159,7 @@ private:
             context.Resolved(&Graphics::DeviceFunctions::cmdDispatch, "vkCmdDispatch")(commands, groups[0], groups[1], groups[2]);
         }
         recorder->EndGpuTiming(dispatchTiming);
+        watchOnGpu(context, *recorder, commands, Downgrades::ProgramHash(stage.program.codeAddress), dispatch.operation.queue, dispatch.operation.submission);
         Graphics::RecordMemoryBarrier(context, commands, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT | VK_PIPELINE_STAGE_HOST_BIT, VK_ACCESS_SHADER_WRITE_BIT, VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT | VK_ACCESS_UNIFORM_READ_BIT | VK_ACCESS_TRANSFER_READ_BIT | VK_ACCESS_TRANSFER_WRITE_BIT | VK_ACCESS_INDIRECT_COMMAND_READ_BIT | VK_ACCESS_INDEX_READ_BIT | VK_ACCESS_VERTEX_ATTRIBUTE_READ_BIT | VK_ACCESS_COLOR_ATTACHMENT_READ_BIT | VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_READ_BIT | VK_ACCESS_HOST_READ_BIT);
         finishHangMark(context, commands);
         recordCopyBacks(context, commands, serial);
@@ -4150,7 +4602,7 @@ private:
                     return false;
                 }
                 const auto address = vertexAddress(attribute);
-                inputRanges.push_back({address, address + Graphics::VertexBufferExtent(attribute), 0});
+                inputRanges.push_back({address, unclampedInputEnd(attribute, address, address + Graphics::VertexBufferExtent(attribute)), 0});
             }
             const auto unions = mergeInputs(inputRanges);
             std::vector<DrawInput> unionInputs;
@@ -4170,6 +4622,7 @@ private:
                     return false;
                 }
                 if (source == InputSource::Written && copiesInputs() && end - begin <= InputCopyLimitBytes) inputCopies.push_back({begin, end - begin, index});
+                if (source == InputSource::Mirrored) compareInput(context, *recorder, begin, end - begin, *input);
                 recorder->NotePendingRead(begin, end - begin, Graphics::Recorder::ReadKind::DrawInput);
                 unionInputs.push_back(*input);
                 unionSources.push_back(source);
@@ -5007,6 +5460,13 @@ private:
     }
 
     std::mutex mutex;
+    std::atomic<std::uint64_t> drawPrebuildNanoseconds{0};
+    struct LargeKnown {
+        std::uint64_t bytes = 0;
+        std::uint64_t mapped = 0;
+        std::uint64_t removals = 0;
+    };
+    std::unordered_map<std::uint64_t, LargeKnown> largeKnown;
     VkDevice device = VK_NULL_HANDLE;
     std::uint64_t alignment = 16;
     std::shared_ptr<Graphics::Buffer> ring;
@@ -5041,6 +5501,18 @@ private:
     std::map<std::uint64_t, MapBuffer> maps;
     std::uint64_t mapBytes = 0;
     std::unordered_map<std::uint64_t, TableImages> tableImages;
+    std::uint64_t tableRetirements = 0;
+    std::shared_ptr<Graphics::Buffer> gpuWatchBuffer;
+    std::uint32_t nextGpuWatch = 0;
+    std::shared_ptr<Graphics::Buffer> inputCompares;
+    std::uint32_t nextInputCompare = 0;
+    std::uint64_t inputCompareTick = 0;
+    std::shared_ptr<Graphics::Buffer> hangArguments;
+    std::uint32_t nextHangArgument = 0;
+    const std::byte* lastHangArguments = nullptr;
+    std::uint64_t lastArgumentsAddress = 0;
+    std::array<std::uint32_t, 8> lastArgumentsCpu{};
+    bool lastArgumentsGpu = false;
     std::uint64_t nextTableImagesId = std::uint64_t{1} << 62u;
     std::set<std::string> seen;
     std::chrono::steady_clock::time_point dumpClock = processStart();
@@ -5134,6 +5606,10 @@ struct HostCopies {
     std::deque<std::function<void()>> queue;
     bool running = false;
     bool started = false;
+    std::uint64_t landings = 0;
+    std::uint64_t busyNanoseconds = 0;
+    std::size_t deepest = 0;
+    std::chrono::steady_clock::time_point reported = std::chrono::steady_clock::now();
 };
 
 HostCopies& hostCopies() {
@@ -5157,10 +5633,22 @@ void hostCopyLoop() {
         auto landing = std::move(copies.queue.front());
         copies.queue.pop_front();
         copies.running = true;
+        copies.deepest = std::max(copies.deepest, copies.queue.size() + 1u);
         lock.unlock();
+        const auto started = std::chrono::steady_clock::now();
         runLanding(landing);
+        const auto finished = std::chrono::steady_clock::now();
         lock.lock();
         copies.running = false;
+        copies.landings++;
+        copies.busyNanoseconds += static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(finished - started).count());
+        if (finished - copies.reported >= std::chrono::seconds(10)) {
+            std::fprintf(stderr, "[recode-host-copy] stage (10 s): %llu landings, busy %.0f ms, deepest queue %zu\n", static_cast<unsigned long long>(copies.landings), static_cast<double>(copies.busyNanoseconds) / 1e6, copies.deepest);
+            copies.reported = finished;
+            copies.landings = 0;
+            copies.busyNanoseconds = 0;
+            copies.deepest = 0;
+        }
         if (copies.queue.empty()) copies.drained.notify_all();
     }
 }
@@ -5626,6 +6114,11 @@ bool RecordPrecheck(const Resolve::ResolvedDraw& draw, const Pm4::DrawParameters
 
 bool RecordResolved(const Context& context, const Resolve::ResolvedDraw& draw, const Pm4::DrawParameters& parameters, std::string& reason) {
     return shared().Record(context, draw, parameters, reason);
+}
+
+void PrebuildDraw(const Context& context, const Resolve::ResolvedDraw& draw) {
+    if (!RecordActive()) return;
+    shared().PrebuildDraw(context, draw);
 }
 
 bool RecordDispatchPrecheck(const Context& context, VulkanDevice& owner, const Resolve::ResolvedDraw& dispatch, std::string& reason) {

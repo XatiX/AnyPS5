@@ -26,6 +26,8 @@
 #include "Optimization/ShaderStageInputInfo.hpp"
 #include <atomic>
 #include <chrono>
+#include <condition_variable>
+#include <deque>
 #include <cstdio>
 #include <cstdlib>
 #include <exception>
@@ -35,6 +37,8 @@
 #include <mutex>
 #include <set>
 #include <span>
+#include <string_view>
+#include <thread>
 #include <utility>
 
 namespace AgcDriver::Unified::Resolve {
@@ -42,6 +46,8 @@ namespace AgcDriver::Unified::Resolve {
 namespace {
 
 constexpr std::uint32_t StorageShapes = 7u;
+constexpr std::uint32_t Image1DShape = 0u;
+constexpr std::uint32_t Image1DArrayShape = 1u;
 constexpr std::uint32_t Image2DShape = 2u;
 constexpr std::uint32_t Image2DArrayShape = 3u;
 constexpr std::uint32_t MultisampleShape = 4u;
@@ -57,7 +63,7 @@ bool storageShapeRecords() {
 }
 
 bool recordStorageShape(std::uint32_t shape) {
-    return shape == Image2DShape || shape == Image2DArrayShape || (shape == Image3DShape && storageShapeRecords());
+    return shape == Image1DShape || shape == Image1DArrayShape || shape == Image2DShape || shape == Image2DArrayShape || (shape == Image3DShape && storageShapeRecords());
 }
 
 bool recordStorageAtomics(std::uint32_t flags) {
@@ -66,6 +72,8 @@ bool recordStorageAtomics(std::uint32_t flags) {
 }
 
 Images::StorageShape storageShapeOf(std::uint32_t shape) {
+    if (shape == Image1DShape) return Images::StorageShape::Line;
+    if (shape == Image1DArrayShape) return Images::StorageShape::LineArray;
     return shape == Image3DShape ? Images::StorageShape::Volume : shape == Image2DArrayShape ? Images::StorageShape::Array : Images::StorageShape::Flat;
 }
 
@@ -210,6 +218,37 @@ struct Totals {
     std::array<std::uint64_t, PhaseCount> phases{};
 };
 
+struct ResolveInput {
+    std::shared_ptr<const QueueState> state;
+    std::shared_ptr<const DriverDetail::Submission> held;
+    const DriverDetail::Submission* submission = nullptr;
+    std::vector<OperationGuard> ownedGuards;
+    const std::vector<OperationGuard>* guards = nullptr;
+
+    [[nodiscard]] const QueueState& Live() const { return *state; }
+    [[nodiscard]] const DriverDetail::Submission* CurrentSubmission() const { return submission; }
+    [[nodiscard]] const std::shared_ptr<const DriverDetail::Submission>& Held() const { return held; }
+    [[nodiscard]] const std::vector<OperationGuard>& Guards() const { return guards != nullptr ? *guards : ownedGuards; }
+};
+
+ResolveInput viewOf(const DecodeState& state) {
+    ResolveInput input;
+    input.state = std::shared_ptr<const QueueState>(std::shared_ptr<const QueueState>{}, &state.Live());
+    input.held = state.Held();
+    input.submission = state.CurrentSubmission();
+    input.guards = &state.Guards();
+    return input;
+}
+
+ResolveInput copyOf(const DecodeState& state) {
+    ResolveInput input;
+    input.state = std::make_shared<const QueueState>(state.Live());
+    input.held = state.Held();
+    input.submission = state.CurrentSubmission();
+    input.ownedGuards = state.Guards();
+    return input;
+}
+
 class Resolver {
 public:
     void Attach(const std::shared_ptr<VulkanDevice>& device) {
@@ -266,8 +305,12 @@ public:
         }
     }
 
-    static Loop::Item loopItem(const Operation& operation, std::shared_ptr<const ResolvedDraw> resolved, const DecodeState& state) {
+    static Loop::Item loopItem(const Operation& operation, std::shared_ptr<const ResolvedDraw> resolved, const ResolveInput& state) {
         Loop::Ensure(operation.queue);
+        if (operation.kind == OpKind::Flip) {
+            static const bool traced = std::getenv("APS5_RECODE_TRACE_LOOP") != nullptr;
+            if (traced) std::fprintf(stderr, "[recode-loop-trace] flip decoded q%u submission %llu offset %u\n", operation.queue, static_cast<unsigned long long>(operation.submission), operation.packetOffset);
+        }
         Loop::Item item{operation, std::move(resolved), state.Held(), std::nullopt, {}, {}, state.Guards(), state.Live().sampleDumpBlocks};
         const auto* submission = state.CurrentSubmission();
         if (submission == nullptr || operation.packetOffset >= submission->commands.size()) return item;
@@ -298,7 +341,7 @@ public:
         return item;
     }
 
-    void Consume(const Operation& operation, const DecodeState& state) {
+    void Consume(const Operation& operation, const ResolveInput& state) {
         if (IsDispatch(operation.kind)) {
             if (!routesQueue(operation.queue)) return;
             std::shared_ptr<const ResolvedDraw> dispatch;
@@ -461,7 +504,7 @@ private:
     std::uint64_t storageRecordRefusals = 0;
     std::map<std::string, std::uint64_t> recordRefusalReasons;
 
-    std::shared_ptr<const ResolvedDraw> resolve(const Operation& operation, const DecodeState& state) {
+    std::shared_ptr<const ResolvedDraw> resolve(const Operation& operation, const ResolveInput& state) {
         totals.draws++;
         const auto* submission = state.CurrentSubmission();
         if (refill == nullptr || submission == nullptr || submission->shaders == nullptr) {
@@ -512,7 +555,7 @@ private:
         return resolveStages(totals, std::move(draw), programs, beforeTargets, slotsStarted);
     }
 
-    std::shared_ptr<const ResolvedDraw> resolveDispatch(const Operation& operation, const DecodeState& state) {
+    std::shared_ptr<const ResolvedDraw> resolveDispatch(const Operation& operation, const ResolveInput& state) {
         dispatchTotals.draws++;
         const auto* submission = state.CurrentSubmission();
         if (refill == nullptr || submission == nullptr || submission->shaders == nullptr) {
@@ -542,7 +585,15 @@ private:
             else dispatch.complete = false;
         }
         const auto beforeTargets = dispatch.uses.size();
-        return resolveStages(dispatchTotals, std::move(dispatch), programs, beforeTargets, slotsStarted);
+        auto resolved = resolveStages(dispatchTotals, std::move(dispatch), programs, beforeTargets, slotsStarted);
+        if (resolved != nullptr && !resolved->stages.empty() && ChecksReads(resolved->stages.front().program.codeAddress)) {
+            resolved->readHashes.clear();
+            for (std::size_t index = 0; index < resolved->uses.size(); ++index) {
+                const auto& use = resolved->uses[index];
+                resolved->readHashes.push_back(use.write || index >= resolved->imageBegin || use.size > (1ull << 20u) ? 0u : HashGuestRange(use.address, use.size));
+            }
+        }
+        return resolved;
     }
 
     std::shared_ptr<const ResolvedDraw> resolveStages(Totals& counts, ResolvedDraw draw, ProgramSet& programs, std::size_t beforeTargets, std::chrono::steady_clock::time_point slotsStarted) {
@@ -561,7 +612,20 @@ private:
             std::vector<Heap::SlotRequest> requests;
             if (stage.result->directHeap) {
                 Heap::SlotStatistics statistics;
-                if (!Heap::BuildSlotRequests(stage.variant->info, stage.capture->snapshot, requests, statistics, reason, storageDispatches() && (&counts == &dispatchTotals || storageDraws()))) {
+                const ShaderRecompiler::ResourceSnapshot* snapshot = &stage.capture->snapshot;
+                ShaderRecompiler::ResourceSnapshot merged;
+                if (!stage.targetMerges.empty() && snapshot->images.size() + stage.targetMerges.size() == stage.variant->info.info.images.size()) {
+                    merged = *snapshot;
+                    for (const auto& words : stage.targetMerges) {
+                        ShaderRecompiler::DescriptorValue descriptor;
+                        std::ranges::copy(words, descriptor.dwords.begin());
+                        descriptor.dwordCount = 8u;
+                        descriptor.availableDwordMask = 0xffu;
+                        merged.images.push_back(descriptor);
+                    }
+                    snapshot = &merged;
+                }
+                if (!Heap::BuildSlotRequests(stage.variant->info, *snapshot, requests, statistics, reason, storageDispatches() && (&counts == &dispatchTotals || storageDraws()))) {
                     refuse(counts, reason);
                     noteSlots(counts, slotsStarted);
                     return nullptr;
@@ -573,7 +637,7 @@ private:
                     const auto& request = requests[index];
                     if ((request.flags & Heap::RequestFlag::Sampler) == 0u) continue;
                     if (((request.words[0] >> 20u) & 1u) != 0u) Downgrades::NoteCurrent(Downgrades::Kind::SamplerMode, static_cast<std::uint32_t>(index), "sampler forces sRGB decoding; its texture is bound without an sRGB view");
-                    if (((request.words[0] >> 15u) & 1u) != 0u) Downgrades::NoteCurrent(Downgrades::Kind::SamplerMode, static_cast<std::uint32_t>(index), "sampler uses unnormalized coordinates; bound as normalized");
+                    if (((request.words[0] >> 15u) & 1u) != 0u && (request.flags & Heap::RequestFlag::Unnormalized) == 0u) Downgrades::NoteCurrent(Downgrades::Kind::SamplerMode, static_cast<std::uint32_t>(index), "sampler uses unnormalized coordinates; bound as normalized");
                 }
                 std::uint32_t bindingIndex = 0;
                 for (const auto& binding : stage.result->bindings) {
@@ -583,10 +647,12 @@ private:
                         }
                         return false;
                     };
-                    if (any(binding.imageUnnormalized)) Downgrades::NoteCurrent(Downgrades::Kind::SamplerMode, 0x100u + bindingIndex, any(binding.imageUnnormalizedBaseLevel) ? "image fetched with unnormalized coordinates at its base level; no base-level view is chosen" : "image fetched with unnormalized coordinates");
-                    if (any(binding.samplerCoordinatesIgnored)) Downgrades::NoteCurrent(Downgrades::Kind::SamplerMode, 0x200u + bindingIndex, "sampler whose coordinates are ignored; its unnormalized bit is not cleared");
+                    bool unnormalizedAcrossLevels = false;
+                    for (std::size_t element = 0; element < binding.imageUnnormalized.size(); ++element) {
+                        if (binding.imageUnnormalized[element] && (element >= binding.imageUnnormalizedBaseLevel.size() || !binding.imageUnnormalizedBaseLevel[element])) unnormalizedAcrossLevels = true;
+                    }
+                    if (unnormalizedAcrossLevels) Downgrades::NoteCurrent(Downgrades::Kind::SamplerMode, 0x100u + bindingIndex, "image fetched with unnormalized coordinates beyond its base level; bound with all its levels");
                     if (any(binding.samplerIntegerBorder)) Downgrades::NoteCurrent(Downgrades::Kind::SamplerMode, 0x300u + bindingIndex, "sampler with an integer border colour; bound with a float border");
-                    if (any(binding.samplerUnnormalized)) Downgrades::NoteCurrent(Downgrades::Kind::SamplerMode, 0x400u + bindingIndex, "sampler proven unnormalized; bound as normalized");
                     ++bindingIndex;
                 }
             }
@@ -953,7 +1019,7 @@ private:
     std::optional<Heap::ResolvedSampler> sampler(const Heap::SlotRequest& request) {
         if (context->samplerCache == nullptr) return std::nullopt;
         try {
-            const auto found = context->samplerCache->Get(*context, std::span<const std::uint32_t>(request.words).first(4), (request.flags & Heap::RequestFlag::Compare) != 0u, false, true, false);
+            const auto found = context->samplerCache->Get(*context, std::span<const std::uint32_t>(request.words).first(4), (request.flags & Heap::RequestFlag::Compare) != 0u, (request.flags & Heap::RequestFlag::Unnormalized) != 0u, true, false);
             if (found == nullptr) return std::nullopt;
             return Heap::ResolvedSampler{reinterpret_cast<std::uint64_t>(found->Handle()), found};
         } catch (const std::exception& error) {
@@ -1018,12 +1084,85 @@ void Attach(const std::shared_ptr<VulkanDevice>& device) {
     if (Active()) shared().Attach(device);
 }
 
-void Consume(const Operation& operation, const DecodeState& state) {
+namespace {
+
+bool resolvesOnOwnThread() {
+    static const bool own = [] {
+        const char* value = RouteValue("APS5_RECODE_RESOLVE_THREAD");
+        return value != nullptr && std::string_view(value) == "1" && Loop::OwnsLoop();
+    }();
+    return own;
+}
+
+void consumeInput(const Operation& operation, const ResolveInput& input) {
     try {
-        shared().Consume(operation, state);
+        shared().Consume(operation, input);
     } catch (const std::exception& error) {
         shared().ConsumeFailed(operation, error.what());
     }
+}
+
+struct ResolveJobs {
+    static constexpr std::size_t Bound = 4096;
+    std::mutex mutex;
+    std::condition_variable ready;
+    std::condition_variable room;
+    std::deque<std::pair<Operation, ResolveInput>> jobs;
+    bool started = false;
+    std::uint64_t done = 0;
+    std::uint64_t busyNanoseconds = 0;
+    std::size_t deepest = 0;
+    std::chrono::steady_clock::time_point reported = std::chrono::steady_clock::now();
+};
+
+ResolveJobs& resolveJobs() {
+    static auto& jobs = *new ResolveJobs();
+    return jobs;
+}
+
+void resolveLoop() {
+    auto& jobs = resolveJobs();
+    std::unique_lock lock(jobs.mutex);
+    for (;;) {
+        jobs.ready.wait(lock, [&] { return !jobs.jobs.empty(); });
+        auto job = std::move(jobs.jobs.front());
+        jobs.jobs.pop_front();
+        jobs.room.notify_one();
+        lock.unlock();
+        const auto started = std::chrono::steady_clock::now();
+        consumeInput(job.first, job.second);
+        const auto finished = std::chrono::steady_clock::now();
+        lock.lock();
+        jobs.done++;
+        jobs.busyNanoseconds += static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(finished - started).count());
+        if (finished - jobs.reported >= std::chrono::seconds(10)) {
+            std::fprintf(stderr, "[recode-resolve-thread] stage (10 s): %llu operations, busy %.0f ms, deepest queue %zu\n", static_cast<unsigned long long>(jobs.done), static_cast<double>(jobs.busyNanoseconds) / 1e6, jobs.deepest);
+            jobs.reported = finished;
+            jobs.done = 0;
+            jobs.busyNanoseconds = 0;
+            jobs.deepest = 0;
+        }
+    }
+}
+
+}
+
+void Consume(const Operation& operation, const DecodeState& state) {
+    if (!resolvesOnOwnThread()) {
+        consumeInput(operation, viewOf(state));
+        return;
+    }
+    auto input = copyOf(state);
+    auto& jobs = resolveJobs();
+    std::unique_lock lock(jobs.mutex);
+    if (!jobs.started) {
+        jobs.started = true;
+        std::thread(resolveLoop).detach();
+    }
+    jobs.room.wait(lock, [&] { return jobs.jobs.size() < ResolveJobs::Bound; });
+    jobs.jobs.emplace_back(operation, std::move(input));
+    jobs.deepest = std::max(jobs.deepest, jobs.jobs.size());
+    jobs.ready.notify_one();
 }
 
 std::string Line() {
@@ -1044,6 +1183,22 @@ PacketTable<ResolvedDraw>& ResolvedDraws() {
 
 bool DispatchesActive() {
     return Active() && dispatchesRouted();
+}
+
+std::uint64_t HashGuestRange(std::uint64_t address, std::uint64_t bytes) {
+    const auto* data = reinterpret_cast<const std::byte*>(static_cast<std::uintptr_t>(address));
+    if (bytes == 0u || !GuestMemory::Accessible(data, static_cast<std::size_t>(bytes), false)) return 0u;
+    std::uint64_t hash = 0xcbf29ce484222325ull;
+    for (std::uint64_t index = 0; index < bytes; ++index) {
+        hash ^= static_cast<std::uint64_t>(data[index]);
+        hash *= 0x100000001b3ull;
+    }
+    return hash == 0u ? 1u : hash;
+}
+
+bool ChecksReads(std::uint64_t codeAddress) {
+    static const char* const listed = std::getenv("APS5_RECODE_CHECK_READS");
+    return listed != nullptr && *listed != '\0' && Downgrades::ListedHash(listed, Downgrades::ProgramHash(codeAddress));
 }
 
 bool DispatchesRoutedOn(std::uint32_t queue) {

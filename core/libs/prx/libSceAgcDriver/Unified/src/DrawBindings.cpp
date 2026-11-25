@@ -37,7 +37,7 @@ bool Describe(std::span<const StageInput> stages, Layout& out, std::string& reas
         for (std::uint32_t index = 0; index < result->bindings.size(); ++index) {
             const auto& binding = result->bindings[index];
             if (binding.descriptorSet == ShaderRecompiler::RuntimeAbi::DirectHeapSet) continue;
-            if (result->directHeap && (binding.role == ShaderRecompiler::DescriptorRole::ImageTable || binding.role == ShaderRecompiler::DescriptorRole::ImageStorageTable)) continue;
+            if (result->directHeap && (binding.role == ShaderRecompiler::DescriptorRole::ImageTable || binding.role == ShaderRecompiler::DescriptorRole::ImageStorageTable || binding.role == ShaderRecompiler::DescriptorRole::SamplerTable)) continue;
             if (binding.descriptorSet != ShaderRecompiler::RuntimeAbi::DescriptorSet && binding.descriptorSet != ShaderRecompiler::RuntimeAbi::FragmentDescriptorSet) {
                 reason = "binding in set " + std::to_string(binding.descriptorSet);
                 return false;
