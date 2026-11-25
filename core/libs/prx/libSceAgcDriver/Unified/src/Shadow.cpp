@@ -34,6 +34,8 @@
 #include <span>
 #include <utility>
 #include <string>
+#include <string_view>
+#include <array>
 
 namespace AgcDriver::Unified::Shadow {
 
@@ -629,6 +631,11 @@ void NoteDriverStore(std::uint64_t address, std::uint64_t bytes) {
         NoteGpuWrites(written);
     }
     coreNoteWritten(static_cast<std::uintptr_t>(address), static_cast<std::size_t>(bytes));
+    static const bool uploads = std::getenv("APS5_RECODE_DRIVER_STORE_UPLOADS") == nullptr || std::string_view(std::getenv("APS5_RECODE_DRIVER_STORE_UPLOADS")) != "0";
+    if (uploads && Mirror::WritesEnabled()) {
+        const std::array stored{DirtyRange{address, bytes}};
+        ResidencyService::Get().NoteDirty(stored);
+    }
 }
 
 bool ResidentDrawInputs() {

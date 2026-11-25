@@ -1267,6 +1267,11 @@ bool pendingInputsFromMirror() {
 }
 
 std::optional<DrawInput> mirrorInput(std::uint64_t address, std::uint64_t bytes) {
+    static const std::uint64_t margin = [] {
+        const char* value = std::getenv("APS5_RECODE_MIRROR_INPUTS_MARGIN");
+        return value != nullptr ? std::strtoull(value, nullptr, 16) : 0ull;
+    }();
+    if (margin != 0u) static_cast<void>(ResidencyService::Get().MirrorSpan(address, bytes + margin));
     const auto span = ResidencyService::Get().MirrorSpan(address, bytes);
     if (!span) return std::nullopt;
     return DrawInput{reinterpret_cast<VkBuffer>(static_cast<std::uintptr_t>(span->handle)), static_cast<VkDeviceSize>(span->offset)};
@@ -2770,6 +2775,72 @@ private:
             noteKnown(stage, Downgrades::Kind::KnownRefused, index, address, bytes, 0u);
             write(zero, 0u);
         }
+    }
+
+    struct InputCompareTotals {
+        std::mutex mutex;
+        std::map<std::pair<std::uint64_t, int>, std::pair<std::uint64_t, std::uint64_t>> counts;
+        std::uint64_t compared = 0;
+        std::uint32_t lines = 0;
+    };
+
+    static InputCompareTotals& inputCompareTotals() {
+        static InputCompareTotals totals;
+        return totals;
+    }
+
+    void compareInput(const Context& context, Graphics::Recorder& recorder, std::uint64_t address, std::uint64_t bytes, const DrawInput& input) {
+        static const std::uint64_t every = [] {
+            const char* value = std::getenv("APS5_RECODE_INPUT_COMPARE");
+            return value != nullptr ? std::max<std::uint64_t>(1u, std::strtoull(value, nullptr, 10)) : 0u;
+        }();
+        constexpr std::uint32_t Slots = 512;
+        constexpr VkDeviceSize SlotBytes = 65536;
+        if (every == 0u || bytes == 0u || ++inputCompareTick % every != 0u) return;
+        bytes = std::min<std::uint64_t>(bytes, SlotBytes);
+        const auto* guest = reinterpret_cast<const std::byte*>(static_cast<std::uintptr_t>(address));
+        if (!GuestMemory::Accessible(guest, static_cast<std::size_t>(bytes), false)) return;
+        auto& pages = MemoryCore::Get().Pages();
+        const int state = gpuPending(address, bytes) ? 3 : !pages.GpuOwnedIn(address, bytes).empty() ? 2 : pages.GpuWrittenIn(address, bytes) ? 1 : pages.CleanIn(address, bytes) ? 0 : 4;
+        std::vector<std::byte> before(guest, guest + bytes);
+        if (inputCompares == nullptr) inputCompares = std::make_shared<Graphics::Buffer>(context, Slots * SlotBytes, VK_BUFFER_USAGE_TRANSFER_DST_BIT);
+        const auto slot = nextInputCompare++ % Slots;
+        const auto commands = recorder.Commands();
+        Graphics::RecordMemoryBarrier(context, commands, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_ACCESS_SHADER_WRITE_BIT | VK_ACCESS_TRANSFER_WRITE_BIT | VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT, VK_ACCESS_TRANSFER_READ_BIT);
+        const VkBufferCopy region{input.offset, slot * SlotBytes, bytes};
+        context.Function<PFN_vkCmdCopyBuffer>("vkCmdCopyBuffer")(commands, input.buffer, inputCompares->Handle(), 1, &region);
+        Graphics::RecordMemoryBarrier(context, commands, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_HOST_BIT | VK_PIPELINE_STAGE_VERTEX_INPUT_BIT, VK_ACCESS_TRANSFER_WRITE_BIT, VK_ACCESS_HOST_READ_BIT);
+        recorder.Keep(inputCompares);
+        recorder.OnComplete([buffer = inputCompares, slot, address, bytes, state, before = std::move(before)] {
+            const auto* mirrored = buffer->Bytes().data() + slot * SlotBytes;
+            std::uint64_t differing = 0;
+            for (std::uint64_t index = 0; index < bytes; ++index) {
+                if (mirrored[index] != before[index]) ++differing;
+            }
+            auto& totals = inputCompareTotals();
+            std::lock_guard lock(totals.mutex);
+            auto& entry = totals.counts[{address >> 28u, state}];
+            ++entry.first;
+            if (differing != 0u) ++entry.second;
+            static const char* const states[] = {"clean", "gpu-written", "gpu-owned", "gpu-pending", "cpu-dirty"};
+            if (differing != 0u && totals.lines < 60u) {
+                ++totals.lines;
+                std::uint32_t mirrorWord = 0;
+                std::uint32_t guestWord = 0;
+                std::memcpy(&mirrorWord, mirrored, std::min<std::size_t>(4u, static_cast<std::size_t>(bytes)));
+                std::memcpy(&guestWord, before.data(), std::min<std::size_t>(4u, static_cast<std::size_t>(bytes)));
+                std::fprintf(stderr, "[recode-input-compare] 0x%llx+0x%llx %s: %llu bytes differ (mirror %08x, guest at record %08x)\n", static_cast<unsigned long long>(address), static_cast<unsigned long long>(bytes), states[state], static_cast<unsigned long long>(differing), mirrorWord, guestWord);
+            }
+            if (++totals.compared % 5000u == 0u) {
+                std::string line;
+                for (const auto& [key, value] : totals.counts) {
+                    char region[32];
+                    std::snprintf(region, sizeof(region), " 0x%llx", static_cast<unsigned long long>(key.first << 28u));
+                    line += region + std::string("/") + states[key.second] + " " + std::to_string(value.second) + "/" + std::to_string(value.first);
+                }
+                std::fprintf(stderr, "[recode-input-compare] %llu compared; differing/compared by 256 MiB region and page state:%s\n", static_cast<unsigned long long>(totals.compared), line.c_str());
+            }
+        });
     }
 
     void readIndirectGroups(const Context& context, Graphics::Recorder& recorder, VkCommandBuffer commands, VkBuffer arguments, VkDeviceSize offset, std::uint64_t codeAddress) {
@@ -4407,6 +4478,7 @@ private:
                     return false;
                 }
                 if (source == InputSource::Written && copiesInputs() && end - begin <= InputCopyLimitBytes) inputCopies.push_back({begin, end - begin, index});
+                if (source == InputSource::Mirrored) compareInput(context, *recorder, begin, end - begin, *input);
                 recorder->NotePendingRead(begin, end - begin, Graphics::Recorder::ReadKind::DrawInput);
                 unionInputs.push_back(*input);
                 unionSources.push_back(source);
@@ -5286,6 +5358,9 @@ private:
     std::uint64_t mapBytes = 0;
     std::unordered_map<std::uint64_t, TableImages> tableImages;
     std::uint64_t tableRetirements = 0;
+    std::shared_ptr<Graphics::Buffer> inputCompares;
+    std::uint32_t nextInputCompare = 0;
+    std::uint64_t inputCompareTick = 0;
     std::shared_ptr<Graphics::Buffer> hangArguments;
     std::uint32_t nextHangArgument = 0;
     const std::byte* lastHangArguments = nullptr;
