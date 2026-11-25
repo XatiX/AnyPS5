@@ -190,6 +190,8 @@ void SurfaceTable::evict() {
             continue;
         }
         found->second->retired = true;
+        retiredSurfaces.push_back(found->second);
+        retirements.fetch_add(1, std::memory_order_release);
         dropStale(*found->second);
         unindexSurface(*found->second);
         heldBytes -= key.bytes;
@@ -397,6 +399,8 @@ void SurfaceTable::Retire(const std::shared_ptr<Surface>& surface) {
     if (surface == nullptr || surface->retired) return;
     surface->retired = true;
     surface->gpuNewer = false;
+    retiredSurfaces.push_back(surface);
+    retirements.fetch_add(1, std::memory_order_release);
     dropStale(*surface);
     const auto found = surfaces.find(surface->key);
     if (found != surfaces.end() && found->second == surface) {
@@ -443,6 +447,16 @@ std::size_t SurfaceTable::Size() const {
 std::uint64_t SurfaceTable::HeldBytes() const {
     std::lock_guard lock(mutex);
     return heldBytes;
+}
+
+std::pair<std::uint64_t, std::uint64_t> SurfaceTable::RetiredAlive() const {
+    std::lock_guard lock(mutex);
+    std::erase_if(retiredSurfaces, [](const std::weak_ptr<Surface>& surface) { return surface.expired(); });
+    std::uint64_t bytes = 0;
+    for (const auto& weak : retiredSurfaces) {
+        if (const auto surface = weak.lock()) bytes += surface->key.bytes;
+    }
+    return {retiredSurfaces.size(), bytes};
 }
 
 }

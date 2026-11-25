@@ -136,8 +136,10 @@ VulkanSurface::VulkanSurface(const Graphics::Context& context, const Graphics::G
     if (allocated != VK_SUCCESS) {
         context.Function<PFN_vkDestroyImage>("vkDestroyImage")(context.device, image, nullptr);
         image = VK_NULL_HANDLE;
+        const auto counts = pool != nullptr ? pool->Counts() : PoolCounts{};
         pool.reset();
-        Graphics::Check(allocated, "vkAllocateMemory recode surface");
+        const auto what = "vkAllocateMemory recode surface (" + std::to_string(requirements.size >> 20u) + " MiB, " + std::to_string(info.extent.width) + "x" + std::to_string(info.extent.height) + "x" + std::to_string(info.extent.depth) + " layers " + std::to_string(info.arrayLayers) + " mips " + std::to_string(info.mipLevels) + " format " + std::to_string(static_cast<int>(info.format)) + "; pool " + std::to_string(counts.blocks) + " blocks " + std::to_string(counts.blockBytes >> 20u) + " MiB, " + std::to_string(counts.dedicated) + " dedicated " + std::to_string(counts.dedicatedBytes >> 20u) + " MiB)";
+        Graphics::Check(allocated, what.c_str());
     }
     const auto bound = pool != nullptr ? context.Function<PFN_vkBindImageMemory>("vkBindImageMemory")(context.device, image, pooled.memory, pooled.offset) : context.Function<PFN_vkBindImageMemory>("vkBindImageMemory")(context.device, image, memory, 0);
     Graphics::Check(bound, "vkBindImageMemory recode surface");

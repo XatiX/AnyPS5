@@ -407,6 +407,7 @@ struct Totals {
     std::uint64_t tableImageRefreshes = 0;
     std::uint64_t tableImageDepthKept = 0;
     std::uint64_t tableImageRetired = 0;
+    std::uint64_t tableImageEntriesDropped = 0;
     std::uint64_t compressedAliases = 0;
     std::uint64_t surfaceFailures = 0;
     std::uint64_t faultReads = 0;
@@ -1820,6 +1821,7 @@ public:
         line += text;
         std::snprintf(text, sizeof(text), "; table maps %llu hits, %llu uploads (%.1f MiB), %llu retired, %zu held (%.1f MiB); table images %llu reused, %llu bound (%llu whole), %llu elements bound, %llu checked for a refresh, %llu depth kept, %llu retired, %zu held; compressed records beside another format %llu; consumes for CPU-written mirror inputs %llu",static_cast<unsigned long long>(totals.mapHits), static_cast<unsigned long long>(totals.mapUploads), static_cast<double>(totals.mapUploadBytes) / 1048576.0, static_cast<unsigned long long>(totals.mapRetired), maps.size(), static_cast<double>(mapBytes) / 1048576.0, static_cast<unsigned long long>(totals.tableImageHits), static_cast<unsigned long long>(totals.tableImageBuilds), static_cast<unsigned long long>(totals.tableImageWhole), static_cast<unsigned long long>(totals.tableImageBinds), static_cast<unsigned long long>(totals.tableImageRefreshes), static_cast<unsigned long long>(totals.tableImageDepthKept), static_cast<unsigned long long>(totals.tableImageRetired), tableImages.size(), static_cast<unsigned long long>(totals.compressedAliases), static_cast<unsigned long long>(inputConsumes().load(std::memory_order_relaxed)));
         line += text;
+        line += "; table image entries dropped for retired records " + std::to_string(totals.tableImageEntriesDropped);
         line += "; record ranges noted GPU-written for the memory core " + std::to_string(totals.recordRangesNoted) + "; records made for a sampled shape after a hand-over " + std::to_string(totals.sampledRecordsCreated) + ", new storage records started from their memory " + std::to_string(totals.storageRecordsSeeded) + "; new chains zeroed " + std::to_string(totals.zeroedChains) + ", new records poisoned " + std::to_string(totals.poisonedRecords);
         if (metadataClears != nullptr) {
             const auto metadata = metadataClears->TakeCounts();
@@ -3168,6 +3170,12 @@ private:
         const auto imagesStamp = Events::Images().Serial();
         const auto depthGeneration = Images::DepthRecordsOn() ? Images::Depths().Generation() : std::uint64_t{0};
         if (tableImages.size() >= TableImagesBound) std::erase_if(tableImages, [](const auto& held) { return held.second.base.expired(); });
+        if (const auto* surfaces = Resolve::Surfaces(); surfaces != nullptr && surfaces->Retirements() != tableRetirements) {
+            tableRetirements = surfaces->Retirements();
+            const auto before = tableImages.size();
+            std::erase_if(tableImages, [](const auto& held) { return std::ranges::any_of(held.second.records, [](const std::shared_ptr<Images::Surface>& record) { return record != nullptr && record->retired; }); });
+            totals.tableImageEntriesDropped += before - tableImages.size();
+        }
         auto& entry = tableImages[base->lineage];
         const bool fresh = entry.bound == nullptr || entry.depths != depthGeneration;
         const bool rebased = !fresh && entry.base.lock() != base;
@@ -5091,6 +5099,7 @@ private:
     std::map<std::uint64_t, MapBuffer> maps;
     std::uint64_t mapBytes = 0;
     std::unordered_map<std::uint64_t, TableImages> tableImages;
+    std::uint64_t tableRetirements = 0;
     std::uint64_t nextTableImagesId = std::uint64_t{1} << 62u;
     std::set<std::string> seen;
     std::chrono::steady_clock::time_point dumpClock = processStart();
