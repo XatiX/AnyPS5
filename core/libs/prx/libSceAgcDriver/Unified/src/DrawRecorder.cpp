@@ -1294,12 +1294,20 @@ std::optional<DrawInput> drawInput(const Context& context, std::uint64_t address
     auto& pages = MemoryCore::Get().Pages();
     static const bool landedFromImports = std::getenv("APS5_RECODE_MIRROR_INPUTS_LANDED_IMPORTS") != nullptr;
     const bool landedGpu = landedFromImports && !gpuPending(address, bytes) && pages.GpuOwnedIn(address, bytes).empty() && pages.GpuWrittenIn(address, bytes);
-    if (!shadowInputs() && mirrorMode() && !landedGpu && !DirectMemoryAliased_nid_postfix(static_cast<std::uintptr_t>(address), static_cast<std::size_t>(bytes))) {
+    static const std::pair<std::uint64_t, std::uint64_t> oldRange = [] {
+        const char* value = std::getenv("APS5_RECODE_MIRROR_INPUTS_OLD_RANGE");
+        if (value == nullptr) return std::pair<std::uint64_t, std::uint64_t>{0u, 0u};
+        const char* dash = std::strchr(value, '-');
+        return std::pair<std::uint64_t, std::uint64_t>{std::strtoull(value, nullptr, 16), dash != nullptr ? std::strtoull(dash + 1, nullptr, 16) : 0u};
+    }();
+    const bool inOldRange = address >= oldRange.first && address < oldRange.second;
+    if (!shadowInputs() && mirrorMode() && !landedGpu && !inOldRange && !DirectMemoryAliased_nid_postfix(static_cast<std::uintptr_t>(address), static_cast<std::size_t>(bytes))) {
         if (auto input = mirrorInput(address, bytes)) {
             const bool gpu = pages.GpuWrittenIn(address, bytes) || !pages.GpuOwnedIn(address, bytes).empty() || gpuPending(address, bytes);
             static const bool consumes = std::getenv("APS5_RECODE_NO_INPUT_CONSUME") == nullptr;
             static const bool globalConsume = std::getenv("APS5_RECODE_INPUT_CONSUME") != nullptr && std::string_view(std::getenv("APS5_RECODE_INPUT_CONSUME")) == "global";
-            if (consumes && !gpu && !pages.CleanIn(address, bytes) && copiesInputs() && bytes <= InputCopyLimitBytes && !globalConsume) {
+            static const bool copiesSmall = std::getenv("APS5_RECODE_MIRROR_INPUTS_COPY_SMALL") != nullptr;
+            if (consumes && !gpu && (copiesSmall || !pages.CleanIn(address, bytes)) && copiesInputs() && bytes <= InputCopyLimitBytes && !globalConsume) {
                 source = InputSource::Written;
                 return input;
             }
