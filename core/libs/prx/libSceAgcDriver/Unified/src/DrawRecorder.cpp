@@ -1,5 +1,6 @@
 #include "prx/libSceAgcDriver/Unified/include/DrawRecorder.hpp"
 #include "prx/libSceAgcDriver/Unified/include/RecordLoop.hpp"
+#include "prx/libc/include/GuestAllocations.hpp"
 #include "prx/libSceAgcDriver/Unified/include/RouteDefaults.hpp"
 #include "prx/libkernel/include/Api.hpp"
 #include "prx/libSceAgcDriver/Execution/include/GuestMemory.hpp"
@@ -1384,6 +1385,17 @@ struct InputRange {
     std::uint64_t end = 0;
     std::size_t merged = 0;
 };
+
+std::uint64_t unclampedInputEnd(const ShaderRecompiler::VertexAttribute& attribute, std::uint64_t address, std::uint64_t end) {
+    constexpr std::uint64_t Cap = 64ull << 20u;
+    static const bool extends = std::getenv("APS5_RECODE_NO_UNCLAMPED_INPUT_RANGES") == nullptr;
+    if (!extends || shadowInputs() || !mirrorMode() || Graphics::NullVertexDescriptor(attribute)) return end;
+    const auto stride = (attribute.resource.fields[1] >> 16u) & 0x3fffu;
+    if (stride == 0u || Graphics::VertexBufferOutOfBoundsSelect(attribute) > 1u) return end;
+    const auto found = GuestAllocations::GuestAllocationsLookup_nid_postfix(static_cast<std::uintptr_t>(address), false);
+    if (!found || found->bytes == 0u || found->address > address) return end;
+    return std::max(end, std::min<std::uint64_t>(found->address + found->bytes, address + Cap));
+}
 
 bool mergesInputs() {
     static const bool merges = std::getenv("APS5_RECODE_NO_INPUT_MERGE") == nullptr;
@@ -4458,7 +4470,7 @@ private:
                     return false;
                 }
                 const auto address = vertexAddress(attribute);
-                inputRanges.push_back({address, address + Graphics::VertexBufferExtent(attribute), 0});
+                inputRanges.push_back({address, unclampedInputEnd(attribute, address, address + Graphics::VertexBufferExtent(attribute)), 0});
             }
             const auto unions = mergeInputs(inputRanges);
             std::vector<DrawInput> unionInputs;
