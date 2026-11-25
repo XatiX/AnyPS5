@@ -550,7 +550,15 @@ private:
             else dispatch.complete = false;
         }
         const auto beforeTargets = dispatch.uses.size();
-        return resolveStages(dispatchTotals, std::move(dispatch), programs, beforeTargets, slotsStarted);
+        auto resolved = resolveStages(dispatchTotals, std::move(dispatch), programs, beforeTargets, slotsStarted);
+        if (resolved != nullptr && !resolved->stages.empty() && ChecksReads(resolved->stages.front().program.codeAddress)) {
+            resolved->readHashes.clear();
+            for (std::size_t index = 0; index < resolved->uses.size(); ++index) {
+                const auto& use = resolved->uses[index];
+                resolved->readHashes.push_back(use.write || index >= resolved->imageBegin || use.size > (1ull << 20u) ? 0u : HashGuestRange(use.address, use.size));
+            }
+        }
+        return resolved;
     }
 
     std::shared_ptr<const ResolvedDraw> resolveStages(Totals& counts, ResolvedDraw draw, ProgramSet& programs, std::size_t beforeTargets, std::chrono::steady_clock::time_point slotsStarted) {
@@ -1067,6 +1075,22 @@ PacketTable<ResolvedDraw>& ResolvedDraws() {
 
 bool DispatchesActive() {
     return Active() && dispatchesRouted();
+}
+
+std::uint64_t HashGuestRange(std::uint64_t address, std::uint64_t bytes) {
+    const auto* data = reinterpret_cast<const std::byte*>(static_cast<std::uintptr_t>(address));
+    if (bytes == 0u || !GuestMemory::Accessible(data, static_cast<std::size_t>(bytes), false)) return 0u;
+    std::uint64_t hash = 0xcbf29ce484222325ull;
+    for (std::uint64_t index = 0; index < bytes; ++index) {
+        hash ^= static_cast<std::uint64_t>(data[index]);
+        hash *= 0x100000001b3ull;
+    }
+    return hash == 0u ? 1u : hash;
+}
+
+bool ChecksReads(std::uint64_t codeAddress) {
+    static const char* const listed = std::getenv("APS5_RECODE_CHECK_READS");
+    return listed != nullptr && *listed != '\0' && Downgrades::ListedHash(listed, Downgrades::ProgramHash(codeAddress));
 }
 
 bool DispatchesRoutedOn(std::uint32_t queue) {

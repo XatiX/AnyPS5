@@ -1,5 +1,6 @@
 #include "prx/libSceAgcDriver/Unified/include/RecordLoop.hpp"
 #include "prx/libSceAgcDriver/Unified/include/DrawRecorder.hpp"
+#include "prx/libSceAgcDriver/Unified/include/Downgrades.hpp"
 #include "prx/libSceAgcDriver/Unified/include/LabelTable.hpp"
 #include "prx/libSceAgcDriver/Unified/include/MemoryCore.hpp"
 #include "prx/libSceAgcDriver/Unified/include/RecordQueue.hpp"
@@ -526,6 +527,17 @@ private:
         }
         const auto context = device.graphicsContext();
         std::string reason;
+        if (!item.resolved->readHashes.empty()) {
+            static std::atomic<std::uint32_t> changedLines{0};
+            const auto& uses = item.resolved->uses;
+            for (std::size_t index = 0; index < uses.size() && index < item.resolved->readHashes.size(); ++index) {
+                const auto before = item.resolved->readHashes[index];
+                if (before == 0u) continue;
+                const auto now = Resolve::HashGuestRange(uses[index].address, uses[index].size);
+                if (now == before || changedLines.fetch_add(1, std::memory_order_relaxed) >= 200u) continue;
+                std::fprintf(stderr, "[recode-read-check] queue 0x%x submission %llu program %016llx: read 0x%llx+0x%llx changed between resolve and record\n", queue, static_cast<unsigned long long>(item.operation.submission), static_cast<unsigned long long>(Downgrades::ProgramHash(item.resolved->stages.empty() ? 0u : item.resolved->stages.front().program.codeAddress)), static_cast<unsigned long long>(uses[index].address), static_cast<unsigned long long>(uses[index].size));
+            }
+        }
         stage("dispatch precheck");
         if (!Record::RecordDispatchPrecheck(context, device, *item.resolved, reason)) {
             Record::RefuseUnrecorded("dispatch", codeOf(item), reason);

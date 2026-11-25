@@ -241,11 +241,20 @@ bool watchesBatchPrograms() {
 }
 
 void watchOpenBatches() {
+    static const long long exitAfter = [] {
+        const char* value = std::getenv("APS5_RECODE_HANG_EXIT");
+        return value != nullptr ? std::strtoll(value, nullptr, 10) : 0ll;
+    }();
     for (;;) {
         std::this_thread::sleep_for(std::chrono::seconds(1));
         auto& programs = batchPrograms();
         std::lock_guard lock(programs.mutex);
         const auto now = std::chrono::steady_clock::now();
+        if (exitAfter > 0 && !programs.open.empty() && now - programs.open.begin()->second.opened > std::chrono::seconds(exitAfter)) {
+            std::fprintf(stderr, "[recode-hang-batch] batch %llu still not finished after %lld s: ending the process (APS5_RECODE_HANG_EXIT)\n", static_cast<unsigned long long>(programs.open.begin()->first), exitAfter);
+            std::fflush(stderr);
+            std::_Exit(3);
+        }
         for (auto& [serial, batch] : programs.open) {
             if (batch.shown || now - batch.opened < std::chrono::seconds(5)) continue;
             batch.shown = true;
