@@ -30,6 +30,7 @@
 #include <exception>
 #include <limits>
 #include <map>
+#include <memory>
 #include <mutex>
 #include <set>
 #include <span>
@@ -222,6 +223,7 @@ public:
             std::fprintf(stderr, "[recode-resolve] device replaced: image records dropped, they refill from guest memory\n");
         }
         attached = device;
+        attachedShared.store(device, std::memory_order_release);
         attachedDevice.store(device.get(), std::memory_order_release);
         context = std::make_unique<Graphics::Context>(device->graphicsContext());
         target = HeapTarget(device->Target());
@@ -348,8 +350,7 @@ public:
     }
 
     std::shared_ptr<VulkanDevice> AttachedDevice() {
-        std::lock_guard lock(mutex);
-        return attached;
+        return attachedShared.load(std::memory_order_acquire);
     }
 
     PacketTable<ResolvedDraw>& Table() { return handoff; }
@@ -963,6 +964,7 @@ private:
     std::mutex mutex;
     std::shared_ptr<VulkanDevice> attached;
     std::atomic<const VulkanDevice*> attachedDevice{nullptr};
+    std::atomic<std::shared_ptr<VulkanDevice>> attachedShared;
     std::unique_ptr<Graphics::Context> context;
     ShaderRecompiler::SpirvTarget target;
     ShaderRecompiler::SpirvTarget computeWave32;
