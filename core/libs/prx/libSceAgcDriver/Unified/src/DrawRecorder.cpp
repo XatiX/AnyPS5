@@ -2724,15 +2724,24 @@ private:
                 continue;
             }
             if (index < infos.size() && infos[index].written && mirrorPart("writes")) {
-                const auto mapped = mirrorKnownWrite(address, bytes, serial);
-                noteKnownPath(mapped != 0u ? "write-mirror" : "write-refused", address, bytes);
+                auto served = bytes;
+                auto mapped = mirrorKnownWrite(address, bytes, serial);
+                if (mapped == 0u) {
+                    const auto committed = GuestMemory::CommittedRanges(address, static_cast<std::size_t>(bytes));
+                    if (!committed.empty() && committed.front().first == address && committed.front().second > address && committed.front().second - address < bytes) {
+                        served = committed.front().second - address;
+                        mapped = mirrorKnownWrite(address, served, serial);
+                    }
+                }
+                noteKnownPath(mapped != 0u ? "write-mirror" : "write-refused", address, served);
                 if (mapped != 0u) {
                     totals.knownWritten++;
+                    if (served < bytes) noteKnown(stage, Downgrades::Kind::KnownPrefix, index, address, bytes, served);
                 } else {
                     totals.knownWriteLookups++;
                     noteKnown(stage, Downgrades::Kind::KnownWriteRefused, index, address, bytes, 0u);
                 }
-                write(mapped, mapped != 0u ? bytes : 0u);
+                write(mapped, mapped != 0u ? served : 0u);
                 continue;
             }
             if (index < infos.size() && infos[index].written) {
