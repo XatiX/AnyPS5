@@ -1291,7 +1291,10 @@ std::atomic<std::uint64_t>& inputConsumes() {
 }
 
 bool shadowInputs() {
-    static const bool shadow = std::getenv("APS5_RECODE_MIRROR_INPUTS") == nullptr;
+    static const bool shadow = [] {
+        const char* value = RouteValue("APS5_RECODE_MIRROR_INPUTS");
+        return value == nullptr || std::string_view(value) == "0";
+    }();
     return shadow;
 }
 
