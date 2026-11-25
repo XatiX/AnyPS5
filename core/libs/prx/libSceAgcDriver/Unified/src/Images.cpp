@@ -112,7 +112,7 @@ std::optional<Found> SurfaceTable::FindResource(const SurfaceKey& key, const Gra
 
 template<typename TCreate>
 std::optional<Found> SurfaceTable::findWith(const SurfaceKey& key, TCreate&& create, std::string& reason) {
-    std::lock_guard lock(mutex);
+    std::unique_lock lock(mutex);
     counts.lookups++;
     const auto found = surfaces.find(key);
     std::erase_if(newer, [](const std::shared_ptr<Surface>& surface) { return !surface->gpuNewer || surface->retired; });
@@ -157,7 +157,13 @@ std::optional<Found> SurfaceTable::findWith(const SurfaceKey& key, TCreate&& cre
         else counts.pending++;
         return Found{surface, surface->state == State::Ready};
     }
+    lock.unlock();
     auto created = create(reason);
+    lock.lock();
+    if (const auto raced = surfaces.find(key); raced != surfaces.end()) {
+        raced->second->used = ++clock;
+        return Found{raced->second, raced->second->state == State::Ready};
+    }
     if (created == nullptr) {
         counts.refused++;
         return std::nullopt;
@@ -226,12 +232,18 @@ std::shared_ptr<Surface> SurfaceTable::CreateResource(const SurfaceKey& key, con
 
 template<typename TCreate>
 std::shared_ptr<Surface> SurfaceTable::createWith(const SurfaceKey& key, TCreate&& create, std::string& reason) {
-    std::lock_guard lock(mutex);
+    std::unique_lock lock(mutex);
     if (const auto found = surfaces.find(key); found != surfaces.end()) {
         found->second->used = ++clock;
         return found->second;
     }
+    lock.unlock();
     auto created = create(reason);
+    lock.lock();
+    if (const auto raced = surfaces.find(key); raced != surfaces.end()) {
+        raced->second->used = ++clock;
+        return raced->second;
+    }
     if (created == nullptr) {
         counts.refused++;
         return nullptr;
