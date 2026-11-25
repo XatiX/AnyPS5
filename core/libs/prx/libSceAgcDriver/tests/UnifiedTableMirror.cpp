@@ -227,9 +227,12 @@ void testOutsideCutsHoles() {
 void testMirrorRefusesStorage() {
     Fixture fixture;
     std::string reason;
-    auto storage = Tables({1u});
+    auto storage = Tables({1u, 2u});
     storage->elements[0].kind = static_cast<ShaderRecompiler::DescriptorBindingKind>(LastSampledKind + 1u);
-    Expect(fixture.mirror.Build(storage, reason) == nullptr && reason == "storage image tables", "storage tables are refused");
+    std::vector<ImageUse> uses;
+    Expect(fixture.mirror.Build(storage, reason, &uses) != nullptr, "storage tables mirror");
+    Expect(std::ranges::count_if(uses, [](const ImageUse& use) { return use.write && use.memory.address == 0x300000000ull + Events::RegionBytes; }) == 1, "a storage element reports its memory as written");
+    Expect(std::ranges::none_of(uses, [](const ImageUse& use) { return use.write && use.memory.address == 0x300000000ull + 2u * Events::RegionBytes; }), "a sampled element is not reported written");
     auto miscounted = Tables({1u});
     miscounted->samplers.push_back({});
     Expect(fixture.mirror.Build(miscounted, reason) == nullptr && reason == "image table header disagrees with its elements", "a header that does not count the samplers is refused");

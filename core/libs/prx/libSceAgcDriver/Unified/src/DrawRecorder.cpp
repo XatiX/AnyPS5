@@ -3211,6 +3211,7 @@ private:
         if (!fresh && !rebased && !anyStale) {
             totals.tableImageHits++;
             stage.tableMap = entry.bound;
+            noteTableStorage(context, entry);
             return true;
         }
         std::vector<std::size_t> rebind;
@@ -3252,6 +3253,20 @@ private:
         for (const auto position : rebind) {
             const auto& deferred = entry.elements[position];
             lastRefusedImage().clear();
+            if ((deferred.request.flags & Heap::RequestFlag::Storage) != 0u) {
+                auto record = ownedStorage(context, deferred.request, entry.slots[position], stage.program.codeAddress);
+                if (record == nullptr) {
+                    entry.bound.reset();
+                    const auto why = "table storage image without a record (" + (lastRefusedImage().empty() ? std::string("not held") : lastRefusedImage()) + ")";
+                    noteImage(stage, Downgrades::Kind::UpstreamStorage, deferred.index, deferred.request, why.c_str());
+                    reason = why;
+                    return false;
+                }
+                entry.memory[position] = {record->key.address, record->key.bytes};
+                entry.owners[position] = record;
+                entry.records[position] = std::move(record);
+                continue;
+            }
             if (!ownedSampledSlot(context, stage.program, deferred, entry.slots[position], &entry.owners[position], &entry.records[position])) {
                 entry.bound.reset();
                 const auto why = "table image without a record (" + (lastRefusedImage().empty() ? std::string(Resolve::Surfaces() == nullptr ? "no surface table" : "not held") : lastRefusedImage()) + ")";
@@ -3282,7 +3297,20 @@ private:
         stage.tableMap = std::move(bound);
         totals.tableImageBuilds++;
         totals.tableImageBinds += rebind.size();
+        noteTableStorage(context, entry);
         return true;
+    }
+
+    void noteTableStorage(const Context& context, const TableImages& entry) {
+        for (std::size_t position = 0; position < entry.elements.size() && position < entry.records.size(); ++position) {
+            const auto& request = entry.elements[position].request;
+            const auto& record = entry.records[position];
+            if ((request.flags & Heap::RequestFlag::Storage) == 0u || record == nullptr) continue;
+            const bool written = (request.flags & Heap::RequestFlag::Written) != 0u;
+            if (context.recorder != nullptr) context.recorder->Keep(record);
+            if (const auto* vulkan = dynamic_cast<const Images::VulkanSurface*>(record->device.get())) stageStorageImages.emplace_back(vulkan->Image(), written);
+            if (written) writtenRecords.push_back(record);
+        }
     }
 
     static bool sameRequest(const Heap::SlotRequest& left, const Heap::SlotRequest& right) {
