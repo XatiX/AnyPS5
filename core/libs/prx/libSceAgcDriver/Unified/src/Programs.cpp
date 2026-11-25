@@ -266,6 +266,10 @@ bool materializeStage(const ProgramInputs& inputs, ShaderRecompiler::RecompileRe
         }
     } else {
         result = invocation.Materialize(*capture);
+        if (result != nullptr) {
+            words.pushConstants = result->pushConstants;
+            words.poisonedSrtReads = result->poisonedSrtReads;
+        }
     }
     lap(PhaseMaterialize);
     if (result == nullptr) {
