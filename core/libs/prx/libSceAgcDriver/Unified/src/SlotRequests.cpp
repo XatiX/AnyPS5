@@ -44,6 +44,14 @@ bool BuildSlotRequests(const ShaderRecompiler::CompiledShaderInfo& compiled, con
     std::vector<std::uint32_t> modeOf(info.images.size(), NoSlot);
     std::size_t slots = 0;
     std::optional<ShaderRecompiler::SamplerCoordinateFacts> coordinates;
+    if (std::ranges::any_of(snapshot.samplers, [](const ShaderRecompiler::DescriptorValue& sampler) { return (sampler.dwords[0] & (1u << 15u)) != 0u; })) {
+        try {
+            coordinates = ShaderRecompiler::ProveSamplerCoordinates(info, snapshot);
+        } catch (const std::exception& error) {
+            reason = std::string("sampler coordinates: ") + error.what();
+            return false;
+        }
+    }
     for (const auto& binding : layout.descriptors) {
         const bool samplerHeap = binding.kind == Kind::Samplers;
         const bool imageHeap = ShaderRecompiler::ImageBindingResourceClass(binding.kind) != ShaderRecompiler::ImageResourceClass::None;
@@ -68,15 +76,7 @@ bool BuildSlotRequests(const ShaderRecompiler::CompiledShaderInfo& compiled, con
                 }
                 std::copy_n(snapshot.samplers[resource].dwords.begin(), 4u, request.words.begin());
                 request.flags = RequestFlag::Sampler;
-                if ((request.words[0] & (1u << 15u)) != 0u) {
-                    if (!coordinates) {
-                        try {
-                            coordinates = ShaderRecompiler::ProveSamplerCoordinates(info, snapshot);
-                        } catch (const std::exception& error) {
-                            reason = std::string("sampler coordinates: ") + error.what();
-                            return false;
-                        }
-                    }
+                if ((request.words[0] & (1u << 15u)) != 0u && coordinates) {
                     if (resource < coordinates->coordinatesIgnored.size() && coordinates->coordinatesIgnored[resource]) request.words[0] &= ~(1u << 15u);
                     else if (resource < coordinates->unnormalized.size() && coordinates->unnormalized[resource]) request.flags |= RequestFlag::Unnormalized;
                 }
@@ -110,7 +110,7 @@ bool BuildSlotRequests(const ShaderRecompiler::CompiledShaderInfo& compiled, con
                     return false;
                 }
             }
-            if (mode >= modes.size() || ShaderRecompiler::DescriptorBindingForImage(modes[mode]) != binding.kind) {
+            if (mode >= modes.size() || ShaderRecompiler::DescriptorBindingForImage(modes[mode]) != binding.kind || modes[mode].constantSwizzle) {
                 ++statistics.inactiveImages;
                 request.flags = RequestFlag::Inactive;
                 requests.push_back(request);
@@ -132,6 +132,10 @@ bool BuildSlotRequests(const ShaderRecompiler::CompiledShaderInfo& compiled, con
                 continue;
             }
             if (modes[mode].conversionFormat != ShaderRecompiler::IrBufferFormat::Invalid || modes[mode].depthBits) request.words[3] = (request.words[3] & ~0xfffu) | ShaderRecompiler::ShaderImageIdentitySwizzle;
+            if (coordinates && resource < coordinates->unnormalizedImages.size() && coordinates->unnormalizedImages[resource] && resource < coordinates->imagesAtBaseLevel.size() && coordinates->imagesAtBaseLevel[resource]) {
+                const auto baseLevel = (request.words[3] >> 12u) & 0xfu;
+                request.words[3] = (request.words[3] & ~(0xfu << 16u)) | (baseLevel << 16u);
+            }
             requests.push_back(request);
         }
     }

@@ -13,6 +13,8 @@ std::uint32_t PointFilteredSamplerWord(std::uint32_t word0, std::uint32_t filter
 struct SamplerCoordinateFacts {
     std::vector<bool> unnormalized;
     std::vector<bool> coordinatesIgnored;
+    std::vector<bool> unnormalizedImages;
+    std::vector<bool> imagesAtBaseLevel;
 };
 SamplerCoordinateFacts ProveSamplerCoordinates(const ShaderInfo& info, const ResourceSnapshot& snapshot);
 struct PreparedDescriptorBinding {

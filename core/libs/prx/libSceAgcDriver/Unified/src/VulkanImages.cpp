@@ -172,7 +172,7 @@ std::uint64_t VulkanSurface::View(const ViewKey& view, std::uint32_t kind, std::
     }
     const bool lineView = type == VK_IMAGE_VIEW_TYPE_1D || type == VK_IMAGE_VIEW_TYPE_1D_ARRAY;
     if ((type == VK_IMAGE_VIEW_TYPE_3D) != volume || lineView != Line()) {
-        reason = "image view shape differs from the surface";
+        reason = "image view shape differs from the surface (view type " + std::to_string(static_cast<int>(type)) + ", surface dimension " + std::to_string(static_cast<int>(resource.dimension)) + " " + std::to_string(resource.width) + "x" + std::to_string(resource.height) + ")";
         return 0;
     }
     const auto levels = static_cast<std::uint32_t>(std::max<std::size_t>(geometry.mips.size(), 1u));

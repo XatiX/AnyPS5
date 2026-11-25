@@ -2686,7 +2686,7 @@ private:
 
     static void noteImage(const Resolve::ResolvedStage& stage, Downgrades::Kind kind, std::uint32_t index, const Heap::SlotRequest& request, const char* what) {
         if (!Downgrades::Active()) return;
-        char text[96];
+        char text[256];
         try {
             const auto resource = Graphics::DecodeTextureResource(request.words);
             std::snprintf(text, sizeof(text), "%s 0x%llx %ux%u fmt %u mips %u", what, static_cast<unsigned long long>(resource.baseAddress), resource.width, resource.height, resource.format, resource.mipCount);
@@ -3146,11 +3146,11 @@ private:
         }
         const Downgrades::ProgramScope programScope(stage.program.codeAddress);
         for (const auto* deferred : sampled) {
-            std::uint32_t slot = 0;
+            lastRefusedImage().clear();
             if (ownsImages() && bindOwnedSampled(context, stage, *deferred)) continue;
             if (Downgrades::Active()) noteStaleRecordRead(stage, *deferred);
-            static_cast<void>(slot);
-            noteImage(stage, Downgrades::Kind::UpstreamSampled, deferred->index, deferred->request, "sampled image without a record");
+            const auto why = "sampled image without a record (" + (lastRefusedImage().empty() ? std::string(Resolve::Surfaces() == nullptr ? "no surface table" : "not held") : lastRefusedImage()) + ")";
+            noteImage(stage, Downgrades::Kind::UpstreamSampled, deferred->index, deferred->request, why.c_str());
             reason = "sampled image without a record";
             return false;
         }

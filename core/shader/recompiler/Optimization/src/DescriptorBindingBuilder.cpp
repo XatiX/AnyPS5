@@ -409,7 +409,7 @@ std::vector<std::uint32_t> ShaderDataDwordsFor(const IrBindingLayout& layout, st
 
 SamplerCoordinateFacts ProveSamplerCoordinates(const ShaderInfo& info, const ResourceSnapshot& snapshot) {
     auto proof = ProveUnnormalized(info, snapshot);
-    return {std::move(proof.samplers), std::move(proof.samplersIgnoreCoordinates)};
+    return {std::move(proof.samplers), std::move(proof.samplersIgnoreCoordinates), std::move(proof.images), std::move(proof.imagesAtBaseLevel)};
 }
 
 bool ReducesBetweenTexels(std::uint32_t word0, std::uint32_t filter) {
