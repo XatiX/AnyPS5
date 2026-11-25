@@ -64,7 +64,9 @@ RecordQueue& QueueFor(std::uint32_t queue) {
 bool OwnsLoop() {
     static const bool owns = [] {
         const char* value = std::getenv("APS5_RECODE_OWN_LOOP");
-        return value != nullptr && std::string_view(value) != "0";
+        if (value != nullptr) return std::string_view(value) != "0";
+        const char* route = std::getenv("APS5_RECODE_DRAW");
+        return route != nullptr && std::string_view(route) == "record";
     }();
     return owns;
 }
