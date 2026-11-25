@@ -1308,6 +1308,11 @@ std::optional<DrawInput> drawInput(const Context& context, std::uint64_t address
     }();
     const bool inOldRange = address >= oldRange.first && address < oldRange.second;
     if (!shadowInputs() && mirrorMode() && !landedGpu && !inOldRange && !DirectMemoryAliased_nid_postfix(static_cast<std::uintptr_t>(address), static_cast<std::size_t>(bytes))) {
+        static const bool servesOwned = std::getenv("APS5_RECODE_MIRROR_INPUTS_SERVE_OWNED") == nullptr || std::string_view(std::getenv("APS5_RECODE_MIRROR_INPUTS_SERVE_OWNED")) != "0";
+        if (servesOwned) {
+            Shadow::OwnedSpan span;
+            static_cast<void>(Shadow::ServeOwned(context, address, bytes, &span));
+        }
         if (auto input = mirrorInput(address, bytes)) {
             const bool gpu = pages.GpuWrittenIn(address, bytes) || !pages.GpuOwnedIn(address, bytes).empty() || gpuPending(address, bytes);
             static const bool consumes = std::getenv("APS5_RECODE_NO_INPUT_CONSUME") == nullptr;
@@ -3386,15 +3391,31 @@ private:
         if (tableImages.size() >= TableImagesBound) std::erase_if(tableImages, [](const auto& held) { return held.second.base.expired(); });
         if (const auto* surfaces = Resolve::Surfaces(); surfaces != nullptr && surfaces->Retirements() != tableRetirements) {
             tableRetirements = surfaces->Retirements();
-            const auto before = tableImages.size();
-            std::erase_if(tableImages, [](const auto& held) { return std::ranges::any_of(held.second.records, [](const std::shared_ptr<Images::Surface>& record) { return record != nullptr && record->retired; }); });
-            totals.tableImageEntriesDropped += before - tableImages.size();
+            for (auto& [lineage, held] : tableImages) {
+                bool released = false;
+                for (std::size_t position = 0; position < held.records.size(); ++position) {
+                    if (held.records[position] == nullptr || !held.records[position]->retired) continue;
+                    held.records[position].reset();
+                    if (position < held.owners.size()) held.owners[position].reset();
+                    released = true;
+                }
+                if (!released) continue;
+                held.bound.reset();
+                totals.tableImageEntriesDropped++;
+            }
         }
         auto& entry = tableImages[base->lineage];
-        const bool fresh = entry.bound == nullptr || entry.depths != depthGeneration;
+        const bool fresh = (entry.bound == nullptr && entry.elements.empty()) || entry.depths != depthGeneration;
         const bool rebased = !fresh && entry.base.lock() != base;
         std::vector<bool> stale(fresh ? 0u : entry.elements.size(), false);
         bool anyStale = false;
+        if (!fresh && entry.bound == nullptr) {
+            for (std::size_t position = 0; position < stale.size() && position < entry.records.size() && position < entry.owners.size(); ++position) {
+                if (entry.records[position] != nullptr || entry.owners[position] != nullptr) continue;
+                stale[position] = true;
+            }
+            anyStale = true;
+        }
         std::vector<std::uint32_t> touched;
         if (!fresh) entry.index.Changed(Events::Shared(), entry.sharedStamp, Events::Images(), entry.imagesStamp, touched);
         if (!touched.empty()) {
