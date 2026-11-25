@@ -9,6 +9,7 @@
 #include "prx/libSceAgcDriver/Execution/include/GuestMemory.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Pm4.hpp"
 #include "prx/libSceAgcDriver/Execution/include/VulkanDevice.hpp"
+#include "prx/libSceAgcDriver/Execution/include/WorkerSampler.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/Recorder.hpp"
 #include <algorithm>
 #include <atomic>
@@ -190,6 +191,7 @@ public:
     explicit Runner(std::uint32_t queue) : queue(queue) {}
 
     void Run() {
+        StartLoopSampler(queue);
         auto& items = QueueFor(queue);
         auto& progress = progressFor(queue);
         busy = &progress;
