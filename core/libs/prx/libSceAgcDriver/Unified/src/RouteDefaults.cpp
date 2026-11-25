@@ -29,6 +29,7 @@ const char* RouteValue(const char* name) {
         {"APS5_RECODE_TABLES", "1"},
         {"APS5_RECODE_DISPATCH", "all"},
         {"APS5_RECODE_MIRROR_INPUTS", "1"},
+        {"APS5_RECODE_LOOP_PRESENT", "1"},
     };
     for (const auto& [key, value] : defaults) {
         if (key == name) return value;

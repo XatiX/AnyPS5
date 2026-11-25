@@ -10,6 +10,15 @@
 
 namespace AgcDriver::DriverDetail {
 
+namespace {
+
+template <class Section>
+void presentSection(Section& section) {
+    GuestMemory::RunGpuSection(GuestMemory::GpuLockSite::Present, [](void* context) { (*static_cast<Section*>(context))(); }, &section);
+}
+
+}
+
 std::uint32_t Driver::ReserveEopFlip(const FlipInfo& info) {
     std::lock_guard lock(mutex);
     require(nextEopToken <= EopFlipTokenLimit, "EOP flip token space exhausted");
@@ -109,9 +118,7 @@ void Driver::Present(const PresentationWindow& window, const DisplayBuffer* buff
         bool trailing = false;
         bool queueUnlocked = false;
         double waitedMs = 0;
-        {
-            GuestMemory::TagGpuLockSite(GuestMemory::GpuLockSite::Present);
-            std::lock_guard lock(GuestMemory::GpuMutex());
+        auto setup = [&] {
             timing.Mark("gpu_mutex_wait");
             require(device != nullptr && device->Window() == window.context, "presentation window is not attached to the device");
             presenting = device;
@@ -124,7 +131,8 @@ void Driver::Present(const PresentationWindow& window, const DisplayBuffer* buff
             timing.Mark("resize");
             presentable = presenting->Presentable();
             if (buffer != nullptr) require(buffer->width == window.width && buffer->height == window.height, "display buffer extent differs from output");
-        }
+        };
+        presentSection(setup);
 
         if (presentable && !syncFlip) {
             if (inFlight != 0) {
@@ -135,9 +143,7 @@ void Driver::Present(const PresentationWindow& window, const DisplayBuffer* buff
             presentable = presenting->AcquireImage();
             timing.Mark("acquire_image");
         }
-        if (presentable) {
-            GuestMemory::TagGpuLockSite(GuestMemory::GpuLockSite::Present);
-            std::lock_guard lock(GuestMemory::GpuMutex());
+        auto blit = [&] {
             timing.Mark("gpu_mutex_wait");
             if (buffer != nullptr) {
                 if (syncFlip) {
@@ -165,7 +171,8 @@ void Driver::Present(const PresentationWindow& window, const DisplayBuffer* buff
                 trailing = !syncFlip;
                 submitted = false;
             }
-        }
+        };
+        if (presentable) presentSection(blit);
         if (queueUnlocked) {
             presenting->QueuePresent();
             timing.Mark("queue_present");
@@ -181,9 +188,8 @@ void Driver::Present(const PresentationWindow& window, const DisplayBuffer* buff
             if (presenting->PresentsOnOwnQueue()) {
                 presenting->QueuePresent();
             } else {
-                GuestMemory::TagGpuLockSite(GuestMemory::GpuLockSite::Present);
-                std::lock_guard lock(GuestMemory::GpuMutex());
-                presenting->QueuePresent();
+                auto queuePresent = [&] { presenting->QueuePresent(); };
+                presentSection(queuePresent);
             }
             timing.Mark("queue_present");
         }

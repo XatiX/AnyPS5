@@ -6,6 +6,7 @@
 #include "prx/libSceAgcDriver/Unified/include/RecordQueue.hpp"
 #include "prx/libSceAgcDriver/Unified/include/Releases.hpp"
 #include "prx/libSceAgcDriver/Unified/include/Resolve.hpp"
+#include "prx/libSceAgcDriver/Unified/include/RouteDefaults.hpp"
 #include "prx/libSceAgcDriver/Unified/include/Shadow.hpp"
 #include "prx/libSceAgcDriver/Execution/include/GuestMemory.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Pm4.hpp"
@@ -19,6 +20,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <exception>
 #include <limits>
 #include <map>
 #include <optional>
@@ -214,6 +216,105 @@ std::atomic<std::uint64_t>& submitRequest() {
     return requested;
 }
 
+constexpr auto SectionClaimLimit = std::chrono::milliseconds(100);
+
+struct GpuSection {
+    void (*run)(void*) = nullptr;
+    void* context = nullptr;
+    std::exception_ptr error;
+    bool finished = false;
+};
+
+struct GpuSections {
+    std::mutex mutex;
+    std::condition_variable changed;
+    GpuSection* pending = nullptr;
+    std::atomic<bool> waiting{false};
+    std::uint64_t onLoop = 0;
+    std::uint64_t onCaller = 0;
+    double waitedMs = 0.0;
+    double maxWaitedMs = 0.0;
+    std::chrono::steady_clock::time_point reported = std::chrono::steady_clock::now();
+};
+
+GpuSections& gpuSections() {
+    static auto& shared = *new GpuSections();
+    return shared;
+}
+
+void runPendingGpuSection() {
+    auto& sections = gpuSections();
+    GpuSection* section = nullptr;
+    {
+        std::lock_guard lock(sections.mutex);
+        section = std::exchange(sections.pending, nullptr);
+        sections.waiting.store(false, std::memory_order_relaxed);
+    }
+    if (section == nullptr) return;
+    sections.changed.notify_all();
+    try {
+        GuestMemory::TagGpuLockSite(GuestMemory::GpuLockSite::Present);
+        std::lock_guard gpu(GuestMemory::GpuMutex());
+        section->run(section->context);
+    } catch (...) {
+        section->error = std::current_exception();
+    }
+    {
+        std::lock_guard lock(sections.mutex);
+        section->finished = true;
+    }
+    sections.changed.notify_all();
+}
+
+void reportGpuSections(GpuSections& sections) {
+    const auto now = std::chrono::steady_clock::now();
+    if (now - sections.reported < std::chrono::seconds(10)) return;
+    sections.reported = now;
+    std::fprintf(stderr, "[recode-present] (10 s): %llu present sections run by the record loop, %llu under the GPU mutex on the presenter (no runner took them within %lld ms); waited %.1f ms, longest %.2f ms\n", static_cast<unsigned long long>(sections.onLoop), static_cast<unsigned long long>(sections.onCaller), static_cast<long long>(SectionClaimLimit.count()), sections.waitedMs, sections.maxWaitedMs);
+    sections.onLoop = 0;
+    sections.onCaller = 0;
+    sections.waitedMs = 0.0;
+    sections.maxWaitedMs = 0.0;
+}
+
+bool runGpuSectionOnLoop(void (*run)(void*), void* context) {
+    if (GuestMemory::GpuMutex().HeldByThisThread()) return false;
+    auto& sections = gpuSections();
+    GpuSection section{run, context};
+    const auto began = std::chrono::steady_clock::now();
+    std::unique_lock lock(sections.mutex);
+    const auto refuse = [&] {
+        sections.onCaller++;
+        reportGpuSections(sections);
+        return false;
+    };
+    if (!sections.changed.wait_for(lock, SectionClaimLimit, [&] { return sections.pending == nullptr; })) return refuse();
+    sections.pending = &section;
+    sections.waiting.store(true, std::memory_order_release);
+    if (!sections.changed.wait_for(lock, SectionClaimLimit, [&] { return sections.pending != &section; })) {
+        sections.pending = nullptr;
+        sections.waiting.store(false, std::memory_order_relaxed);
+        return refuse();
+    }
+    sections.changed.wait(lock, [&] { return section.finished; });
+    const auto waited = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - began).count();
+    sections.onLoop++;
+    sections.waitedMs += waited;
+    sections.maxWaitedMs = std::max(sections.maxWaitedMs, waited);
+    reportGpuSections(sections);
+    lock.unlock();
+    if (section.error) std::rethrow_exception(section.error);
+    return true;
+}
+
+bool presentsOnLoop() {
+    static const bool enabled = [] {
+        const char* value = RouteValue("APS5_RECODE_LOOP_PRESENT");
+        return value != nullptr && std::string_view(value) == "1";
+    }();
+    return enabled;
+}
+
 struct WaitNote {
     std::uint64_t submission = 0;
     std::uint32_t offset = 0;
@@ -290,6 +391,7 @@ public:
             }
             progress.advanced.notify_all();
             if (submitRequest().load(std::memory_order_relaxed) != 0u) honourSubmitRequest();
+            if (gpuSections().waiting.load(std::memory_order_acquire)) runPendingGpuSection();
         }
     }
 
@@ -329,6 +431,7 @@ private:
     void settleIdle() {
         reportIdle();
         honourSubmitRequest();
+        if (gpuSections().waiting.load(std::memory_order_acquire)) runPendingGpuSection();
         const auto device = Resolve::AttachedDevice();
         if (device == nullptr) return;
         GuestMemory::TagGpuLockSite(GuestMemory::GpuLockSite::Wait);
@@ -918,6 +1021,7 @@ void Ensure(std::uint32_t queue) {
     if (runners.contains(queue)) return;
     runners.emplace(queue, std::thread([queue] { Runner(queue).Run(); }));
     runners[queue].detach();
+    if (presentsOnLoop()) GuestMemory::SetGpuSectionRunner(&runGpuSectionOnLoop);
 }
 
 bool Takes(std::span<const std::uint32_t> packet, std::uint32_t opcode, std::uint32_t queue) {
