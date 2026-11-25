@@ -36,6 +36,7 @@ namespace {
 
 constexpr std::size_t GpuStoreLimit = 65536;
 constexpr auto WaitReport = std::chrono::seconds(5);
+constexpr auto WaitSubmitInterval = std::chrono::microseconds(500);
 
 struct Totals {
     std::atomic<std::uint64_t> draws{0};
@@ -410,20 +411,25 @@ private:
 
     void settle(VulkanDevice& device, const char* why = "settling recorded work") {
         stage(why);
+        static const bool polls = std::getenv("APS5_RECODE_SETTLE_POLLS") != nullptr;
         for (;;) {
             bool idle = true;
+            std::uint64_t submitted = 0;
+            Graphics::Recorder* recorder = nullptr;
             {
                 GuestMemory::TagGpuLockSite(GuestMemory::GpuLockSite::Wait);
                 std::lock_guard lock(GuestMemory::GpuMutex());
-                auto* recorder = device.graphicsContext().recorder;
+                recorder = device.graphicsContext().recorder;
                 if (recorder != nullptr && !recorder->Idle()) {
                     recorder->Submit();
                     static_cast<void>(recorder->Reap());
                     idle = recorder->Idle();
+                    submitted = recorder->Submissions();
                 }
             }
             if (idle) break;
-            std::this_thread::sleep_for(std::chrono::microseconds(50));
+            if (polls || recorder == nullptr || submitted == 0u || recorder->TimelineValue() == 0u) std::this_thread::sleep_for(std::chrono::microseconds(50));
+            else recorder->WaitSerial(submitted);
         }
         Record::DrainHostCopies();
     }
@@ -761,7 +767,8 @@ private:
                 return;
             }
             totals().waitPolls.fetch_add(1, std::memory_order_relaxed);
-            {
+            if (const auto now = std::chrono::steady_clock::now(); now - lastWaitSubmit >= WaitSubmitInterval) {
+                lastWaitSubmit = now;
                 GuestMemory::TagGpuLockSite(GuestMemory::GpuLockSite::Wait);
                 std::lock_guard lock(GuestMemory::GpuMutex());
                 auto* recorder = device.graphicsContext().recorder;
@@ -833,6 +840,7 @@ private:
     std::array<Stored, 6> recent{};
     std::size_t recentNext = 0;
     std::chrono::steady_clock::time_point lastWork{};
+    std::chrono::steady_clock::time_point lastWaitSubmit{};
     std::chrono::steady_clock::time_point lastIdleReport{};
 };
 
