@@ -1298,6 +1298,7 @@ void countInput(Totals& totals, InputSource source) {
 
 constexpr std::uint64_t KnownBufferLimitBytes = 1024ull << 20u;
 constexpr std::uint64_t KnownCopyLimitBytes = 64ull << 10u;
+constexpr std::uint64_t LargeKnownBytes = 16ull << 20u;
 constexpr std::uint64_t KnownWriteLimitBytes = 1ull << 20u;
 constexpr std::size_t ExtentsShown = 3;
 std::uint32_t coldSmallWrites() {
@@ -2590,6 +2591,16 @@ private:
                 write(copied, bytes);
                 continue;
             }
+            const bool large = bytes >= LargeKnownBytes;
+            const auto removals = large ? ResidencyService::Get().Removals() : 0u;
+            if (large) {
+                if (const auto found = largeKnown.find(address); found != largeKnown.end() && found->second.bytes == bytes && found->second.removals == removals) {
+                    totals.knownMapped++;
+                    noteKnownPath("mapped", address, bytes);
+                    write(found->second.mapped, bytes);
+                    continue;
+                }
+            }
             const auto reach = std::max(bytes, KnownReadableBytes);
             Shadow::OwnedSpan span;
             if (bytes <= KnownBufferLimitBytes && !MemoryCore::Get().Pages().GpuWrittenIn(address, reach) && ((reach != bytes && Shadow::ServeOwned(context, address, reach, &span)) || Shadow::ServeOwned(context, address, bytes, &span)) && span.address != 0u) {
@@ -2610,6 +2621,7 @@ private:
             if (mapped != 0u) {
                 totals.knownMapped++;
                 noteKnownPath("mapped", address, bytes);
+                if (large) largeKnown[address] = {bytes, mapped, removals};
                 write(mapped, bytes);
                 continue;
             }
@@ -5039,6 +5051,12 @@ private:
 
     std::mutex mutex;
     std::atomic<std::uint64_t> drawPrebuildNanoseconds{0};
+    struct LargeKnown {
+        std::uint64_t bytes = 0;
+        std::uint64_t mapped = 0;
+        std::uint64_t removals = 0;
+    };
+    std::unordered_map<std::uint64_t, LargeKnown> largeKnown;
     VkDevice device = VK_NULL_HANDLE;
     std::uint64_t alignment = 16;
     std::shared_ptr<Graphics::Buffer> ring;
