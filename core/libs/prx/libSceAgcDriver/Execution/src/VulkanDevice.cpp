@@ -4354,7 +4354,7 @@ bool VulkanDevice::PresentDisplayBuffer(const DisplayBuffer& buffer, const Displ
     VkImage recordImage = VK_NULL_HANDLE;
     std::shared_ptr<void> recordOwner;
 #if ANYPS5_UNIFIED
-    if (!NoResidentPresent() && buffer.dccAddress == 0 && buffer.tilingMode != DisplayTilingGcn) {
+    if (!NoResidentPresent() && buffer.tilingMode != DisplayTilingGcn) {
         if (auto source = Unified::Record::DisplayRecord(buffer.address, bytes)) {
             const auto path = RecordPresentable(graphicsContext(), source->format, source->resource, buffer, filter);
             if (path != ResidentPresent::None) {
