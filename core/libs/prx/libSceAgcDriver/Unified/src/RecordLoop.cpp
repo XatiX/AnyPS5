@@ -270,9 +270,14 @@ private:
 
     void trace(const Item& item, const char* stage) const {
         static const bool traced = std::getenv("APS5_RECODE_TRACE_LOOP") != nullptr;
+        static const std::uint64_t watched = [] {
+            const char* value = std::getenv("APS5_RECODE_TRACE_LOOP_ADDRESS");
+            return value != nullptr ? std::strtoull(value, nullptr, 16) : 0ull;
+        }();
         static std::atomic<std::uint32_t> lines{0};
-        if (!traced || lines.fetch_add(1, std::memory_order_relaxed) >= 400u) return;
         const auto& operation = item.operation;
+        if (watched != 0u && (operation.address > watched || operation.address + std::max<std::uint64_t>(operation.size, 1u) <= watched)) return;
+        if ((!traced && watched == 0u) || lines.fetch_add(1, std::memory_order_relaxed) >= (watched != 0u ? 4000u : 400u)) return;
         const auto select = item.words.size() >= 8u && operation.opcode == 0x49u ? (item.words[2] >> 24u) & 7u : 0u;
         const auto context = item.words.size() >= 8u && operation.opcode == 0x49u ? item.words[7] : 0u;
         std::fprintf(stderr, "[recode-loop-trace] %s runner 0x%x q%u kind %u submission %llu offset %u opcode 0x%x address 0x%llx size %llu value 0x%llx function %u words %zu interrupt %u context 0x%x\n", stage, queue, operation.queue, static_cast<unsigned>(operation.kind), static_cast<unsigned long long>(operation.submission), operation.packetOffset, operation.opcode, static_cast<unsigned long long>(operation.address), static_cast<unsigned long long>(operation.size), static_cast<unsigned long long>(operation.value), static_cast<unsigned>(operation.function), item.words.size(), select, context);
@@ -582,12 +587,13 @@ private:
                 storeBytes(context, label->address, label->Bytes());
                 context.recorder->Submit();
             }
-            if (opcode == 0x49u && item.words.size() >= 8u) {
+            if (opcode == 0x49u && item.words.size() >= 8u && item.operation.function == 0u) {
                 const auto select = (item.words[2] >> 24u) & 7u;
                 if (select != 0u && select != 3u) {
                     const auto interrupt = item.words[7] & 0x0fffffffu;
                     const auto target = queue;
                     if (!context.recorder->AfterRecordedWork([target, interrupt] { Record::AfterLandings([target, interrupt] { deliverInterrupt(target, interrupt); }); })) deliverInterrupt(target, interrupt);
+                    context.recorder->Submit();
                 }
             }
             return;
@@ -739,7 +745,8 @@ void SetInterruptHook(InterruptHook hook, void* owner) {
 void TraceKept(std::span<const std::uint32_t> packet, std::uint32_t opcode, std::uint32_t queue, std::uint64_t submission, std::size_t offset, bool flip) {
     static const bool traced = std::getenv("APS5_RECODE_TRACE_LOOP") != nullptr;
     static std::atomic<std::uint32_t> lines{0};
-    if (!traced || packet.empty() || lines.fetch_add(1, std::memory_order_relaxed) >= 400u) return;
+    const bool memoryPacket = opcode == 0x37u || opcode == 0x3cu || opcode == 0x40u || opcode == 0x46u || opcode == 0x49u || opcode == 0x50u || opcode == 0x58u || opcode == 0x83u || opcode == 0x93u;
+    if (!traced || packet.empty() || (!memoryPacket && !flip) || lines.fetch_add(1, std::memory_order_relaxed) >= 400u) return;
     const auto word = [&](std::size_t at) { return at < packet.size() ? packet[at] : 0u; };
     std::fprintf(stderr, "[recode-loop-trace] kept q%u submission %llu offset %zu opcode 0x%x%s words %zu: %08x %08x %08x %08x %08x %08x %08x\n", queue, static_cast<unsigned long long>(submission), offset, opcode, flip ? " flip" : "", packet.size(), word(1), word(2), word(3), word(4), word(5), word(6), word(7));
 }
@@ -788,7 +795,7 @@ bool Takes(std::span<const std::uint32_t> packet, std::uint32_t opcode, std::uin
             case 0x37:
                 if (Pm4::CopyDataToRegister(packet)) return false;
                 return Pm4::DecodeLabelWrite(packet).has_value();
-            case 0x49: return Pm4::DecodeLabelWrite(packet).has_value();
+            case 0x49: return true;
             case 0x40:
                 if (packet.size() >= 6u && Pm4::CopyDataToRegister(packet)) return false;
                 return !Pm4::DecodeStores(packet).empty();

@@ -131,7 +131,7 @@ private:
             return;
         }
         if (submission.flips.contains(cursor)) {
-            if (opcode == 0x49) labelStore(packet);
+            if (opcode == 0x49) labelStore(packet, true);
             ++state.counts.flips;
             emit(OpKind::Flip, 0, 0, submission.flipHandles.contains(cursor) ? submission.flipHandles.at(cursor) : 0);
             return;
@@ -354,14 +354,19 @@ private:
         }
     }
 
-    void labelStore(std::span<const std::uint32_t> packet) {
+    void labelStore(std::span<const std::uint32_t> packet, bool carriesFlip = false) {
         const auto label = Pm4::DecodeLabelWrite(packet);
-        if (!label.has_value()) return;
+        const std::uint8_t flipCarrier = carriesFlip ? 1u : 0u;
+        if (!label.has_value()) {
+            const bool interrupts = !carriesFlip && ((packet[0] >> 8u) & 0xffu) == 0x49u && packet.size() >= 8u && ((packet[2] >> 24u) & 7u) != 0u && ((packet[2] >> 24u) & 7u) != 3u;
+            if (interrupts) emit(OpKind::LabelStore, 0, 0, 0);
+            return;
+        }
         const auto bytes = label->Bytes();
         std::uint64_t value = 0;
         std::memcpy(&value, bytes.data(), std::min(bytes.size(), sizeof(value)));
         ++state.counts.labelStores;
-        emit(OpKind::LabelStore, label->address, bytes.size(), value);
+        emit(OpKind::LabelStore, label->address, bytes.size(), value, {}, ~std::uint64_t{0}, flipCarrier);
     }
 
     void store(std::span<const std::uint32_t> packet, std::uint32_t opcode) {
