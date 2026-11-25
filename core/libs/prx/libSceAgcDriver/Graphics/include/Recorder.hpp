@@ -438,6 +438,7 @@ public:
     std::uint64_t Submissions() const { return submissions; }
     // Batches submitted and not yet finished (what a full Sync() waits for); under GuestMemory::GpuMutex.
     std::size_t InFlightBatches() const { return inFlight.size(); }
+    std::string StampProgress(std::uint64_t serial);
     // Reaps that retired at least one batch so far (the [recorder] line's 'with work' count).
     static std::uint64_t ReapsWithWork();
 
@@ -1105,6 +1106,12 @@ private:
     std::vector<std::shared_ptr<void>> holdKept;
     std::uint64_t holdKeptSerial = 0;
     std::deque<std::unique_ptr<Batch>> inFlight;
+    struct StampedBatch {
+        VkQueryPool pool = VK_NULL_HANDLE;
+        std::vector<std::uint64_t> keys;
+    };
+    std::mutex stampedMutex;
+    std::map<std::uint64_t, StampedBatch> stamped;
     // Batches popped from inFlight whose completions have not run yet: their writes stay in the
     // snapshot (a rebuild from inside a completion must not drop them) until finish returns.
     std::vector<const Batch*> finishing;

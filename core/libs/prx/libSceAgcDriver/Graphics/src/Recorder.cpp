@@ -3474,7 +3474,26 @@ void Recorder::readSamples(Batch& batch) {
     samplesPassed.fetch_add(total + samples, std::memory_order_acq_rel);
 }
 
+std::string Recorder::StampProgress(std::uint64_t serial) {
+    std::lock_guard lock(stampedMutex);
+    const auto found = stamped.find(serial);
+    if (found == stamped.end()) return " (no GPU stamps: APS5_PROFILE_GPU)";
+    std::string line;
+    char text[48];
+    for (std::size_t index = 0; index < found->second.keys.size(); ++index) {
+        std::array<std::uint64_t, 2> result{};
+        const auto status = context.Function<PFN_vkGetQueryPoolResults>("vkGetQueryPoolResults")(context.device, found->second.pool, static_cast<std::uint32_t>(index * 2 + 1), 1, sizeof(result), result.data(), sizeof(result), VK_QUERY_RESULT_64_BIT | VK_QUERY_RESULT_WITH_AVAILABILITY_BIT);
+        std::snprintf(text, sizeof(text), " %s:%s", TimingKeyLabel(found->second.keys[index]).c_str(), status == VK_SUCCESS && result[1] != 0u ? "done" : "open");
+        line += text;
+    }
+    return line;
+}
+
 void Recorder::readGpuTiming(Batch& batch) {
+    {
+        std::lock_guard lock(stampedMutex);
+        stamped.erase(batch.serial);
+    }
     if (batch.queries == VK_NULL_HANDLE || batch.timedKeys.empty()) return;
     std::vector<std::uint64_t> stamps(batch.timedKeys.size() * 2);
     const auto result = context.Function<PFN_vkGetQueryPoolResults>("vkGetQueryPoolResults")(context.device, batch.queries, 0, static_cast<std::uint32_t>(stamps.size()), stamps.size() * sizeof(std::uint64_t), stamps.data(), sizeof(std::uint64_t), VK_QUERY_RESULT_64_BIT);
@@ -4888,6 +4907,10 @@ void Recorder::Submit() {
                                                                 context.Function<PFN_vkGetSemaphoreCounterValueKHR>("vkGetSemaphoreCounterValueKHR"));
         }
         progressWatcher->Submitted(batch->serial);
+    }
+    if (GpuTimingEnabled() && batch->queries != VK_NULL_HANDLE && !batch->timedKeys.empty()) {
+        std::lock_guard lock(stampedMutex);
+        stamped[batch->serial] = {batch->queries, batch->timedKeys};
     }
     inFlight.push_back(std::move(batch));
     inFlightKeptBytes += inFlight.back()->keptBytes;

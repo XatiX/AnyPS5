@@ -228,6 +228,7 @@ struct BatchPrograms {
     std::array<std::pair<std::uint64_t, std::string>, 4096> recent;
     std::size_t recentNext = 0;
     bool historyShown = false;
+    Graphics::Recorder* recorder = nullptr;
 };
 
 BatchPrograms& batchPrograms() {
@@ -267,6 +268,7 @@ void watchOpenBatches() {
                 list += "(" + std::to_string(counts[0]) + "x" + std::to_string(counts[1]) + "x" + std::to_string(counts[2]) + ")";
             }
             std::fprintf(stderr, "[recode-hang-batch] batch %llu not finished %lld s after its first recorded work; %zu items:%s\n", static_cast<unsigned long long>(serial), static_cast<long long>(std::chrono::duration_cast<std::chrono::seconds>(now - batch.opened).count()), batch.work.size(), list.c_str());
+            if (programs.recorder != nullptr) std::fprintf(stderr, "[recode-hang-stamps] batch %llu, end stamps in order:%s\n", static_cast<unsigned long long>(serial), programs.recorder->StampProgress(serial).c_str());
             if (!programs.historyShown) {
                 programs.historyShown = true;
                 static const std::uint64_t window = [] {
@@ -291,6 +293,7 @@ void noteBatchWork(Graphics::Recorder& recorder, std::uint64_t serial, const cha
     bool first = false;
     {
         std::lock_guard lock(programs.mutex);
+        programs.recorder = &recorder;
         auto [found, inserted] = programs.open.try_emplace(serial);
         if (inserted) {
             found->second.opened = std::chrono::steady_clock::now();
@@ -3988,6 +3991,21 @@ private:
     }
 
 
+    bool checkDispatchArguments(const Context& context, Graphics::Recorder& recorder, VkCommandBuffer commands, std::uint64_t serial, std::uint64_t completed, VkBuffer& buffer, VkDeviceSize& offset) {
+        static const bool unchecked = std::getenv("APS5_RECODE_UNCHECKED_DISPATCH_ARGUMENTS") != nullptr;
+        if (unchecked || ringAddress == 0u || !context.bufferDeviceAddress) return false;
+        VkBufferDeviceAddressInfo info{VK_STRUCTURE_TYPE_BUFFER_DEVICE_ADDRESS_INFO};
+        info.buffer = buffer;
+        const auto base = context.Function<PFN_vkGetBufferDeviceAddressKHR>("vkGetBufferDeviceAddressKHR")(context.device, &info);
+        if (base == 0u) return false;
+        constexpr std::array<std::byte, 3u * sizeof(std::uint32_t)> cleared{};
+        const auto placed = ringWrite(std::span<const std::byte>(cleared), serial, completed);
+        if (!placed.has_value() || !recorder.RecordDispatchArguments(commands, base + offset, ringAddress + *placed)) return false;
+        buffer = ring->Handle();
+        offset = *placed;
+        return true;
+    }
+
     bool placeDispatchArguments(const Context& context, Graphics::Recorder& recorder, std::uint64_t address, std::uint64_t serial, std::uint64_t completed, VkBuffer& buffer, VkDeviceSize& offset, std::string& reason) {
         constexpr std::size_t bytes = 3u * sizeof(std::uint32_t);
         const auto* source = reinterpret_cast<const std::byte*>(address);
@@ -4102,6 +4120,7 @@ private:
         }
         const auto commands = recorder->Commands();
         Graphics::RecordMemoryBarrier(context, commands, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT | VK_PIPELINE_STAGE_HOST_BIT, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT | (indirect ? VK_PIPELINE_STAGE_DRAW_INDIRECT_BIT : 0u), VK_ACCESS_SHADER_WRITE_BIT | VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT | VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT | VK_ACCESS_TRANSFER_WRITE_BIT | VK_ACCESS_HOST_WRITE_BIT, VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT | (indirect ? VK_ACCESS_INDIRECT_COMMAND_READ_BIT : 0u));
+        if (indirect) static_cast<void>(checkDispatchArguments(context, *recorder, commands, serial, completed, argumentBuffer, argumentOffset));
         markHang(context, *recorder, commands, Downgrades::ProgramHash(stage.program.codeAddress), groups[0] * groups[1] * groups[2], dispatch);
         context.BindComputePipeline(commands, pipeline->pipeline);
         Downgrades::NotePipeline(reinterpret_cast<std::uint64_t>(pipeline->pipeline), stage.program.codeAddress, stage.program.result != nullptr ? stage.program.result->spirv.ContentHash().low : 0u);
