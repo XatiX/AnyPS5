@@ -102,6 +102,11 @@ void LabelWithoutALandingStaysOnTheGpu(AgcDriver::VulkanDevice& device, const Gu
 }
 
 int main() {
+#ifdef _WIN32
+    _putenv_s("APS5_RECODE_HOST_COPY_THREAD", "0");
+#else
+    setenv("APS5_RECODE_HOST_COPY_THREAD", "0", 1);
+#endif
     try {
         GuestBlock block;
         auto device = OpenVulkanTestDevice();
