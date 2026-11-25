@@ -268,6 +268,10 @@ public:
 
     static Loop::Item loopItem(const Operation& operation, std::shared_ptr<const ResolvedDraw> resolved, const DecodeState& state) {
         Loop::Ensure(operation.queue);
+        if (operation.kind == OpKind::Flip) {
+            static const bool traced = std::getenv("APS5_RECODE_TRACE_LOOP") != nullptr;
+            if (traced) std::fprintf(stderr, "[recode-loop-trace] flip decoded q%u submission %llu offset %u\n", operation.queue, static_cast<unsigned long long>(operation.submission), operation.packetOffset);
+        }
         Loop::Item item{operation, std::move(resolved), state.Held(), std::nullopt, {}, {}, state.Guards(), state.Live().sampleDumpBlocks};
         const auto* submission = state.CurrentSubmission();
         if (submission == nullptr || operation.packetOffset >= submission->commands.size()) return item;
