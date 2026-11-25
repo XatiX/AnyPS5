@@ -3991,24 +3991,25 @@ private:
     }
 
 
-    bool checkDispatchArguments(const Context& context, Graphics::Recorder& recorder, VkCommandBuffer commands, std::uint64_t serial, std::uint64_t completed, VkBuffer& buffer, VkDeviceSize& offset) {
+    bool checkDispatchArguments(Graphics::Recorder& recorder, VkCommandBuffer commands, std::uint64_t serial, std::uint64_t completed, VkDeviceAddress source, VkBuffer& buffer, VkDeviceSize& offset) {
         static const bool unchecked = std::getenv("APS5_RECODE_UNCHECKED_DISPATCH_ARGUMENTS") != nullptr;
-        if (unchecked || ringAddress == 0u || !context.bufferDeviceAddress) return false;
-        VkBufferDeviceAddressInfo info{VK_STRUCTURE_TYPE_BUFFER_DEVICE_ADDRESS_INFO};
-        info.buffer = buffer;
-        const auto base = context.Function<PFN_vkGetBufferDeviceAddressKHR>("vkGetBufferDeviceAddressKHR")(context.device, &info);
-        if (base == 0u) return false;
+        if (unchecked || ringAddress == 0u || source == 0u) return false;
         constexpr std::array<std::byte, 3u * sizeof(std::uint32_t)> cleared{};
         const auto placed = ringWrite(std::span<const std::byte>(cleared), serial, completed);
-        if (!placed.has_value() || !recorder.RecordDispatchArguments(commands, base + offset, ringAddress + *placed)) return false;
+        if (!placed.has_value() || !recorder.RecordDispatchArguments(commands, source, ringAddress + *placed)) return false;
         buffer = ring->Handle();
         offset = *placed;
         return true;
     }
 
-    bool placeDispatchArguments(const Context& context, Graphics::Recorder& recorder, std::uint64_t address, std::uint64_t serial, std::uint64_t completed, VkBuffer& buffer, VkDeviceSize& offset, std::string& reason) {
+    bool placeDispatchArguments(const Context& context, Graphics::Recorder& recorder, std::uint64_t address, std::uint64_t serial, std::uint64_t completed, VkBuffer& buffer, VkDeviceSize& offset, VkDeviceAddress& device, std::string& reason) {
         constexpr std::size_t bytes = 3u * sizeof(std::uint32_t);
         const auto* source = reinterpret_cast<const std::byte*>(address);
+        device = 0u;
+        const auto mirrorDevice = [&] {
+            const auto span = ResidencyService::Get().MirrorSpan(address, bytes);
+            return span.has_value() && span->handle == reinterpret_cast<std::uintptr_t>(buffer) && span->offset == offset ? span->address : 0u;
+        };
         if (watchesBatchPrograms()) {
             lastArgumentsAddress = address;
             lastArgumentsCpu = {};
@@ -4020,6 +4021,7 @@ private:
             if (const auto input = mirrorInput(address, bytes)) {
                 buffer = input->buffer;
                 offset = input->offset;
+                device = mirrorDevice();
                 totals.mirrorArguments++;
                 return true;
             }
@@ -4032,6 +4034,7 @@ private:
             }
             buffer = ring->Handle();
             offset = *placed;
+            device = ringAddress != 0u ? ringAddress + *placed : 0u;
             totals.snapshotArguments++;
             return true;
         }
@@ -4039,6 +4042,7 @@ private:
             if (const auto input = mirrorInput(address, bytes)) {
                 buffer = input->buffer;
                 offset = input->offset;
+                device = mirrorDevice();
                 totals.mirrorArguments++;
                 return true;
             }
@@ -4055,6 +4059,7 @@ private:
         recorder.NotePendingRead(address, bytes, Graphics::Recorder::ReadKind::Indirect);
         buffer = import->buffer;
         offset = Graphics::HostImportOffset(*import, address);
+        device = import->address != 0u ? import->address + (address - import->base) : 0u;
         return true;
     }
 
@@ -4104,7 +4109,8 @@ private:
         }
         VkBuffer argumentBuffer = VK_NULL_HANDLE;
         VkDeviceSize argumentOffset = 0;
-        if (indirect && !placeDispatchArguments(context, *recorder, dispatch.operation.dispatch.indirectAddress, serial, completed, argumentBuffer, argumentOffset, reason)) {
+        VkDeviceAddress argumentDevice = 0u;
+        if (indirect && !placeDispatchArguments(context, *recorder, dispatch.operation.dispatch.indirectAddress, serial, completed, argumentBuffer, argumentOffset, argumentDevice, reason)) {
             copyBacks.clear();
             return false;
         }
@@ -4120,7 +4126,7 @@ private:
         }
         const auto commands = recorder->Commands();
         Graphics::RecordMemoryBarrier(context, commands, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT | VK_PIPELINE_STAGE_HOST_BIT, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT | (indirect ? VK_PIPELINE_STAGE_DRAW_INDIRECT_BIT : 0u), VK_ACCESS_SHADER_WRITE_BIT | VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT | VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT | VK_ACCESS_TRANSFER_WRITE_BIT | VK_ACCESS_HOST_WRITE_BIT, VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT | (indirect ? VK_ACCESS_INDIRECT_COMMAND_READ_BIT : 0u));
-        if (indirect) static_cast<void>(checkDispatchArguments(context, *recorder, commands, serial, completed, argumentBuffer, argumentOffset));
+        if (indirect) static_cast<void>(checkDispatchArguments(*recorder, commands, serial, completed, argumentDevice, argumentBuffer, argumentOffset));
         markHang(context, *recorder, commands, Downgrades::ProgramHash(stage.program.codeAddress), groups[0] * groups[1] * groups[2], dispatch);
         context.BindComputePipeline(commands, pipeline->pipeline);
         Downgrades::NotePipeline(reinterpret_cast<std::uint64_t>(pipeline->pipeline), stage.program.codeAddress, stage.program.result != nullptr ? stage.program.result->spirv.ContentHash().low : 0u);
