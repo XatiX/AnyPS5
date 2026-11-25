@@ -2797,6 +2797,63 @@ private:
         }
     }
 
+    struct GpuWatch {
+        std::mutex mutex;
+        std::vector<std::byte> last;
+        std::uint32_t lines = 0;
+    };
+
+    static GpuWatch& gpuWatch() {
+        static GpuWatch watch;
+        return watch;
+    }
+
+    void watchOnGpu(const Context& context, Graphics::Recorder& recorder, VkCommandBuffer commands, std::uint64_t program, std::uint32_t queue, std::uint64_t submission) {
+        static const std::pair<std::uint64_t, std::uint64_t> range = [] {
+            const char* value = std::getenv("APS5_RECODE_GPU_WATCH");
+            if (value == nullptr) return std::pair<std::uint64_t, std::uint64_t>{0u, 0u};
+            const char* plus = std::strchr(value, '+');
+            return std::pair<std::uint64_t, std::uint64_t>{std::strtoull(value, nullptr, 16), plus != nullptr ? std::min<std::uint64_t>(std::strtoull(plus + 1, nullptr, 16), 65536u) : 0u};
+        }();
+        constexpr std::uint32_t Slots = 256;
+        if (range.second == 0u) return;
+        const auto span = ResidencyService::Get().Translate(range.first, range.second);
+        if (!span || span->handle == 0u) return;
+        if (gpuWatchBuffer == nullptr) gpuWatchBuffer = std::make_shared<Graphics::Buffer>(context, Slots * range.second, VK_BUFFER_USAGE_TRANSFER_DST_BIT);
+        const auto slot = nextGpuWatch++ % Slots;
+        Graphics::RecordMemoryBarrier(context, commands, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_ACCESS_SHADER_WRITE_BIT | VK_ACCESS_TRANSFER_WRITE_BIT, VK_ACCESS_TRANSFER_READ_BIT);
+        const VkBufferCopy region{span->offset, slot * range.second, range.second};
+        context.Function<PFN_vkCmdCopyBuffer>("vkCmdCopyBuffer")(commands, reinterpret_cast<VkBuffer>(static_cast<std::uintptr_t>(span->handle)), gpuWatchBuffer->Handle(), 1, &region);
+        Graphics::RecordMemoryBarrier(context, commands, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_HOST_BIT | VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_ACCESS_TRANSFER_WRITE_BIT, VK_ACCESS_HOST_READ_BIT);
+        recorder.Keep(gpuWatchBuffer);
+        recorder.OnComplete([buffer = gpuWatchBuffer, slot, bytes = range.second, base = range.first, program, queue, submission] {
+            const auto* now = buffer->Bytes().data() + slot * bytes;
+            auto& watch = gpuWatch();
+            std::lock_guard lock(watch.mutex);
+            if (watch.last.size() != bytes) {
+                watch.last.assign(now, now + bytes);
+                return;
+            }
+            std::uint64_t first = bytes;
+            std::uint64_t changed = 0;
+            for (std::uint64_t index = 0; index < bytes; ++index) {
+                if (now[index] == watch.last[index]) continue;
+                if (first == bytes) first = index;
+                ++changed;
+            }
+            if (changed != 0u && watch.lines < 400u) {
+                ++watch.lines;
+                const auto at = first & ~std::uint64_t{3};
+                std::uint32_t before = 0;
+                std::uint32_t after = 0;
+                std::memcpy(&before, watch.last.data() + at, 4u);
+                std::memcpy(&after, now + at, 4u);
+                std::fprintf(stderr, "[recode-gpu-watch] queue 0x%x submission %llu program %016llx changed %llu bytes, first at 0x%llx: %08x -> %08x\n", queue, static_cast<unsigned long long>(submission), static_cast<unsigned long long>(program), static_cast<unsigned long long>(changed), static_cast<unsigned long long>(base + first), before, after);
+            }
+            watch.last.assign(now, now + bytes);
+        });
+    }
+
     struct InputCompareTotals {
         std::mutex mutex;
         std::map<std::pair<std::uint64_t, int>, std::pair<std::uint64_t, std::uint64_t>> counts;
@@ -4052,6 +4109,7 @@ private:
             context.Resolved(&Graphics::DeviceFunctions::cmdDispatch, "vkCmdDispatch")(commands, groups[0], groups[1], groups[2]);
         }
         recorder->EndGpuTiming(dispatchTiming);
+        watchOnGpu(context, *recorder, commands, Downgrades::ProgramHash(stage.program.codeAddress), dispatch.operation.queue, dispatch.operation.submission);
         Graphics::RecordMemoryBarrier(context, commands, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT | VK_PIPELINE_STAGE_HOST_BIT, VK_ACCESS_SHADER_WRITE_BIT, VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT | VK_ACCESS_UNIFORM_READ_BIT | VK_ACCESS_TRANSFER_READ_BIT | VK_ACCESS_TRANSFER_WRITE_BIT | VK_ACCESS_INDIRECT_COMMAND_READ_BIT | VK_ACCESS_INDEX_READ_BIT | VK_ACCESS_VERTEX_ATTRIBUTE_READ_BIT | VK_ACCESS_COLOR_ATTACHMENT_READ_BIT | VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_READ_BIT | VK_ACCESS_HOST_READ_BIT);
         finishHangMark(context, commands);
         recordCopyBacks(context, commands, serial);
@@ -5394,6 +5452,8 @@ private:
     std::uint64_t mapBytes = 0;
     std::unordered_map<std::uint64_t, TableImages> tableImages;
     std::uint64_t tableRetirements = 0;
+    std::shared_ptr<Graphics::Buffer> gpuWatchBuffer;
+    std::uint32_t nextGpuWatch = 0;
     std::shared_ptr<Graphics::Buffer> inputCompares;
     std::uint32_t nextInputCompare = 0;
     std::uint64_t inputCompareTick = 0;
