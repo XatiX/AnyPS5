@@ -3,6 +3,9 @@
 #include "prx/libSceAgcDriver/Execution/include/VideoOutput.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/Draw/DrawRegisterKey.hpp"
 #include <algorithm>
+#include <atomic>
+#include <cstdio>
+#include <cstdlib>
 #include <optional>
 #include <cstring>
 #include <exception>
@@ -312,6 +315,14 @@ private:
                 address = Pm4::DispatchArgumentAddress(packet, state.state);
             } catch (const std::exception&) {
                 ++state.counts.stateErrors;
+            }
+            static const std::uint32_t traced = [] {
+                const char* value = std::getenv("APS5_RECODE_TRACE_INDIRECT");
+                return value != nullptr ? static_cast<std::uint32_t>(std::strtoul(value, nullptr, 10)) : 0u;
+            }();
+            static std::atomic<std::uint32_t> tracedLines{0};
+            if (traced != 0u && tracedLines.fetch_add(1, std::memory_order_relaxed) < traced) {
+                std::fprintf(stderr, "[recode-indirect] queue 0x%x submission %llu: %zu words, header %08x word1 %08x word2 %08x, dispatch base 0x%llx, draw base 0x%llx -> arguments at 0x%llx\n", submission.queue, static_cast<unsigned long long>(submission.serial), packet.size(), packet[0], packet.size() > 1 ? packet[1] : 0u, packet.size() > 2 ? packet[2] : 0u, static_cast<unsigned long long>(state.state.dispatchIndirectBase), static_cast<unsigned long long>(state.state.drawIndirectBase), static_cast<unsigned long long>(address));
             }
         }
         const auto ids = snapshot();

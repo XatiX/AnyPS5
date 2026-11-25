@@ -234,7 +234,9 @@ bool materializeStage(const ProgramInputs& inputs, ShaderRecompiler::RecompileRe
     std::shared_ptr<const ShaderRecompiler::RecompileResult> result;
     std::shared_ptr<const ShaderRecompiler::ResultTemplate> shape;
     ShaderRecompiler::TemplateWords words;
-    if (inputs.templates != nullptr && !probe.Active()) {
+    static const char* const untemplated = std::getenv("APS5_RECODE_NO_TEMPLATES");
+    const bool templateRefused = untemplated != nullptr && *untemplated != '\0' && Downgrades::ListedHash(untemplated, Downgrades::ProgramHash(snapshot.codeAddress + codeOffset * sizeof(std::uint32_t)));
+    if (inputs.templates != nullptr && !probe.Active() && !templateRefused) {
         const auto key = invocation.TemplateKey(*capture);
         shape = inputs.templates->Find(key);
         const bool stale = shape != nullptr && !shape->refillable && shape->snapshotKey != invocation.SnapshotKey(*capture);
