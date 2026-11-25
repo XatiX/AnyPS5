@@ -216,7 +216,7 @@ bool materializeStage(const ProgramInputs& inputs, ShaderRecompiler::RecompileRe
         reason = "compiled variant not reachable";
         return false;
     }
-    if (usesSamplerTables(source->artifact->info.info)) {
+    if (!tablesRouted() && usesSamplerTables(source->artifact->info.info)) {
         reason = "sampler tables";
         return false;
     }

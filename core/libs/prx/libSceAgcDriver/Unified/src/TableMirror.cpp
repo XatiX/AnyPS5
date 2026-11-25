@@ -8,15 +8,15 @@ namespace AgcDriver::Unified::Tables {
 
 bool ElementRequests(const ShaderRecompiler::ResolvedImageTables& tables, std::vector<Heap::SlotRequest>& requests, std::string& reason) {
     requests.clear();
-    if (!tables.samplers.empty()) {
-        reason = "sampler tables";
-        return false;
-    }
     if (tables.map.size() < ShaderRecompiler::ImageTableAbi::HeaderWords) {
         reason = "image table map without a header";
         return false;
     }
-    requests.reserve(tables.elements.size());
+    if (tables.map[ShaderRecompiler::ImageTableAbi::HeaderElementCount] != tables.elements.size() || tables.map[ShaderRecompiler::ImageTableAbi::HeaderSamplerCount] != tables.samplers.size()) {
+        reason = "image table header disagrees with its elements";
+        return false;
+    }
+    requests.reserve(tables.elements.size() + tables.samplers.size());
     for (const auto& element : tables.elements) {
         const auto kind = static_cast<std::uint32_t>(element.kind);
         if (kind < Heap::FirstImageKind || kind > Heap::LastStorageKind) {
@@ -29,6 +29,16 @@ bool ElementRequests(const ShaderRecompiler::ResolvedImageTables& tables, std::v
         }
         Heap::SlotRequest request{kind, 0u, element.words};
         if (element.words[0] == 0u && (element.words[1] & 0xffu) == 0u) request.flags = Heap::RequestFlag::Inactive;
+        requests.push_back(request);
+    }
+    for (const auto& sampler : tables.samplers) {
+        Heap::SlotRequest request{static_cast<std::uint32_t>(ShaderRecompiler::DescriptorBindingKind::Samplers), Heap::RequestFlag::Sampler, {}};
+        std::copy_n(sampler.words.begin(), 4u, request.words.begin());
+        if (sampler.compare) request.flags |= Heap::RequestFlag::Compare;
+        if (sampler.point) {
+            request.words[2] = Heap::PointFilterWord(request.words[2]);
+            request.flags |= Heap::RequestFlag::Point;
+        }
         requests.push_back(request);
     }
     return true;
