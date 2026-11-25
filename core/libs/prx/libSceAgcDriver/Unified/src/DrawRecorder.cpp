@@ -236,7 +236,7 @@ BatchPrograms& batchPrograms() {
 }
 
 bool watchesBatchPrograms() {
-    static const bool watching = std::getenv("APS5_RECODE_HANG_PROGRAMS") != nullptr;
+    static const bool watching = std::getenv("APS5_RECODE_HANG_PROGRAMS") != nullptr || std::getenv("APS5_RECODE_HANG_EXIT") != nullptr;
     return watching;
 }
 
