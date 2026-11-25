@@ -39,6 +39,9 @@ namespace {
 constexpr std::size_t GpuStoreLimit = 65536;
 constexpr auto WaitReport = std::chrono::seconds(5);
 constexpr auto WaitSubmitInterval = std::chrono::microseconds(500);
+constexpr auto RecorderLabelDeadline = std::chrono::microseconds(250);
+constexpr auto RecorderReapInterval = std::chrono::microseconds(250);
+constexpr std::uint64_t RecorderBatchCap = 512;
 
 struct Totals {
     std::atomic<std::uint64_t> draws{0};
@@ -67,6 +70,8 @@ struct Totals {
     std::atomic<std::uint64_t> copiesOnGpu{0};
     std::atomic<std::uint64_t> copiesFromMirror{0};
     std::atomic<std::uint64_t> submitsDeferred{0};
+    std::atomic<std::uint64_t> keptSubmits{0};
+    std::atomic<std::uint64_t> keptReaps{0};
     std::atomic<std::uint64_t> flipsReleasedByWorker{0};
     std::atomic<std::uint64_t> guarded{0};
     std::atomic<std::uint64_t> skipped{0};
@@ -391,6 +396,7 @@ public:
             }
             progress.advanced.notify_all();
             if (submitRequest().load(std::memory_order_relaxed) != 0u) honourSubmitRequest();
+            keepRecorderMoving();
             if (gpuSections().waiting.load(std::memory_order_acquire)) runPendingGpuSection();
         }
     }
@@ -428,9 +434,36 @@ private:
         if (recorder->Submissions() >= requested || recorder->Idle()) submitRequest().compare_exchange_strong(expected, 0u, std::memory_order_acq_rel);
     }
 
+    void keepRecorderMoving() {
+        if (!KeepsRecorder()) return;
+        const auto now = std::chrono::steady_clock::now();
+        const auto pending = Graphics::Recorder::PendingLabelSince();
+        const bool labelDue = pending.has_value() && now - *pending >= RecorderLabelDeadline;
+        const bool capped = Graphics::Recorder::RecordedWorkSinceSubmit() >= RecorderBatchCap;
+        const bool reapDue = (Graphics::Recorder::PendingCompletionLabels() != 0 || Graphics::Recorder::PendingWriteBackCompletions() != 0) && now - lastReap >= RecorderReapInterval;
+        if (!labelDue && !capped && !reapDue) return;
+        const auto device = Resolve::AttachedDevice();
+        if (device == nullptr) return;
+        GuestMemory::TagGpuLockSite(labelDue || capped ? GuestMemory::GpuLockSite::Flush : GuestMemory::GpuLockSite::Try);
+        std::unique_lock lock(GuestMemory::GpuMutex(), std::defer_lock);
+        if (labelDue || capped) lock.lock();
+        else if (!lock.try_lock()) return;
+        auto* recorder = device->graphicsContext().recorder;
+        if (recorder == nullptr) return;
+        if ((labelDue && Graphics::Recorder::PendingLabelSince().has_value()) || (capped && Graphics::Recorder::RecordedWorkSinceSubmit() >= RecorderBatchCap)) {
+            recorder->Submit();
+            lastSubmit = now;
+            totals().keptSubmits.fetch_add(1, std::memory_order_relaxed);
+        } else if (reapDue) {
+            lastReap = now;
+            if (recorder->Reap()) totals().keptReaps.fetch_add(1, std::memory_order_relaxed);
+        }
+    }
+
     void settleIdle() {
         reportIdle();
         honourSubmitRequest();
+        keepRecorderMoving();
         if (gpuSections().waiting.load(std::memory_order_acquire)) runPendingGpuSection();
         const auto device = Resolve::AttachedDevice();
         if (device == nullptr) return;
@@ -956,6 +989,7 @@ private:
     Progress* busy = nullptr;
     bool drawnSinceSeal = false;
     std::chrono::steady_clock::time_point lastSubmit{};
+    std::chrono::steady_clock::time_point lastReap{};
     const char* stageName = "idle";
     std::chrono::steady_clock::time_point stageSince = std::chrono::steady_clock::now();
     std::vector<std::pair<const char*, std::uint64_t>> stageTimes;
@@ -1067,6 +1101,14 @@ LoopCounts Counts() {
     return {held.draws.load(), held.dispatches.load(), held.refused.load(), held.labels.load(), held.labelsAtOnce.load(), held.interrupts.load(), held.waits.load(), held.waitsFromTable.load(), held.waitsFromGuest.load(), held.waitPolls.load(), held.copies.load(), held.copiesOnCpu.load(), held.flips.load()};
 }
 
+bool KeepsRecorder() {
+    static const bool keeps = [] {
+        const char* value = RouteValue("APS5_RECODE_LOOP_KEEPS_RECORDER");
+        return value != nullptr && std::string_view(value) == "1";
+    }();
+    return keeps && OwnsLoop();
+}
+
 void RequestSubmit(std::uint64_t serial) {
     auto& requested = submitRequest();
     auto current = requested.load(std::memory_order_acquire);
@@ -1104,7 +1146,7 @@ std::string Line() {
         handed = shared.handed.size();
         reached = shared.reached.size();
     }
-    return std::string(text) + "; label submits deferred " + std::to_string(totals().submitsDeferred.load()) + "; flips handed over but not reached " + std::to_string(handed) + ", reached but not handed over " + std::to_string(reached);
+    return std::string(text) + "; label submits deferred " + std::to_string(totals().submitsDeferred.load()) + "; recorder kept moving by the loop: " + std::to_string(totals().keptSubmits.load()) + " submits, " + std::to_string(totals().keptReaps.load()) + " reaps" +"; flips handed over but not reached " + std::to_string(handed) + ", reached but not handed over " + std::to_string(reached);
 }
 
 }
