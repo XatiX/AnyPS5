@@ -1296,8 +1296,18 @@ std::optional<DrawInput> drawInput(const Context& context, std::uint64_t address
         if (auto input = mirrorInput(address, bytes)) {
             const bool gpu = pages.GpuWrittenIn(address, bytes) || !pages.GpuOwnedIn(address, bytes).empty() || gpuPending(address, bytes);
             static const bool consumes = std::getenv("APS5_RECODE_NO_INPUT_CONSUME") == nullptr;
+            static const bool globalConsume = std::getenv("APS5_RECODE_INPUT_CONSUME") != nullptr && std::string_view(std::getenv("APS5_RECODE_INPUT_CONSUME")) == "global";
+            if (consumes && !gpu && !pages.CleanIn(address, bytes) && copiesInputs() && bytes <= InputCopyLimitBytes && !globalConsume) {
+                source = InputSource::Written;
+                return input;
+            }
             if (consumes && !gpu && !pages.CleanIn(address, bytes)) {
-                Shadow::ConsumeNow();
+                if (globalConsume) {
+                    Shadow::ConsumeNow();
+                } else {
+                    const std::array range{std::pair<std::uint64_t, std::uint64_t>{address, bytes}};
+                    static_cast<void>(Shadow::ConsumeIn(range));
+                }
                 inputConsumes().fetch_add(1, std::memory_order_relaxed);
             }
             source = InputSource::Mirrored;
