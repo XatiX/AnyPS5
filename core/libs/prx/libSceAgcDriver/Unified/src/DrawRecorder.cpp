@@ -5576,6 +5576,10 @@ struct HostCopies {
     std::deque<std::function<void()>> queue;
     bool running = false;
     bool started = false;
+    std::uint64_t landings = 0;
+    std::uint64_t busyNanoseconds = 0;
+    std::size_t deepest = 0;
+    std::chrono::steady_clock::time_point reported = std::chrono::steady_clock::now();
 };
 
 HostCopies& hostCopies() {
@@ -5599,10 +5603,22 @@ void hostCopyLoop() {
         auto landing = std::move(copies.queue.front());
         copies.queue.pop_front();
         copies.running = true;
+        copies.deepest = std::max(copies.deepest, copies.queue.size() + 1u);
         lock.unlock();
+        const auto started = std::chrono::steady_clock::now();
         runLanding(landing);
+        const auto finished = std::chrono::steady_clock::now();
         lock.lock();
         copies.running = false;
+        copies.landings++;
+        copies.busyNanoseconds += static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(finished - started).count());
+        if (finished - copies.reported >= std::chrono::seconds(10)) {
+            std::fprintf(stderr, "[recode-host-copy] stage (10 s): %llu landings, busy %.0f ms, deepest queue %zu\n", static_cast<unsigned long long>(copies.landings), static_cast<double>(copies.busyNanoseconds) / 1e6, copies.deepest);
+            copies.reported = finished;
+            copies.landings = 0;
+            copies.busyNanoseconds = 0;
+            copies.deepest = 0;
+        }
         if (copies.queue.empty()) copies.drained.notify_all();
     }
 }
