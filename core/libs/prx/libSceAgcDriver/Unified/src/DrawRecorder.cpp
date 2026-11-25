@@ -2835,10 +2835,12 @@ private:
                 return;
             }
             std::uint64_t first = bytes;
+            std::uint64_t lastChanged = 0;
             std::uint64_t changed = 0;
             for (std::uint64_t index = 0; index < bytes; ++index) {
                 if (now[index] == watch.last[index]) continue;
                 if (first == bytes) first = index;
+                lastChanged = index;
                 ++changed;
             }
             if (changed != 0u && watch.lines < 400u) {
@@ -2848,7 +2850,7 @@ private:
                 std::uint32_t after = 0;
                 std::memcpy(&before, watch.last.data() + at, 4u);
                 std::memcpy(&after, now + at, 4u);
-                std::fprintf(stderr, "[recode-gpu-watch] queue 0x%x submission %llu program %016llx changed %llu bytes, first at 0x%llx: %08x -> %08x\n", queue, static_cast<unsigned long long>(submission), static_cast<unsigned long long>(program), static_cast<unsigned long long>(changed), static_cast<unsigned long long>(base + first), before, after);
+                std::fprintf(stderr, "[recode-gpu-watch] queue 0x%x submission %llu program %016llx changed %llu bytes, first at 0x%llx: %08x -> %08x, last at 0x%llx\n", queue, static_cast<unsigned long long>(submission), static_cast<unsigned long long>(program), static_cast<unsigned long long>(changed), static_cast<unsigned long long>(base + first), before, after, static_cast<unsigned long long>(base + lastChanged));
             }
             watch.last.assign(now, now + bytes);
         });
