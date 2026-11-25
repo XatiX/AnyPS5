@@ -103,18 +103,19 @@ bool CompressedSiblings(std::uint32_t left, std::uint32_t right) {
 
 VulkanSurface::VulkanSurface(const Graphics::Context& context, const Graphics::GuestTextureResource& resource, Graphics::SurfaceGeometry geometry, VkFormat format) : context(context), resource(resource), geometry(std::move(geometry)), format(format) {
     const bool volume = resource.dimension == Graphics::TextureDimension::k3D;
+    const bool line = Line();
     compressed = Graphics::BlockWidth(resource.format) != 1u;
     identity = Graphics::IsConvertedTextureFormat(resource.format) && format != VK_FORMAT_B10G11R11_UFLOAT_PACK32;
     VkImageCreateInfo info{VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO};
     info.flags = compressed ? (hasCompressedSibling(format) ? VK_IMAGE_CREATE_MUTABLE_FORMAT_BIT : 0u) : VK_IMAGE_CREATE_MUTABLE_FORMAT_BIT | VK_IMAGE_CREATE_EXTENDED_USAGE_BIT | (volume && volumeTargets() ? VK_IMAGE_CREATE_2D_ARRAY_COMPATIBLE_BIT : 0u);
-    info.imageType = volume ? VK_IMAGE_TYPE_3D : VK_IMAGE_TYPE_2D;
+    info.imageType = volume ? VK_IMAGE_TYPE_3D : line ? VK_IMAGE_TYPE_1D : VK_IMAGE_TYPE_2D;
     info.format = format;
-    info.extent = {std::max(resource.width, 1u), std::max(resource.height, 1u), volume ? std::max(this->geometry.imageDepth, 1u) : 1u};
+    info.extent = {std::max(resource.width, 1u), line ? 1u : std::max(resource.height, 1u), volume ? std::max(this->geometry.imageDepth, 1u) : 1u};
     info.mipLevels = static_cast<std::uint32_t>(std::max<std::size_t>(this->geometry.mips.size(), 1u));
     info.arrayLayers = volume ? 1u : std::max(this->geometry.imageLayers, 1u);
     info.samples = VK_SAMPLE_COUNT_1_BIT;
     info.tiling = VK_IMAGE_TILING_OPTIMAL;
-    attachable = !compressed && (!volume || volumeTargets());
+    attachable = !compressed && !line && (!volume || volumeTargets());
     info.usage = VK_IMAGE_USAGE_SAMPLED_BIT | (compressed ? 0u : VK_IMAGE_USAGE_STORAGE_BIT) | (attachable ? VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT : 0u) | VK_IMAGE_USAGE_TRANSFER_DST_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT;
     info.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
     info.initialLayout = VK_IMAGE_LAYOUT_UNDEFINED;
@@ -162,12 +163,15 @@ std::uint64_t VulkanSurface::View(const ViewKey& view, std::uint32_t kind, std::
     const bool volume = resource.dimension == Graphics::TextureDimension::k3D;
     VkImageViewType type = VK_IMAGE_VIEW_TYPE_2D;
     switch (dimension) {
+        case 0: type = VK_IMAGE_VIEW_TYPE_1D; break;
+        case 1: type = VK_IMAGE_VIEW_TYPE_1D_ARRAY; break;
         case 2: type = VK_IMAGE_VIEW_TYPE_2D; break;
         case 3: type = VK_IMAGE_VIEW_TYPE_2D_ARRAY; break;
         case 6: type = VK_IMAGE_VIEW_TYPE_3D; break;
         default: reason = "image view dimension " + std::to_string(dimension); return 0;
     }
-    if ((type == VK_IMAGE_VIEW_TYPE_3D) != volume) {
+    const bool lineView = type == VK_IMAGE_VIEW_TYPE_1D || type == VK_IMAGE_VIEW_TYPE_1D_ARRAY;
+    if ((type == VK_IMAGE_VIEW_TYPE_3D) != volume || lineView != Line()) {
         reason = "image view shape differs from the surface";
         return 0;
     }
@@ -176,7 +180,7 @@ std::uint64_t VulkanSurface::View(const ViewKey& view, std::uint32_t kind, std::
     const auto baseLevel = std::min(view.baseLevel, levels - 1u);
     const auto lastLevel = std::clamp(view.lastLevel, baseLevel, levels - 1u);
     const auto baseLayer = volume ? 0u : std::min(view.baseArray, layers - 1u);
-    const auto layerCount = type == VK_IMAGE_VIEW_TYPE_2D_ARRAY ? std::max(std::min(view.lastArray, layers - 1u), baseLayer) - baseLayer + 1u : 1u;
+    const auto layerCount = type == VK_IMAGE_VIEW_TYPE_2D_ARRAY || type == VK_IMAGE_VIEW_TYPE_1D_ARRAY ? std::max(std::min(view.lastArray, layers - 1u), baseLayer) - baseLayer + 1u : 1u;
     const auto guestFormat = view.format != 0u && (!compressed || (view.format != resource.format && CompressedSiblings(view.format, resource.format) && hasCompressedSibling(format))) ? view.format : resource.format;
     auto viewFormat = format;
     auto viewIdentity = identity;
@@ -330,6 +334,10 @@ VkImageView VulkanSurface::ShapedStorageView(std::uint32_t level, StorageShape s
         reason = volume ? "flat storage view of a volume" : "volume storage view of a flat surface";
         return VK_NULL_HANDLE;
     }
+    if (Line() != (shape == StorageShape::Line || shape == StorageShape::LineArray)) {
+        reason = "storage view shape differs from the surface";
+        return VK_NULL_HANDLE;
+    }
     const auto levels = static_cast<std::uint32_t>(std::max<std::size_t>(geometry.mips.size(), 1u));
     if (level >= levels) {
         reason = "storage view past the levels";
@@ -340,7 +348,8 @@ VkImageView VulkanSurface::ShapedStorageView(std::uint32_t level, StorageShape s
         reason = "atomic storage view of a format that is not 32-bit single-channel";
         return VK_NULL_HANDLE;
     }
-    if (shape != StorageShape::Flat) layer = 0;
+    const bool arrayed = shape == StorageShape::Array || shape == StorageShape::LineArray;
+    if (shape != StorageShape::Flat && shape != StorageShape::Line) layer = 0;
     if (layer >= std::max(geometry.imageLayers, 1u)) {
         reason = "storage view past the layers";
         return VK_NULL_HANDLE;
@@ -353,11 +362,11 @@ VkImageView VulkanSurface::ShapedStorageView(std::uint32_t level, StorageShape s
     VkImageViewCreateInfo info{VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO};
     info.pNext = &usage;
     info.image = image;
-    info.viewType = shape == StorageShape::Volume ? VK_IMAGE_VIEW_TYPE_3D : shape == StorageShape::Array ? VK_IMAGE_VIEW_TYPE_2D_ARRAY : VK_IMAGE_VIEW_TYPE_2D;
+    info.viewType = shape == StorageShape::Volume ? VK_IMAGE_VIEW_TYPE_3D : shape == StorageShape::Array ? VK_IMAGE_VIEW_TYPE_2D_ARRAY : shape == StorageShape::Line ? VK_IMAGE_VIEW_TYPE_1D : shape == StorageShape::LineArray ? VK_IMAGE_VIEW_TYPE_1D_ARRAY : VK_IMAGE_VIEW_TYPE_2D;
     const auto packed = packedStorageView(storageFormat);
     const auto uintFormat = uintView ? uintStorageView(storageFormat) : VK_FORMAT_UNDEFINED;
     info.format = atomic ? VK_FORMAT_R32_UINT : packed != VK_FORMAT_UNDEFINED ? packed : uintFormat != VK_FORMAT_UNDEFINED ? uintFormat : storageFormat;
-    info.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, level, 1u, layer, shape == StorageShape::Array ? std::max(geometry.imageLayers, 1u) : 1u};
+    info.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, level, 1u, layer, arrayed ? std::max(geometry.imageLayers, 1u) : 1u};
     VkImageView created = VK_NULL_HANDLE;
     if (context.Function<PFN_vkCreateImageView>("vkCreateImageView")(context.device, &info, nullptr, &created) != VK_SUCCESS) {
         reason = "vkCreateImageView recode storage";
@@ -378,7 +387,7 @@ std::shared_ptr<DeviceSurface> VulkanSurfaceDevice::Create(const SurfaceKey& key
 
 std::shared_ptr<DeviceSurface> VulkanSurfaceDevice::CreateFromResource(const SurfaceKey&, const Graphics::GuestTextureResource& resource, std::string& reason) {
     try {
-        if (resource.dimension != Graphics::TextureDimension::k2D && resource.dimension != Graphics::TextureDimension::k2DArray && resource.dimension != Graphics::TextureDimension::kCube && resource.dimension != Graphics::TextureDimension::k3D) {
+        if (resource.dimension != Graphics::TextureDimension::k2D && resource.dimension != Graphics::TextureDimension::k2DArray && resource.dimension != Graphics::TextureDimension::kCube && resource.dimension != Graphics::TextureDimension::k3D && resource.dimension != Graphics::TextureDimension::k1D && resource.dimension != Graphics::TextureDimension::k1DArray) {
             reason = "surface dimension";
             return nullptr;
         }

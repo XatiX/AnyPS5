@@ -42,6 +42,8 @@ namespace AgcDriver::Unified::Resolve {
 namespace {
 
 constexpr std::uint32_t StorageShapes = 7u;
+constexpr std::uint32_t Image1DShape = 0u;
+constexpr std::uint32_t Image1DArrayShape = 1u;
 constexpr std::uint32_t Image2DShape = 2u;
 constexpr std::uint32_t Image2DArrayShape = 3u;
 constexpr std::uint32_t MultisampleShape = 4u;
@@ -57,7 +59,7 @@ bool storageShapeRecords() {
 }
 
 bool recordStorageShape(std::uint32_t shape) {
-    return shape == Image2DShape || shape == Image2DArrayShape || (shape == Image3DShape && storageShapeRecords());
+    return shape == Image1DShape || shape == Image1DArrayShape || shape == Image2DShape || shape == Image2DArrayShape || (shape == Image3DShape && storageShapeRecords());
 }
 
 bool recordStorageAtomics(std::uint32_t flags) {
@@ -66,6 +68,8 @@ bool recordStorageAtomics(std::uint32_t flags) {
 }
 
 Images::StorageShape storageShapeOf(std::uint32_t shape) {
+    if (shape == Image1DShape) return Images::StorageShape::Line;
+    if (shape == Image1DArrayShape) return Images::StorageShape::LineArray;
     return shape == Image3DShape ? Images::StorageShape::Volume : shape == Image2DArrayShape ? Images::StorageShape::Array : Images::StorageShape::Flat;
 }
 
