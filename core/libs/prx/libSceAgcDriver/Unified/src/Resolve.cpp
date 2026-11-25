@@ -1,4 +1,5 @@
 #include "prx/libSceAgcDriver/Unified/include/Resolve.hpp"
+#include "prx/libSceAgcDriver/Unified/include/RouteDefaults.hpp"
 #include "prx/libSceAgcDriver/Unified/include/MemoryCore.hpp"
 #include "prx/libSceAgcDriver/Unified/include/RecordLoop.hpp"
 #include "prx/libSceAgcDriver/Unified/include/RecordQueue.hpp"
@@ -73,7 +74,7 @@ enum class DispatchRoute : std::uint8_t { None, Graphics, Compute, All };
 DispatchRoute dispatchRoute() {
     static const DispatchRoute route = [] {
         if (Record::RecordActive()) return DispatchRoute::All;
-        const auto* value = std::getenv("APS5_RECODE_DISPATCH");
+        const auto* value = RouteValue("APS5_RECODE_DISPATCH");
         if (value == nullptr) return DispatchRoute::None;
         const std::string_view text(value);
         if (text == "1") return DispatchRoute::Graphics;
@@ -96,7 +97,7 @@ bool routesQueue(std::uint32_t queue) {
 
 bool imagesRouted() {
     static const bool enabled = [] {
-        const auto* value = std::getenv("APS5_RECODE_IMAGES");
+        const auto* value = RouteValue("APS5_RECODE_IMAGES");
         return value != nullptr && std::string_view(value) == "1";
     }();
     return enabled;
@@ -1007,7 +1008,7 @@ Resolver& shared() {
 
 bool Active() {
     static const bool enabled = [] {
-        const auto* value = std::getenv("APS5_RECODE_DRAW");
+        const auto* value = RouteValue("APS5_RECODE_DRAW");
         return value != nullptr && (value[0] == '1' || std::string_view(value) == "record");
     }();
     return enabled;

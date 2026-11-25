@@ -1,4 +1,5 @@
 #include "prx/libSceAgcDriver/Unified/include/ProofVerdict.hpp"
+#include "prx/libSceAgcDriver/Unified/include/RouteDefaults.hpp"
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -71,7 +72,7 @@ VerdictCounts Tally::Counts() const {
 
 bool VerifyActive() {
     static const bool active = [] {
-        const char* value = std::getenv("APS5_RECODE_PROOF");
+        const char* value = RouteValue("APS5_RECODE_PROOF");
         return value != nullptr && std::strcmp(value, "verify") == 0;
     }();
     return active;
@@ -79,7 +80,7 @@ bool VerifyActive() {
 
 bool ShortcutActive() {
     static const bool active = [] {
-        const char* value = std::getenv("APS5_RECODE_PROOF");
+        const char* value = RouteValue("APS5_RECODE_PROOF");
         return value != nullptr && std::strcmp(value, "1") == 0;
     }();
     return active;

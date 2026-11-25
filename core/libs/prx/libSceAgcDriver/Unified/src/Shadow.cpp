@@ -1,4 +1,5 @@
 #include "prx/libSceAgcDriver/Unified/include/Shadow.hpp"
+#include "prx/libSceAgcDriver/Unified/include/RouteDefaults.hpp"
 #include "prx/libSceAgcDriver/Unified/include/Downgrades.hpp"
 #include "prx/libSceAgcDriver/Unified/include/FaultSites.hpp"
 #include "prx/libSceAgcDriver/Unified/include/Front.hpp"
@@ -42,7 +43,7 @@ namespace {
 
 bool drawScope() {
     static const bool scoped = [] {
-        const char* value = std::getenv("APS5_RECODE_MEMORY");
+        const char* value = RouteValue("APS5_RECODE_MEMORY");
         return value != nullptr && std::strcmp(value, "draws") == 0;
     }();
     return scoped;
@@ -332,7 +333,7 @@ bool Active() {
 }
 
 bool MemoryActive() {
-    static const bool active = std::getenv("APS5_RECODE_MEMORY") != nullptr;
+    static const bool active = RouteValue("APS5_RECODE_MEMORY") != nullptr;
     return active;
 }
 

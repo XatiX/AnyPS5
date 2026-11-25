@@ -1,4 +1,5 @@
 #include "prx/libSceAgcDriver/Unified/include/ResidencyService.hpp"
+#include "prx/libSceAgcDriver/Unified/include/RouteDefaults.hpp"
 #include "prx/libSceAgcDriver/Execution/include/GuestMemory.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/Recorder.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/Resources.hpp"
@@ -36,7 +37,7 @@ ResidencyService& ResidencyService::Get() {
 }
 
 bool ResidencyService::Enabled() {
-    static const bool enabled = std::getenv("APS5_RECODE_MEMORY") != nullptr && std::getenv("APS5_RECODE_NO_RESIDENCY") == nullptr;
+    static const bool enabled = RouteValue("APS5_RECODE_MEMORY") != nullptr && std::getenv("APS5_RECODE_NO_RESIDENCY") == nullptr;
     return enabled;
 }
 

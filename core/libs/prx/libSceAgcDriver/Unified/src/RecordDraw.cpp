@@ -1,4 +1,5 @@
 #include "prx/libSceAgcDriver/Unified/include/RecordDraw.hpp"
+#include "prx/libSceAgcDriver/Unified/include/RouteDefaults.hpp"
 #include "prx/libSceAgcDriver/Unified/include/RecordState.hpp"
 #include <cstdio>
 #include <cstdlib>
@@ -54,7 +55,7 @@ HandoffCounts Handoff::Counts() const {
 
 bool DrawActive() {
     static const bool active = [] {
-        const char* value = std::getenv("APS5_RECODE_RECORD");
+        const char* value = RouteValue("APS5_RECODE_RECORD");
         return value != nullptr && std::strcmp(value, "1") == 0;
     }();
     return active;

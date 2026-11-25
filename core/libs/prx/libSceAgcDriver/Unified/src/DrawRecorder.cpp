@@ -1,4 +1,5 @@
 #include "prx/libSceAgcDriver/Unified/include/DrawRecorder.hpp"
+#include "prx/libSceAgcDriver/Unified/include/RouteDefaults.hpp"
 #include "prx/libkernel/include/Api.hpp"
 #include "prx/libSceAgcDriver/Execution/include/GuestMemory.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Pm4.hpp"
@@ -5090,7 +5091,7 @@ DrawRecorder& shared() {
 
 bool RecordActive() {
     static const bool enabled = [] {
-        const auto* value = std::getenv("APS5_RECODE_DRAW");
+        const auto* value = RouteValue("APS5_RECODE_DRAW");
         return value != nullptr && std::string_view(value) == "record";
     }();
     return enabled;

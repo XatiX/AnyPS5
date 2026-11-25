@@ -1,4 +1,5 @@
 #include "prx/libSceAgcDriver/Unified/include/Programs.hpp"
+#include "prx/libSceAgcDriver/Unified/include/RouteDefaults.hpp"
 #include "prx/libSceAgcDriver/Unified/include/Downgrades.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/Diagnostics.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/Driver.hpp"
@@ -42,7 +43,7 @@ bool readOnlyDepthBoundsCompare() {
 
 bool tablesRouted() {
     static const bool enabled = [] {
-        const auto* value = std::getenv("APS5_RECODE_TABLES");
+        const auto* value = RouteValue("APS5_RECODE_TABLES");
         return value != nullptr && std::string_view(value) == "1";
     }();
     return enabled;

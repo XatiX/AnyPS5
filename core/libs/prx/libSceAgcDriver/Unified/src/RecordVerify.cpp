@@ -1,4 +1,5 @@
 #include "prx/libSceAgcDriver/Unified/include/RecordVerify.hpp"
+#include "prx/libSceAgcDriver/Unified/include/RouteDefaults.hpp"
 #include "prx/libSceAgcDriver/Unified/include/RecordState.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/Draw/DrawRegisterKey.hpp"
 #include <cstdio>
@@ -122,7 +123,7 @@ VerifyCounts Verifier::Counts() const {
 
 bool VerifyActive() {
     static const bool active = [] {
-        const char* value = std::getenv("APS5_RECODE_RECORD");
+        const char* value = RouteValue("APS5_RECODE_RECORD");
         return value != nullptr && std::strcmp(value, "verify") == 0;
     }();
     return active;
