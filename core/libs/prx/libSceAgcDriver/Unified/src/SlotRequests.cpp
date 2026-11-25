@@ -90,7 +90,7 @@ bool BuildSlotRequests(const ShaderRecompiler::CompiledShaderInfo& compiled, con
             }
             ++statistics.images;
             if (resource >= snapshot.images.size() || resource >= info.images.size() || resource >= info.runtimeImageModes.size()) {
-                reason = "image without a snapshot";
+                reason = "image without a snapshot (resource " + std::to_string(resource) + ", snapshot " + std::to_string(snapshot.images.size()) + ", images " + std::to_string(info.images.size()) + ", modes " + std::to_string(info.runtimeImageModes.size()) + ")";
                 return false;
             }
             const auto& descriptor = snapshot.images[resource].dwords;

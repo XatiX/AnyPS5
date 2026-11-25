@@ -283,6 +283,10 @@ bool materializeStage(const ProgramInputs& inputs, ShaderRecompiler::RecompileRe
     stage.variant = source->artifact;
     stage.shape = std::move(shape);
     stage.words = std::move(words);
+    stage.targetMerges.clear();
+    if (request.context.pixel && std::ranges::any_of(source->artifact->info.info.images, [](const ShaderRecompiler::ImageResource& image) { return image.targetMerge; })) {
+        for (const auto& merge : request.context.pixel->targetMerges) stage.targetMerges.push_back(merge.descriptor);
+    }
     return true;
 }
 

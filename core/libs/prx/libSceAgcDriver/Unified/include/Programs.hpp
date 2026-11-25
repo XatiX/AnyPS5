@@ -36,6 +36,7 @@ struct StageProgram {
     std::shared_ptr<const ShaderRecompiler::ResultTemplate> shape;
     ShaderRecompiler::TemplateWords words;
     std::vector<ShaderRecompiler::VertexAttribute> vertexAttributes;
+    std::vector<std::array<std::uint32_t, 8>> targetMerges;
 };
 
 enum ProgramPhase : std::size_t {

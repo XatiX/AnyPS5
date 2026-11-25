@@ -569,7 +569,20 @@ private:
             std::vector<Heap::SlotRequest> requests;
             if (stage.result->directHeap) {
                 Heap::SlotStatistics statistics;
-                if (!Heap::BuildSlotRequests(stage.variant->info, stage.capture->snapshot, requests, statistics, reason, storageDispatches() && (&counts == &dispatchTotals || storageDraws()))) {
+                const ShaderRecompiler::ResourceSnapshot* snapshot = &stage.capture->snapshot;
+                ShaderRecompiler::ResourceSnapshot merged;
+                if (!stage.targetMerges.empty() && snapshot->images.size() + stage.targetMerges.size() == stage.variant->info.info.images.size()) {
+                    merged = *snapshot;
+                    for (const auto& words : stage.targetMerges) {
+                        ShaderRecompiler::DescriptorValue descriptor;
+                        std::ranges::copy(words, descriptor.dwords.begin());
+                        descriptor.dwordCount = 8u;
+                        descriptor.availableDwordMask = 0xffu;
+                        merged.images.push_back(descriptor);
+                    }
+                    snapshot = &merged;
+                }
+                if (!Heap::BuildSlotRequests(stage.variant->info, *snapshot, requests, statistics, reason, storageDispatches() && (&counts == &dispatchTotals || storageDraws()))) {
                     refuse(counts, reason);
                     noteSlots(counts, slotsStarted);
                     return nullptr;
