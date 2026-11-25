@@ -26,6 +26,8 @@
 #include "Optimization/ShaderStageInputInfo.hpp"
 #include <atomic>
 #include <chrono>
+#include <condition_variable>
+#include <deque>
 #include <cstdio>
 #include <cstdlib>
 #include <exception>
@@ -35,6 +37,8 @@
 #include <mutex>
 #include <set>
 #include <span>
+#include <string_view>
+#include <thread>
 #include <utility>
 
 namespace AgcDriver::Unified::Resolve {
@@ -214,6 +218,37 @@ struct Totals {
     std::array<std::uint64_t, PhaseCount> phases{};
 };
 
+struct ResolveInput {
+    std::shared_ptr<const QueueState> state;
+    std::shared_ptr<const DriverDetail::Submission> held;
+    const DriverDetail::Submission* submission = nullptr;
+    std::vector<OperationGuard> ownedGuards;
+    const std::vector<OperationGuard>* guards = nullptr;
+
+    [[nodiscard]] const QueueState& Live() const { return *state; }
+    [[nodiscard]] const DriverDetail::Submission* CurrentSubmission() const { return submission; }
+    [[nodiscard]] const std::shared_ptr<const DriverDetail::Submission>& Held() const { return held; }
+    [[nodiscard]] const std::vector<OperationGuard>& Guards() const { return guards != nullptr ? *guards : ownedGuards; }
+};
+
+ResolveInput viewOf(const DecodeState& state) {
+    ResolveInput input;
+    input.state = std::shared_ptr<const QueueState>(std::shared_ptr<const QueueState>{}, &state.Live());
+    input.held = state.Held();
+    input.submission = state.CurrentSubmission();
+    input.guards = &state.Guards();
+    return input;
+}
+
+ResolveInput copyOf(const DecodeState& state) {
+    ResolveInput input;
+    input.state = std::make_shared<const QueueState>(state.Live());
+    input.held = state.Held();
+    input.submission = state.CurrentSubmission();
+    input.ownedGuards = state.Guards();
+    return input;
+}
+
 class Resolver {
 public:
     void Attach(const std::shared_ptr<VulkanDevice>& device) {
@@ -270,7 +305,7 @@ public:
         }
     }
 
-    static Loop::Item loopItem(const Operation& operation, std::shared_ptr<const ResolvedDraw> resolved, const DecodeState& state) {
+    static Loop::Item loopItem(const Operation& operation, std::shared_ptr<const ResolvedDraw> resolved, const ResolveInput& state) {
         Loop::Ensure(operation.queue);
         if (operation.kind == OpKind::Flip) {
             static const bool traced = std::getenv("APS5_RECODE_TRACE_LOOP") != nullptr;
@@ -306,7 +341,7 @@ public:
         return item;
     }
 
-    void Consume(const Operation& operation, const DecodeState& state) {
+    void Consume(const Operation& operation, const ResolveInput& state) {
         if (IsDispatch(operation.kind)) {
             if (!routesQueue(operation.queue)) return;
             std::shared_ptr<const ResolvedDraw> dispatch;
@@ -469,7 +504,7 @@ private:
     std::uint64_t storageRecordRefusals = 0;
     std::map<std::string, std::uint64_t> recordRefusalReasons;
 
-    std::shared_ptr<const ResolvedDraw> resolve(const Operation& operation, const DecodeState& state) {
+    std::shared_ptr<const ResolvedDraw> resolve(const Operation& operation, const ResolveInput& state) {
         totals.draws++;
         const auto* submission = state.CurrentSubmission();
         if (refill == nullptr || submission == nullptr || submission->shaders == nullptr) {
@@ -520,7 +555,7 @@ private:
         return resolveStages(totals, std::move(draw), programs, beforeTargets, slotsStarted);
     }
 
-    std::shared_ptr<const ResolvedDraw> resolveDispatch(const Operation& operation, const DecodeState& state) {
+    std::shared_ptr<const ResolvedDraw> resolveDispatch(const Operation& operation, const ResolveInput& state) {
         dispatchTotals.draws++;
         const auto* submission = state.CurrentSubmission();
         if (refill == nullptr || submission == nullptr || submission->shaders == nullptr) {
@@ -1049,12 +1084,85 @@ void Attach(const std::shared_ptr<VulkanDevice>& device) {
     if (Active()) shared().Attach(device);
 }
 
-void Consume(const Operation& operation, const DecodeState& state) {
+namespace {
+
+bool resolvesOnOwnThread() {
+    static const bool own = [] {
+        const char* value = RouteValue("APS5_RECODE_RESOLVE_THREAD");
+        return value != nullptr && std::string_view(value) == "1" && Loop::OwnsLoop();
+    }();
+    return own;
+}
+
+void consumeInput(const Operation& operation, const ResolveInput& input) {
     try {
-        shared().Consume(operation, state);
+        shared().Consume(operation, input);
     } catch (const std::exception& error) {
         shared().ConsumeFailed(operation, error.what());
     }
+}
+
+struct ResolveJobs {
+    static constexpr std::size_t Bound = 4096;
+    std::mutex mutex;
+    std::condition_variable ready;
+    std::condition_variable room;
+    std::deque<std::pair<Operation, ResolveInput>> jobs;
+    bool started = false;
+    std::uint64_t done = 0;
+    std::uint64_t busyNanoseconds = 0;
+    std::size_t deepest = 0;
+    std::chrono::steady_clock::time_point reported = std::chrono::steady_clock::now();
+};
+
+ResolveJobs& resolveJobs() {
+    static auto& jobs = *new ResolveJobs();
+    return jobs;
+}
+
+void resolveLoop() {
+    auto& jobs = resolveJobs();
+    std::unique_lock lock(jobs.mutex);
+    for (;;) {
+        jobs.ready.wait(lock, [&] { return !jobs.jobs.empty(); });
+        auto job = std::move(jobs.jobs.front());
+        jobs.jobs.pop_front();
+        jobs.room.notify_one();
+        lock.unlock();
+        const auto started = std::chrono::steady_clock::now();
+        consumeInput(job.first, job.second);
+        const auto finished = std::chrono::steady_clock::now();
+        lock.lock();
+        jobs.done++;
+        jobs.busyNanoseconds += static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(finished - started).count());
+        if (finished - jobs.reported >= std::chrono::seconds(10)) {
+            std::fprintf(stderr, "[recode-resolve-thread] stage (10 s): %llu operations, busy %.0f ms, deepest queue %zu\n", static_cast<unsigned long long>(jobs.done), static_cast<double>(jobs.busyNanoseconds) / 1e6, jobs.deepest);
+            jobs.reported = finished;
+            jobs.done = 0;
+            jobs.busyNanoseconds = 0;
+            jobs.deepest = 0;
+        }
+    }
+}
+
+}
+
+void Consume(const Operation& operation, const DecodeState& state) {
+    if (!resolvesOnOwnThread()) {
+        consumeInput(operation, viewOf(state));
+        return;
+    }
+    auto input = copyOf(state);
+    auto& jobs = resolveJobs();
+    std::unique_lock lock(jobs.mutex);
+    if (!jobs.started) {
+        jobs.started = true;
+        std::thread(resolveLoop).detach();
+    }
+    jobs.room.wait(lock, [&] { return jobs.jobs.size() < ResolveJobs::Bound; });
+    jobs.jobs.emplace_back(operation, std::move(input));
+    jobs.deepest = std::max(jobs.deepest, jobs.jobs.size());
+    jobs.ready.notify_one();
 }
 
 std::string Line() {
