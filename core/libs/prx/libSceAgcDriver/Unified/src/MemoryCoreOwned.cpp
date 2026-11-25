@@ -392,6 +392,13 @@ void MemoryCore::resolverLoop() {
     }
 }
 
+bool MemoryCore::GpuWritesPending(std::uint64_t address, std::uint64_t size) const {
+    if (size == 0 || !written.Any(address, size)) return false;
+    auto* current = host.load(std::memory_order_acquire);
+    if (current == nullptr) return false;
+    return written.Pending(address, size) > current->Completed();
+}
+
 void MemoryCore::FlushGpuWrites(std::uint64_t address, std::uint64_t size) {
     if (size == 0 || !written.Any(address, size)) return;
     auto* current = host.load(std::memory_order_acquire);

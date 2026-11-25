@@ -620,6 +620,15 @@ void LandGpuWrites(GuestRanges ranges) {
     for (const auto& piece : pieces) core.LandGpuWrite(piece.guest, piece.bytes, GuestMemory::OwnStoreTarget(piece.guest, piece.bytes.size()));
 }
 
+void NoteDriverStore(std::uint64_t address, std::uint64_t bytes) {
+    if (bytes == 0u) return;
+    if (ResidentDrawInputs()) {
+        const std::array written{std::pair{address, address + bytes}};
+        NoteGpuWrites(written);
+    }
+    coreNoteWritten(static_cast<std::uintptr_t>(address), static_cast<std::size_t>(bytes));
+}
+
 bool ResidentDrawInputs() {
     static const bool resident = [] {
         if (std::getenv("APS5_RECODE_IMPORTED_INPUTS") != nullptr) return false;

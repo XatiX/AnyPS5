@@ -5,6 +5,7 @@
 #include "prx/libSceAgcDriver/Unified/include/RecordQueue.hpp"
 #include "prx/libSceAgcDriver/Unified/include/Releases.hpp"
 #include "prx/libSceAgcDriver/Unified/include/Resolve.hpp"
+#include "prx/libSceAgcDriver/Unified/include/Shadow.hpp"
 #include "prx/libSceAgcDriver/Execution/include/GuestMemory.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Pm4.hpp"
 #include "prx/libSceAgcDriver/Execution/include/VulkanDevice.hpp"
@@ -55,6 +56,8 @@ struct Totals {
     std::atomic<std::uint64_t> constantRamDumps{0};
     std::atomic<std::uint64_t> refreshedSegments{0};
     std::atomic<std::uint64_t> flipsReleased{0};
+    std::atomic<std::uint64_t> copiedBytes{0};
+    std::atomic<std::uint64_t> copiesOnGpu{0};
     std::atomic<std::uint64_t> flipsReleasedByWorker{0};
     std::atomic<std::uint64_t> guarded{0};
     std::atomic<std::uint64_t> skipped{0};
@@ -118,6 +121,42 @@ bool reached(const Progress& progress, std::uint64_t submission, std::uint32_t o
     return progress.any && (progress.submission > submission || (progress.submission == submission && progress.offset >= offset));
 }
 
+struct PendingLabels {
+    std::mutex mutex;
+    std::multimap<std::uint64_t, std::uint64_t> ranges;
+};
+
+PendingLabels& pendingLabels() {
+    static PendingLabels held;
+    return held;
+}
+
+void notePendingLabel(std::uint64_t address, std::uint64_t bytes) {
+    auto& shared = pendingLabels();
+    std::lock_guard lock(shared.mutex);
+    shared.ranges.emplace(address, address + bytes);
+}
+
+void dropPendingLabel(std::uint64_t address, std::uint64_t bytes) {
+    auto& shared = pendingLabels();
+    std::lock_guard lock(shared.mutex);
+    const auto [first, last] = shared.ranges.equal_range(address);
+    for (auto it = first; it != last; ++it) {
+        if (it->second != address + bytes) continue;
+        shared.ranges.erase(it);
+        return;
+    }
+}
+
+bool LabelsPending(std::uint64_t address, std::uint64_t bytes) {
+    auto& shared = pendingLabels();
+    std::lock_guard lock(shared.mutex);
+    for (auto it = shared.ranges.begin(); it != shared.ranges.end() && it->first < address + bytes; ++it) {
+        if (it->second > address) return true;
+    }
+    return false;
+}
+
 using FlipKey = std::tuple<std::uint32_t, std::uint64_t, std::uint32_t>;
 
 struct FlipHandOver {
@@ -156,20 +195,22 @@ public:
         busy = &progress;
         auto reported = std::chrono::steady_clock::now();
         for (;;) {
+            stage("waiting for operations");
             auto item = items.Pop(std::chrono::milliseconds(1));
             if (std::chrono::steady_clock::now() - reported > std::chrono::seconds(10)) {
                 reported = std::chrono::steady_clock::now();
-                std::fprintf(stderr, "[recode-loop] queue 0x%x: %s%s\n", queue, Line().c_str(), stuckLine().c_str());
+                std::fprintf(stderr, "[recode-loop] queue 0x%x: %s%s\n[recode-loop] queue 0x%x stages (10 s): %s\n", queue, Line().c_str(), stuckLine().c_str(), queue, stageLine().c_str());
             }
             if (!item) {
+                stage("reaping while idle");
                 settleIdle();
                 continue;
             }
+            stage("operation");
             lastWork = std::chrono::steady_clock::now();
             progress.busySubmission.store(item->operation.submission, std::memory_order_relaxed);
             progress.busyOffset.store(item->operation.packetOffset, std::memory_order_relaxed);
             progress.busyOpcode.store(item->operation.opcode, std::memory_order_relaxed);
-            progress.stage.store("operation", std::memory_order_relaxed);
             progress.busySince.store(nowNanoseconds(), std::memory_order_release);
             try {
                 if (item->guards.empty() || guardsPass(*item)) handle(*item);
@@ -289,8 +330,8 @@ private:
         return true;
     }
 
-    void settle(VulkanDevice& device) {
-        stage("settling recorded work");
+    void settle(VulkanDevice& device, const char* why = "settling recorded work") {
+        stage(why);
         for (;;) {
             {
                 GuestMemory::TagGpuLockSite(GuestMemory::GpuLockSite::Wait);
@@ -307,7 +348,9 @@ private:
 
     bool evaluate(const OperationGuard& guard) {
         totals().conditionsRead.fetch_add(1, std::memory_order_relaxed);
-        if (const auto device = Resolve::AttachedDevice()) settle(*device);
+        const auto conditionAddress = guard.condition ? (static_cast<std::uint64_t>(guard.words[1]) | (static_cast<std::uint64_t>(guard.words[2]) << 32u)) : guard.predication.address;
+        const auto conditionBytes = guard.condition ? 4u : Pm4::PredicationBytes(guard.predication);
+        if (const auto device = Resolve::AttachedDevice(); device != nullptr && (guard.predication.operation == 1u || MemoryCore::Get().GpuWritesPending(conditionAddress, conditionBytes) || LabelsPending(conditionAddress, conditionBytes))) settle(*device, guard.predication.operation == 1u ? "settling for a Z-pass condition" : MemoryCore::Get().GpuWritesPending(conditionAddress, conditionBytes) ? "settling for a GPU-written condition" : "settling for a label condition");
         stage("reading a condition");
         if (guard.condition) {
             const auto address = static_cast<std::uint64_t>(guard.words[1]) | (static_cast<std::uint64_t>(guard.words[2]) << 32u);
@@ -366,13 +409,16 @@ private:
         }
         std::vector<std::pair<std::uint64_t, std::uint64_t>> reads;
         std::string reason;
+        stage("draw precheck");
         if (!Record::RecordPrecheck(*item.resolved, *item.parameters, reads, reason)) {
             Record::RefuseUnrecorded("draw", codeOf(item), reason);
             totals().refused.fetch_add(1, std::memory_order_relaxed);
             return;
         }
+        stage("GPU mutex wait");
         GuestMemory::TagGpuLockSite(GuestMemory::GpuLockSite::Draw);
         std::lock_guard lock(GuestMemory::GpuMutex());
+        stage("recording a draw");
         if (Record::RecordResolved(device.graphicsContext(), *item.resolved, *item.parameters, reason)) totals().draws.fetch_add(1, std::memory_order_relaxed);
         drawnSinceSeal = true;
     }
@@ -393,13 +439,16 @@ private:
         }
         const auto context = device.graphicsContext();
         std::string reason;
+        stage("dispatch precheck");
         if (!Record::RecordDispatchPrecheck(context, device, *item.resolved, reason)) {
             Record::RefuseUnrecorded("dispatch", codeOf(item), reason);
             totals().refused.fetch_add(1, std::memory_order_relaxed);
             return;
         }
+        stage("GPU mutex wait");
         GuestMemory::TagGpuLockSite(GuestMemory::GpuLockSite::Dispatch);
         std::lock_guard lock(GuestMemory::GpuMutex());
+        stage("recording a dispatch");
         if (Record::RecordDispatch(device.graphicsContext(), *item.resolved, item.groups, reason)) totals().dispatches.fetch_add(1, std::memory_order_relaxed);
     }
 
@@ -419,7 +468,12 @@ private:
             return;
         }
         std::vector<std::byte> held(bytes.begin(), bytes.end());
-        if (context.recorder->AfterRecordedWork([address, held] { GuestMemory::Write(address, held, 1); })) return;
+        notePendingLabel(address, bytes.size());
+        if (context.recorder->AfterRecordedWork([address, held] {
+                GuestMemory::Write(address, held, 1);
+                dropPendingLabel(address, held.size());
+            })) return;
+        dropPendingLabel(address, bytes.size());
         GuestMemory::Write(address, bytes, 1);
         totals().labelsAtOnce.fetch_add(1, std::memory_order_relaxed);
     }
@@ -437,17 +491,39 @@ private:
     }
 
     void landNow(VulkanDevice& device, std::span<const std::uint32_t> words) {
-        if (const auto copy = memoryCopyOf(words)) {
-            settle(device);
+        auto copy = memoryCopyOf(words);
+        if (!copy && words.size() == 7u && ((words[0] >> 8u) & 0xffu) == 0x50u) {
+            const auto end = [&](std::uint32_t select, std::uint32_t low, std::uint32_t high) -> std::optional<std::uint64_t> {
+                if (select == 0u || select == 3u) return static_cast<std::uint64_t>(low) | (static_cast<std::uint64_t>(high) << 32u);
+                if (select == Pm4::DmaSelectGds) return Pm4::GdsAddress() + low;
+                return std::nullopt;
+            };
+            const auto from = end(Pm4::DmaSource(words), words[2], words[3]);
+            const auto to = end(Pm4::DmaDestination(words), words[4], words[5]);
+            const auto bytes = Pm4::DmaBytes(words);
+            if (from && to && bytes != 0u && (*from + bytes <= *to || *to + bytes <= *from)) copy = Pm4::MemoryCopy{*from, *to, bytes};
+        }
+        if (copy) {
+            if (MemoryCore::Get().GpuWritesPending(copy->source, copy->bytes)) settle(device, "settling for a copy source");
             stage("landing a copy source");
             MemoryCore::Get().FlushGpuWrites(copy->source, copy->bytes);
-            stage("copying on the CPU");
+            stage("reading a copy source");
+            totals().copiedBytes.fetch_add(copy->bytes, std::memory_order_relaxed);
             std::vector<std::byte> bytes(copy->bytes);
-            GuestMemory::Read(copy->source, bytes, 1);
-            GuestMemory::Write(copy->destination, bytes, 1);
+            if (GuestMemory::Accessible(reinterpret_cast<const void*>(static_cast<std::uintptr_t>(copy->source)), bytes.size())) std::memcpy(bytes.data(), reinterpret_cast<const void*>(static_cast<std::uintptr_t>(copy->source)), bytes.size());
+            else GuestMemory::Read(copy->source, bytes, 1);
+            stage("writing a copy destination");
+            if (GuestMemory::Accessible(reinterpret_cast<const void*>(static_cast<std::uintptr_t>(copy->destination)), bytes.size(), true)) {
+                std::memcpy(reinterpret_cast<void*>(static_cast<std::uintptr_t>(copy->destination)), bytes.data(), bytes.size());
+                Shadow::NoteDriverStore(copy->destination, bytes.size());
+            } else {
+                GuestMemory::Write(copy->destination, bytes, 1);
+            }
             return;
         }
-        stage("run-time store on the CPU");
+        const auto storeOpcode = (words[0] >> 8u) & 0xffu;
+        const auto clock = storeOpcode == 0x40u && words.size() >= 2u && Pm4::CopyDataSource(words) == Pm4::CopyDataGpuClockSource;
+        stage(storeOpcode == 0x50u ? "run-time DMA on the CPU" : clock ? "GPU clock store on the CPU" : storeOpcode == 0x40u ? "run-time COPY_DATA on the CPU" : "run-time store on the CPU");
         static const QueueState unwritten{};
         if (const auto resolved = Pm4::ResolveStore(words, unwritten, std::numeric_limits<std::size_t>::max())) {
             const auto bytes = resolved->Bytes();
@@ -516,7 +592,10 @@ private:
             const auto copy = memoryCopyOf(item.words);
             if (copy) {
                 totals().copies.fetch_add(1, std::memory_order_relaxed);
-                if (Record::StoresToMirror(copy->bytes, copy->destination) && Record::CopyInMirror(context, *context.recorder, *copy)) continue;
+                if (Record::StoresToMirror(copy->bytes, copy->destination) && Record::CopyInMirror(context, *context.recorder, *copy)) {
+                    totals().copiesOnGpu.fetch_add(1, std::memory_order_relaxed);
+                    continue;
+                }
                 totals().copiesOnCpu.fetch_add(1, std::memory_order_relaxed);
             } else {
                 totals().runTimeStores.fetch_add(1, std::memory_order_relaxed);
@@ -568,13 +647,38 @@ private:
         std::uint64_t value = 0;
     };
 
-    void stage(const char* name) const {
+    void stage(const char* name) {
         if (busy != nullptr) busy->stage.store(name, std::memory_order_relaxed);
+        const auto now = std::chrono::steady_clock::now();
+        const auto spent = static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(now - stageSince).count());
+        stageSince = now;
+        const auto found = std::find_if(stageTimes.begin(), stageTimes.end(), [&](const auto& entry) { return entry.first == stageName; });
+        if (found != stageTimes.end()) found->second += spent;
+        else stageTimes.emplace_back(stageName, spent);
+        stageName = name;
+    }
+
+    std::string stageLine() {
+        stage(stageName);
+        std::uint64_t total = 0;
+        for (const auto& entry : stageTimes) total += entry.second;
+        std::string line;
+        char text[128];
+        for (const auto& [name, spent] : stageTimes) {
+            if (spent * 1000u < total) continue;
+            std::snprintf(text, sizeof(text), "%s%s %.0f ms", line.empty() ? "" : ", ", name, static_cast<double>(spent) / 1e6);
+            line += text;
+        }
+        stageTimes.clear();
+        return line;
     }
 
     std::uint32_t queue;
     Progress* busy = nullptr;
     bool drawnSinceSeal = false;
+    const char* stageName = "idle";
+    std::chrono::steady_clock::time_point stageSince = std::chrono::steady_clock::now();
+    std::vector<std::pair<const char*, std::uint64_t>> stageTimes;
     std::array<Decided, 8> decided{};
     std::size_t decidedNext = 0;
     std::array<Stored, 6> recent{};
@@ -680,8 +784,8 @@ LoopCounts Counts() {
 std::string Line() {
     const auto counts = Counts();
     char text[1024];
-    std::snprintf(text, sizeof(text), "draws %llu, dispatches %llu, refused %llu; label stores %llu (%llu at once on the CPU), interrupts %llu; waits %llu (%llu from the label table, %llu from guest memory, %llu polls); copies %llu (%llu on the CPU in stream order); run-time stores %llu (%llu refused); occlusion dumps %llu; constant RAM dumps %llu; indirect buffers changed after decode %llu; pass write seals %llu; flips %llu (%llu released by the loop, %llu by the worker); guarded operations %llu (%llu skipped, %llu conditions read); predicated operations with no guard %llu; idle reaps %llu",
-                  static_cast<unsigned long long>(counts.draws), static_cast<unsigned long long>(counts.dispatches), static_cast<unsigned long long>(counts.refused), static_cast<unsigned long long>(counts.labels), static_cast<unsigned long long>(counts.labelsAtOnce), static_cast<unsigned long long>(counts.interrupts), static_cast<unsigned long long>(counts.waits), static_cast<unsigned long long>(counts.waitsFromTable), static_cast<unsigned long long>(counts.waitsFromGuest), static_cast<unsigned long long>(counts.waitPolls), static_cast<unsigned long long>(counts.copies), static_cast<unsigned long long>(counts.copiesOnCpu), static_cast<unsigned long long>(totals().runTimeStores.load()), static_cast<unsigned long long>(totals().runTimeRefused.load()), static_cast<unsigned long long>(totals().sampleDumps.load()), static_cast<unsigned long long>(totals().constantRamDumps.load()), static_cast<unsigned long long>(totals().refreshedSegments.load()), static_cast<unsigned long long>(totals().seals.load()), static_cast<unsigned long long>(counts.flips), static_cast<unsigned long long>(totals().flipsReleased.load()), static_cast<unsigned long long>(totals().flipsReleasedByWorker.load()), static_cast<unsigned long long>(totals().guarded.load()), static_cast<unsigned long long>(totals().skipped.load()), static_cast<unsigned long long>(totals().conditionsRead.load()), static_cast<unsigned long long>(totals().predicated.load()), static_cast<unsigned long long>(totals().idleReaps.load()));
+    std::snprintf(text, sizeof(text), "draws %llu, dispatches %llu, refused %llu; label stores %llu (%llu at once on the CPU), interrupts %llu; waits %llu (%llu from the label table, %llu from guest memory, %llu polls); copies %llu (%llu on the CPU in stream order, %.1f MiB; %llu in the mirror); run-time stores %llu (%llu refused); occlusion dumps %llu; constant RAM dumps %llu; indirect buffers changed after decode %llu; pass write seals %llu; flips %llu (%llu released by the loop, %llu by the worker); guarded operations %llu (%llu skipped, %llu conditions read); predicated operations with no guard %llu; idle reaps %llu",
+                  static_cast<unsigned long long>(counts.draws), static_cast<unsigned long long>(counts.dispatches), static_cast<unsigned long long>(counts.refused), static_cast<unsigned long long>(counts.labels), static_cast<unsigned long long>(counts.labelsAtOnce), static_cast<unsigned long long>(counts.interrupts), static_cast<unsigned long long>(counts.waits), static_cast<unsigned long long>(counts.waitsFromTable), static_cast<unsigned long long>(counts.waitsFromGuest), static_cast<unsigned long long>(counts.waitPolls), static_cast<unsigned long long>(counts.copies), static_cast<unsigned long long>(counts.copiesOnCpu), static_cast<double>(totals().copiedBytes.load()) / 1048576.0, static_cast<unsigned long long>(totals().copiesOnGpu.load()), static_cast<unsigned long long>(totals().runTimeStores.load()), static_cast<unsigned long long>(totals().runTimeRefused.load()), static_cast<unsigned long long>(totals().sampleDumps.load()), static_cast<unsigned long long>(totals().constantRamDumps.load()), static_cast<unsigned long long>(totals().refreshedSegments.load()), static_cast<unsigned long long>(totals().seals.load()), static_cast<unsigned long long>(counts.flips), static_cast<unsigned long long>(totals().flipsReleased.load()), static_cast<unsigned long long>(totals().flipsReleasedByWorker.load()), static_cast<unsigned long long>(totals().guarded.load()), static_cast<unsigned long long>(totals().skipped.load()), static_cast<unsigned long long>(totals().conditionsRead.load()), static_cast<unsigned long long>(totals().predicated.load()), static_cast<unsigned long long>(totals().idleReaps.load()));
     return text;
 }
 

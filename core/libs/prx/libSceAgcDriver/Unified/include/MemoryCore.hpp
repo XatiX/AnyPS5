@@ -133,6 +133,7 @@ public:
     void TrackGpuShared(std::uint64_t address, std::uint64_t size);
     void LandDiff(std::uint64_t address, std::span<const std::byte> before, std::span<const std::byte> after, std::uint64_t serial);
     void FlushGpuWrites(std::uint64_t address, std::uint64_t size);
+    [[nodiscard]] bool GpuWritesPending(std::uint64_t address, std::uint64_t size) const;
     void LandAhead();
     void LandOpened();
     [[nodiscard]] std::vector<DirtyRange> WithoutGpuWritten(std::span<const DirtyRange> ranges) const;

@@ -46,6 +46,7 @@ bool ServeOwned(const Graphics::Context& context, std::uint64_t address, std::ui
 void ServeFaultPages(std::span<const std::uint64_t> pages);
 void LandGpuWrites(GuestRanges ranges);
 bool ResidentDrawInputs();
+void NoteDriverStore(std::uint64_t address, std::uint64_t bytes);
 void NoteGpuWrites(GuestRanges ranges);
 bool OwnedUploadsPending();
 void ConsumeNow();
