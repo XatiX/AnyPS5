@@ -209,6 +209,11 @@ bool earlierWorkElsewhere(std::uint32_t self, std::uint64_t submission) {
     return false;
 }
 
+std::atomic<std::uint64_t>& submitRequest() {
+    static std::atomic<std::uint64_t> requested{0};
+    return requested;
+}
+
 struct WaitNote {
     std::uint64_t submission = 0;
     std::uint32_t offset = 0;
@@ -284,6 +289,7 @@ public:
                 progress.any = true;
             }
             progress.advanced.notify_all();
+            if (submitRequest().load(std::memory_order_relaxed) != 0u) honourSubmitRequest();
         }
     }
 
@@ -306,8 +312,23 @@ private:
         std::fprintf(stderr, "[recode-loop] queue 0x%x idle %.1f s, recorder %s; last label stores:%s\n%s\n", queue, std::chrono::duration<double>(now - lastWork).count(), recorder == nullptr ? "none" : recorder->Idle() ? "idle" : "busy", line.c_str(), Releases::Line().c_str());
     }
 
+    void honourSubmitRequest() {
+        const auto requested = submitRequest().load(std::memory_order_acquire);
+        if (requested == 0u) return;
+        const auto device = Resolve::AttachedDevice();
+        if (device == nullptr) return;
+        GuestMemory::TagGpuLockSite(GuestMemory::GpuLockSite::Wait);
+        std::lock_guard lock(GuestMemory::GpuMutex());
+        auto* recorder = device->graphicsContext().recorder;
+        if (recorder == nullptr) return;
+        if (recorder->Submissions() < requested && !recorder->Idle()) recorder->Submit();
+        auto expected = requested;
+        if (recorder->Submissions() >= requested || recorder->Idle()) submitRequest().compare_exchange_strong(expected, 0u, std::memory_order_acq_rel);
+    }
+
     void settleIdle() {
         reportIdle();
+        honourSubmitRequest();
         const auto device = Resolve::AttachedDevice();
         if (device == nullptr) return;
         GuestMemory::TagGpuLockSite(GuestMemory::GpuLockSite::Wait);
@@ -940,6 +961,13 @@ bool WaitPassed(std::uint32_t queue, std::uint64_t submission, std::uint32_t pac
 LoopCounts Counts() {
     const auto& held = totals();
     return {held.draws.load(), held.dispatches.load(), held.refused.load(), held.labels.load(), held.labelsAtOnce.load(), held.interrupts.load(), held.waits.load(), held.waitsFromTable.load(), held.waitsFromGuest.load(), held.waitPolls.load(), held.copies.load(), held.copiesOnCpu.load(), held.flips.load()};
+}
+
+void RequestSubmit(std::uint64_t serial) {
+    auto& requested = submitRequest();
+    auto current = requested.load(std::memory_order_acquire);
+    while (current < serial && !requested.compare_exchange_weak(current, serial, std::memory_order_acq_rel)) {
+    }
 }
 
 void PrintRecentWaits() {

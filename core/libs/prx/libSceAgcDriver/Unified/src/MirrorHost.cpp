@@ -3,6 +3,8 @@
 #include "prx/libSceAgcDriver/Execution/include/VulkanDevice.hpp"
 #include "prx/libSceAgcDriver/Unified/include/Images.hpp"
 #include "prx/libSceAgcDriver/Unified/include/MemoryCore.hpp"
+#include "prx/libSceAgcDriver/Unified/include/RecordLoop.hpp"
+#include "prx/libSceAgcDriver/Unified/include/RecordQueue.hpp"
 #include "prx/libSceAgcDriver/Unified/include/Resolve.hpp"
 #include "prx/libSceAgcDriver/Unified/include/ResidencyService.hpp"
 #include <algorithm>
@@ -84,6 +86,12 @@ public:
         if (held == nullptr) return false;
         if (held->CompletedEpoch() >= serial) return true;
         auto& gpu = GuestMemory::GpuMutex();
+        if (Loop::OwnsLoop() && !gpu.HeldByThisThread()) {
+            Loop::RequestSubmit(serial);
+            for (int tries = 0; tries < SubmitTries && held->SubmittedEpoch() < serial; ++tries) std::this_thread::sleep_for(std::chrono::microseconds(500));
+            if (held->SubmittedEpoch() < serial) return false;
+            return held->WaitRecordedFor(serial, WaitNanoseconds);
+        }
         for (int tries = 0; tries < SubmitTries && held->SubmittedEpoch() < serial; ++tries) {
             if (gpu.try_lock()) {
                 if (held->SubmittedEpoch() < serial) held->SubmitRecorded(false);

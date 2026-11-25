@@ -39,6 +39,7 @@ bool WaitPassed(std::uint32_t queue, std::uint64_t submission, std::uint32_t pac
 [[nodiscard]] LoopCounts Counts();
 [[nodiscard]] std::string Line();
 void PrintRecentWaits();
+void RequestSubmit(std::uint64_t serial);
 
 }
 
