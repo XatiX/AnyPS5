@@ -1,4 +1,5 @@
 #include "prx/libSceAgcDriver/Unified/include/DrawRecorder.hpp"
+#include "prx/libSceAgcDriver/Unified/include/RecordLoop.hpp"
 #include "prx/libSceAgcDriver/Unified/include/RouteDefaults.hpp"
 #include "prx/libkernel/include/Api.hpp"
 #include "prx/libSceAgcDriver/Execution/include/GuestMemory.hpp"
@@ -266,6 +267,7 @@ void watchOpenBatches() {
                     const auto& [batchSerial, line] = programs.recent[(programs.recentNext + index) % programs.recent.size()];
                     if (!line.empty() && batchSerial + window >= serial && batchSerial <= serial) std::fprintf(stderr, "[recode-hang-history] %s\n", line.c_str());
                 }
+                Loop::PrintRecentWaits();
             }
         }
     }

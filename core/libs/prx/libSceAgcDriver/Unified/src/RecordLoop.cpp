@@ -189,6 +189,29 @@ void deliverInterrupt(std::uint32_t queue, std::uint32_t context) {
     totals().interrupts.fetch_add(1, std::memory_order_relaxed);
 }
 
+struct WaitNote {
+    std::uint64_t submission = 0;
+    std::uint32_t offset = 0;
+    std::uint64_t address = 0;
+    std::uint64_t reference = 0;
+    std::uint64_t mask = 0;
+    std::uint32_t function = 0;
+    std::uint64_t guest = 0;
+    char source = ' ';
+    double seconds = 0.0;
+    double at = 0.0;
+};
+
+struct WaitHistory {
+    std::mutex mutex;
+    std::map<std::uint32_t, std::pair<std::array<WaitNote, 64>, std::size_t>> rings;
+};
+
+WaitHistory& waitHistory() {
+    static WaitHistory history;
+    return history;
+}
+
 class Runner {
 public:
     explicit Runner(std::uint32_t queue) : queue(queue) {}
@@ -675,13 +698,16 @@ private:
         const auto compares = [&](std::uint64_t value) { return Pm4::WaitCompares(operation.function, operation.value, operation.mask, value); };
         const auto started = std::chrono::steady_clock::now();
         auto warned = started;
+        const auto readable = [&] { return GuestMemory::Accessible(reinterpret_cast<const void*>(static_cast<std::uintptr_t>(operation.address)), static_cast<std::size_t>(operation.size)); };
         for (;;) {
-            if (GuestMemory::Accessible(reinterpret_cast<const void*>(static_cast<std::uintptr_t>(operation.address)), static_cast<std::size_t>(operation.size)) && compares(Pm4::LoadLabel(operation.address, static_cast<std::size_t>(operation.size)))) {
+            if (readable() && compares(Pm4::LoadLabel(operation.address, static_cast<std::size_t>(operation.size)))) {
                 totals().waitsFromGuest.fetch_add(1, std::memory_order_relaxed);
+                noteWait(operation, 'g', Pm4::LoadLabel(operation.address, static_cast<std::size_t>(operation.size)), started);
                 return;
             }
             if (Labels::Table().IssuedAfter(operation.address, static_cast<std::size_t>(operation.size), 0u, compares)) {
                 totals().waitsFromTable.fetch_add(1, std::memory_order_relaxed);
+                noteWait(operation, 't', readable() ? Pm4::LoadLabel(operation.address, static_cast<std::size_t>(operation.size)) : 0u, started);
                 return;
             }
             totals().waitPolls.fetch_add(1, std::memory_order_relaxed);
@@ -700,6 +726,17 @@ private:
             }
             std::this_thread::sleep_for(std::chrono::microseconds(100));
         }
+    }
+
+    void noteWait(const auto& operation, char source, std::uint64_t guest, std::chrono::steady_clock::time_point started) const {
+        static const bool noted = std::getenv("APS5_RECODE_HANG_PROGRAMS") != nullptr;
+        if (!noted) return;
+        static const auto origin = std::chrono::steady_clock::now();
+        const auto now = std::chrono::steady_clock::now();
+        auto& history = waitHistory();
+        std::lock_guard lock(history.mutex);
+        auto& [ring, next] = history.rings[queue];
+        ring[next++ % ring.size()] = {operation.submission, static_cast<std::uint32_t>(operation.packetOffset), operation.address, operation.value, operation.mask, static_cast<std::uint32_t>(operation.function), guest, source, std::chrono::duration<double>(now - started).count(), std::chrono::duration<double>(now - origin).count()};
     }
 
     struct Stored {
@@ -845,6 +882,19 @@ bool WaitPassed(std::uint32_t queue, std::uint64_t submission, std::uint32_t pac
 LoopCounts Counts() {
     const auto& held = totals();
     return {held.draws.load(), held.dispatches.load(), held.refused.load(), held.labels.load(), held.labelsAtOnce.load(), held.interrupts.load(), held.waits.load(), held.waitsFromTable.load(), held.waitsFromGuest.load(), held.waitPolls.load(), held.copies.load(), held.copiesOnCpu.load(), held.flips.load()};
+}
+
+void PrintRecentWaits() {
+    auto& history = waitHistory();
+    std::lock_guard lock(history.mutex);
+    for (const auto& [queue, entry] : history.rings) {
+        const auto& [ring, next] = entry;
+        for (std::size_t index = 0; index < ring.size(); ++index) {
+            const auto& note = ring[(next + index) % ring.size()];
+            if (note.address == 0u) continue;
+            std::fprintf(stderr, "[recode-hang-wait] %.3f s queue 0x%x submission %llu offset %u at 0x%llx function %u ref 0x%llx mask 0x%llx passed by %s (guest 0x%llx) after %.3f s\n", note.at, queue, static_cast<unsigned long long>(note.submission), note.offset, static_cast<unsigned long long>(note.address), note.function, static_cast<unsigned long long>(note.reference), static_cast<unsigned long long>(note.mask), note.source == 'g' ? "guest memory" : "the label table", static_cast<unsigned long long>(note.guest), note.seconds);
+        }
+    }
 }
 
 std::string Line() {
