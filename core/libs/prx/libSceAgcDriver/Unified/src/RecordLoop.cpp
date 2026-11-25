@@ -61,6 +61,7 @@ struct Totals {
     std::atomic<std::uint64_t> copiedBytes{0};
     std::atomic<std::uint64_t> copiesOnGpu{0};
     std::atomic<std::uint64_t> copiesFromMirror{0};
+    std::atomic<std::uint64_t> submitsDeferred{0};
     std::atomic<std::uint64_t> flipsReleasedByWorker{0};
     std::atomic<std::uint64_t> guarded{0};
     std::atomic<std::uint64_t> skipped{0};
@@ -219,6 +220,7 @@ public:
             try {
                 if (!item->guards.empty()) stage("checking guards");
                 if (item->guards.empty() || guardsPass(*item)) handle(*item);
+                else if (item->operation.kind == OpKind::Flip) releaseFlip(*item);
                 else trace(*item, "skip");
                 stage("finishing an operation");
             } catch (const std::exception& error) {
@@ -401,6 +403,8 @@ private:
         totals().flips.fetch_add(1, std::memory_order_relaxed);
         auto& shared = flipHandOver();
         const FlipKey key{item.operation.queue, item.operation.submission, item.operation.packetOffset};
+        static const bool traced = std::getenv("APS5_RECODE_TRACE_LOOP") != nullptr;
+        if (traced) std::fprintf(stderr, "[recode-loop-trace] flip reached q%u submission %llu offset %u\n", item.operation.queue, static_cast<unsigned long long>(item.operation.submission), item.operation.packetOffset);
         std::function<void()> release;
         {
             std::lock_guard lock(shared.mutex);
@@ -511,6 +515,16 @@ private:
         return Pm4::MemoryCopy{from, to, bytes};
     }
 
+    void submitSoon(Graphics::Recorder& recorder) {
+        const auto now = std::chrono::steady_clock::now();
+        if (now - lastSubmit < std::chrono::microseconds(500)) {
+            totals().submitsDeferred.fetch_add(1, std::memory_order_relaxed);
+            return;
+        }
+        lastSubmit = now;
+        recorder.Submit();
+    }
+
     static void writeCopy(std::uint64_t destination, std::span<const std::byte> bytes) {
         if (GuestMemory::Accessible(reinterpret_cast<const void*>(static_cast<std::uintptr_t>(destination)), bytes.size(), true)) {
             std::memcpy(reinterpret_cast<void*>(static_cast<std::uintptr_t>(destination)), bytes.data(), bytes.size());
@@ -585,7 +599,7 @@ private:
         if (opcode == 0x37u || opcode == 0x49u) {
             if (const auto label = Pm4::DecodeLabelWrite(item.words)) {
                 storeBytes(context, label->address, label->Bytes());
-                context.recorder->Submit();
+                submitSoon(*context.recorder);
             }
             if (opcode == 0x49u && item.words.size() >= 8u && item.operation.function == 0u) {
                 const auto select = (item.words[2] >> 24u) & 7u;
@@ -593,7 +607,7 @@ private:
                     const auto interrupt = item.words[7] & 0x0fffffffu;
                     const auto target = queue;
                     if (!context.recorder->AfterRecordedWork([target, interrupt] { Record::AfterLandings([target, interrupt] { deliverInterrupt(target, interrupt); }); })) deliverInterrupt(target, interrupt);
-                    context.recorder->Submit();
+                    submitSoon(*context.recorder);
                 }
             }
             return;
@@ -719,6 +733,7 @@ private:
     std::uint32_t queue;
     Progress* busy = nullptr;
     bool drawnSinceSeal = false;
+    std::chrono::steady_clock::time_point lastSubmit{};
     const char* stageName = "idle";
     std::chrono::steady_clock::time_point stageSince = std::chrono::steady_clock::now();
     std::vector<std::pair<const char*, std::uint64_t>> stageTimes;
@@ -760,6 +775,8 @@ void TraceInterrupt(std::uint32_t queue, std::uint32_t context) {
 void HandFlip(std::uint32_t queue, std::uint64_t submission, std::uint32_t packetOffset, std::function<void()> release) {
     auto& shared = flipHandOver();
     const FlipKey key{queue, submission, packetOffset};
+    static const bool traced = std::getenv("APS5_RECODE_TRACE_LOOP") != nullptr;
+    if (traced) std::fprintf(stderr, "[recode-loop-trace] flip handed over q%u submission %llu offset %u\n", queue, static_cast<unsigned long long>(submission), packetOffset);
     {
         std::lock_guard lock(shared.mutex);
         if (shared.reached.erase(key) == 0u) {
@@ -800,6 +817,7 @@ bool Takes(std::span<const std::uint32_t> packet, std::uint32_t opcode, std::uin
                 if (packet.size() >= 6u && Pm4::CopyDataToRegister(packet)) return false;
                 return !Pm4::DecodeStores(packet).empty();
             case 0x50: case 0x83: return true;
+            case 0x22: case 0x3f: return true;
             case 0x46: case 0x58: return true;
             default: return false;
         }
@@ -830,7 +848,15 @@ std::string Line() {
     char text[1024];
     std::snprintf(text, sizeof(text), "draws %llu, dispatches %llu, refused %llu; label stores %llu (%llu at once on the CPU), interrupts %llu; waits %llu (%llu from the label table, %llu from guest memory, %llu polls); copies %llu (%llu on the CPU in stream order, %.1f MiB; %llu in the mirror; %llu read from the mirror after their batch); run-time stores %llu (%llu refused); occlusion dumps %llu; constant RAM dumps %llu; indirect buffers changed after decode %llu; pass write seals %llu; flips %llu (%llu released by the loop, %llu by the worker); guarded operations %llu (%llu skipped, %llu conditions read); predicated operations with no guard %llu; idle reaps %llu",
                   static_cast<unsigned long long>(counts.draws), static_cast<unsigned long long>(counts.dispatches), static_cast<unsigned long long>(counts.refused), static_cast<unsigned long long>(counts.labels), static_cast<unsigned long long>(counts.labelsAtOnce), static_cast<unsigned long long>(counts.interrupts), static_cast<unsigned long long>(counts.waits), static_cast<unsigned long long>(counts.waitsFromTable), static_cast<unsigned long long>(counts.waitsFromGuest), static_cast<unsigned long long>(counts.waitPolls), static_cast<unsigned long long>(counts.copies), static_cast<unsigned long long>(counts.copiesOnCpu), static_cast<double>(totals().copiedBytes.load()) / 1048576.0, static_cast<unsigned long long>(totals().copiesOnGpu.load()), static_cast<unsigned long long>(totals().copiesFromMirror.load()),static_cast<unsigned long long>(totals().runTimeStores.load()), static_cast<unsigned long long>(totals().runTimeRefused.load()), static_cast<unsigned long long>(totals().sampleDumps.load()), static_cast<unsigned long long>(totals().constantRamDumps.load()), static_cast<unsigned long long>(totals().refreshedSegments.load()), static_cast<unsigned long long>(totals().seals.load()), static_cast<unsigned long long>(counts.flips), static_cast<unsigned long long>(totals().flipsReleased.load()), static_cast<unsigned long long>(totals().flipsReleasedByWorker.load()), static_cast<unsigned long long>(totals().guarded.load()), static_cast<unsigned long long>(totals().skipped.load()), static_cast<unsigned long long>(totals().conditionsRead.load()), static_cast<unsigned long long>(totals().predicated.load()), static_cast<unsigned long long>(totals().idleReaps.load()));
-    return text;
+    std::size_t handed = 0;
+    std::size_t reached = 0;
+    {
+        auto& shared = flipHandOver();
+        std::lock_guard lock(shared.mutex);
+        handed = shared.handed.size();
+        reached = shared.reached.size();
+    }
+    return std::string(text) + "; label submits deferred " + std::to_string(totals().submitsDeferred.load()) + "; flips handed over but not reached " + std::to_string(handed) + ", reached but not handed over " + std::to_string(reached);
 }
 
 }
