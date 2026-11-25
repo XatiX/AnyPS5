@@ -961,7 +961,7 @@ private:
     std::optional<Heap::ResolvedSampler> sampler(const Heap::SlotRequest& request) {
         if (context->samplerCache == nullptr) return std::nullopt;
         try {
-            const auto found = context->samplerCache->Get(*context, std::span<const std::uint32_t>(request.words).first(4), (request.flags & Heap::RequestFlag::Compare) != 0u, false, true, false);
+            const auto found = context->samplerCache->Get(*context, std::span<const std::uint32_t>(request.words).first(4), (request.flags & Heap::RequestFlag::Compare) != 0u, (request.flags & Heap::RequestFlag::Unnormalized) != 0u, true, false);
             if (found == nullptr) return std::nullopt;
             return Heap::ResolvedSampler{reinterpret_cast<std::uint64_t>(found->Handle()), found};
         } catch (const std::exception& error) {

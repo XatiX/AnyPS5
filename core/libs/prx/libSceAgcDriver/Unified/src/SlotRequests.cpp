@@ -2,10 +2,13 @@
 #include "prx/libSceAgcDriver/Unified/include/Heap.hpp"
 #include "IntermediateRepresentation/IrMetadata/BufferFormat.hpp"
 #include "IntermediateRepresentation/IrProgram.hpp"
+#include "Optimization/DescriptorBindingBuilder.hpp"
 #include "Optimization/ResourceMaterializer.hpp"
 #include "RuntimeAbi.hpp"
 #include <algorithm>
 #include <exception>
+#include <optional>
+#include <string>
 
 namespace AgcDriver::Unified::Heap {
 
@@ -40,6 +43,7 @@ bool BuildSlotRequests(const ShaderRecompiler::CompiledShaderInfo& compiled, con
     requests.reserve(layout.directSlotCount);
     std::vector<std::uint32_t> modeOf(info.images.size(), NoSlot);
     std::size_t slots = 0;
+    std::optional<ShaderRecompiler::SamplerCoordinateFacts> coordinates;
     for (const auto& binding : layout.descriptors) {
         const bool samplerHeap = binding.kind == Kind::Samplers;
         const bool imageHeap = ShaderRecompiler::ImageBindingResourceClass(binding.kind) != ShaderRecompiler::ImageResourceClass::None;
@@ -64,6 +68,18 @@ bool BuildSlotRequests(const ShaderRecompiler::CompiledShaderInfo& compiled, con
                 }
                 std::copy_n(snapshot.samplers[resource].dwords.begin(), 4u, request.words.begin());
                 request.flags = RequestFlag::Sampler;
+                if ((request.words[0] & (1u << 15u)) != 0u) {
+                    if (!coordinates) {
+                        try {
+                            coordinates = ShaderRecompiler::ProveSamplerCoordinates(info, snapshot);
+                        } catch (const std::exception& error) {
+                            reason = std::string("sampler coordinates: ") + error.what();
+                            return false;
+                        }
+                    }
+                    if (resource < coordinates->coordinatesIgnored.size() && coordinates->coordinatesIgnored[resource]) request.words[0] &= ~(1u << 15u);
+                    else if (resource < coordinates->unnormalized.size() && coordinates->unnormalized[resource]) request.flags |= RequestFlag::Unnormalized;
+                }
                 if (comparesDepth(info, snapshot, resource)) request.flags |= RequestFlag::Compare;
                 if ((element & 1u) != 0u) {
                     request.words[2] = PointFilterWord(request.words[2]);

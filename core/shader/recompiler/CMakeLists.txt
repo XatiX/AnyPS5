@@ -295,6 +295,7 @@ function(add_shader_recompiler target runtimeTarget)
             PipelineSpecialization::WorkgroupOffsetWords
             PixelInput
             PixelInputBit
+            ProveSamplerCoordinates
             RayTracingStrict
             RayTracingMiss
             ReadWholeFile
