@@ -156,6 +156,7 @@ std::optional<DeviceSpan> ResidencyService::Serve(std::uint64_t address, std::ui
     }
     if (auto [at, added] = served.try_emplace(address, end); !added) at->second = std::max(at->second, end);
     const auto now = frame.load(std::memory_order_relaxed);
+    ledger->Touch(address, now);
     for (const auto& [from, to] : committed) {
         const auto first = std::max(from, address);
         const auto last = std::min(to, end);
@@ -200,7 +201,7 @@ bool ResidencyService::ServeFaultPage(std::uint64_t page, std::uint64_t allocati
             return false;
         }
     }
-    served.try_emplace(page, end);
+    if (served.try_emplace(page, end).second) ledger->Touch(page, now);
     ++faultPagesServed;
     return true;
 }
@@ -413,7 +414,10 @@ std::size_t ResidencyService::Record(VkCommandBuffer commands, std::vector<std::
         }
     }
     const auto now = frame.load(std::memory_order_relaxed);
-    for (const auto& [address, end] : served) ledger->Touch(address, now);
+    if (touchedFrame != now) {
+        for (const auto& [address, end] : served) ledger->Touch(address, now);
+        touchedFrame = now;
+    }
     auto taken = uploads->Take();
     if (taken.empty()) return 0;
     std::size_t uploadBytes = 0;

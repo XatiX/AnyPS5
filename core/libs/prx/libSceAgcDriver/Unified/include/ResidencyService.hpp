@@ -91,6 +91,7 @@ private:
     std::uint64_t readBackMissedBytes = 0;
     std::vector<std::pair<std::uint64_t, std::uint64_t>> queued;
     std::map<std::uint64_t, std::uint64_t> served;
+    std::uint64_t touchedFrame = 0;
     std::deque<std::shared_ptr<const std::vector<ShaderRecompiler::BdaAbi::Range>>> importSpaces;
     std::uint64_t importSerial = 0;
     std::uint64_t importMaps = 0;
