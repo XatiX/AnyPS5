@@ -22,6 +22,7 @@
 #include <map>
 #include <optional>
 #include <set>
+#include <string_view>
 #include <tuple>
 #include <mutex>
 #include <thread>
@@ -189,6 +190,23 @@ void deliverInterrupt(std::uint32_t queue, std::uint32_t context) {
     totals().interrupts.fetch_add(1, std::memory_order_relaxed);
 }
 
+bool earlierWorkElsewhere(std::uint32_t self, std::uint64_t submission) {
+    std::vector<std::pair<std::uint32_t, Progress*>> others;
+    {
+        std::lock_guard lock(progressMutex);
+        for (const auto& [queue, progress] : progresses) {
+            if (queue != self) others.emplace_back(queue, progress.get());
+        }
+    }
+    for (const auto& [queue, progress] : others) {
+        const std::string_view stage = progress->stage.load(std::memory_order_relaxed);
+        if (stage == "waiting on memory") continue;
+        if (progress->busySince.load(std::memory_order_acquire) != 0 && progress->busySubmission.load(std::memory_order_relaxed) < submission) return true;
+        if (const auto front = QueueFor(queue).FrontSubmission(); front && *front < submission) return true;
+    }
+    return false;
+}
+
 struct WaitNote {
     std::uint64_t submission = 0;
     std::uint32_t offset = 0;
@@ -233,6 +251,12 @@ public:
                 stage("reaping while idle");
                 settleIdle();
                 continue;
+            }
+            static const bool keepsSubmissionOrder = std::getenv("APS5_RECODE_SUBMISSION_ORDER") != nullptr;
+            if (keepsSubmissionOrder && (item->operation.kind == OpKind::Dispatch || item->operation.kind == OpKind::DispatchIndirect || IsDraw(item->operation.kind))) {
+                stage("yielding to earlier submissions");
+                const auto yieldStarted = std::chrono::steady_clock::now();
+                while (earlierWorkElsewhere(queue, item->operation.submission) && std::chrono::steady_clock::now() - yieldStarted < std::chrono::milliseconds(5)) std::this_thread::sleep_for(std::chrono::microseconds(50));
             }
             stage("operation");
             lastWork = std::chrono::steady_clock::now();
