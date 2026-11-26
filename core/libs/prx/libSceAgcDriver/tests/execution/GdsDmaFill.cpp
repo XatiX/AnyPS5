@@ -161,6 +161,31 @@ int main() {
         auto* secondOutput = GuestBlock();
         std::memcpy(code, AppendProgram.data(), sizeof(AppendProgram));
 
+        if (std::getenv("APS5_TEST_RECODE_GDS_COPY") != nullptr) {
+            const std::array<std::uint32_t, 4> initial{500u, 500u, 500u, 500u};
+            AgcDriver::GuestMemory::Write(AgcDriver::Pm4::GdsAddress() + CounterOffset, std::as_bytes(std::span(initial)), 4);
+            std::vector<std::uint32_t> commands;
+            AppendDispatch(commands, code, output);
+            Append(commands, CopyGdsTo(Address(readBack), CounterOffset, 4));
+            Append(commands, CopyToGds(Address(readBack), GdsOffset, 4));
+            Append(commands, CopyGdsTo(Address(secondOutput), GdsOffset, 4));
+            const auto label = Address(held);
+            Append(commands, std::array<std::uint32_t, 5>{0xc0033700u, 0x00100200u, static_cast<std::uint32_t>(label), static_cast<std::uint32_t>(label >> 32u), 1u});
+            Submit(std::move(commands));
+            const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(10);
+            std::uint32_t completed = 0;
+            while (completed != 1u && std::chrono::steady_clock::now() < deadline) {
+                AgcDriver::GuestMemory::Read(label, std::as_writable_bytes(std::span(&completed, 1)), 4);
+                if (completed != 1u) std::this_thread::sleep_for(std::chrono::milliseconds(1));
+            }
+            check(completed == 1u, "GDS copy completion label timed out");
+            std::uint32_t result = 0;
+            AgcDriver::GuestMemory::Read(Address(secondOutput), std::as_writable_bytes(std::span(&result, 1)), 4);
+            check(result == 532u, "GDS counter copied after a dispatch was " + std::to_string(result) + ", expected 532");
+            LibcRunShutdown_nid_postfix();
+            return 0;
+        }
+
         std::vector<std::uint32_t> words;
         AppendDispatch(words, code, output);
         Submit(std::move(words));

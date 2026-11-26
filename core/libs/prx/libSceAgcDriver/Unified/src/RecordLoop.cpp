@@ -786,6 +786,11 @@ private:
             const auto bytes = Pm4::DmaBytes(words);
             if (from && to && bytes != 0u && (*from + bytes <= *to || *to + bytes <= *from)) copy = Pm4::MemoryCopy{*from, *to, bytes};
         }
+        if (copy) {
+            const auto gds = Pm4::GdsAddress();
+            const auto overlapsGds = [&](std::uint64_t address) { return address < gds + Pm4::GdsBytes && gds < address + copy->bytes; };
+            if (overlapsGds(copy->source) || overlapsGds(copy->destination)) settle(device, "settling for a GDS copy");
+        }
         if (copy && copy->bytes <= GpuStoreLimit && MemoryCore::Get().GpuWritesPending(copy->source, copy->bytes)) {
             const std::array source{DirtyRange{copy->source, copy->bytes}};
             std::shared_ptr<Graphics::Buffer> landing;

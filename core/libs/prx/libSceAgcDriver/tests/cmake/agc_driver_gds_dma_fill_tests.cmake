@@ -1,7 +1,10 @@
 if(BUILD_TESTING)
+    add_test(NAME agc_driver_recode_gds_copy_order COMMAND agc_driver_gds_dma_fill_tests)
+    set_tests_properties(agc_driver_recode_gds_copy_order PROPERTIES TIMEOUT 30 ENVIRONMENT "ANYPS5_NO_SHADER_CACHE=1;APS5_RECODE_ROUTE=1;APS5_PROTECT_TRACKING=1;APS5_RECODE_MIRROR_WRITES=1;APS5_TEST_RECODE_GDS_COPY=1" SKIP_RETURN_CODE 77 WORKING_DIRECTORY "${CMAKE_SOURCE_DIR}")
     add_test(NAME agc_driver_gds_dma_fill_private COMMAND agc_driver_gds_dma_fill_tests)
     set_tests_properties(agc_driver_gds_dma_fill_private PROPERTIES TIMEOUT 30 ENVIRONMENT "ANYPS5_NO_SHADER_CACHE=1;APS5_NO_SHARED_GDS=1" SKIP_RETURN_CODE 77 WORKING_DIRECTORY "${CMAKE_SOURCE_DIR}")
     if(WIN32)
+        set_tests_properties(agc_driver_recode_gds_copy_order PROPERTIES ENVIRONMENT_MODIFICATION "PATH=path_list_prepend:$<TARGET_FILE_DIR:libc>")
         set_tests_properties(agc_driver_gds_dma_fill_private PROPERTIES ENVIRONMENT_MODIFICATION
             "PATH=path_list_prepend:$<TARGET_FILE_DIR:libc>")
     endif()
