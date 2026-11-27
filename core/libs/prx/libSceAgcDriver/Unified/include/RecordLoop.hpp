@@ -10,6 +10,7 @@
 namespace AgcDriver::Unified::Loop {
 
 using InterruptHook = void (*)(void* owner, std::uint32_t queue, std::uint32_t context);
+using CompletionHook = void (*)(void* owner, std::uint64_t serial);
 
 struct LoopCounts {
     std::uint64_t draws = 0;
@@ -28,6 +29,7 @@ struct LoopCounts {
 };
 
 void SetInterruptHook(InterruptHook hook, void* owner);
+void SetCompletionHook(CompletionHook hook, void* owner);
 [[nodiscard]] bool Takes(std::span<const std::uint32_t> packet, std::uint32_t opcode, std::uint32_t queue);
 void TraceKept(std::span<const std::uint32_t> packet, std::uint32_t opcode, std::uint32_t queue, std::uint64_t submission, std::size_t offset, bool flip);
 void HandFlip(std::uint32_t queue, std::uint64_t submission, std::uint32_t packetOffset, std::function<void()> release);

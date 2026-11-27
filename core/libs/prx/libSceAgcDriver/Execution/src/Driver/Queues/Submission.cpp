@@ -18,6 +18,8 @@
 #if ANYPS5_UNIFIED
 #include "prx/libSceAgcDriver/Execution/include/VulkanDevice.hpp"
 #include "prx/libSceAgcDriver/Unified/include/DrawRecorder.hpp"
+#include "prx/libSceAgcDriver/Unified/include/RecordLoop.hpp"
+#include "prx/libSceAgcDriver/Unified/include/RecordQueue.hpp"
 #include "prx/libSceAgcDriver/Unified/include/Shadow.hpp"
 #endif
 #include <algorithm>
@@ -1055,6 +1057,18 @@ void Driver::noteWaitBlocked(std::uint32_t queue, std::uint64_t awaited, bool bl
 void Driver::enqueue(Submission submission) {
 #if ANYPS5_UNIFIED
     if (Unified::Shadow::Teeing()) {
+        const bool routeOwned = Unified::Record::RecordActive() && Unified::Loop::OwnsLoop() && submission.rewindTail == nullptr;
+        if (routeOwned) {
+            Unified::Loop::SetInterruptHook([](void* owner, std::uint32_t target, std::uint32_t context) { static_cast<Driver*>(owner)->deliverGuestEopInterrupt(target, context); }, this);
+            Unified::Loop::SetCompletionHook([](void* owner, std::uint64_t serial) {
+                auto* self = static_cast<Driver*>(owner);
+                {
+                    std::lock_guard lock(self->mutex);
+                    self->markCompleted(serial);
+                }
+                self->changed.notify_all();
+            }, this);
+        }
         if (Unified::Record::RecordActive() && !submission.commands.empty()) {
             auto local = device.Load();
             if (local == nullptr) {
@@ -1065,7 +1079,16 @@ void Driver::enqueue(Submission submission) {
             }
             Unified::Shadow::NoteDevice(local);
         }
+        if (routeOwned) {
+            bool holds = submission.holdsFlip;
+            bool working = submission.flipWork != nullptr;
+            for (const auto& [cursor, flip] : submission.flips) handFlipToRecode(submission, cursor, std::exchange(holds, false), std::exchange(working, false));
+        }
         Unified::Shadow::Tee(submission);
+        if (routeOwned) {
+            if (submission.suspend || submission.commands.empty()) markCompleted(submission.serial);
+            return;
+        }
     }
 #endif
     const auto queue = submission.queue;

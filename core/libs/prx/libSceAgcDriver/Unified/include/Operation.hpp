@@ -16,6 +16,8 @@ enum class OpKind : std::uint8_t {
     Fill,
     Flip,
     Marker,
+    SubmissionEnd,
+    RenderingWait,
 };
 
 struct SnapshotIds {

@@ -727,6 +727,7 @@ std::shared_ptr<DriverDetail::Submission> Copy(const DriverDetail::Submission& s
     copy->shaders = submission.shaders;
     copy->flipHandles = submission.flipHandles;
     for (const auto& [cursor, request] : submission.flips) copy->flips.emplace(cursor, nullptr);
+    for (const auto& [cursor, wait] : submission.renderingWaits) copy->renderingWaits.emplace(cursor, wait);
     return copy;
 }
 

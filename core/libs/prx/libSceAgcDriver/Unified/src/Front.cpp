@@ -97,6 +97,12 @@ void Front::run(Lane& lane) {
         if (next->reset) lane.state.ResetQueueState();
         lane.state.Hold(next->submission);
         DecodeSubmission(*next->submission, lane.state, sink);
+        Operation end{};
+        end.kind = OpKind::SubmissionEnd;
+        end.queue = next->submission->queue;
+        end.submission = next->submission->serial;
+        end.packetOffset = static_cast<std::uint32_t>(next->submission->commands.size());
+        sink.Emit(end);
         lane.state.Hold(nullptr);
         const auto spent = std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - start).count();
         lane.decodeNanoseconds.fetch_add(static_cast<std::uint64_t>(spent), std::memory_order_relaxed);

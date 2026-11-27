@@ -195,10 +195,12 @@ void testFrontDecodesQueuesOnTheirOwnThreads() {
     constexpr std::uint32_t Rounds = 300;
     std::mutex seenMutex;
     std::map<std::uint32_t, std::uint64_t> seen;
+    std::map<std::uint32_t, std::uint64_t> completed;
     {
         Front front([&](const Operation& operation, const DecodeState&) {
             std::lock_guard lock(seenMutex);
-            ++seen[operation.queue];
+            if (operation.kind == OpKind::SubmissionEnd) ++completed[operation.queue];
+            else ++seen[operation.queue];
         });
         for (std::uint32_t round = 0; round < Rounds; ++round) {
             auto compute = std::make_shared<DriverDetail::Submission>();
@@ -223,6 +225,7 @@ void testFrontDecodesQueuesOnTheirOwnThreads() {
         Expect(counts.edges + counts.released > 0, "waits across queues find the stores that meet them");
     }
     Expect(seen[0] == Rounds * 2 && seen[0x20] == Rounds * 2, "the consumer sees every operation of both queues");
+    Expect(completed[0] == Rounds && completed[0x20] == Rounds, "the consumer sees a submission end for every submission");
 }
 
 void testShadowCopyKeepsWhatTheDecoderReads() {

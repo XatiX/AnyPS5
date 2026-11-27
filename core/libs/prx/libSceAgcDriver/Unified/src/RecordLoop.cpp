@@ -101,7 +101,13 @@ struct Hook {
     void* owner = nullptr;
 };
 
+struct CompletedHook {
+    CompletionHook hook = nullptr;
+    void* owner = nullptr;
+};
+
 std::atomic<Hook*> interruptHook{nullptr};
+std::atomic<CompletedHook*> completionHook{nullptr};
 
 std::mutex progressMutex;
 std::map<std::uint32_t, std::unique_ptr<Progress>> progresses;
@@ -494,13 +500,24 @@ private:
     void handle(const Item& item) {
         trace(item, "take");
         if (item.operation.predicated && item.guards.empty()) totals().predicated.fetch_add(1, std::memory_order_relaxed);
+        if (item.operation.kind == OpKind::SubmissionEnd) {
+            if (const auto* hook = completionHook.load(std::memory_order_acquire); hook != nullptr && hook->hook != nullptr) hook->hook(hook->owner, item.operation.submission);
+            return;
+        }
+        if (item.operation.kind == OpKind::RenderingWait) {
+            stage("waiting for rendering");
+            if (item.submission != nullptr) {
+                if (const auto found = item.submission->renderingWaits.find(item.operation.packetOffset); found != item.submission->renderingWaits.end() && found->second != nullptr) found->second->Wait();
+            }
+            return;
+        }
         if (item.operation.kind == OpKind::Flip) {
             releaseFlip(item);
             return;
         }
         const auto device = Resolve::AttachedDevice();
         if (device == nullptr) {
-            if (item.operation.kind != OpKind::Wait && item.operation.kind != OpKind::Flip && item.operation.kind != OpKind::Marker) Record::RefuseUnrecorded("loop operation", 0, "the recode has no device yet");
+            if (item.operation.kind != OpKind::Wait && item.operation.kind != OpKind::Flip && item.operation.kind != OpKind::Marker && item.operation.kind != OpKind::SubmissionEnd && item.operation.kind != OpKind::RenderingWait) Record::RefuseUnrecorded("loop operation", 0, "the recode has no device yet");
             return;
         }
         switch (item.operation.kind) {
@@ -524,7 +541,9 @@ private:
                 stage("waiting on memory");
                 wait(*device, item);
                 return;
-            case OpKind::Flip: return;
+            case OpKind::Flip:
+            case OpKind::SubmissionEnd:
+            case OpKind::RenderingWait: return;
             case OpKind::Marker:
                 stage("sealing pass writes");
                 sealPassWrites(*device);
@@ -1017,6 +1036,13 @@ void SetInterruptHook(InterruptHook hook, void* owner) {
     held.hook = hook;
     held.owner = owner;
     interruptHook.store(&held, std::memory_order_release);
+}
+
+void SetCompletionHook(CompletionHook hook, void* owner) {
+    static CompletedHook held;
+    held.hook = hook;
+    held.owner = owner;
+    completionHook.store(&held, std::memory_order_release);
 }
 
 void TraceKept(std::span<const std::uint32_t> packet, std::uint32_t opcode, std::uint32_t queue, std::uint64_t submission, std::size_t offset, bool flip) {

@@ -133,6 +133,10 @@ private:
             emit(OpKind::Wait, 0, 0, 0);
             return;
         }
+        if (submission.renderingWaits.contains(cursor)) {
+            emit(OpKind::RenderingWait, 0, 0, 0);
+            return;
+        }
         if (submission.flips.contains(cursor)) {
             if (opcode == 0x49) labelStore(packet, true);
             ++state.counts.flips;
