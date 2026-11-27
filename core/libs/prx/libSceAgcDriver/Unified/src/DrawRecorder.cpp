@@ -5310,15 +5310,19 @@ private:
             return nullptr;
         }
         std::uint32_t layer = 0;
-        auto record = ownedRecord(context, *table, surface, why, &layer);
+        Absorbed absorbed;
+        auto record = ownedRecord(context, *table, surface, why, &layer, &absorbed);
         if (record == nullptr && why.empty()) {
             layer = 0;
             record = table->Create(surface, request.words, why);
             poisonRecord(context, record.get());
             record = table->Seed(record);
-            if (record != nullptr && seedsStorageRecords() && context.recorder != nullptr) {
-                drainSurfaces(context, *context.recorder);
-                totals.storageRecordsSeeded++;
+            if (record != nullptr) {
+                if (seedsStorageRecords() && context.recorder != nullptr) {
+                    drainSurfaces(context, *context.recorder);
+                    totals.storageRecordsSeeded++;
+                }
+                absorbLayers(context, *table, record, absorbed);
             }
         }
         applyMetadataClear(context, record, program);
