@@ -51,6 +51,7 @@ enum ProgramPhase : std::size_t {
 struct ProgramSet {
     DriverDetail::DrawDecode decode;
     std::vector<ShaderRecompiler::MemoryRegion> memory;
+    std::vector<std::pair<std::uint64_t, std::uint64_t>> decodeReads;
     std::vector<StageProgram> stages;
     std::array<std::uint64_t, PhaseCount> nanoseconds{};
     std::uint32_t templateMismatches = 0;

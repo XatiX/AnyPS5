@@ -54,6 +54,7 @@ struct ResolvedDraw {
     std::size_t imageBegin = 0;
     Bindings::Layout layout;
     std::shared_ptr<const Graphics::State> state;
+    std::vector<std::pair<std::uint64_t, std::uint64_t>> decodeReads;
     mutable std::vector<std::uint64_t> readHashes;
 };
 

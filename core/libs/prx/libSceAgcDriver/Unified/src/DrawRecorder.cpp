@@ -4902,6 +4902,18 @@ private:
         if (recorder->HasQueuedKeyStores()) recorder->FlushKeyStores();
         if (recorder->HasQueuedStores()) recorder->FlushStores();
         markHangPhase(context, *recorder, 2u);
+        if (pageTable != nullptr && !draw.decodeReads.empty()) {
+            std::vector<std::pair<std::uint64_t, std::uint64_t>> dirtyDecodeReads;
+            auto& pageState = MemoryCore::Get().Pages();
+            for (const auto& [address, size] : draw.decodeReads) {
+                if (address == 0u || size == 0u) continue;
+                if (servesFaultPages()) {
+                    if (const auto pages = ResidencyService::Get().UnmappedPages(address, size); !pages.empty()) Shadow::ServeFaultPages(pages);
+                }
+                if (!pageState.CleanIn(address, size)) dirtyDecodeReads.emplace_back(address, size);
+            }
+            if (!dirtyDecodeReads.empty()) static_cast<void>(Shadow::ConsumeIn(dirtyDecodeReads));
+        }
         if (Shadow::OwnedUploadsPending()) {
             phase = std::chrono::steady_clock::now();
             std::vector<std::shared_ptr<void>> kept;

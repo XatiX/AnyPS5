@@ -545,6 +545,10 @@ private:
             else draw.complete = false;
             if (facts.countAddress != 0u) draw.uses.push_back({facts.countAddress, sizeof(std::uint32_t), false});
         }
+        draw.decodeReads = programs.decodeReads;
+        for (const auto& [address, size] : draw.decodeReads) {
+            if (address != 0u && size != 0u) draw.uses.push_back({address, size, false});
+        }
         const auto beforeTargets = draw.uses.size();
         TargetUses(programs.decode.state, draw.uses);
         noteTargetWrites(std::span<const GuestUse>(draw.uses).subspan(beforeTargets));

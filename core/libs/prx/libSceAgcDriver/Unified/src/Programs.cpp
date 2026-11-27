@@ -421,6 +421,7 @@ bool BuildPrograms(const ProgramInputs& inputs, const DrawFacts& facts, ProgramS
     shareSupplies();
     out.stages.clear();
     out.memory.clear();
+    out.decodeReads.clear();
     out.nanoseconds = {};
     auto mark = std::chrono::steady_clock::now();
     const auto lap = [&](ProgramPhase phase) {
@@ -458,6 +459,9 @@ bool BuildPrograms(const ProgramInputs& inputs, const DrawFacts& facts, ProgramS
         if (program.binary.stage == Stage::Fragment) continue;
         reads.clear();
         auto info = DriverDetail::DecodeOrderedVertexStageInfo(program.binary.header, program.binary.headerAddress, program.userData, reads, 8u - program.firstUserSgpr);
+        for (const auto& read : reads) {
+            if (read.address != 0u && read.size != 0u) out.decodeReads.emplace_back(read.address, static_cast<std::uint64_t>(read.size));
+        }
         info.paClVsOutCntl = DriverDetail::PositionExportLayout(program.snapshot.get(), program.codeOffset, program.binary.code, DriverDetail::readRegister(inputs.queue.context, 0x207), program.tailContinuation.get()) | state.layerExports | state.viewportExports;
         info.depthRemapMode = state.depthRemap.mode;
         Graphics::ApplyPointSize(state, info);
@@ -522,6 +526,7 @@ bool BuildComputeProgram(const ProgramInputs& inputs, const DispatchFacts& facts
     shareSupplies();
     out.stages.clear();
     out.memory.clear();
+    out.decodeReads.clear();
     out.nanoseconds = {};
     auto mark = std::chrono::steady_clock::now();
     const auto lap = [&](ProgramPhase phase) {
