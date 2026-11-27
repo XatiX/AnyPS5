@@ -27,6 +27,7 @@ public:
     PipelineCacheSynchronization& Synchronization() { return synchronization; }
     void SaveNow();
     void SaveUnlessBusy();
+    void RequestSave();
 
     friend struct PipelineCacheTestAccess;
 
@@ -64,6 +65,7 @@ private:
     std::optional<FileHeader> settledFile;
     std::mutex mutex;
     std::condition_variable wake;
+    bool saveRequested = false;
     bool stopping = false;
     std::thread saver;
 };

@@ -2976,6 +2976,10 @@ void VulkanDevice::SavePipelineCache() {
     if (state->pipelineCache) state->pipelineCache->SaveNow();
 }
 
+void VulkanDevice::RequestPipelineCacheSave() {
+    if (state->pipelineCache) state->pipelineCache->RequestSave();
+}
+
 std::uint64_t VulkanDevice::ComputePipelinesCreated() const {
     return state->computePipelinesCreated.load(std::memory_order_relaxed);
 }

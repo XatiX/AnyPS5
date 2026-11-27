@@ -308,11 +308,23 @@ void PipelineCache::SaveUnlessBusy() {
     save(false, false);
 }
 
+void PipelineCache::RequestSave() {
+    if (path.empty()) return;
+    {
+        std::lock_guard lock(mutex);
+        saveRequested = true;
+    }
+    wake.notify_one();
+}
+
 void PipelineCache::run() {
     std::unique_lock lock(mutex);
-    while (!wake.wait_for(lock, std::chrono::seconds(SaveIntervalSeconds), [&] { return stopping; })) {
+    for (;;) {
+        wake.wait_for(lock, std::chrono::seconds(SaveIntervalSeconds), [&] { return stopping || saveRequested; });
+        if (stopping) return;
+        saveRequested = false;
         lock.unlock();
-        save(false, false);
+        SaveUnlessBusy();
         lock.lock();
     }
 }

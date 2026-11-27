@@ -3220,6 +3220,12 @@ private:
         if (computePipelines.contains(key)) return true;
         if (!queuePipeline(context, owner, dispatch, key, reason)) return false;
         if (buildsPipelinesAhead()) return false;
+        const auto queued = std::ranges::find_if(pipelineJobs, [&](const PipelineJob& job) { return job.key == key; });
+        if (queued != pipelineJobs.end() && queued != pipelineJobs.begin()) {
+            const auto ahead = std::distance(pipelineJobs.begin(), queued);
+            std::rotate(pipelineJobs.begin(), queued, std::next(queued));
+            if (Downgrades::Active()) std::fprintf(stderr, "[recode-pipeline-priority] requested compute pipeline moved ahead of %lld queued builds\n", static_cast<long long>(ahead));
+        }
         const auto started = std::chrono::steady_clock::now();
         lock.unlock();
         pipelinesDone.wait(pipelineLock, [&] { return !buildingPipelines.contains(key); });
@@ -3307,14 +3313,13 @@ private:
             if (made != nullptr && Downgrades::Active() && job->result != nullptr) std::fprintf(stderr, "[recode-build] %016llx module %016llx %s %.0f ms (cache lock %.0f ms)\n", static_cast<unsigned long long>(Downgrades::ProgramHash(job->codeAddress)), static_cast<unsigned long long>(job->result->spirv.ContentHash().low), (made->feedback & VK_PIPELINE_CREATION_FEEDBACK_VALID_BIT) == 0u ? "no-feedback" : (made->feedback & VK_PIPELINE_CREATION_FEEDBACK_APPLICATION_PIPELINE_CACHE_HIT_BIT) != 0u ? "cache-hit" : "cache-miss", static_cast<double>(built) / 1e6, static_cast<double>(made->lockNanoseconds) / 1e6);
             if (job->result != nullptr) Downgrades::DumpModule(job->codeAddress, job->result->spirv.ContentHash().low, std::span<const std::uint32_t>(job->result->spirv.data(), job->result->spirv.size()));
             Downgrades::NoteBuild(job->codeAddress, built, job->result != nullptr ? job->result->spirv.size() * sizeof(std::uint32_t) : 0u, job->result != nullptr ? job->result->spirv.ContentHash().low : 0u, job->key.size() > 2u ? Downgrades::HashCode(std::as_bytes(std::span(job->key).subspan(2))) : 0u);
-            bool save = false;
             {
                 std::lock_guard lock(pipelineMutex);
                 buildingPipelines.erase(job->key);
                 buildNanoseconds += built;
                 unsavedBuildNanoseconds += made != nullptr ? built : 0u;
                 if (unsavedBuildNanoseconds >= UnsavedBuildNanoseconds && job->owner != nullptr) {
-                    save = true;
+                    job->owner->RequestPipelineCacheSave();
                     unsavedBuildNanoseconds = 0;
                 }
                 if (made != nullptr) {
@@ -3326,7 +3331,6 @@ private:
                 }
                 pipelinesDone.notify_all();
             }
-            if (save) job->owner->SavePipelineCache();
         }
     }
 

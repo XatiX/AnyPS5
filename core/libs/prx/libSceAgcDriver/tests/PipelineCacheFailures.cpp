@@ -224,8 +224,9 @@ int main(int argc, char** argv) {
     armed = true;
     if (mode == "destructor") cache.reset();
     else if (mode == "worker") {
+        cache->RequestSave();
         std::unique_lock lock(mutex);
-        Check(changed.wait_for(lock, 14s, [] { return faults == 1; }), "background save did not reach the allocation failure");
+        Check(changed.wait_for(lock, 5s, [] { return faults == 1; }), "requested background save did not reach the allocation failure");
     } else if (mode == "busy") cache->SaveUnlessBusy();
     else cache->SaveNow();
     Check(faults == 1 && !armed, "the snapshot allocation was not exercised");
