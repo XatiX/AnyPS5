@@ -2702,6 +2702,8 @@ private:
         const auto& layout = stage.program.variant->info.bindings;
         const auto& known = stage.program.capture != nullptr ? stage.program.capture->snapshot.knownBuffers : none;
         const auto& infos = stage.program.variant->info.info.knownBuffers;
+        const bool preferOwnedReads = stage.program.stage == ShaderRecompiler::ShaderStage::Compute && Shadow::ServesOwned() && stage.program.result != nullptr &&
+            std::ranges::any_of(stage.program.result->bindings, [](const auto& binding) { return binding.role == ShaderRecompiler::DescriptorRole::BdaPagetable; });
         landKnownWrites(completed);
         for (std::uint32_t index = 0; index < layout.knownBufferCount; ++index) {
             const auto dword = layout.KnownBufferDword() + index * ShaderRecompiler::KnownBufferDwords;
@@ -2764,12 +2766,16 @@ private:
                 write(mapped, mapped != 0u ? served : 0u);
                 continue;
             }
-            if (const auto copied = copyKnownBuffer(address, bytes, serial, completed); copied != 0u) {
+            const bool preferOwned = preferOwnedReads && index < infos.size() && !infos[index].Pointer();
+            const auto copyReadOnly = [&] {
+                const auto copied = copyKnownBuffer(address, bytes, serial, completed);
+                if (copied == 0u) return false;
                 totals.knownCopied++;
                 noteKnownPath("copied", address, bytes);
                 write(copied, bytes);
-                continue;
-            }
+                return true;
+            };
+            if (!preferOwned && copyReadOnly()) continue;
             const bool large = bytes >= LargeKnownBytes;
             const auto removals = large ? ResidencyService::Get().Removals() : 0u;
             if (large) {
@@ -2788,6 +2794,7 @@ private:
                 write(span.address, bytes);
                 continue;
             }
+            if (preferOwned && copyReadOnly()) continue;
             auto mapped = ResidencyService::Get().TranslateMapped(address, reach);
             if (mapped == 0u && reach != bytes) mapped = ResidencyService::Get().TranslateMapped(address, bytes);
             if (mapped == 0u && bytes <= KnownBufferLimitBytes && servesFaultPages()) {
