@@ -588,6 +588,10 @@ private:
             if (facts.indirectAddress != 0u) dispatch.uses.push_back({facts.indirectAddress, 3u * sizeof(std::uint32_t), false});
             else dispatch.complete = false;
         }
+        dispatch.decodeReads = programs.decodeReads;
+        for (const auto& [address, size] : dispatch.decodeReads) {
+            if (address != 0u && size != 0u) dispatch.uses.push_back({address, size, false});
+        }
         const auto beforeTargets = dispatch.uses.size();
         auto resolved = resolveStages(dispatchTotals, std::move(dispatch), programs, beforeTargets, slotsStarted);
         if (resolved != nullptr && !resolved->stages.empty() && ChecksReads(resolved->stages.front().program.codeAddress)) {

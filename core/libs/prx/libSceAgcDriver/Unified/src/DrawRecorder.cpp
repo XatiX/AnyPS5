@@ -2702,7 +2702,8 @@ private:
         const auto& layout = stage.program.variant->info.bindings;
         const auto& known = stage.program.capture != nullptr ? stage.program.capture->snapshot.knownBuffers : none;
         const auto& infos = stage.program.variant->info.info.knownBuffers;
-        const bool preferOwnedReads = stage.program.stage == ShaderRecompiler::ShaderStage::Compute && Shadow::ServesOwned() && stage.program.result != nullptr &&
+        const bool preferOwnedReads = (stage.program.stage == ShaderRecompiler::ShaderStage::Compute || stage.program.stage == ShaderRecompiler::ShaderStage::Mesh) &&
+            Shadow::ServesOwned() && stage.program.result != nullptr &&
             std::ranges::any_of(stage.program.result->bindings, [](const auto& binding) { return binding.role == ShaderRecompiler::DescriptorRole::BdaPagetable; });
         landKnownWrites(completed);
         for (std::uint32_t index = 0; index < layout.knownBufferCount; ++index) {
@@ -4130,6 +4131,18 @@ private:
         if (recorder->HasQueuedKeyStores()) recorder->FlushKeyStores();
         if (recorder->HasQueuedStores()) recorder->FlushStores();
         markHangPhase(context, *recorder, 2u);
+        if (pageTable != nullptr && !dispatch.decodeReads.empty()) {
+            std::vector<std::pair<std::uint64_t, std::uint64_t>> dirtyDecodeReads;
+            auto& pageState = MemoryCore::Get().Pages();
+            for (const auto& [address, size] : dispatch.decodeReads) {
+                if (address == 0u || size == 0u) continue;
+                if (servesFaultPages()) {
+                    if (const auto pages = ResidencyService::Get().UnmappedPages(address, size); !pages.empty()) Shadow::ServeFaultPages(pages);
+                }
+                if (!pageState.CleanIn(address, size)) dirtyDecodeReads.emplace_back(address, size);
+            }
+            if (!dirtyDecodeReads.empty()) static_cast<void>(Shadow::ConsumeIn(dirtyDecodeReads));
+        }
         if (Shadow::OwnedUploadsPending()) {
             std::vector<std::shared_ptr<void>> kept;
             if (Shadow::RecordOwnedUploads(recorder->Commands(), kept) != 0u) totals.residencyLands++;

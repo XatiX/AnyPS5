@@ -3945,6 +3945,32 @@ void verifyImageTableKeys() {
 #if ANYPS5_ENABLE_SPIRV_TOOLS
     static_cast<void>(ValidateAndOptimizeSpirv(heapResult.spirv, heapRequest.target.vulkanVersion, heapRequest.target.spirvVersion));
 #endif
+    {
+        const std::vector<std::uint32_t> formattedCode{
+            0xf4080300u, 0xfa000020u, 0xf4080700u, 0xfa000030u, 0xbf8cc07fu,
+            0xe00c1000u, 0x80030400u, 0xea6b1000u, 0x80230800u, 0xbf8c3f70u,
+            0x06000904u, 0xe0700000u, 0x80070000u, 0xbf810000u,
+        };
+        auto formattedRequest = TableRequest(formattedCode, userData);
+        formattedRequest.target.directResources = true;
+        formattedRequest.target.bdaAbiVersion = BdaAbi::MirrorVersion;
+        const auto formatted = CompileTable(formattedRequest);
+        require(formatted.capture->snapshot.knownBuffers.size() >= 2u, "known buffers: formatted buffer loads were not captured as known buffers");
+        bool hasKnownHelper = false;
+        const auto& spirv = formatted.result->spirv;
+        for (std::size_t word = 5; word < spirv.size();) {
+            const auto count = spirv[word] >> 16u;
+            if ((spirv[word] & 0xffffu) == spv::OpName && count > 2u) {
+                const std::string name(reinterpret_cast<const char*>(&spirv[word + 2]));
+                if (name == "load_known_formatted_gpu_buffer_x4") hasKnownHelper = true;
+            }
+            word += count == 0u ? 1u : count;
+        }
+        require(hasKnownHelper, "known buffers: runtime-formatted load of a known buffer did not emit load_known_formatted_gpu_buffer_x4");
+#if ANYPS5_ENABLE_SPIRV_TOOLS
+        static_cast<void>(ValidateAndOptimizeSpirv(spirv, formattedRequest.target.vulkanVersion, formattedRequest.target.spirvVersion));
+#endif
+    }
     std::cout << "image table heap mode: " << heapTables << " table image arrays in set " << RuntimeAbi::DirectHeapSet << "; the map stays a per-draw binding\n";
 }
 

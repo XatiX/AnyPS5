@@ -33,6 +33,16 @@ namespace {
 using Stage = ShaderRecompiler::ShaderStage;
 using Role = ShaderRecompiler::ProgramRole;
 
+constexpr std::size_t CaptureReadLimitBytes = 64u << 10u;
+
+void appendMaterializedReads(std::span<const ShaderRecompiler::MemoryRegion> memory, std::size_t from, std::vector<std::pair<std::uint64_t, std::uint64_t>>& reads) {
+    for (std::size_t index = from; index < memory.size(); ++index) {
+        const auto& region = memory[index];
+        if (region.guestAddress == 0u || region.bytes.empty() || region.bytes.size() > CaptureReadLimitBytes) continue;
+        reads.emplace_back(region.guestAddress, static_cast<std::uint64_t>(region.bytes.size()));
+    }
+}
+
 bool readOnlyDepthBoundsCompare() {
     static const bool enabled = [] {
         const auto* value = std::getenv("APS5_READONLY_DEPTH_BOUNDS_COMPARE");
@@ -449,6 +459,7 @@ bool BuildPrograms(const ProgramInputs& inputs, const DrawFacts& facts, ProgramS
     auto& memory = out.memory;
     memory.reserve(2 * programs.size() + 32);
     DriverDetail::AppendProgramMemory(memory, programs);
+    const auto initialMemory = memory.size();
     std::vector<ShaderRecompiler::LinkedProgram> linked;
     linked.reserve(programs.size());
     for (std::size_t i = 0; i < programs.size(); ++i) linked.push_back({decode.roles[i], programs[i].binary, programs[i].userDataBase, programs[i].firstUserSgpr, programs[i].userData});
@@ -515,6 +526,7 @@ bool BuildPrograms(const ProgramInputs& inputs, const DrawFacts& facts, ProgramS
         out.stages.push_back(std::move(built));
         pushCursor += static_cast<std::uint32_t>(out.stages.back().result->pushConstants.size());
     }
+    appendMaterializedReads(out.memory, initialMemory, out.decodeReads);
     if (static std::atomic<std::uint32_t> lines{0}; state.stages.mesh && Downgrades::Active() && lines.fetch_add(1, std::memory_order_relaxed) < 4u) std::fprintf(stderr, "[recode-mesh] program set built: mesh %016llx\n", static_cast<unsigned long long>(Downgrades::ProgramHash(out.stages.front().codeAddress)));
     return true;
 } catch (const std::exception& error) {
@@ -569,6 +581,7 @@ bool BuildComputeProgram(const ProgramInputs& inputs, const DispatchFacts& facts
     std::vector<ShaderRecompiler::MemoryRegion>& memory = out.memory;
     memory.push_back({snapshot->codeAddress, std::as_bytes(std::span(snapshot->code))});
     if (!snapshot->header.empty()) memory.push_back({snapshot->headerAddress, snapshot->header});
+    const auto initialMemory = memory.size();
     const auto waveSize = (facts.initiator & 0x8000u) != 0u ? 32u : 64u;
     const auto* target = waveSize == 32u ? inputs.computeWave32 : inputs.computeWave64;
     if (target == nullptr) {
@@ -590,6 +603,7 @@ bool BuildComputeProgram(const ProgramInputs& inputs, const DispatchFacts& facts
     built.codeAddress = address;
     built.pushOffset = 0u;
     out.stages.push_back(std::move(built));
+    appendMaterializedReads(out.memory, initialMemory, out.decodeReads);
     return true;
 } catch (const std::exception& error) {
     reason = error.what();
