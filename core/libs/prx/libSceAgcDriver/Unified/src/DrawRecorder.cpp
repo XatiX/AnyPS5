@@ -2112,6 +2112,7 @@ public:
     void Detach(VkDevice replaced) {
         listReplayStops.store(true, std::memory_order_release);
         while (listReplaying.load(std::memory_order_acquire)) std::this_thread::yield();
+        listReplayStops.store(false, std::memory_order_release);
         {
             std::unique_lock jobs(pipelineMutex);
             ++framesWaiting;
@@ -2123,7 +2124,6 @@ public:
         if (device != replaced && device != VK_NULL_HANDLE) return;
         device = VK_NULL_HANDLE;
         attachedDevice.store(VK_NULL_HANDLE, std::memory_order_release);
-        listReplayStops.store(false, std::memory_order_release);
         listReplayStarted.store(false, std::memory_order_release);
         ring.reset();
         ringAddress = 0;
@@ -3284,7 +3284,8 @@ private:
     }
 
     void startListReplay(const Context& context, VulkanDevice& owner) {
-        if (listReplayStarted.exchange(true, std::memory_order_acq_rel) || pipelineListDirectory().empty()) return;
+        if (listReplayStarted.load(std::memory_order_acquire) || pipelineListDirectory().empty() || Resolve::HeapDevice() == nullptr || attachedDevice.load(std::memory_order_acquire) != context.device) return;
+        if (listReplayStarted.exchange(true, std::memory_order_acq_rel)) return;
         listReplaying.store(true, std::memory_order_release);
         std::thread([this, context, &owner] {
             replayList(context, owner);
@@ -3314,6 +3315,7 @@ private:
         const auto started = std::chrono::steady_clock::now();
         const auto files = PipelineList::Newest(pipelineListDirectory());
         std::uint32_t queued = 0;
+        const char* stopped = "";
         for (const auto& file : files) {
             auto loaded = PipelineList::Load(file);
             if (!loaded.has_value() || loaded->key.size() < 2u || (loaded->key.size() - 2u) % 3u != 0u) continue;
@@ -3327,7 +3329,10 @@ private:
             const auto hash = result->spirv.ContentHash();
             if (hash.low != held->key[0] || hash.high != held->key[1]) continue;
             const auto* heap = Resolve::HeapDevice();
-            if (heap == nullptr || attachedDevice.load(std::memory_order_acquire) != context.device || listReplayStops.load(std::memory_order_acquire)) break;
+            if (heap == nullptr || attachedDevice.load(std::memory_order_acquire) != context.device || listReplayStops.load(std::memory_order_acquire)) {
+                stopped = heap == nullptr ? "; stopped: no heap" : listReplayStops.load(std::memory_order_acquire) ? "; stopped: the device is being replaced" : "; stopped: another device is attached";
+                break;
+            }
             try {
                 const auto main = listedSetLayout(context, std::span(held->key).subspan(2));
                 std::lock_guard lock(pipelineMutex);
@@ -3346,7 +3351,7 @@ private:
                 continue;
             }
         }
-        std::fprintf(stderr, "[recode-pipeline-list] %u of %zu listed compute pipelines queued in %.0f ms\n", queued, files.size(), static_cast<double>(elapsed(started)) / 1e6);
+        std::fprintf(stderr, "[recode-pipeline-list] %u of %zu listed compute pipelines queued in %.0f ms%s\n", queued, files.size(), static_cast<double>(elapsed(started)) / 1e6, stopped);
     }
 
     struct PipelineCounts {
