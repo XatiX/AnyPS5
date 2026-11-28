@@ -2652,10 +2652,12 @@ const HostImport* importRunAt(const Context& context, HostImports& state, Import
     const GuestArena::HostImportAccess importAccess(reinterpret_cast<void*>(base), static_cast<std::size_t>(bytes));
     auto pages = importPages(base, bytes);
     if (!pages.committed) return failedImport();
+#if ANYPS5_UNIFIED
     if (!pages.writable && !pages.shared && pages.refused.BaseAddress == nullptr && Unified::MemoryCore::Get().OpenCleanForImport(base, bytes)) {
         pages = importPages(base, bytes);
         if (!pages.committed) return failedImport();
     }
+#endif
     const bool writable = pages.writable;
     if (!writable && pages.readOnly) return failedImport();
     if (!writable) {
