@@ -8,6 +8,7 @@
 #include <stdexcept>
 #include <vector>
 #include <span>
+#include <string>
 #include <string_view>
 
 namespace ShaderRecompiler {
@@ -52,6 +53,8 @@ struct SpirvTargetOptions {
     bool float16NarrowNans = false;
     bool meshInlineFunctions = false;
     bool spannedShuffleThroughMemory = false;
+    bool spannedUnreachableStays = false;
+    bool spannedUnreachableVerify = false;
 };
 
 struct SpirvEmitInfo {
@@ -62,6 +65,7 @@ struct SpirvEmitInfo {
     std::uint32_t scratchPoolSlotDwords = 0;
     bool anySubgroupSize = false;
     std::vector<std::uint32_t> runtimeSpecIds;
+    std::string keptPastUnreachable;
 };
 
 struct SpannedWaveUnsupported : std::runtime_error {

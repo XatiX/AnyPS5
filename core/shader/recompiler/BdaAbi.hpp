@@ -12,6 +12,8 @@ inline constexpr std::uint32_t Version = 1;
 inline constexpr std::uint32_t MirrorVersion = 3;
 inline constexpr std::uint32_t Read = 1;
 inline constexpr std::uint32_t Write = 2;
+inline constexpr std::uint32_t Spill = 4;
+inline constexpr std::uint32_t Masked = 8;
 
 inline constexpr bool Known(std::uint32_t version) {
     return version == Version || version == MirrorVersion;
@@ -46,7 +48,7 @@ inline bool RangesOrdered(const Range* ranges, std::size_t count) {
 }
 
 enum class FaultState : std::uint32_t { Empty, Writing, Ready };
-enum class FaultReason : std::uint32_t { Unmapped = 1, Permission, Overflow, InvalidTable, InvalidRectangle, LoopLimit, Unaligned, InvalidDescriptor, ImageTable, UnlinkedCall, WindowLaneSpill, SplitState };
+enum class FaultReason : std::uint32_t { Unmapped = 1, Permission, Overflow, InvalidTable, InvalidRectangle, LoopLimit, Unaligned, InvalidDescriptor, ImageTable, UnlinkedCall, WindowLaneSpill, SplitState, StorePages };
 
 struct Fault {
     FaultState state;
@@ -91,10 +93,42 @@ inline constexpr std::uint32_t FaultPageOverflowWord = SrtGuardWord + 1;
 inline constexpr std::uint32_t FaultPageCountWord = FaultPageOverflowWord + 1;
 inline constexpr std::uint32_t FaultPageSlotsWord = FaultPageCountWord + 1;
 inline constexpr std::uint32_t FaultPageListWord = FaultPageSlotsWord + FaultPageSlots;
-inline constexpr std::size_t FaultBufferBytes = (FaultPageListWord + FaultPageSlots) * sizeof(std::uint32_t);
 static_assert((FaultPageSlots & (FaultPageSlots - 1)) == 0);
+inline constexpr std::uint32_t StorePagesWord = FaultPageListWord + FaultPageSlots;
+inline constexpr std::uint32_t StorePageBaseWord = StorePagesWord + 2;
+inline constexpr std::uint32_t StorePageSlotsWord = StorePageBaseWord + 2;
+inline constexpr std::uint32_t StorePageOverflowWord = StorePageSlotsWord + 1;
+inline constexpr std::size_t FaultBufferBytes = (StorePageOverflowWord + 1) * sizeof(std::uint32_t);
 static_assert((WrittenPageSlots & (WrittenPageSlots - 1)) == 0);
 static_assert(WrittenChunkPages == 32);
+
+inline constexpr std::uint32_t StorePageShift = 12;
+inline constexpr std::uint32_t StorePageBytes = 1u << StorePageShift;
+inline constexpr std::uint32_t StorePageWords = StorePageBytes / sizeof(std::uint32_t);
+inline constexpr std::uint32_t StoreMaskWords = StorePageBytes / 32u;
+inline constexpr std::uint32_t StorePageProbes = 16;
+inline constexpr std::uint64_t StorePageSpan = std::uint64_t{0xfffffffeu} << StorePageShift;
+inline constexpr std::uint32_t StorePageNone = 0xffffffffu;
+
+inline constexpr std::uint32_t StorePageKey(std::uint64_t base, std::uint64_t address) {
+    return static_cast<std::uint32_t>((address - base) >> StorePageShift) + 1u;
+}
+
+inline constexpr std::uint32_t StorePageHash(std::uint32_t key, std::uint32_t slots) {
+    return (key * 0x9e3779b1u) >> (32u - static_cast<std::uint32_t>(std::countr_zero(slots)));
+}
+
+inline constexpr std::size_t StoreMaskWord(std::uint32_t slots, std::uint32_t slot) {
+    return slots + static_cast<std::size_t>(slot) * StoreMaskWords;
+}
+
+inline constexpr std::size_t StorePageWord(std::uint32_t slots, std::uint32_t slot) {
+    return static_cast<std::size_t>(slots) * (1u + StoreMaskWords) + static_cast<std::size_t>(slot) * StorePageWords;
+}
+
+inline constexpr std::size_t StorePagePoolBytes(std::uint32_t slots) {
+    return StorePageWord(slots, slots) * sizeof(std::uint32_t);
+}
 
 inline constexpr std::uint32_t WrittenChunkKey(std::uint64_t address) {
     return static_cast<std::uint32_t>(address >> WrittenChunkShift) + 1u;

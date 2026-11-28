@@ -4956,8 +4956,8 @@ private:
             else passReads.push_back(range);
         }
         if (!passWrites.empty()) Shadow::NoteGpuWrites(passWrites);
-        std::vector<std::pair<VkImage, bool>> attachments;
-        for (const auto& resident : residents) attachments.emplace_back(resident->Image(), true);
+        std::vector<Graphics::PassAttachment> attachments;
+        for (const auto& resident : residents) attachments.push_back({resident->Image(), true});
         Graphics::PassAccess access{passReads, passWrites, stageStorageImages, attachments};
         const bool storesImages = std::ranges::any_of(stageStorageImages, [](const std::pair<VkImage, bool>& image) { return image.second; });
         access.anyReads = pageTable != nullptr;

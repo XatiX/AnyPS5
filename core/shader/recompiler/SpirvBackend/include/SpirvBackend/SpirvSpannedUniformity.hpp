@@ -10,7 +10,9 @@ namespace ShaderRecompiler {
 
 [[nodiscard]] bool SpannedSnapshotLoadsEnabled(const char* optOut);
 
-[[nodiscard]] std::optional<std::string> SpannedBarrierInDivergentFlow(std::span<const std::uint32_t> words, std::span<const std::uint32_t> snapshotVariables = {}, std::span<const std::uint32_t> privateVariables = {});
+[[nodiscard]] std::optional<std::string> SpannedBarrierInDivergentFlow(std::span<const std::uint32_t> words, std::span<const std::uint32_t> snapshotVariables = {}, bool unreachableExits = true, std::span<const std::uint32_t> privateVariables = {});
+
+[[nodiscard]] std::optional<std::string> SpannedUnreachableOutsideSpecializedSwitch(std::span<const std::uint32_t> words);
 
 }
 
