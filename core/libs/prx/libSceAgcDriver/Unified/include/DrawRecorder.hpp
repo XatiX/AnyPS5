@@ -47,6 +47,13 @@ void DeviceReplaced(const Graphics::Context& context, Graphics::Recorder& record
 [[nodiscard]] std::optional<Pm4::MemoryCopy> MirrorCopyOf(std::span<const std::uint32_t> packet);
 [[nodiscard]] std::shared_ptr<Graphics::Buffer> ReadMirrorAfterBatch(const Graphics::Context& context, Graphics::Recorder& recorder, std::uint64_t address, std::uint64_t bytes);
 [[nodiscard]] bool CopyInMirror(const Graphics::Context& context, Graphics::Recorder& recorder, const Pm4::MemoryCopy& copy);
+struct GdsTransferHooks {
+    bool (*busy)(std::uint64_t address, std::uint64_t bytes) = nullptr;
+    void (*pending)(std::uint64_t address, std::uint64_t bytes) = nullptr;
+    void (*landed)(std::uint64_t address, std::uint64_t bytes) = nullptr;
+};
+[[nodiscard]] bool TransferGds(const Graphics::Context& context, Graphics::Recorder& recorder, std::span<const std::uint32_t> packet, const GdsTransferHooks& hooks);
+[[nodiscard]] std::string GdsTransferLine();
 [[nodiscard]] int StoreToMirror(const Graphics::Context& context, Graphics::Recorder& recorder, std::uint64_t address, std::span<const std::byte> bytes, std::uint64_t stamp, std::uint32_t queue);
 void NoteExistingPacket(std::span<const std::uint32_t> packet, std::uint32_t queue);
 [[nodiscard]] bool LandingsPending();

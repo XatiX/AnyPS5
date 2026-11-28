@@ -5994,6 +5994,202 @@ bool CopyInMirror(const Context& context, Graphics::Recorder& recorder, const Pm
     return true;
 }
 
+namespace {
+
+struct GdsLanding {
+    std::uint64_t address = 0;
+    std::uint64_t bytes = 0;
+    std::shared_ptr<Graphics::Buffer> buffer;
+};
+
+struct GdsLandings {
+    std::mutex mutex;
+    std::vector<GdsLanding> pending;
+};
+
+GdsLandings& gdsLandings() {
+    static auto& landings = *new GdsLandings();
+    return landings;
+}
+
+std::atomic<std::uint64_t> gdsTransfers{0};
+std::atomic<std::uint64_t> gdsFills{0};
+std::atomic<std::uint64_t> gdsFromLandings{0};
+std::atomic<std::uint64_t> gdsFromMirror{0};
+std::atomic<std::uint64_t> gdsRefused{0};
+
+}
+
+std::string GdsTransferLine() {
+    char text[256];
+    std::snprintf(text, sizeof(text), "GDS transfers recorded in stream order %llu (%llu fills, %llu read from a pending GDS copy, %llu read from the mirror), left to the CPU %llu", static_cast<unsigned long long>(gdsTransfers.load(std::memory_order_relaxed)), static_cast<unsigned long long>(gdsFills.load(std::memory_order_relaxed)), static_cast<unsigned long long>(gdsFromLandings.load(std::memory_order_relaxed)), static_cast<unsigned long long>(gdsFromMirror.load(std::memory_order_relaxed)), static_cast<unsigned long long>(gdsRefused.load(std::memory_order_relaxed)));
+    return text;
+}
+
+bool TransferGds(const Context& context, Graphics::Recorder& recorder, std::span<const std::uint32_t> packet, const GdsTransferHooks& hooks) {
+    static const bool enabled = std::getenv("APS5_RECODE_GDS_ON_CPU") == nullptr;
+    if (!enabled || packet.size() != 7u || ((packet[0] >> 8u) & 0xffu) != 0x50u || recorder.Idle()) return false;
+    const auto sourceSelect = Pm4::DmaSource(packet);
+    const auto destinationSelect = Pm4::DmaDestination(packet);
+    const std::uint64_t bytes = Pm4::DmaBytes(packet);
+    const bool fromGds = sourceSelect == Pm4::DmaSelectGds;
+    const bool toGds = destinationSelect == Pm4::DmaSelectGds;
+    const auto memory = [](std::uint32_t select) { return select == 0u || select == 3u; };
+    const auto inGds = [&](std::uint32_t low, std::uint32_t high) { return high == 0u && low <= Pm4::GdsBytes && bytes <= Pm4::GdsBytes - low; };
+    if ((!fromGds && !toGds) || bytes == 0u) return false;
+    const auto refuse = [] {
+        gdsRefused.fetch_add(1, std::memory_order_relaxed);
+        return false;
+    };
+    if (fromGds && !inGds(packet[2], packet[3])) return refuse();
+    if (toGds && !inGds(packet[4], packet[5])) return refuse();
+    if (fromGds && !toGds && !memory(destinationSelect)) return refuse();
+    if (toGds && !fromGds && !memory(sourceSelect) && sourceSelect != Pm4::DmaSourceData) return refuse();
+    const auto gds = Pm4::GdsAddress();
+    const auto sourceAddress = fromGds ? gds + packet[2] : packet[2] | (static_cast<std::uint64_t>(packet[3]) << 32u);
+    const auto destinationAddress = toGds ? gds + packet[4] : packet[4] | (static_cast<std::uint64_t>(packet[5]) << 32u);
+    if (fromGds && toGds && sourceAddress < destinationAddress + bytes && destinationAddress < sourceAddress + bytes) return refuse();
+    if (toGds && sourceSelect == Pm4::DmaSourceData && (bytes % 4u != 0u || packet[4] % 4u != 0u)) return refuse();
+
+    std::shared_ptr<Graphics::Buffer> landed;
+    std::uint64_t landedOffset = 0;
+    std::optional<DeviceSpan> mirrored;
+    std::vector<std::byte> current;
+    if (toGds && memory(sourceSelect)) {
+        bool overlapped = false;
+        {
+            auto& landings = gdsLandings();
+            std::lock_guard lock(landings.mutex);
+            for (auto entry = landings.pending.rbegin(); entry != landings.pending.rend(); ++entry) {
+                if (sourceAddress >= entry->address + entry->bytes || entry->address >= sourceAddress + bytes) continue;
+                overlapped = true;
+                if (sourceAddress >= entry->address && sourceAddress + bytes <= entry->address + entry->bytes) {
+                    landed = entry->buffer;
+                    landedOffset = sourceAddress - entry->address;
+                }
+                break;
+            }
+        }
+        if (overlapped && landed == nullptr) return refuse();
+        if (landed == nullptr) {
+            if (MemoryCore::Get().GpuWritesPending(sourceAddress, bytes)) {
+                const std::array range{DirtyRange{sourceAddress, bytes}};
+                if (!MemoryCore::Get().WithoutGpuWritten(range).empty()) return refuse();
+                mirrored = ResidencyService::Get().MirrorSpan(sourceAddress, bytes);
+                if (!mirrored || mirrored->handle == 0u) return refuse();
+            } else {
+                if (hooks.busy != nullptr && hooks.busy(sourceAddress, bytes)) return refuse();
+                if (bytes > 0x10000u || !GuestMemory::Accessible(reinterpret_cast<const void*>(static_cast<std::uintptr_t>(sourceAddress)), static_cast<std::size_t>(bytes), false)) return refuse();
+                current.resize(static_cast<std::size_t>(bytes));
+                std::memcpy(current.data(), reinterpret_cast<const void*>(static_cast<std::uintptr_t>(sourceAddress)), current.size());
+            }
+        }
+    }
+
+    MemoryCore::Get().Protection().NeverArm(gds, Pm4::GdsBytes);
+    static_cast<void>(MemoryCore::Get().OpenCleanForImport(gds, Pm4::GdsBytes));
+    const auto* import = Graphics::HostImportFor(context, gds, Pm4::GdsBytes);
+    if (import == nullptr) return refuse();
+    const auto gdsBuffer = import->buffer;
+    const auto gdsBase = Graphics::HostImportOffset(*import, gds);
+
+    if (recorder.HasQueuedKeyStores()) recorder.FlushKeyStores();
+    if (recorder.HasQueuedStores()) recorder.FlushStores();
+    if (mirrored && Shadow::OwnedUploadsPending()) {
+        std::vector<std::shared_ptr<void>> kept;
+        static_cast<void>(Shadow::RecordOwnedUploads(recorder.Commands(), kept));
+        for (auto& object : kept) recorder.Keep(std::move(object));
+    }
+    if (!current.empty()) {
+        recorder.RecordStore(gdsBuffer, gdsBase + (destinationAddress - gds), current, destinationAddress);
+        recorder.FlushStores();
+        const std::array written{std::pair{destinationAddress, destinationAddress + bytes}};
+        Events::NoteRanges(written);
+        recorder.NotePendingWrite(destinationAddress, static_cast<std::size_t>(bytes));
+        gdsTransfers.fetch_add(1, std::memory_order_relaxed);
+        return true;
+    }
+
+    const auto commands = recorder.Commands();
+    const auto copy = context.Function<PFN_vkCmdCopyBuffer>("vkCmdCopyBuffer");
+    Graphics::RecordMemoryBarrier(context, commands, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT | VK_PIPELINE_STAGE_HOST_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_ACCESS_SHADER_WRITE_BIT | VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT | VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT | VK_ACCESS_TRANSFER_WRITE_BIT | VK_ACCESS_HOST_WRITE_BIT, VK_ACCESS_TRANSFER_READ_BIT | VK_ACCESS_TRANSFER_WRITE_BIT);
+    const auto close = [&] { Graphics::RecordMemoryBarrier(context, commands, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT | VK_PIPELINE_STAGE_HOST_BIT, VK_ACCESS_TRANSFER_WRITE_BIT, VK_ACCESS_MEMORY_READ_BIT | VK_ACCESS_MEMORY_WRITE_BIT | VK_ACCESS_HOST_READ_BIT); };
+    if (toGds) {
+        const auto destinationOffset = gdsBase + (destinationAddress - gds);
+        if (fromGds) {
+            const VkBufferCopy region{gdsBase + (sourceAddress - gds), destinationOffset, bytes};
+            copy(commands, gdsBuffer, gdsBuffer, 1, &region);
+        } else if (sourceSelect == Pm4::DmaSourceData) {
+            context.Function<PFN_vkCmdFillBuffer>("vkCmdFillBuffer")(commands, gdsBuffer, destinationOffset, bytes, packet[2]);
+            gdsFills.fetch_add(1, std::memory_order_relaxed);
+        } else if (landed != nullptr) {
+            const VkBufferCopy region{landedOffset, destinationOffset, bytes};
+            copy(commands, landed->Handle(), gdsBuffer, 1, &region);
+            recorder.Keep(landed);
+            gdsFromLandings.fetch_add(1, std::memory_order_relaxed);
+        } else {
+            const VkBufferCopy region{mirrored->offset, destinationOffset, bytes};
+            copy(commands, reinterpret_cast<VkBuffer>(static_cast<std::uintptr_t>(mirrored->handle)), gdsBuffer, 1, &region);
+            gdsFromMirror.fetch_add(1, std::memory_order_relaxed);
+        }
+        close();
+        const std::array written{std::pair{destinationAddress, destinationAddress + bytes}};
+        Events::NoteRanges(written);
+        recorder.NotePendingWrite(destinationAddress, static_cast<std::size_t>(bytes));
+        gdsTransfers.fetch_add(1, std::memory_order_relaxed);
+        return true;
+    }
+
+    auto landing = std::make_shared<Graphics::Buffer>(context, static_cast<std::size_t>(bytes), VK_BUFFER_USAGE_TRANSFER_DST_BIT | VK_BUFFER_USAGE_TRANSFER_SRC_BIT);
+    const VkBufferCopy toLanding{gdsBase + (sourceAddress - gds), 0, bytes};
+    copy(commands, gdsBuffer, landing->Handle(), 1, &toLanding);
+    const auto to = ResidencyService::Get().MirrorSpan(destinationAddress, bytes);
+    const bool inMirror = to && to->handle != 0u;
+    if (inMirror) {
+        const VkBufferCopy toMirror{gdsBase + (sourceAddress - gds), to->offset, bytes};
+        copy(commands, gdsBuffer, reinterpret_cast<VkBuffer>(static_cast<std::uintptr_t>(to->handle)), 1, &toMirror);
+    }
+    close();
+    recorder.Keep(landing);
+    std::uint64_t sequence = 0;
+    if (inMirror) {
+        const std::array written{std::pair{destinationAddress, destinationAddress + bytes}};
+        Shadow::NoteGpuWrites(written);
+        const auto mark = MemoryCore::Get().NoteGpuWrite(destinationAddress, bytes, recorder.OpenBatchSerial());
+        if (!mark.upload.empty()) ResidencyService::Get().NoteDirty(mark.upload);
+        sequence = mark.sequence;
+        Events::NoteRanges(written);
+    }
+    {
+        auto& landings = gdsLandings();
+        std::lock_guard lock(landings.mutex);
+        landings.pending.push_back({destinationAddress, bytes, landing});
+    }
+    if (hooks.pending != nullptr) hooks.pending(destinationAddress, bytes);
+    LandAfterBatch(recorder, [landing, inMirror, sequence, address = destinationAddress, bytes, done = hooks.landed] {
+        landing->Invalidate();
+        auto& core = MemoryCore::Get();
+        const std::span<const std::byte> stored(landing->Bytes().data(), static_cast<std::size_t>(bytes));
+        if (inMirror) {
+            core.LandGpuWrite(address, stored);
+            core.ReleaseLandedWrite(address, bytes, sequence);
+        } else if (GuestMemory::Accessible(reinterpret_cast<const void*>(static_cast<std::uintptr_t>(address)), stored.size(), true)) {
+            std::memcpy(reinterpret_cast<void*>(static_cast<std::uintptr_t>(address)), stored.data(), stored.size());
+            Shadow::NoteDriverStore(address, stored.size());
+        } else {
+            GuestMemory::Write(address, stored, 1);
+        }
+        {
+            auto& landings = gdsLandings();
+            std::lock_guard lock(landings.mutex);
+            std::erase_if(landings.pending, [&](const GdsLanding& entry) { return entry.buffer == landing; });
+        }
+        if (done != nullptr) done(address, bytes);
+    });
+    gdsTransfers.fetch_add(1, std::memory_order_relaxed);
+    return true;
+}
+
 bool StoresToMirror(std::size_t bytes, std::uint64_t address) {
     static const bool stores = RecordActive() && std::getenv("APS5_RECODE_MIRROR_STORES") != nullptr;
     static const std::size_t smallest = [] {

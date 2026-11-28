@@ -816,9 +816,15 @@ private:
             const std::array source{DirtyRange{copy->source, copy->bytes}};
             std::shared_ptr<Graphics::Buffer> landing;
             if (MemoryCore::Get().WithoutGpuWritten(source).empty()) {
+                static const bool ordersCopies = std::getenv("APS5_RECODE_COPIES_SETTLE") == nullptr;
                 GuestMemory::TagGpuLockSite(GuestMemory::GpuLockSite::Label);
                 std::lock_guard lock(GuestMemory::GpuMutex());
-                if (auto* recorder = device.graphicsContext().recorder) landing = Record::ReadMirrorAfterBatch(device.graphicsContext(), *recorder, copy->source, copy->bytes);
+                auto* recorder = device.graphicsContext().recorder;
+                if (ordersCopies && recorder != nullptr && !recorder->Idle() && !LabelsPending(copy->destination, copy->bytes) && Record::CopyInMirror(device.graphicsContext(), *recorder, *copy)) {
+                    totals().copiesOnGpu.fetch_add(1, std::memory_order_relaxed);
+                    return;
+                }
+                if (recorder != nullptr) landing = Record::ReadMirrorAfterBatch(device.graphicsContext(), *recorder, copy->source, copy->bytes);
             }
             if (landing != nullptr) {
                 settle(device, "settling for a copy read from the mirror");
@@ -830,7 +836,7 @@ private:
             }
         }
         if (copy) {
-            if (MemoryCore::Get().GpuWritesPending(copy->source, copy->bytes)) settle(device, "settling for a copy source");
+            if (MemoryCore::Get().GpuWritesPending(copy->source, copy->bytes) || LabelsPending(copy->source, copy->bytes)) settle(device, "settling for a copy source");
             stage("landing a copy source");
             MemoryCore::Get().FlushGpuWrites(copy->source, copy->bytes);
             stage("reading a copy source");
@@ -896,6 +902,13 @@ private:
             totals().refused.fetch_add(1, std::memory_order_relaxed);
             Record::RefuseUnrecorded("loop sample dump", 0, "the occlusion counter dump was not recorded");
             return;
+        }
+        if (opcode == 0x50u && item.words.size() == 7u && (Pm4::DmaSource(item.words) == Pm4::DmaSelectGds || Pm4::DmaDestination(item.words) == Pm4::DmaSelectGds)) {
+            static constexpr Record::GdsTransferHooks hooks{LabelsPending, notePendingLabel, dropPendingLabel};
+            if (Record::TransferGds(context, *context.recorder, item.words, hooks)) {
+                totals().runTimeStores.fetch_add(1, std::memory_order_relaxed);
+                return;
+            }
         }
         const auto pieces = Pm4::DecodeStores(item.words);
         bool onCpu = pieces.empty() && opcode == 0x50u && item.words.size() == 7u && Pm4::DmaDestination(item.words) == Pm4::DmaSelectGds;
@@ -1185,7 +1198,7 @@ std::string Line() {
         handed = shared.handed.size();
         reached = shared.reached.size();
     }
-    return std::string(text) + "; label submits deferred " + std::to_string(totals().submitsDeferred.load()) + "; recorder kept moving by the loop: " + std::to_string(totals().keptSubmits.load()) + " submits, " + std::to_string(totals().keptReaps.load()) + " reaps" +"; flips handed over but not reached " + std::to_string(handed) + ", reached but not handed over " + std::to_string(reached);
+    return std::string(text) + "; label submits deferred " + std::to_string(totals().submitsDeferred.load()) + "; recorder kept moving by the loop: " + std::to_string(totals().keptSubmits.load()) + " submits, " + std::to_string(totals().keptReaps.load()) + " reaps; " + Record::GdsTransferLine() + "; flips handed over but not reached " + std::to_string(handed) + ", reached but not handed over " + std::to_string(reached);
 }
 
 }
