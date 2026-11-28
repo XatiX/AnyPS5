@@ -1494,8 +1494,21 @@ std::uint32_t EmitFPSqrt(SpirvEmitterState& state, std::uint32_t arg0) {
     return EmitExt(state, TypeF32(state), GLSLstd450Sqrt, {arg0});
 }
 
+std::uint32_t Exp2SeriesNearZero(SpirvEmitterState& state, std::uint32_t value) {
+    const auto scaled = ExactMul(state, value, ConstantF32(state, 0x3f317218u));
+    auto polynomial = ConstantF32(state, 0x3ab60b61u);
+    for (const std::uint32_t coefficient : {0x3c088889u, 0x3d2aaaabu, 0x3e2aaaabu, 0x3f000000u, 0x3f800000u}) {
+        polynomial = Exact(state, EmitExt(state, TypeF32(state), GLSLstd450Fma, {polynomial, scaled, ConstantF32(state, coefficient)}));
+    }
+    return Exact(state, EmitExt(state, TypeF32(state), GLSLstd450Fma, {scaled, polynomial, ConstantF32(state, 0x3f800000u)}));
+}
+
 std::uint32_t EmitFPExp2(SpirvEmitterState& state, std::uint32_t arg0) {
-    return EmitExt(state, TypeF32(state), GLSLstd450Exp2, {arg0});
+    const auto value = EmitExt(state, TypeF32(state), GLSLstd450Exp2, {arg0});
+    const auto near = Binary(state, spv::OpFOrdLessThanEqual, TypeBool(state), EmitExt(state, TypeF32(state), GLSLstd450FAbs, {arg0}), ConstantF32(state, 0x3e000000u));
+    return EmitValueOrDefaultIfCondition(state, near, TypeF32(state), value, [&] {
+        return Exp2SeriesNearZero(state, arg0);
+    });
 }
 
 std::uint32_t Log2SeriesNearOne(SpirvEmitterState& state, std::uint32_t difference) {
