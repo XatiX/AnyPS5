@@ -38,7 +38,7 @@ std::uint64_t hashOf(std::span<const std::uint64_t> key, std::span<const std::by
 }
 
 std::filesystem::path Directory() {
-    if (std::getenv("APS5_RECODE_NO_PIPELINE_LIST") != nullptr) return {};
+    if (std::getenv("APS5_RECODE_PIPELINE_LIST") == nullptr) return {};
     const auto root = ShaderRecompiler::ShaderCacheDirectory();
     if (root.empty()) return {};
     char version[17];
