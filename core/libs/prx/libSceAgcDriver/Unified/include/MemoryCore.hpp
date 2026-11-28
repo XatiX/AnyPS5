@@ -116,6 +116,7 @@ public:
     void MarkGpuOwned(std::uint64_t address, std::uint64_t size);
     bool HandleFault(std::uint64_t address, bool write);
     void PrepareHostWrite(std::uint64_t address, std::uint64_t size);
+    bool OpenCleanForImport(std::uint64_t address, std::uint64_t size);
     void LandGpuWrite(std::uint64_t address, std::span<const std::byte> bytes, void* view = nullptr);
     void CollectWrites(std::uint64_t address, std::uint64_t size, PageTable::WrittenRun written, void* context);
     void NoteDriverWrite(std::uint64_t address, std::uint64_t size);

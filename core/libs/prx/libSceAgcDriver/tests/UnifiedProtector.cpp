@@ -147,6 +147,10 @@ void testWriteFaultOpensACleanPage() {
     Expect(core.Counts().hostWritesOpened == 2, "both pages are counted as opened by the host write");
     const auto third = core.ConsumeDirty();
     Expect(third.size() == 1 && third[0].address == base + 2 * PageBytes && third[0].size == 2 * PageBytes, "the pages the host wrote are uploaded at the next consume");
+    Expect(protectionAt(base) == PAGE_READONLY, "an untouched page stays armed before import");
+    Expect(core.OpenCleanForImport(base, PageBytes), "open clean for import reopens an armed page");
+    Expect(protectionAt(base) == PAGE_READWRITE, "the clean page opened for import is writable");
+    Expect(!core.OpenCleanForImport(base, PageBytes), "reopening an already dirty page reports no clean change");
     core.Unregister(base, 4 * PageBytes);
     Expect(protectionAt(base) == PAGE_READWRITE, "unregistering opens the pages");
     release(base);

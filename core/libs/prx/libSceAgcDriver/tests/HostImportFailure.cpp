@@ -1,6 +1,7 @@
 #include "HostImportFailure.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/GuestBufferMemory.hpp"
 #include "prx/libSceAgcDriver/Execution/include/GuestMemory.hpp"
+#include "prx/libSceAgcDriver/Unified/include/MemoryCore.hpp"
 #include "prx/libc/include/GuestAllocations.hpp"
 #include "prx/libc/include/GuestArena.hpp"
 #ifdef _WIN32
@@ -179,6 +180,31 @@ void PartialResidentAliasRefused(const Context& context, bool left) {
     Require(std::all_of(data, data + allocationBytes, [](std::byte value) { return value == std::byte{0x37}; }), "alias refusal or retry changed guest bytes");
     std::printf("partial resident alias %s: refused without a live import, complete run imported, guest bytes preserved\n", left ? "left" : "right");
 }
+
+void TrackedPrivateImportReopensCleanPages(const Context& context) {
+    Heap heap;
+    auto& core = AgcDriver::Unified::MemoryCore::Get();
+    struct Cleanup {
+        VkDevice device;
+        AgcDriver::Unified::MemoryCore& core;
+        std::uint64_t address;
+        ~Cleanup() {
+            ClearHostImports(device);
+            core.Unregister(address, Alignment);
+        }
+    } cleanup{context.device, core, heap.Address()};
+    ClearHostImports(context.device);
+    core.Register(heap.Address(), AgcDriver::Unified::PageBytes);
+    static_cast<void>(core.ConsumeDirty());
+    const auto* partial = HostImportFor(context, heap.Address(), Bytes);
+    Require(partial != nullptr && partial->alias == nullptr, "partially clean tracked private memory did not reopen and import");
+    ClearHostImports(context.device);
+    core.Register(heap.Address(), Alignment);
+    static_cast<void>(core.ConsumeDirty());
+    const auto* full = HostImportFor(context, heap.Address(), Bytes);
+    Require(full != nullptr && full->alias == nullptr, "fully clean tracked private memory did not reopen and import");
+    std::printf("tracked private import: partial and full MemoryCore-armed pages reopened and imported\n");
+}
 #endif
 
 }
@@ -189,6 +215,7 @@ void AgcDriver::Tests::RunHostImportFailureTests(const Graphics::Context& origin
         std::lock_guard gpu(AgcDriver::GuestMemory::GpuMutex());
         ClearHostImports(original.device);
         for (const bool left : {false, true}) PartialResidentAliasRefused(original, left);
+        TrackedPrivateImportReopensCleanPages(original);
     }
 #endif
     unsigned failures = 0;

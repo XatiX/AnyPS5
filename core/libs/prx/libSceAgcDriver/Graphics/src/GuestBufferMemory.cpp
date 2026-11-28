@@ -25,6 +25,7 @@
 #include "prx/libc/include/GuestWriteWatch.hpp"
 #include "prx/libc/include/HostThreadLocal.hpp"
 #include "prx/libc/include/general/AtomicSharedPtr.hpp"
+#include "prx/libSceAgcDriver/Unified/include/MemoryCore.hpp"
 #include "prx/libSceAgcDriver/Unified/include/Shadow.hpp"
 #ifdef _WIN32
 #include <windows.h>
@@ -2637,8 +2638,12 @@ const HostImport* importRunAt(const Context& context, HostImports& state, Import
 #ifdef _WIN32
     // Drivers pin imported pages, so every page must be committed and accessible.
     const GuestArena::HostImportAccess importAccess(reinterpret_cast<void*>(base), static_cast<std::size_t>(bytes));
-    const auto pages = importPages(base, bytes);
+    auto pages = importPages(base, bytes);
     if (!pages.committed) return failedImport();
+    if (!pages.writable && !pages.shared && pages.refused.BaseAddress == nullptr && Unified::MemoryCore::Get().OpenCleanForImport(base, bytes)) {
+        pages = importPages(base, bytes);
+        if (!pages.committed) return failedImport();
+    }
     const bool writable = pages.writable;
     if (!writable && pages.readOnly) return failedImport();
     if (!writable) {

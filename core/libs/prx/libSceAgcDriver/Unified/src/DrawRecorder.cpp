@@ -3119,6 +3119,8 @@ private:
                 }
                 case Bindings::Source::Gds: {
                     const auto gds = Pm4::GdsAddress();
+                    MemoryCore::Get().Protection().NeverArm(gds, Pm4::GdsBytes);
+                    static_cast<void>(MemoryCore::Get().OpenCleanForImport(gds, Pm4::GdsBytes));
                     const auto* import = Graphics::HostImportFor(context, gds, Pm4::GdsBytes);
                     if (import == nullptr) {
                         reason = "GDS not imported";

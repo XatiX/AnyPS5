@@ -335,6 +335,25 @@ void MemoryCore::PrepareHostWrite(std::uint64_t address, std::uint64_t size) {
     protector.Apply(changes);
 }
 
+bool MemoryCore::OpenCleanForImport(std::uint64_t address, std::uint64_t size) {
+    if (size == 0) return false;
+    std::lock_guard lock(mutex);
+    std::vector<ProtectionChange> changes;
+    const auto end = address + size;
+    for (auto page = address & ~(PageBytes - 1); page < end; page += PageBytes) {
+        if (pages.StateOf(page) != PageState::CpuClean) continue;
+        static_cast<void>(pages.HandleWrite(page, changes));
+    }
+    if (changes.empty()) return false;
+    if (!sharedPages.empty()) {
+        for (const auto& change : changes) {
+            for (auto at = change.address; at < change.address + change.size; at += PageBytes) keepSharedPreImage(at);
+        }
+    }
+    protector.Apply(changes);
+    return true;
+}
+
 void MemoryCore::LandGpuWrite(std::uint64_t address, std::span<const std::byte> bytes, void* view) {
     if (bytes.empty()) return;
     Downgrades::WatchTouch("a GPU write landed from residency", address, bytes.size());
