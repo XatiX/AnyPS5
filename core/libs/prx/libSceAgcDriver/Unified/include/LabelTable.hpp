@@ -31,6 +31,7 @@ class LabelTable {
 public:
     std::uint64_t Note(std::uint64_t address, std::span<const std::byte> bytes, std::uint32_t queue);
     [[nodiscard]] std::optional<Issued> IssuedAfter(std::uint64_t address, std::size_t bytes, std::uint64_t after, const std::function<bool(std::uint64_t value)>& compares) const;
+    [[nodiscard]] std::optional<Issued> Latest(std::uint64_t address, std::size_t bytes) const;
     [[nodiscard]] std::uint64_t Serial() const { return serial.load(std::memory_order_acquire); }
     void Clear();
 

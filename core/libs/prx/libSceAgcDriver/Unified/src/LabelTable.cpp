@@ -36,6 +36,21 @@ std::optional<Issued> LabelTable::IssuedAfter(std::uint64_t address, std::size_t
     return std::nullopt;
 }
 
+std::optional<Issued> LabelTable::Latest(std::uint64_t address, std::size_t bytes) const {
+    if (bytes != sizeof(std::uint32_t) && bytes != sizeof(std::uint64_t)) return std::nullopt;
+    std::lock_guard lock(mutex);
+    const auto low = words.find(address);
+    if (low == words.end() || low->second[0].stamp == 0u) return std::nullopt;
+    const auto& entry = low->second[0];
+    std::uint64_t value = entry.value;
+    if (bytes == sizeof(std::uint64_t)) {
+        const auto high = words.find(address + sizeof(std::uint32_t));
+        if (high == words.end() || high->second[0].stamp != entry.stamp) return std::nullopt;
+        value |= static_cast<std::uint64_t>(high->second[0].value) << 32u;
+    }
+    return Issued{entry.stamp, entry.queue, value};
+}
+
 void LabelTable::Clear() {
     std::lock_guard lock(mutex);
     words.clear();

@@ -734,6 +734,7 @@ private:
     }
 
     void storeBytes(const Graphics::Context& context, std::uint64_t address, std::span<const std::byte> bytes, bool inStream = false) {
+        notePendingLabel(address, bytes.size());
         const auto stamp = Labels::Table().Note(address, bytes, queue);
         if (bytes.size() >= 4u) {
             std::uint64_t value = 0;
@@ -743,21 +744,22 @@ private:
         totals().labels.fetch_add(1, std::memory_order_relaxed);
         static const bool mirrorLabels = std::getenv("APS5_RECODE_LOOP_MIRROR_LABELS") != nullptr;
         if ((mirrorLabels || inStream) && bytes.size() <= GpuStoreLimit && address % 4u == 0u && bytes.size() % 4u == 0u && !bytes.empty()) {
-            if (Record::StoreToMirror(context, *context.recorder, address, bytes, stamp, queue) == 0) return;
+            if (Record::StoreToMirror(context, *context.recorder, address, bytes, stamp, queue) == 0) {
+                dropPendingLabel(address, bytes.size());
+                return;
+            }
             GuestMemory::Write(address, bytes, 4);
+            dropPendingLabel(address, bytes.size());
             totals().labelsAtOnce.fetch_add(1, std::memory_order_relaxed);
             return;
         }
-        std::vector<std::byte> held(bytes.begin(), bytes.end());
-        notePendingLabel(address, bytes.size());
-        if (context.recorder->AfterRecordedWork([address, held] {
-                Record::AfterLandings([address, held] {
-                    GuestMemory::Write(address, held, 1);
-                    dropPendingLabel(address, held.size());
-                });
-            })) return;
-        dropPendingLabel(address, bytes.size());
-        GuestMemory::Write(address, bytes, 1);
+        auto held = std::make_shared<std::vector<std::byte>>(bytes.begin(), bytes.end());
+        auto land = [address, held = std::move(held)] {
+            GuestMemory::Write(address, *held, 1);
+            dropPendingLabel(address, held->size());
+        };
+        if (context.recorder->AfterRecordedWork([land] { Record::AfterLandings(land); })) return;
+        Record::AfterLandings(std::move(land));
         totals().labelsAtOnce.fetch_add(1, std::memory_order_relaxed);
     }
 
@@ -936,16 +938,22 @@ private:
         auto warned = started;
         const auto readable = [&] { return GuestMemory::Accessible(reinterpret_cast<const void*>(static_cast<std::uintptr_t>(operation.address)), static_cast<std::size_t>(operation.size)); };
         for (;;) {
-            if (readable() && compares(Pm4::LoadLabel(operation.address, static_cast<std::size_t>(operation.size)))) {
-                totals().waitsFromGuest.fetch_add(1, std::memory_order_relaxed);
-                noteWait(operation, 'g', Pm4::LoadLabel(operation.address, static_cast<std::size_t>(operation.size)), started);
-                return;
-            }
-            static const bool guestOnly = std::getenv("APS5_RECODE_WAITS_FROM_GUEST") != nullptr;
-            if (!guestOnly && Labels::Table().IssuedAfter(operation.address, static_cast<std::size_t>(operation.size), 0u, compares)) {
-                totals().waitsFromTable.fetch_add(1, std::memory_order_relaxed);
-                noteWait(operation, 't', readable() ? Pm4::LoadLabel(operation.address, static_cast<std::size_t>(operation.size)) : 0u, started);
-                return;
+            const bool pending = LabelsPending(operation.address, static_cast<std::size_t>(operation.size));
+            if (!pending) {
+                if (readable() && compares(Pm4::LoadLabel(operation.address, static_cast<std::size_t>(operation.size)))) {
+                    totals().waitsFromGuest.fetch_add(1, std::memory_order_relaxed);
+                    noteWait(operation, 'g', Pm4::LoadLabel(operation.address, static_cast<std::size_t>(operation.size)), started);
+                    return;
+                }
+            } else {
+                static const bool guestOnly = std::getenv("APS5_RECODE_WAITS_FROM_GUEST") != nullptr;
+                if (!guestOnly) {
+                    if (const auto latest = Labels::Table().Latest(operation.address, static_cast<std::size_t>(operation.size)); latest && compares(latest->value)) {
+                        totals().waitsFromTable.fetch_add(1, std::memory_order_relaxed);
+                        noteWait(operation, 't', readable() ? Pm4::LoadLabel(operation.address, static_cast<std::size_t>(operation.size)) : 0u, started);
+                        return;
+                    }
+                }
             }
             totals().waitPolls.fetch_add(1, std::memory_order_relaxed);
             if (const auto now = std::chrono::steady_clock::now(); now - lastWaitSubmit >= WaitSubmitInterval) {

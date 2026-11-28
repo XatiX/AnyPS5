@@ -65,6 +65,21 @@ void testHistoryKeepsTheLastStores() {
     Expect(newest.has_value(), "the newest store is kept");
 }
 
+void testLatestReturnsOnlyTheNewestStore() {
+    LabelTable table;
+    Expect(!table.Latest(0x5000, 4).has_value(), "unknown address has no latest store");
+    const auto one = bytesOf(1u);
+    const auto zero = bytesOf(0u);
+    static_cast<void>(table.Note(0x5000, std::span(one).first(4), 0));
+    const auto resetStamp = table.Note(0x5000, std::span(zero).first(4), 0);
+    const auto latest = table.Latest(0x5000, 4);
+    Expect(latest.has_value() && latest->stamp == resetStamp && latest->value == 0u, "latest returns only the newest store after a binary label reset");
+    const auto wide = bytesOf(0x0000001200000034ull);
+    const auto wideStamp = table.Note(0x6000, wide, 1);
+    const auto latestWide = table.Latest(0x6000, 8);
+    Expect(latestWide.has_value() && latestWide->stamp == wideStamp && latestWide->queue == 1u && latestWide->value == 0x0000001200000034ull, "latest combines both words of the newest 8-byte store");
+}
+
 }
 
 int main() {
@@ -72,6 +87,7 @@ int main() {
     testCompareSelectsTheMatchingStore();
     testEightByteLabelsJoinBothWords();
     testHistoryKeepsTheLastStores();
+    testLatestReturnsOnlyTheNewestStore();
     if (failures != 0) return 1;
     std::printf("agc_unified_label_table_tests passed\n");
     return 0;
