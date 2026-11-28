@@ -312,8 +312,9 @@ struct ProcessSampler {
 };
 
 void StartProcessSampler() {
+    static std::atomic<bool> started{false};
     const auto path = ConfiguredPath(_wgetenv(L"APS5_SAMPLE_THREADS"));
-    if (!path) return;
+    if (!path || started.exchange(true, std::memory_order_acq_rel)) return;
     processSamplerThread = Libc::StartHostJThread([path = *path](std::stop_token token) {
         auto sampler = std::make_unique<ProcessSampler>();
         sampler->path = path;
@@ -382,6 +383,7 @@ void StartLaneSampler(std::uint32_t queue) {
 }
 
 void StartLoopSampler(std::uint32_t queue) {
+    if (queue == 0) StartProcessSampler();
     static const auto sampledQueue = [] {
         const char* value = std::getenv("APS5_SAMPLE_WORKER_QUEUE");
         return value != nullptr ? static_cast<std::uint32_t>(std::strtoul(value, nullptr, 0)) : 0u;
