@@ -90,7 +90,7 @@ void testSetEnd(const Variant& variant) {
     }
 
     expectInvalidPacket(variant, [=](std::uint32_t* packet) { return setEnd(nullptr, at(endAfter(packet, 2))); });
-    expectInvalidPacket(variant, [=](std::uint32_t* packet) { return setEnd(packet + 1, at(endAfter(packet, 2))); });
+    expectInvalidPacket(variant, [=](std::uint32_t* packet) { return setEnd(packet + 5, at(endAfter(packet, 2))); });
     {
         Storage storage(variant.write);
         storage.packet[0] = (storage.packet[0] & ~0xff00u) | 0x2100u;
@@ -127,7 +127,7 @@ void testSetCommandAddress(const Variant& variant) {
     }
 
     expectInvalidPacket(variant, [=](std::uint32_t*) { return setCommandAddress(nullptr, at(0x1000u)); });
-    expectInvalidPacket(variant, [=](std::uint32_t* packet) { return setCommandAddress(packet + 1, at(0x1000u)); });
+    expectInvalidPacket(variant, [=](std::uint32_t* packet) { return setCommandAddress(packet + 5, at(0x1000u)); });
     {
         Storage storage(variant.write);
         storage.packet[0] = (storage.packet[0] & ~0xff00u) | 0x2100u;
