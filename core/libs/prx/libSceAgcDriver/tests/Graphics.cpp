@@ -6140,7 +6140,6 @@ void InitialContextTests() {
     Require(queue.context.at(0x206) == 0x43f, "the initial viewport control does not apply the viewport transform");
     Require(queue.context.at(0x8e) == 0 && queue.context.at(0x8f) == 0, "the initial color masks write color");
     queue.userConfig[0x242] = 4;
-    queue.context.at(0x206) = 0;
     for (const auto offset : {0x2d5u, 0x204u, 0x8eu, 0x8fu, 0x1c3u, 0x1c5u, 0x31cu, 0x3b0u, 0x3b8u, 0x318u, 0x390u, 0x10fu, 0x110u, 0x111u, 0x112u, 0x113u, 0x114u, 0xb4u, 0xb5u}) queue.context.at(offset) = configured.context.at(offset);
     const auto state = AgcDriver::Graphics::DecodeState(queue);
     Require(state.color.address == reinterpret_cast<std::uintptr_t>(colorMemory.data()) && state.color.bytes == colorMemory.size(), "sparse guest setup lost its render target");
