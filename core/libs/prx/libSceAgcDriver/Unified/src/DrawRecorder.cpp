@@ -18,6 +18,7 @@
 #include "prx/libSceAgcDriver/Graphics/include/Texture.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/TextureFormat.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/VertexInput.hpp"
+#include "prx/libSceAgcDriver/Unified/include/BuildBudget.hpp"
 #include "prx/libSceAgcDriver/Unified/include/DataRing.hpp"
 #include "prx/libSceAgcDriver/Unified/include/DepthRecords.hpp"
 #include "prx/libSceAgcDriver/Unified/include/LabelImports.hpp"
@@ -1633,6 +1634,7 @@ struct PipelineJob {
     std::uint32_t subgroupSize = 0;
     VulkanDevice* owner = nullptr;
     std::uint64_t codeAddress = 0;
+    std::uint64_t spirvBytes = 0;
 };
 
 constexpr std::uint64_t UnsavedBuildNanoseconds = 5'000'000'000u;
@@ -1987,6 +1989,7 @@ public:
         line += text;
         std::snprintf(text, sizeof(text), "; dispatches %llu recorded (%llu indirect, %llu storage images written), %llu to the existing path, %.1f us per dispatch; compute pipelines %zu held, %llu queued (%llu ahead of recording), %llu built in %.1f ms, %zu building, %zu failed", static_cast<unsigned long long>(totals.dispatches), static_cast<unsigned long long>(totals.indirectDispatches), static_cast<unsigned long long>(totals.storageWrites), static_cast<unsigned long long>(totals.dispatchExisting), totals.dispatches == 0 ? 0.0 : static_cast<double>(totals.dispatchNanoseconds) / 1000.0 / static_cast<double>(totals.dispatches), pipelineCounts.held, static_cast<unsigned long long>(pipelinesQueued.load(std::memory_order_relaxed)), static_cast<unsigned long long>(pipelinesPrebuilt.load(std::memory_order_relaxed)), static_cast<unsigned long long>(pipelineCounts.built), static_cast<double>(pipelineCounts.nanoseconds) / 1e6, pipelineCounts.building, pipelineCounts.failed);
         line += text;
+        line += "; pipeline builders " + std::to_string(pipelineCounts.builders) + " threads, at most " + std::to_string(pipelineCounts.mostAtOnce) + " builds at once";
         std::snprintf(text, sizeof(text), "; table maps %llu hits, %llu uploads (%.1f MiB), %llu retired, %zu held (%.1f MiB); table images %llu reused, %llu bound (%llu whole), %llu elements bound, %llu checked for a refresh, %llu depth kept, %llu retired, %zu held; compressed records beside another format %llu; consumes for CPU-written mirror inputs %llu",static_cast<unsigned long long>(totals.mapHits), static_cast<unsigned long long>(totals.mapUploads), static_cast<double>(totals.mapUploadBytes) / 1048576.0, static_cast<unsigned long long>(totals.mapRetired), maps.size(), static_cast<double>(mapBytes) / 1048576.0, static_cast<unsigned long long>(totals.tableImageHits), static_cast<unsigned long long>(totals.tableImageBuilds), static_cast<unsigned long long>(totals.tableImageWhole), static_cast<unsigned long long>(totals.tableImageBinds), static_cast<unsigned long long>(totals.tableImageRefreshes), static_cast<unsigned long long>(totals.tableImageDepthKept), static_cast<unsigned long long>(totals.tableImageRetired), tableImages.size(), static_cast<unsigned long long>(totals.compressedAliases), static_cast<unsigned long long>(inputConsumes().load(std::memory_order_relaxed)));
         line += text;
         line += "; table image entries dropped for retired records " + std::to_string(totals.tableImageEntriesDropped);
@@ -2105,7 +2108,10 @@ public:
     void Detach(VkDevice replaced) {
         {
             std::unique_lock jobs(pipelineMutex);
+            ++framesWaiting;
+            jobsReady.notify_all();
             pipelinesDone.wait(jobs, [&] { return pipelineJobs.empty() && buildingPipelines.empty(); });
+            --framesWaiting;
         }
         std::lock_guard lock(mutex);
         if (device != replaced && device != VK_NULL_HANDLE) return;
@@ -3238,7 +3244,10 @@ private:
         }
         const auto started = std::chrono::steady_clock::now();
         lock.unlock();
+        ++framesWaiting;
+        jobsReady.notify_all();
         pipelinesDone.wait(pipelineLock, [&] { return !buildingPipelines.contains(key); });
+        --framesWaiting;
         pipelineLock.unlock();
         lock.lock();
         pipelineLock.lock();
@@ -3257,13 +3266,16 @@ private:
         std::size_t failed = 0;
         std::uint64_t built = 0;
         std::uint64_t nanoseconds = 0;
+        std::uint32_t builders = 0;
+        std::uint32_t mostAtOnce = 0;
     };
 
     PipelineCounts takePipelineCounts() {
         std::lock_guard pipelineLock(pipelineMutex);
-        PipelineCounts counts{computePipelines.size(), buildingPipelines.size(), failedPipelines.size(), builtPipelines, buildNanoseconds};
+        PipelineCounts counts{computePipelines.size(), buildingPipelines.size(), failedPipelines.size(), builtPipelines, buildNanoseconds, static_cast<std::uint32_t>(builders.size()), mostBuildsAtOnce};
         builtPipelines = 0;
         buildNanoseconds = 0;
+        mostBuildsAtOnce = runningBuilds.builds;
         return counts;
     }
 
@@ -3294,11 +3306,13 @@ private:
             reason = std::string("compute pipeline failed: ") + error.what();
             return false;
         }
+        job.spirvBytes = result->spirv.size() * sizeof(std::uint32_t);
         buildingPipelines.insert(key);
         pipelineJobs.push_back(std::move(job));
         pipelinesQueued.fetch_add(1, std::memory_order_relaxed);
-        while (builders.size() < pipelineBuilderCount()) builders.emplace_back([this] { buildPipelines(); });
-        jobsReady.notify_one();
+        const std::size_t wanted = std::min<std::size_t>(BuildBudget::Threads(BuildBudget::Host()), pipelineJobs.size() + runningBuilds.builds);
+        while (builders.size() < wanted) builders.emplace_back([this] { buildPipelines(); });
+        jobsReady.notify_all();
         return true;
     }
 
@@ -3307,9 +3321,12 @@ private:
             std::optional<PipelineJob> job;
             {
                 std::unique_lock lock(pipelineMutex);
-                jobsReady.wait(lock, [&] { return !pipelineJobs.empty(); });
+                jobsReady.wait(lock, [&] { return !pipelineJobs.empty() && BuildBudget::Admits(BuildBudget::Host(), framesWaiting != 0u, runningBuilds, pipelineJobs.front().spirvBytes); });
                 job.emplace(std::move(pipelineJobs.front()));
                 pipelineJobs.pop_front();
+                runningBuilds.builds++;
+                runningBuilds.memoryBytes += BuildBudget::MemoryBytes(job->spirvBytes);
+                mostBuildsAtOnce = std::max(mostBuildsAtOnce, runningBuilds.builds);
             }
             const auto started = std::chrono::steady_clock::now();
             std::shared_ptr<ComputePipeline> made;
@@ -3325,6 +3342,8 @@ private:
             Downgrades::NoteBuild(job->codeAddress, built, job->result != nullptr ? job->result->spirv.size() * sizeof(std::uint32_t) : 0u, job->result != nullptr ? job->result->spirv.ContentHash().low : 0u, job->key.size() > 2u ? Downgrades::HashCode(std::as_bytes(std::span(job->key).subspan(2))) : 0u);
             {
                 std::lock_guard lock(pipelineMutex);
+                runningBuilds.builds--;
+                runningBuilds.memoryBytes -= BuildBudget::MemoryBytes(job->spirvBytes);
                 buildingPipelines.erase(job->key);
                 buildNanoseconds += built;
                 unsavedBuildNanoseconds += made != nullptr ? built : 0u;
@@ -3340,16 +3359,9 @@ private:
                     failedPipelines.emplace(std::move(job->key), std::move(failure));
                 }
                 pipelinesDone.notify_all();
+                jobsReady.notify_all();
             }
         }
-    }
-
-    static std::uint32_t pipelineBuilderCount() {
-        static const std::uint32_t count = [] {
-            if (const char* value = std::getenv("APS5_RECODE_PIPELINE_BUILDERS"); value != nullptr && std::atoi(value) > 0) return static_cast<std::uint32_t>(std::atoi(value));
-            return std::clamp(std::thread::hardware_concurrency() / 2u, 1u, 4u);
-        }();
-        return count;
     }
 
     static void traceSourceWrites(const Resolve::ResolvedDraw& work) {
@@ -5584,6 +5596,9 @@ private:
     std::uint64_t builtPipelines = 0;
     std::uint64_t buildNanoseconds = 0;
     std::uint64_t unsavedBuildNanoseconds = 0;
+    BuildBudget::Running runningBuilds;
+    std::uint32_t framesWaiting = 0;
+    std::uint32_t mostBuildsAtOnce = 0;
     std::mutex pipelineMutex;
     std::mutex layoutMutex;
     std::atomic<VkDevice> attachedDevice{VK_NULL_HANDLE};
