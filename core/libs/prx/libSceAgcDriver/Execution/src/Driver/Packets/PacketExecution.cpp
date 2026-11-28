@@ -29,7 +29,7 @@
 #include "prx/libSceAgcDriver/Unified/include/RecordQueue.hpp"
 #include "prx/libSceAgcDriver/Unified/include/Releases.hpp"
 #include "prx/libSceAgcDriver/Unified/include/Resolve.hpp"
-#include "prx/libSceAgcDriver/Unified/include/Shadow.hpp"
+#include "prx/libSceAgcDriver/Unified/include/Intake.hpp"
 #endif
 
 namespace AgcDriver::DriverDetail {
@@ -628,7 +628,7 @@ void Driver::execute(Submission& submission) {
                 try {
                     std::string rejected;
 #if ANYPS5_UNIFIED
-                    const auto recorded = Unified::Shadow::RecordedState(submission, cursor);
+                    const auto recorded = Unified::Intake::RecordedState(submission, cursor);
                     auto& drawState = recorded != nullptr ? *recorded : queue;
 #else
                     auto& drawState = queue;

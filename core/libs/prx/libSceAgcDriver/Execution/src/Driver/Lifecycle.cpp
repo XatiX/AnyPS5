@@ -20,7 +20,7 @@
 #include "prx/libc/include/GuestArena.hpp"
 #include "prx/libc/include/GuestWriteWatch.hpp"
 #if ANYPS5_UNIFIED
-#include "prx/libSceAgcDriver/Unified/include/Shadow.hpp"
+#include "prx/libSceAgcDriver/Unified/include/RouteMemory.hpp"
 #endif
 #include <atomic>
 #include <chrono>
@@ -300,7 +300,7 @@ Driver::Driver() {
     GuestArena::GuestArenaSetHostWriteHook_nid_no_patch(&GuestMemory::PrepareHostWrite);
     GuestAllocations::GuestAllocationsSetGpuMapObserver_nid_postfix([](const GuestAllocations::Mapped& ranges, std::uint64_t generation) {
 #if ANYPS5_UNIFIED
-        Unified::Shadow::NoteGpuMapping(ranges);
+        Unified::RouteMemory::RegisterMapping(ranges);
 #endif
         const auto import = [&] {
             try {

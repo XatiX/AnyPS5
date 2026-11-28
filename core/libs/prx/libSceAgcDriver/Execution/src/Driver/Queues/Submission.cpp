@@ -20,7 +20,7 @@
 #include "prx/libSceAgcDriver/Unified/include/DrawRecorder.hpp"
 #include "prx/libSceAgcDriver/Unified/include/RecordLoop.hpp"
 #include "prx/libSceAgcDriver/Unified/include/RecordQueue.hpp"
-#include "prx/libSceAgcDriver/Unified/include/Shadow.hpp"
+#include "prx/libSceAgcDriver/Unified/include/Intake.hpp"
 #endif
 #include <algorithm>
 #include <array>
@@ -1127,7 +1127,7 @@ void Driver::noteWaitBlocked(std::uint32_t queue, std::uint64_t awaited, bool bl
 
 void Driver::enqueue(Submission submission) {
 #if ANYPS5_UNIFIED
-    if (Unified::Shadow::Teeing()) {
+    if (Unified::Intake::Takes()) {
         const bool routeOwned = Unified::Record::RecordActive() && Unified::Loop::OwnsLoop() && submission.rewindTail == nullptr;
         if (routeOwned) {
             Unified::Loop::SetInterruptHook([](void* owner, std::uint32_t target, std::uint32_t context) { static_cast<Driver*>(owner)->deliverGuestEopInterrupt(target, context); }, this);
@@ -1148,14 +1148,14 @@ void Driver::enqueue(Submission submission) {
                 if (device == nullptr) device = std::make_shared<VulkanDevice>();
                 local = device;
             }
-            Unified::Shadow::NoteDevice(local);
+            Unified::Intake::AttachDevice(local);
         }
         if (routeOwned) {
             bool holds = submission.holdsFlip;
             bool working = submission.flipWork != nullptr;
             for (const auto& [cursor, flip] : submission.flips) handFlipToRecode(submission, cursor, std::exchange(holds, false), std::exchange(working, false));
         }
-        Unified::Shadow::Tee(submission);
+        Unified::Intake::Submit(submission);
         if (routeOwned) {
             if (submission.suspend || submission.commands.empty()) markCompleted(submission.serial);
             return;

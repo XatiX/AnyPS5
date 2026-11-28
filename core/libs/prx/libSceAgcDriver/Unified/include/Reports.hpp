@@ -1,0 +1,10 @@
+#ifndef CORE_LIBS_PRX_LIBSCEAGCDRIVER_UNIFIED_INCLUDE_REPORTS_HPP
+#define CORE_LIBS_PRX_LIBSCEAGCDRIVER_UNIFIED_INCLUDE_REPORTS_HPP
+
+namespace AgcDriver::Unified::Reports {
+
+void Report();
+
+}
+
+#endif

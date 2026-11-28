@@ -35,7 +35,7 @@
 #include "prx/libSceAgcDriver/Unified/include/MetadataClears.hpp"
 #include "prx/libSceAgcDriver/Unified/include/ResidencyService.hpp"
 #include "prx/libSceAgcDriver/Unified/include/SlotPatch.hpp"
-#include "prx/libSceAgcDriver/Unified/include/Shadow.hpp"
+#include "prx/libSceAgcDriver/Unified/include/RouteMemory.hpp"
 #include "prx/libSceAgcDriver/Unified/include/TableMirror.hpp"
 #include "prx/libSceAgcDriver/Unified/include/Targets.hpp"
 #include "prx/libSceAgcDriver/Unified/include/VulkanHeap.hpp"
@@ -1325,8 +1325,8 @@ std::optional<DrawInput> drawInput(const Context& context, std::uint64_t address
     if (!shadowInputs() && mirrorMode() && !landedGpu && !inOldRange && !DirectMemoryAliased_nid_postfix(static_cast<std::uintptr_t>(address), static_cast<std::size_t>(bytes))) {
         static const bool servesOwned = std::getenv("APS5_RECODE_MIRROR_INPUTS_SERVE_OWNED") == nullptr || std::string_view(std::getenv("APS5_RECODE_MIRROR_INPUTS_SERVE_OWNED")) != "0";
         if (servesOwned) {
-            Shadow::OwnedSpan span;
-            static_cast<void>(Shadow::ServeOwned(context, address, bytes, &span));
+            RouteMemory::OwnedSpan span;
+            static_cast<void>(RouteMemory::ServeOwned(context, address, bytes, &span));
         }
         if (auto input = mirrorInput(address, bytes)) {
             const bool gpu = pages.GpuWrittenIn(address, bytes) || !pages.GpuOwnedIn(address, bytes).empty() || gpuPending(address, bytes);
@@ -1339,10 +1339,10 @@ std::optional<DrawInput> drawInput(const Context& context, std::uint64_t address
             }
             if (consumes && !gpu && !pages.CleanIn(address, bytes)) {
                 if (globalConsume) {
-                    Shadow::ConsumeNow();
+                    RouteMemory::ConsumeNow();
                 } else {
                     const std::array range{std::pair<std::uint64_t, std::uint64_t>{address, bytes}};
-                    static_cast<void>(Shadow::ConsumeIn(range));
+                    static_cast<void>(RouteMemory::ConsumeIn(range));
                 }
                 inputConsumes().fetch_add(1, std::memory_order_relaxed);
             }
@@ -1350,7 +1350,7 @@ std::optional<DrawInput> drawInput(const Context& context, std::uint64_t address
             return input;
         }
     }
-    if (!Shadow::ResidentDrawInputs()) return importedInput(context, address, bytes);
+    if (!RouteMemory::ResidentDrawInputs()) return importedInput(context, address, bytes);
     if (pages.GpuWrittenIn(address, bytes) || !pages.GpuOwnedIn(address, bytes).empty() || gpuPending(address, bytes)) {
         source = InputSource::GpuWritten;
         if (pendingInputsFromMirror() && (gpuPending(address, bytes) || !pages.GpuOwnedIn(address, bytes).empty())) {
@@ -1364,8 +1364,8 @@ std::optional<DrawInput> drawInput(const Context& context, std::uint64_t address
     }
     std::optional<DrawInput> written;
     if (source == InputSource::Imported) {
-        Shadow::OwnedSpan span;
-        if (Shadow::ServeOwned(context, address, bytes, &span) && span.handle != 0u) {
+        RouteMemory::OwnedSpan span;
+        if (RouteMemory::ServeOwned(context, address, bytes, &span) && span.handle != 0u) {
             const DrawInput resident{reinterpret_cast<VkBuffer>(static_cast<std::uintptr_t>(span.handle)), static_cast<VkDeviceSize>(address - span.origin)};
             if (pages.CleanIn(address, bytes)) {
                 source = InputSource::Resident;
@@ -2185,9 +2185,9 @@ private:
         if (work.empty()) return;
         if (surfaceDetiler == nullptr) surfaceDetiler = std::make_unique<Images::SurfaceDetiler>(context);
         markHangPhase(context, recorder, 7u);
-        if (hangMarking() && Shadow::OwnedUploadsPending()) {
+        if (hangMarking() && RouteMemory::UploadsPending()) {
             std::vector<std::shared_ptr<void>> kept;
-            static_cast<void>(Shadow::RecordOwnedUploads(recorder.Commands(), kept));
+            static_cast<void>(RouteMemory::RecordUploads(recorder.Commands(), kept));
             for (auto& object : kept) recorder.Keep(std::move(object));
             markHangPhase(context, recorder, 9u);
         }
@@ -2248,7 +2248,7 @@ private:
             landOwned(written, serials);
         } else {
             for (const auto& [begin, size] : written) Downgrades::NoteGuestWrite("a landed GPU write", begin, size);
-            Shadow::LandGpuWrites(written);
+            RouteMemory::LandGpuWrites(written);
         }
         std::vector<std::pair<std::uint64_t, std::uint64_t>> ends;
         ends.reserve(written.size());
@@ -2276,7 +2276,7 @@ private:
             Downgrades::NoteGuestWrite("a landed GPU write", begin, size);
             totals.openLandedBytes += size;
         }
-        Shadow::LandGpuWrites(eager);
+        RouteMemory::LandGpuWrites(eager);
         for (std::size_t index = 0; index < eager.size(); ++index) core.NoteLandedGpuWrite(eager[index].first, eager[index].second, eagerSerials[index]);
     }
 
@@ -2526,7 +2526,7 @@ private:
         auto mapped = residency.TranslateMapped(address, bytes);
         if (mapped == 0u && bytes <= KnownWriteLimitBytes && servesFaultPages()) {
             if (const auto pages = residency.UnmappedPages(address, bytes); !pages.empty()) {
-                Shadow::ServeFaultPages(pages);
+                RouteMemory::ServeFaultPages(pages);
                 mapped = residency.TranslateMapped(address, bytes);
             }
         }
@@ -2572,7 +2572,7 @@ private:
             std::vector<std::uint64_t> pages;
             if (Abi::ForEachFaultPage(words, [&](std::uint64_t page) { pages.push_back(page); }) && !pages.empty()) {
                 totals.faultPages += pages.size();
-                if (servesFaultPages()) Shadow::ServeFaultPages(pages);
+                if (servesFaultPages()) RouteMemory::ServeFaultPages(pages);
             }
         }
         std::memset(bytes.data(), 0, bytes.size());
@@ -2703,7 +2703,7 @@ private:
         const auto& known = stage.program.capture != nullptr ? stage.program.capture->snapshot.knownBuffers : none;
         const auto& infos = stage.program.variant->info.info.knownBuffers;
         const bool preferOwnedReads = (stage.program.stage == ShaderRecompiler::ShaderStage::Compute || stage.program.stage == ShaderRecompiler::ShaderStage::Mesh) &&
-            Shadow::ServesOwned() && stage.program.result != nullptr &&
+            RouteMemory::ServesOwned() && stage.program.result != nullptr &&
             std::ranges::any_of(stage.program.result->bindings, [](const auto& binding) { return binding.role == ShaderRecompiler::DescriptorRole::BdaPagetable; });
         landKnownWrites(completed);
         for (std::uint32_t index = 0; index < layout.knownBufferCount; ++index) {
@@ -2788,8 +2788,8 @@ private:
                 }
             }
             const auto reach = std::max(bytes, KnownReadableBytes);
-            Shadow::OwnedSpan span;
-            if (bytes <= KnownBufferLimitBytes && !MemoryCore::Get().Pages().GpuWrittenIn(address, reach) && ((reach != bytes && Shadow::ServeOwned(context, address, reach, &span)) || Shadow::ServeOwned(context, address, bytes, &span)) && span.address != 0u) {
+            RouteMemory::OwnedSpan span;
+            if (bytes <= KnownBufferLimitBytes && !MemoryCore::Get().Pages().GpuWrittenIn(address, reach) && ((reach != bytes && RouteMemory::ServeOwned(context, address, reach, &span)) || RouteMemory::ServeOwned(context, address, bytes, &span)) && span.address != 0u) {
                 totals.knownServed++;
                 noteKnownPath("owned", address, bytes);
                 write(span.address, bytes);
@@ -2800,7 +2800,7 @@ private:
             if (mapped == 0u && reach != bytes) mapped = ResidencyService::Get().TranslateMapped(address, bytes);
             if (mapped == 0u && bytes <= KnownBufferLimitBytes && servesFaultPages()) {
                 if (const auto pages = ResidencyService::Get().UnmappedPages(address, bytes); !pages.empty()) {
-                    Shadow::ServeFaultPages(pages);
+                    RouteMemory::ServeFaultPages(pages);
                     mapped = ResidencyService::Get().TranslateMapped(address, bytes);
                     if (mapped != 0u) totals.knownPaged++;
                 }
@@ -3396,13 +3396,13 @@ private:
         static const bool every = mode != nullptr && std::string_view(mode) == "every";
         if (mode == nullptr || std::string_view(mode) == "0") return;
         if (every) {
-            if (Shadow::ConsumeIn({}) != 0u) inputConsumes().fetch_add(1, std::memory_order_relaxed);
+            if (RouteMemory::ConsumeIn({}) != 0u) inputConsumes().fetch_add(1, std::memory_order_relaxed);
             return;
         }
         if (quick) {
             for (const auto& use : operation.uses) {
                 if (use.size == 0u || use.write || MemoryCore::Get().Pages().CleanIn(use.address, use.size)) continue;
-                static_cast<void>(Shadow::ConsumeIn({}));
+                static_cast<void>(RouteMemory::ConsumeIn({}));
                 inputConsumes().fetch_add(1, std::memory_order_relaxed);
                 return;
             }
@@ -3414,14 +3414,14 @@ private:
         for (const auto& use : operation.uses) {
             if (use.size == 0u || use.write || pages.CleanIn(use.address, use.size)) continue;
             if (global) {
-                Shadow::ConsumeNow();
+                RouteMemory::ConsumeNow();
                 inputConsumes().fetch_add(1, std::memory_order_relaxed);
                 return;
             }
             dirty.emplace_back(use.address, use.size);
         }
         if (dirty.empty()) return;
-        static_cast<void>(Shadow::ConsumeIn(dirty));
+        static_cast<void>(RouteMemory::ConsumeIn(dirty));
         inputConsumes().fetch_add(1, std::memory_order_relaxed);
     }
 
@@ -4139,15 +4139,15 @@ private:
             for (const auto& [address, size] : dispatch.decodeReads) {
                 if (address == 0u || size == 0u) continue;
                 if (servesFaultPages()) {
-                    if (const auto pages = ResidencyService::Get().UnmappedPages(address, size); !pages.empty()) Shadow::ServeFaultPages(pages);
+                    if (const auto pages = ResidencyService::Get().UnmappedPages(address, size); !pages.empty()) RouteMemory::ServeFaultPages(pages);
                 }
                 if (!pageState.CleanIn(address, size)) dirtyDecodeReads.emplace_back(address, size);
             }
-            if (!dirtyDecodeReads.empty()) static_cast<void>(Shadow::ConsumeIn(dirtyDecodeReads));
+            if (!dirtyDecodeReads.empty()) static_cast<void>(RouteMemory::ConsumeIn(dirtyDecodeReads));
         }
-        if (Shadow::OwnedUploadsPending()) {
+        if (RouteMemory::UploadsPending()) {
             std::vector<std::shared_ptr<void>> kept;
-            if (Shadow::RecordOwnedUploads(recorder->Commands(), kept) != 0u) totals.residencyLands++;
+            if (RouteMemory::RecordUploads(recorder->Commands(), kept) != 0u) totals.residencyLands++;
             for (auto& object : kept) recorder->Keep(std::move(object));
         }
         const auto commands = recorder->Commands();
@@ -4272,13 +4272,13 @@ private:
         const bool gpuWritten = record->TakeGpuHtileWrite();
         if (!gpuWritten && !record->HtileSaysCleared()) return;
         const auto bytes = record->HtileBytes();
-        Shadow::OwnedSpan span;
-        const bool served = Shadow::ServeOwned(context, target.htileAddress, bytes, &span) && span.handle != 0u && target.htileAddress >= span.origin;
+        RouteMemory::OwnedSpan span;
+        const bool served = RouteMemory::ServeOwned(context, target.htileAddress, bytes, &span) && span.handle != 0u && target.htileAddress >= span.origin;
         std::string reason = served ? "" : "HTILE memory not resident";
         if (served) {
             const auto commands = recorder.Commands();
             std::vector<std::shared_ptr<void>> kept;
-            if (Shadow::RecordOwnedUploads(commands, kept) != 0u) {
+            if (RouteMemory::RecordUploads(commands, kept) != 0u) {
                 for (auto& object : kept) recorder.Keep(std::move(object));
             }
         }
@@ -4923,18 +4923,18 @@ private:
             for (const auto& [address, size] : draw.decodeReads) {
                 if (address == 0u || size == 0u) continue;
                 if (servesFaultPages()) {
-                    if (const auto pages = ResidencyService::Get().UnmappedPages(address, size); !pages.empty()) Shadow::ServeFaultPages(pages);
+                    if (const auto pages = ResidencyService::Get().UnmappedPages(address, size); !pages.empty()) RouteMemory::ServeFaultPages(pages);
                 }
                 if (!pageState.CleanIn(address, size)) dirtyDecodeReads.emplace_back(address, size);
             }
-            if (!dirtyDecodeReads.empty()) static_cast<void>(Shadow::ConsumeIn(dirtyDecodeReads));
+            if (!dirtyDecodeReads.empty()) static_cast<void>(RouteMemory::ConsumeIn(dirtyDecodeReads));
         }
-        if (Shadow::OwnedUploadsPending()) {
+        if (RouteMemory::UploadsPending()) {
             phase = std::chrono::steady_clock::now();
             std::vector<std::shared_ptr<void>> kept;
             const auto uploadCommands = recorder->Commands();
             const auto uploadTiming = recorder->BeginGpuTiming(UploadTimingKey);
-            if (Shadow::RecordOwnedUploads(uploadCommands, kept) != 0u) totals.residencyLands++;
+            if (RouteMemory::RecordUploads(uploadCommands, kept) != 0u) totals.residencyLands++;
             recorder->EndGpuTiming(uploadTiming);
             for (auto& object : kept) recorder->Keep(std::move(object));
             const auto uploadSpent = elapsed(phase);
@@ -4955,7 +4955,7 @@ private:
             else if (use.write) passWrites.push_back(range);
             else passReads.push_back(range);
         }
-        if (!passWrites.empty()) Shadow::NoteGpuWrites(passWrites);
+        if (!passWrites.empty()) RouteMemory::NoteGpuWrites(passWrites);
         std::vector<Graphics::PassAttachment> attachments;
         for (const auto& resident : residents) attachments.push_back({resident->Image(), true});
         Graphics::PassAccess access{passReads, passWrites, stageStorageImages, attachments};
@@ -5782,7 +5782,7 @@ bool DumpSamplesToMirror(const Context& context, Graphics::Recorder& recorder, s
     if (!recorder.DumpSamples(buffer->DeviceAddress() + offset, address, blocks)) return false;
     recorder.Keep(buffer);
     const std::array written{std::pair{address, address + bytes}};
-    Shadow::NoteGpuWrites(written);
+    RouteMemory::NoteGpuWrites(written);
     Events::NoteRanges(written);
     LandAfterBatch(recorder, [buffer, offset, address, bytes] {
         buffer->Invalidate();
@@ -5899,7 +5899,7 @@ int StoreToMirror(const Context& context, Graphics::Recorder& recorder, std::uin
     static const bool unmarked = std::getenv("APS5_RECODE_MIRROR_STORES_UNMARKED") != nullptr;
     std::uint64_t sequence = 0;
     if (!unmarked) {
-        Shadow::NoteGpuWrites(written);
+        RouteMemory::NoteGpuWrites(written);
         static const bool takesDirty = std::getenv("APS5_RECODE_MIRROR_STORES_KEEP_DIRTY") == nullptr;
         const auto mark = MemoryCore::Get().NoteGpuWrite(address, bytes.size(), recorder.OpenBatchSerial(), takesDirty);
         if (!mark.upload.empty()) ResidencyService::Get().NoteDirty(mark.upload);
@@ -5962,9 +5962,9 @@ bool CopyInMirror(const Context& context, Graphics::Recorder& recorder, const Pm
     }
     if (recorder.HasQueuedKeyStores()) recorder.FlushKeyStores();
     if (recorder.HasQueuedStores()) recorder.FlushStores();
-    if (Shadow::OwnedUploadsPending()) {
+    if (RouteMemory::UploadsPending()) {
         std::vector<std::shared_ptr<void>> kept;
-        static_cast<void>(Shadow::RecordOwnedUploads(recorder.Commands(), kept));
+        static_cast<void>(RouteMemory::RecordUploads(recorder.Commands(), kept));
         for (auto& object : kept) recorder.Keep(std::move(object));
     }
     auto landing = std::make_shared<Graphics::Buffer>(context, copy.bytes, VK_BUFFER_USAGE_TRANSFER_DST_BIT);
@@ -5980,7 +5980,7 @@ bool CopyInMirror(const Context& context, Graphics::Recorder& recorder, const Pm
     Graphics::RecordMemoryBarrier(context, commands, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT | VK_PIPELINE_STAGE_HOST_BIT, VK_ACCESS_TRANSFER_WRITE_BIT, VK_ACCESS_MEMORY_READ_BIT | VK_ACCESS_MEMORY_WRITE_BIT | VK_ACCESS_HOST_READ_BIT);
     recorder.Keep(landing);
     const std::array written{std::pair{copy.destination, copy.destination + copy.bytes}};
-    Shadow::NoteGpuWrites(written);
+    RouteMemory::NoteGpuWrites(written);
     const auto mark = MemoryCore::Get().NoteGpuWrite(copy.destination, copy.bytes, recorder.OpenBatchSerial());
     if (!mark.upload.empty()) ResidencyService::Get().NoteDirty(mark.upload);
     Events::NoteRanges(written);
@@ -6095,9 +6095,9 @@ bool TransferGds(const Context& context, Graphics::Recorder& recorder, std::span
 
     if (recorder.HasQueuedKeyStores()) recorder.FlushKeyStores();
     if (recorder.HasQueuedStores()) recorder.FlushStores();
-    if (mirrored && Shadow::OwnedUploadsPending()) {
+    if (mirrored && RouteMemory::UploadsPending()) {
         std::vector<std::shared_ptr<void>> kept;
-        static_cast<void>(Shadow::RecordOwnedUploads(recorder.Commands(), kept));
+        static_cast<void>(RouteMemory::RecordUploads(recorder.Commands(), kept));
         for (auto& object : kept) recorder.Keep(std::move(object));
     }
     if (!current.empty()) {
@@ -6154,7 +6154,7 @@ bool TransferGds(const Context& context, Graphics::Recorder& recorder, std::span
     std::uint64_t sequence = 0;
     if (inMirror) {
         const std::array written{std::pair{destinationAddress, destinationAddress + bytes}};
-        Shadow::NoteGpuWrites(written);
+        RouteMemory::NoteGpuWrites(written);
         const auto mark = MemoryCore::Get().NoteGpuWrite(destinationAddress, bytes, recorder.OpenBatchSerial());
         if (!mark.upload.empty()) ResidencyService::Get().NoteDirty(mark.upload);
         sequence = mark.sequence;
@@ -6175,7 +6175,7 @@ bool TransferGds(const Context& context, Graphics::Recorder& recorder, std::span
             core.ReleaseLandedWrite(address, bytes, sequence);
         } else if (GuestMemory::Accessible(reinterpret_cast<const void*>(static_cast<std::uintptr_t>(address)), stored.size(), true)) {
             std::memcpy(reinterpret_cast<void*>(static_cast<std::uintptr_t>(address)), stored.data(), stored.size());
-            Shadow::NoteDriverStore(address, stored.size());
+            RouteMemory::NoteDriverStore(address, stored.size());
         } else {
             GuestMemory::Write(address, stored, 1);
         }

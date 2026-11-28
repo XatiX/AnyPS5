@@ -56,7 +56,7 @@
 #include "prx/libc/include/GuestAllocations.hpp"
 #if ANYPS5_UNIFIED
 #include "prx/libSceAgcDriver/Unified/include/Events.hpp"
-#include "prx/libSceAgcDriver/Unified/include/Shadow.hpp"
+#include "prx/libSceAgcDriver/Unified/include/RouteMemory.hpp"
 #endif
 
 namespace AgcDriver::Graphics {
@@ -4826,7 +4826,7 @@ ShaderResources::IndexOutcome ShaderResources::indexRevalidate(std::span<const C
 #if ANYPS5_UNIFIED
 void ShaderResources::registerProofSpans() {
     using Kind = Unified::Proof::SpanKind;
-    proofRangesRegistered = Unified::Shadow::NoteProofRanges(ProofRanges());
+    proofRangesRegistered = Unified::RouteMemory::RegisterProofRanges(ProofRanges());
     proofSpans.clear();
     std::vector<std::pair<std::uint64_t, std::uint64_t>> covered;
     const auto add = [&](std::uint64_t address, std::uint64_t bytes, std::uintptr_t owner, Kind kind) {

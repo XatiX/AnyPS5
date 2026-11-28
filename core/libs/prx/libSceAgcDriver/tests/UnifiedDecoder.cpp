@@ -1,7 +1,7 @@
 #include "prx/libSceAgcDriver/Unified/include/Decoder.hpp"
 #include "prx/libSceAgcDriver/Unified/include/Order.hpp"
 #include "prx/libSceAgcDriver/Unified/include/Front.hpp"
-#include "prx/libSceAgcDriver/Unified/include/Shadow.hpp"
+#include "prx/libSceAgcDriver/Unified/include/Intake.hpp"
 #include "prx/libSceAgcDriver/Unified/include/Replay.hpp"
 #include "prx/libSceAgcDriver/Unified/include/RecordState.hpp"
 #include "prx/libSceAgcDriver/Unified/include/RecordVerify.hpp"
@@ -239,7 +239,7 @@ void testShadowCopyKeepsWhatTheDecoderReads() {
     stream.submission.flips[flip] = nullptr;
     stream.submission.flipHandles[flip] = 3;
     stream.submission.labelWrites = {1, 2};
-    const auto copy = Shadow::Copy(stream.submission);
+    const auto copy = Intake::Copy(stream.submission);
     Expect(copy->serial == 9 && copy->queue == 0 && copy->commands == stream.submission.commands, "the copy keeps serial, queue and commands");
     Expect(copy->conditionalEnds == stream.submission.conditionalEnds && copy->registerLists == stream.submission.registerLists && copy->flipHandles == stream.submission.flipHandles, "the copy keeps conditional ends, register lists and flip handles");
     Expect(copy->flips.size() == 1 && copy->flips.begin()->first == flip && copy->flips.begin()->second == nullptr, "the copy marks flips without holding the flip request");

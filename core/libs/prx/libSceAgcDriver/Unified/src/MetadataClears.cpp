@@ -5,7 +5,7 @@
 #include "prx/libSceAgcDriver/Graphics/include/Resources.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/TextureDetiler.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/TextureFormat.hpp"
-#include "prx/libSceAgcDriver/Unified/include/Shadow.hpp"
+#include "prx/libSceAgcDriver/Unified/include/RouteMemory.hpp"
 #include "prx/libSceAgcDriver/Unified/include/VulkanImages.hpp"
 #include "prx/libSceAgcDriver/Unified/shaders/DccClear_spv.h"
 #include "prx/libSceAgcDriver/Unified/shaders/DccClearVolume_spv.h"
@@ -163,8 +163,8 @@ bool MetadataClears::Apply(Graphics::Recorder& recorder, std::uint64_t address, 
 }
 
 bool MetadataClears::applyCmask(Graphics::Recorder& recorder, const Target& target, VulkanSurface& surface, std::string& reason) {
-    Shadow::OwnedSpan span;
-    if (!Shadow::ServeOwned(context, target.cmask, target.cmaskBytes, &span) || span.handle == 0u || target.cmask < span.origin) {
+    RouteMemory::OwnedSpan span;
+    if (!RouteMemory::ServeOwned(context, target.cmask, target.cmaskBytes, &span) || span.handle == 0u || target.cmask < span.origin) {
         reason = notResident("CMASK", target.cmask, target.cmaskBytes);
         return false;
     }
@@ -262,8 +262,8 @@ bool MetadataClears::applyDcc(Graphics::Recorder& recorder, const Target& target
     }
     std::memcpy(texel.data(), target.clearWords.data(), std::min<std::size_t>(sizeof(target.clearWords), elementBytes));
     static_cast<void>(pack(std::span(texel.data(), std::min<std::size_t>(elementBytes, sizeof(target.clearWords))), push.patterns[4]));
-    Shadow::OwnedSpan span;
-    if (!Shadow::ServeOwned(context, target.dcc, target.dccKeys, &span) || span.handle == 0u || target.dcc < span.origin) {
+    RouteMemory::OwnedSpan span;
+    if (!RouteMemory::ServeOwned(context, target.dcc, target.dccKeys, &span) || span.handle == 0u || target.dcc < span.origin) {
         reason = notResident("DCC", target.dcc, target.dccKeys);
         return false;
     }

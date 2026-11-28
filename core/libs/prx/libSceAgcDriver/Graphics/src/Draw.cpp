@@ -57,7 +57,7 @@
 #include <type_traits>
 #include <utility>
 #if ANYPS5_UNIFIED
-#include "prx/libSceAgcDriver/Unified/include/Shadow.hpp"
+#include "prx/libSceAgcDriver/Unified/include/RouteMemory.hpp"
 #include "prx/libSceAgcDriver/Unified/include/Events.hpp"
 #endif
 
@@ -3259,7 +3259,7 @@ void recordDraw(const Context& context, const State& state, const Pm4::DrawParam
     const PassAccess passAccess{passReads, passWrites, passImages, passAttachments.Span(), unknownMemory, unknownWrites, passWriteOnly};
 #if ANYPS5_UNIFIED
     Unified::Events::NoteRanges(resources.GpuWrites(), Unified::Events::ResourceOwner(&resources));
-    Unified::Shadow::NoteGuestAccess(passReads, resources.GpuWrites(), unknownMemory);
+    Unified::RouteMemory::RegisterAccess(passReads, resources.GpuWrites(), unknownMemory);
 #endif
     const bool fenced = state.depth.has_value() || !record.proxies.empty();
     resources.RequireGuestBuffers();

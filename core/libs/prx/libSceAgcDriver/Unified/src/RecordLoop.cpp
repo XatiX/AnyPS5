@@ -7,7 +7,7 @@
 #include "prx/libSceAgcDriver/Unified/include/Releases.hpp"
 #include "prx/libSceAgcDriver/Unified/include/Resolve.hpp"
 #include "prx/libSceAgcDriver/Unified/include/RouteDefaults.hpp"
-#include "prx/libSceAgcDriver/Unified/include/Shadow.hpp"
+#include "prx/libSceAgcDriver/Unified/include/RouteMemory.hpp"
 #include "prx/libSceAgcDriver/Execution/include/GuestMemory.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Pm4.hpp"
 #include "prx/libSceAgcDriver/Execution/include/VulkanDevice.hpp"
@@ -788,7 +788,7 @@ private:
     static void writeCopy(std::uint64_t destination, std::span<const std::byte> bytes) {
         if (GuestMemory::Accessible(reinterpret_cast<const void*>(static_cast<std::uintptr_t>(destination)), bytes.size(), true)) {
             std::memcpy(reinterpret_cast<void*>(static_cast<std::uintptr_t>(destination)), bytes.data(), bytes.size());
-            Shadow::NoteDriverStore(destination, bytes.size());
+            RouteMemory::NoteDriverStore(destination, bytes.size());
             return;
         }
         GuestMemory::Write(destination, bytes, 1);

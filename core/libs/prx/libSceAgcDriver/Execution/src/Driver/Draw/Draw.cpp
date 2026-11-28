@@ -37,7 +37,7 @@
 #include <typeinfo>
 #if ANYPS5_UNIFIED
 #include "prx/libSceAgcDriver/Unified/include/DrawRecorder.hpp"
-#include "prx/libSceAgcDriver/Unified/include/Shadow.hpp"
+#include "prx/libSceAgcDriver/Unified/include/Intake.hpp"
 #endif
 #include <utility>
 
@@ -339,7 +339,7 @@ std::unordered_map<std::uint64_t, bool>& CpuIndirectPrograms() {
 
 DrawVerdict Driver::draw(QueueState& queue, std::span<const std::uint32_t> packet, const Submission& submission, std::size_t packetOffset, std::string& rejected) {
 #if ANYPS5_UNIFIED
-    Unified::Shadow::NoteDriverDraw(queue, submission, packetOffset);
+    Unified::Intake::NoteDriverDraw(queue, submission, packetOffset);
 #endif
     PerformanceTimer timing("Driver.Draw");
     static const bool profile = std::getenv("APS5_PROFILE_DRAW") != nullptr;
@@ -421,7 +421,7 @@ DrawVerdict Driver::draw(QueueState& queue, std::span<const std::uint32_t> packe
         localDevice = device;
     }
 #if ANYPS5_UNIFIED
-    Unified::Shadow::NoteDevice(localDevice);
+    Unified::Intake::AttachDevice(localDevice);
     if (Unified::Record::RecordActive() && pipelined && !lockedPrepare) {
         auto& resolvedDraws = Unified::Resolve::ResolvedDraws();
         const auto found = resolvedDraws.Find(submission.queue, submission.serial, packetOffset, Unified::Resolve::HandoffWait());

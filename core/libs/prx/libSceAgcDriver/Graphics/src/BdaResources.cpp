@@ -6,7 +6,7 @@
 #include "prx/libSceAgcDriver/Execution/include/GuestMemory.hpp"
 #if ANYPS5_UNIFIED
 #include "prx/libSceAgcDriver/Unified/include/ResidencyService.hpp"
-#include "prx/libSceAgcDriver/Unified/include/Shadow.hpp"
+#include "prx/libSceAgcDriver/Unified/include/RouteMemory.hpp"
 #endif
 #include <algorithm>
 #include <array>
@@ -612,7 +612,7 @@ void BdaResources::checkFault(const BdaResources& record) const {
     if (pageTable) {
         std::vector<std::uint64_t> pages;
         Require(ShaderRecompiler::BdaAbi::ForEachFaultPage(reinterpret_cast<const std::uint32_t*>(record.faultBytes().data()), [&](std::uint64_t page) { pages.push_back(page); }), "invalid BDA fault page list");
-        Unified::Shadow::ServeFaultPages(pages);
+        Unified::RouteMemory::ServeFaultPages(pages);
         if (report.reason == ShaderRecompiler::BdaAbi::FaultReason::Unmapped && ShaderRecompiler::BdaAbi::OtherFaults(report) == 0) {
             clearFaultSlot(record.faultBytes());
             return;
@@ -738,7 +738,7 @@ void BdaResources::markWrittenPages(const BdaResources& record) const {
         writtenPages.emplace_back(begin, end);
     }), "invalid BDA written-page record");
 #if ANYPS5_UNIFIED
-    if (pageTable) Unified::Shadow::LandGpuWrites(written);
+    if (pageTable) Unified::RouteMemory::LandGpuWrites(written);
 #endif
     for (const auto& [begin, bytes] : written) GuestMemory::MarkPossiblyWritten(begin, static_cast<std::size_t>(bytes));
     for (std::uint32_t claim = 0; claim < count; ++claim) {

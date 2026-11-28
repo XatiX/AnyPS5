@@ -6,7 +6,7 @@
 #include "prx/libSceAgcDriver/Graphics/include/TextureTiling.hpp"
 #include "prx/libSceAgcDriver/Unified/include/DepthRecords.hpp"
 #include "prx/libSceAgcDriver/Unified/include/Events.hpp"
-#include "prx/libSceAgcDriver/Unified/include/Shadow.hpp"
+#include "prx/libSceAgcDriver/Unified/include/RouteMemory.hpp"
 #include "prx/libSceAgcDriver/Unified/include/VulkanImages.hpp"
 #include <algorithm>
 #include <exception>
@@ -60,8 +60,8 @@ void SurfaceDetiler::Record(Graphics::Recorder& recorder, SurfaceTable& table, s
             continue;
         }
         const auto& key = surface->key;
-        Shadow::OwnedSpan span;
-        if (!Shadow::ServeOwned(context, key.address, key.bytes, &span) || span.handle == 0u || key.address < span.origin) {
+        RouteMemory::OwnedSpan span;
+        if (!RouteMemory::ServeOwned(context, key.address, key.bytes, &span) || span.handle == 0u || key.address < span.origin) {
             counts.refused++;
             refused("surface memory not resident");
             continue;
@@ -80,7 +80,7 @@ void SurfaceDetiler::Record(Graphics::Recorder& recorder, SurfaceTable& table, s
         commands = recorder.Commands();
         timing = recorder.BeginGpuTiming(DetileTimingKey);
         std::vector<std::shared_ptr<void>> kept;
-        if (Shadow::RecordOwnedUploads(commands, kept) != 0u) {
+        if (RouteMemory::RecordUploads(commands, kept) != 0u) {
             for (auto& object : kept) recorder.Keep(std::move(object));
         }
         Graphics::RecordMemoryBarrier(context, commands, VK_PIPELINE_STAGE_TRANSFER_BIT | VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_ACCESS_TRANSFER_WRITE_BIT | VK_ACCESS_SHADER_WRITE_BIT, VK_ACCESS_SHADER_READ_BIT);
@@ -236,8 +236,8 @@ bool SurfaceDetiler::WriteBack(Graphics::Recorder& recorder, const std::shared_p
         return false;
     }
     const auto& key = surface->key;
-    Shadow::OwnedSpan span;
-    if (!Shadow::ServeOwned(context, key.address, key.bytes, &span) || span.handle == 0u || key.address < span.origin) {
+    RouteMemory::OwnedSpan span;
+    if (!RouteMemory::ServeOwned(context, key.address, key.bytes, &span) || span.handle == 0u || key.address < span.origin) {
         static std::atomic<std::uint32_t> notes{0};
         if (notes.fetch_add(1, std::memory_order_relaxed) < 8u) std::fprintf(stderr, "[recode-images] write-back refused, memory not served: record 0x%llx+0x%llx %ux%u format %u (span handle %llu origin 0x%llx)\n", static_cast<unsigned long long>(key.address), static_cast<unsigned long long>(key.bytes), key.width, key.height, key.format, static_cast<unsigned long long>(span.handle), static_cast<unsigned long long>(span.origin));
         reason = "record memory not resident";
@@ -253,7 +253,7 @@ bool SurfaceDetiler::WriteBack(Graphics::Recorder& recorder, const std::shared_p
     const auto commands = recorder.Commands();
     const auto timing = recorder.BeginGpuTiming(DetileTimingKey);
     std::vector<std::shared_ptr<void>> kept;
-    if (Shadow::RecordOwnedUploads(commands, kept) != 0u) {
+    if (RouteMemory::RecordUploads(commands, kept) != 0u) {
         for (auto& object : kept) recorder.Keep(std::move(object));
     }
     imageBarrier(context, commands, vulkan->Image(), VK_IMAGE_LAYOUT_GENERAL, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_ACCESS_SHADER_WRITE_BIT | VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT | VK_ACCESS_TRANSFER_WRITE_BIT, VK_ACCESS_SHADER_READ_BIT);
@@ -325,8 +325,8 @@ bool SurfaceDetiler::depthPlanes(const DepthRecord& record, std::vector<DepthPla
             reason = "depth plane pitch";
             return false;
         }
-        Shadow::OwnedSpan span;
-        if (!Shadow::ServeOwned(context, plane.address, plane.geometry.guestBytes, &span) || span.handle == 0u || plane.address < span.origin) {
+        RouteMemory::OwnedSpan span;
+        if (!RouteMemory::ServeOwned(context, plane.address, plane.geometry.guestBytes, &span) || span.handle == 0u || plane.address < span.origin) {
             reason = "depth plane memory not resident";
             return false;
         }
@@ -346,7 +346,7 @@ VkCommandBuffer SurfaceDetiler::depthCommands(Graphics::Recorder& recorder) {
     }
     const auto commands = recorder.Commands();
     std::vector<std::shared_ptr<void>> kept;
-    if (Shadow::RecordOwnedUploads(commands, kept) != 0u) {
+    if (RouteMemory::RecordUploads(commands, kept) != 0u) {
         for (auto& object : kept) recorder.Keep(std::move(object));
     }
     return commands;

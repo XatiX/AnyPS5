@@ -26,7 +26,7 @@
 #include "prx/libc/include/HostThreadLocal.hpp"
 #include "prx/libc/include/general/AtomicSharedPtr.hpp"
 #include "prx/libSceAgcDriver/Unified/include/MemoryCore.hpp"
-#include "prx/libSceAgcDriver/Unified/include/Shadow.hpp"
+#include "prx/libSceAgcDriver/Unified/include/RouteMemory.hpp"
 #ifdef _WIN32
 #include <windows.h>
 #else
@@ -4321,7 +4321,7 @@ OwnedMirrors& ownedMirrors() {
 
 std::uint64_t ownedSerial(std::uint64_t address, std::size_t bytes) {
 #if ANYPS5_UNIFIED
-    if (!Unified::Shadow::ServesOwned()) return 0;
+    if (!Unified::RouteMemory::ServesOwned()) return 0;
 #else
     return 0;
 #endif
@@ -4336,9 +4336,9 @@ std::uint64_t ownedSerial(std::uint64_t address, std::size_t bytes) {
 }
 
 std::shared_ptr<ImageMirror> ownedMirror(const Context& context, const std::shared_ptr<const GuestAllocations::Range>& range) {
-    Unified::Shadow::OwnedSpan span;
+    Unified::RouteMemory::OwnedSpan span;
 #if ANYPS5_UNIFIED
-    if (!Unified::Shadow::ServeOwned(context, range->address, range->bytes, &span)) return nullptr;
+    if (!Unified::RouteMemory::ServeOwned(context, range->address, range->bytes, &span)) return nullptr;
 #else
     (void)context;
     return nullptr;
@@ -4369,11 +4369,11 @@ std::shared_ptr<ImageMirror> ownedMirror(const Context& context, const std::shar
 
 void recordOwnedUploads() {
 #if ANYPS5_UNIFIED
-    if (!Unified::Shadow::OwnedUploadsPending()) return;
+    if (!Unified::RouteMemory::UploadsPending()) return;
     auto* recorder = Recorder::Active();
     if (recorder == nullptr) return;
     std::vector<std::shared_ptr<void>> kept;
-    if (Unified::Shadow::RecordOwnedUploads(recorder->Commands(), kept) == 0) return;
+    if (Unified::RouteMemory::RecordUploads(recorder->Commands(), kept) == 0) return;
     for (auto& object : kept) recorder->Keep(std::move(object));
 #endif
 }

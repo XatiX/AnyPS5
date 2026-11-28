@@ -127,7 +127,7 @@ void ResetCheckpointSnapshots() noexcept;
 #include <vector>
 #include <utility>
 #if ANYPS5_UNIFIED
-#include "prx/libSceAgcDriver/Unified/include/Shadow.hpp"
+#include "prx/libSceAgcDriver/Unified/include/RouteMemory.hpp"
 #include "prx/libSceAgcDriver/Unified/include/Events.hpp"
 #include "prx/libSceAgcDriver/Unified/include/ResidencyService.hpp"
 #include "prx/libSceAgcDriver/Unified/include/DrawRecorder.hpp"
@@ -6433,9 +6433,9 @@ void VulkanDevice::recordDispatch(RecordedDispatch& record) {
     }
 #if ANYPS5_UNIFIED
     Unified::Events::NoteRanges(resources.GpuWrites(), Unified::Events::ResourceOwner(&resources));
-    if (Unified::Shadow::DrawScope()) {
+    if (Unified::RouteMemory::DrawScope()) {
         const auto reads = resources.DeviceReads();
-        Unified::Shadow::NoteGuestAccess(reads, resources.GpuWrites(), resources.HoldsLease() || resources.UsesAddressTable() || resources.HasCopiedWrites());
+        Unified::RouteMemory::RegisterAccess(reads, resources.GpuWrites(), resources.HoldsLease() || resources.UsesAddressTable() || resources.HasCopiedWrites());
     }
 #endif
     using CommandClass = Graphics::Recorder::CommandClass;
