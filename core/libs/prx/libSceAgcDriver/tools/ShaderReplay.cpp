@@ -6,6 +6,7 @@
 #include "Optimization/ResourceMaterializer.hpp"
 #include "Optimization/ResourceProgram.hpp"
 #include "Optimization/RequestMemoryView.hpp"
+#include "BdaAbi.hpp"
 #include "Recompiler.hpp"
 #include "RdnaDecoder/RdnaInstructionDecoder.hpp"
 
@@ -65,6 +66,7 @@ bool g_code = false;
 bool g_float16WidenNans = false;
 bool g_float16NarrowNans = false;
 bool g_directResources = false;
+bool g_mirrorAddressing = false;
 
 bool OutputSpirv(const char* path, std::span<const std::uint32_t> spirv) {
     if (g_spirv) {
@@ -104,6 +106,7 @@ bool Replay(const char* path) {
     if (g_deviceAtomicWorkgroupMemoryBarriers) request.request.target.deviceAtomicWorkgroupMemoryBarriers = true;
     if (g_f16HostNans) request.request.target.float16HostNans = true;
     if (g_directResources) request.request.target.directResources = true;
+    if (g_mirrorAddressing) request.request.target.bdaAbiVersion = ShaderRecompiler::BdaAbi::MirrorVersion;
     if (g_spannedShuffleThroughMemory) request.request.target.spannedShuffleThroughMemory = true;
     if (g_shaderFma) {
         request.supportedCapabilities.push_back(spv::CapabilityFMAKHR);
@@ -275,7 +278,7 @@ bool Replay(const char* path) {
 
 int main(int argc, char** argv) {
     if (argc < 2) {
-        std::fprintf(stderr, "usage: agc_shader_replay [--dis] [--asm] [--cfg] [--mem] [--spv] [--prepare] [--materialize] [--code] [--maintenance8] [--robust2] [--wave-lds-memory-barriers] [--device-scope-lds-memory-barriers] [--lds-lock-fences] [--device-atomic-workgroup-memory-barriers] [--shader-fma] [--shader-int16] [--f16-widen-nans] [--f16-narrow-nans] [--f16-host-nans] [--direct] [--spanned-shuffle-memory] <shader.req>...\n  the driver writes shader_<address>.req files when APS5_DUMP_SHADERS is set; shader_<address>.prepare.req holds a request whose preparation failed before any resource capture, so replay it with --prepare\n");
+        std::fprintf(stderr, "usage: agc_shader_replay [--dis] [--asm] [--cfg] [--mem] [--spv] [--prepare] [--materialize] [--code] [--maintenance8] [--robust2] [--wave-lds-memory-barriers] [--device-scope-lds-memory-barriers] [--lds-lock-fences] [--device-atomic-workgroup-memory-barriers] [--shader-fma] [--shader-int16] [--f16-widen-nans] [--f16-narrow-nans] [--f16-host-nans] [--direct] [--mirror] [--spanned-shuffle-memory] <shader.req>...\n  the driver writes shader_<address>.req files when APS5_DUMP_SHADERS is set; shader_<address>.prepare.req holds a request whose preparation failed before any resource capture, so replay it with --prepare\n");
         return 2;
     }
     int failures = 0;
@@ -366,6 +369,10 @@ int main(int argc, char** argv) {
         }
         if (std::string(argv[i]) == "--direct") {
             g_directResources = true;
+            continue;
+        }
+        if (std::string(argv[i]) == "--mirror") {
+            g_mirrorAddressing = true;
             continue;
         }
         try {

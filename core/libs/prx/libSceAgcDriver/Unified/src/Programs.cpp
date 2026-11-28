@@ -241,6 +241,8 @@ bool materializeStage(const ProgramInputs& inputs, ShaderRecompiler::RecompileRe
     lap(PhaseCapture);
     out.memory = shaderMemory.Regions();
     request.context.memory = out.memory;
+    static const bool dumpsRequests = std::getenv("APS5_DUMP_SHADERS") != nullptr;
+    if (dumpsRequests) static_cast<void>(DriverDetail::Driver::dumpRequest(snapshot.codeAddress + codeOffset * sizeof(std::uint32_t), request));
     std::shared_ptr<const ShaderRecompiler::RecompileResult> result;
     std::shared_ptr<const ShaderRecompiler::ResultTemplate> shape;
     ShaderRecompiler::TemplateWords words;
