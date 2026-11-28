@@ -46,6 +46,7 @@ struct PageTableCounts {
     std::uint64_t rangedConsumes = 0;
     std::uint64_t rangedPages = 0;
     std::uint64_t keptBusy = 0;
+    std::uint64_t rangedBusy = 0;
     std::uint64_t rearmed = 0;
     std::uint64_t unchangedBusy = 0;
     std::uint64_t gpuOwnedPages = 0;

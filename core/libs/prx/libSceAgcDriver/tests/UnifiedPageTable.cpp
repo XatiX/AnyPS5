@@ -153,6 +153,42 @@ void testFramePacedPagesStayOpen() {
     Expect(table.StateOf(Base) == PageState::CpuDirty && table.Counts().keptBusy == 1, "a page written in three frames in a row stays open across the submissions of later frames");
 }
 
+void testOperationConsumesKeepFramePacedPagesOpen() {
+    PageTable table;
+    std::vector<ProtectionChange> changes;
+    table.Register(Base, 2 * PageBytes);
+    table.AdvanceFrame();
+    table.ConsumeDirty(changes);
+    const std::vector<std::pair<std::uint64_t, std::uint64_t>> span{{Base, PageBytes}};
+    bool changed = true;
+    int proven = 0;
+    const PageTable::WriteCheck written = [&](std::uint64_t, bool isProven) {
+        if (isProven) ++proven;
+        return isProven || changed;
+    };
+    std::uint64_t faults = 0;
+    for (int frame = 0; frame < 5; ++frame) {
+        table.AdvanceFrame();
+        changes.clear();
+        if (table.StateOf(Base) == PageState::CpuClean && table.HandleWrite(Base, changes)) ++faults;
+        for (int draw = 0; draw < 4; ++draw) {
+            changes.clear();
+            const auto ranges = table.ConsumeDirtyIn(span, changes, written);
+            Expect(draw != 0 || ranges.size() == 1, "the first operation of a frame uploads the written page");
+            changed = table.StateOf(Base) != PageState::CpuDirty;
+        }
+        changed = true;
+        changes.clear();
+        table.ConsumeDirty(changes, written);
+    }
+    Expect(faults == 2, "a page an operation consumes every frame faults in two frames, then stays open");
+    Expect(table.StateOf(Base) == PageState::CpuDirty && table.Counts().keptBusy == 1 && table.Counts().rangedBusy == 1 && proven == 1, "the operation's consume of the third frame makes the page busy and records it as written");
+    Expect(table.StateOf(Base + PageBytes) == PageState::CpuClean, "the page beside it stays armed");
+    changed = false;
+    changes.clear();
+    Expect(table.ConsumeDirtyIn(span, changes, written).empty() && changes.empty(), "an unchanged busy page is neither uploaded nor protected by an operation's consume");
+}
+
 void testUnchangedBusyPagesAreNotReported() {
     PageTable table;
     std::vector<ProtectionChange> changes;
@@ -515,6 +551,7 @@ int main() {
     testOwnedByNeedsEveryPage();
     testBusyPagesListed();
     testFramePacedPagesStayOpen();
+    testOperationConsumesKeepFramePacedPagesOpen();
     testUnchangedBusyPagesAreNotReported();
     testRegisteredPagesUploadOnceThenArm();
     testWriteFaultOpensOnePage();

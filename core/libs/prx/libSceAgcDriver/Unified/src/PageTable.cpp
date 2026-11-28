@@ -464,6 +464,7 @@ std::vector<DirtyRange> PageTable::ConsumeDirtyIn(std::span<const std::pair<std:
     std::sort(pages.begin(), pages.end());
     pages.erase(std::unique(pages.begin(), pages.end()), pages.end());
     std::vector<DirtyRange> ranges;
+    const auto epoch = framePaced ? frameEpoch : consumeEpoch;
     for (const auto page : pages) {
         auto* region = regionOf(page, false);
         const auto slot = slotOf(page);
@@ -474,6 +475,21 @@ std::vector<DirtyRange> PageTable::ConsumeDirtyIn(std::span<const std::pair<std:
         }
         if (region->busyUntil[slot] != 0) {
             if (written && !written(page, false)) continue;
+            region->lastConsume[slot] = epoch;
+            ranges.push_back({address, PageBytes});
+            ++counts.rangedPages;
+            continue;
+        }
+        auto& streak = region->streak[slot];
+        auto& last = region->lastConsume[slot];
+        if (last != epoch) streak = last + 1 == epoch ? static_cast<std::uint8_t>(std::min<int>(streak + 1, 255)) : 1;
+        last = epoch;
+        if (framePaced && streak >= BusyAfterWrites) {
+            region->busyUntil[slot] = epoch + BusyConsumes;
+            region->unproven[slot / 64].fetch_and(~(std::uint64_t{1} << (slot % 64)), std::memory_order_acq_rel);
+            ++counts.keptBusy;
+            ++counts.rangedBusy;
+            if (written) static_cast<void>(written(page, true));
             ranges.push_back({address, PageBytes});
             ++counts.rangedPages;
             continue;
