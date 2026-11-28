@@ -698,16 +698,19 @@ std::optional<SpirvEmitterState::BdaAnchor> KnownBdaAnchor(SpirvEmitterState& st
     const auto bound = Unary(state, spv::OpUConvert, u64, EmitShaderDataDwordLoad(state, first + 2u));
     anchor.size = Select(state, u64, Binary(state, spv::OpINotEqual, TypeBool(state), anchor.device, BdaConstant(state, 0u)), bound, BdaConstant(state, 0u));
     anchor.offset = BdaConstant(state, 0u);
+    const auto& known = state.program.Info().knownBuffers;
+    anchor.alwaysServed = memory.knownBuffer < known.size() && !known[memory.knownBuffer].written;
     return anchor;
 }
 
-bool KnownLookupFallback(const SpirvEmitterState& state) {
+bool KnownLookupFallback(const SpirvEmitterState& state, const SpirvEmitterState::BdaAnchor& anchor) {
     static const bool off = std::getenv("APS5_RECODE_NO_KNOWN_FALLBACK") != nullptr;
-    return !off && state.program.Metadata().directResources;
+    static const bool everyRead = std::getenv("APS5_RECODE_KNOWN_READ_FALLBACK") != nullptr;
+    return !off && state.program.Metadata().directResources && (everyRead || !anchor.alwaysServed);
 }
 
 std::array<std::uint32_t, 4> EmitKnownOrLookup(SpirvEmitterState& state, const IrValue& inst, const SpirvEmitterState::BdaAnchor& anchor, std::uint32_t low, std::int32_t immediate, std::uint32_t bits, std::uint32_t dwords, std::uint32_t usedDwords, const std::function<std::array<std::uint32_t, 4>()>& lookup) {
-    if (!KnownLookupFallback(state)) return EmitBoundedBdaRead(state, inst, anchor, low, immediate, bits, dwords, usedDwords);
+    if (!KnownLookupFallback(state, anchor)) return EmitBoundedBdaRead(state, inst, anchor, low, immediate, bits, dwords, usedDwords);
     const auto u32 = TypeU32(state);
     const auto captured = Binary(state, spv::OpINotEqual, TypeBool(state), anchor.device, BdaConstant(state, 0u));
     const auto knownLabel = state.module.AllocateId();

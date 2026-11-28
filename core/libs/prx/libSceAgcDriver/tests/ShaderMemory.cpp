@@ -54,6 +54,7 @@
 #include <future>
 #include <memory>
 #include <new>
+#include <optional>
 #include <stdexcept>
 #include <span>
 #include <atomic>
@@ -3954,6 +3955,53 @@ void verifyImageTableKeys() {
     require(plain.capture->snapshot.knownBuffers.empty(), "known buffers: the default compile lists known buffers");
     const auto* heapData = TableBinding(heapResult, DescriptorRole::ShaderData);
     require(heapData == nullptr || heapData->guestDescriptor.size() >= KnownBufferDwords, "known buffers: the shader data has no room for the known buffer's address words");
+    {
+        struct Definition {
+            std::uint32_t op = 0;
+            std::vector<std::uint32_t> operands;
+        };
+        std::unordered_map<std::uint32_t, Definition> definitions;
+        std::vector<std::uint32_t> conditions;
+        const auto& words = heapResult.spirv;
+        for (std::size_t word = 5; word < words.size();) {
+            const auto count = words[word] >> 16u;
+            const auto op = words[word] & 0xffffu;
+            if (op == spv::OpConstant && count > 3u) definitions[words[word + 2]] = {op, {words.begin() + word + 3, words.begin() + word + count}};
+            if ((op == spv::OpAccessChain || op == spv::OpLoad || op == spv::OpUConvert || op == spv::OpShiftLeftLogical || op == spv::OpBitwiseOr || op == spv::OpINotEqual) && count > 3u) definitions[words[word + 2]] = {op, {words.begin() + word + 3, words.begin() + word + count}};
+            if (op == spv::OpBranchConditional && count > 1u) conditions.push_back(words[word + 1]);
+            word += count == 0u ? 1u : count;
+        }
+        const auto defined = [&](std::uint32_t id, std::uint32_t op) -> const Definition* {
+            const auto found = definitions.find(id);
+            return found != definitions.end() && found->second.op == op ? &found->second : nullptr;
+        };
+        const auto zero = [&](std::uint32_t id) {
+            const auto* constant = defined(id, spv::OpConstant);
+            return constant != nullptr && std::ranges::all_of(constant->operands, [](std::uint32_t value) { return value == 0u; });
+        };
+        const auto dataWord = [&](std::uint32_t id) -> std::optional<std::uint32_t> {
+            const auto* widened = defined(id, spv::OpUConvert);
+            const auto* loaded = widened != nullptr ? defined(widened->operands[0], spv::OpLoad) : nullptr;
+            const auto* chain = loaded != nullptr ? defined(loaded->operands[0], spv::OpAccessChain) : nullptr;
+            const auto* index = chain != nullptr && !chain->operands.empty() ? defined(chain->operands.back(), spv::OpConstant) : nullptr;
+            return index != nullptr ? std::optional<std::uint32_t>(index->operands[0]) : std::nullopt;
+        };
+        std::set<std::uint32_t> branchedBases;
+        for (const auto condition : conditions) {
+            const auto* compare = defined(condition, spv::OpINotEqual);
+            if (compare == nullptr || !zero(compare->operands[1])) continue;
+            const auto* joined = defined(compare->operands[0], spv::OpBitwiseOr);
+            const auto* shifted = joined != nullptr ? defined(joined->operands[1], spv::OpShiftLeftLogical) : nullptr;
+            if (shifted == nullptr) continue;
+            const auto low = dataWord(joined->operands[0]);
+            const auto high = dataWord(shifted->operands[0]);
+            if (low.has_value() && high.has_value() && *high == *low + 1u) branchedBases.insert(*low);
+        }
+        const auto written = static_cast<std::size_t>(std::ranges::count_if(knownInfo, [](const KnownBuffer& info) { return info.written; }));
+        std::cout << "known buffers: " << branchedBases.size() << " of " << knownInfo.size() << " bases decide a branch (" << written << " written)\n";
+        if (std::getenv("APS5_RECODE_KNOWN_READ_FALLBACK") != nullptr) require(branchedBases.size() == knownInfo.size(), "known buffers: APS5_RECODE_KNOWN_READ_FALLBACK did not restore the lookup beside every known read");
+        else require(branchedBases.size() == written, "known buffers: a read-only known buffer still carries the page-table lookup the recorder never needs");
+    }
 #if ANYPS5_ENABLE_SPIRV_TOOLS
     static_cast<void>(ValidateAndOptimizeSpirv(heapResult.spirv, heapRequest.target.vulkanVersion, heapRequest.target.spirvVersion));
 #endif

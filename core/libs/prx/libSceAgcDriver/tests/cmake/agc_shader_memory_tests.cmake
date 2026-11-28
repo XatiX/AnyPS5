@@ -122,6 +122,11 @@ if(BUILD_TESTING)
     if(WIN32)
         set_tests_properties(agc_shader_memory_coherent_atomic_loads PROPERTIES ENVIRONMENT_MODIFICATION "PATH=path_list_prepend:$<TARGET_FILE_DIR:libc>")
     endif()
+    add_test(NAME agc_shader_memory_known_read_fallback COMMAND agc_shader_memory_tests)
+    set_tests_properties(agc_shader_memory_known_read_fallback PROPERTIES ENVIRONMENT "ANYPS5_NO_SHADER_CACHE=1;APS5_RECODE_KNOWN_READ_FALLBACK=1" WORKING_DIRECTORY "${CMAKE_SOURCE_DIR}")
+    if(WIN32)
+        set_tests_properties(agc_shader_memory_known_read_fallback PROPERTIES ENVIRONMENT_MODIFICATION "PATH=path_list_prepend:$<TARGET_FILE_DIR:libc>")
+    endif()
 
 endif()
 

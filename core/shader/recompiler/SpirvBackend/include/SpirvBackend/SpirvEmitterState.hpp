@@ -213,6 +213,7 @@ struct SpirvEmitterState {
         std::uint32_t size = 0;
         std::uint32_t device = 0;
         std::uint32_t offset = 0;
+        bool alwaysServed = false;
     };
     std::vector<BdaAnchor> bdaAnchors;
     std::uint32_t bdaAnchorFunction = 0;
