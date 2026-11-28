@@ -29,6 +29,7 @@
 #include "prx/libSceAgcDriver/Unified/include/IndirectArguments.hpp"
 #include "prx/libSceAgcDriver/Unified/include/MemoryCore.hpp"
 #include "prx/libSceAgcDriver/Unified/include/MirrorHost.hpp"
+#include "prx/libSceAgcDriver/Unified/include/PipelineList.hpp"
 #include "prx/libSceAgcDriver/Unified/include/Releases.hpp"
 #include "prx/libSceAgcDriver/Unified/include/UploadClash.hpp"
 #include "prx/libSceAgcDriver/Unified/include/MetadataWatch.hpp"
@@ -44,6 +45,7 @@
 #include "prx/libc/include/GuestArena.hpp"
 #include "Optimization/ShaderStageInputInfo.hpp"
 #include "BdaAbi.hpp"
+#include "ShaderDiskCache.hpp"
 #include "RuntimeAbi.hpp"
 #include <algorithm>
 #include <array>
@@ -55,6 +57,7 @@
 #include <cstring>
 #include <deque>
 #include <exception>
+#include <filesystem>
 #include <map>
 #include <mutex>
 #include <numeric>
@@ -1635,6 +1638,7 @@ struct PipelineJob {
     VulkanDevice* owner = nullptr;
     std::uint64_t codeAddress = 0;
     std::uint64_t spirvBytes = 0;
+    bool listed = false;
 };
 
 constexpr std::uint64_t UnsavedBuildNanoseconds = 5'000'000'000u;
@@ -1989,7 +1993,7 @@ public:
         line += text;
         std::snprintf(text, sizeof(text), "; dispatches %llu recorded (%llu indirect, %llu storage images written), %llu to the existing path, %.1f us per dispatch; compute pipelines %zu held, %llu queued (%llu ahead of recording), %llu built in %.1f ms, %zu building, %zu failed", static_cast<unsigned long long>(totals.dispatches), static_cast<unsigned long long>(totals.indirectDispatches), static_cast<unsigned long long>(totals.storageWrites), static_cast<unsigned long long>(totals.dispatchExisting), totals.dispatches == 0 ? 0.0 : static_cast<double>(totals.dispatchNanoseconds) / 1000.0 / static_cast<double>(totals.dispatches), pipelineCounts.held, static_cast<unsigned long long>(pipelinesQueued.load(std::memory_order_relaxed)), static_cast<unsigned long long>(pipelinesPrebuilt.load(std::memory_order_relaxed)), static_cast<unsigned long long>(pipelineCounts.built), static_cast<double>(pipelineCounts.nanoseconds) / 1e6, pipelineCounts.building, pipelineCounts.failed);
         line += text;
-        line += "; pipeline builders " + std::to_string(pipelineCounts.builders) + " threads, at most " + std::to_string(pipelineCounts.mostAtOnce) + " builds at once";
+        line += "; pipeline builders " + std::to_string(pipelineCounts.builders) + " threads, at most " + std::to_string(pipelineCounts.mostAtOnce) + " builds at once, " + std::to_string(pipelinesReplayed.load(std::memory_order_relaxed)) + " built from the list";
         std::snprintf(text, sizeof(text), "; table maps %llu hits, %llu uploads (%.1f MiB), %llu retired, %zu held (%.1f MiB); table images %llu reused, %llu bound (%llu whole), %llu elements bound, %llu checked for a refresh, %llu depth kept, %llu retired, %zu held; compressed records beside another format %llu; consumes for CPU-written mirror inputs %llu",static_cast<unsigned long long>(totals.mapHits), static_cast<unsigned long long>(totals.mapUploads), static_cast<double>(totals.mapUploadBytes) / 1048576.0, static_cast<unsigned long long>(totals.mapRetired), maps.size(), static_cast<double>(mapBytes) / 1048576.0, static_cast<unsigned long long>(totals.tableImageHits), static_cast<unsigned long long>(totals.tableImageBuilds), static_cast<unsigned long long>(totals.tableImageWhole), static_cast<unsigned long long>(totals.tableImageBinds), static_cast<unsigned long long>(totals.tableImageRefreshes), static_cast<unsigned long long>(totals.tableImageDepthKept), static_cast<unsigned long long>(totals.tableImageRetired), tableImages.size(), static_cast<unsigned long long>(totals.compressedAliases), static_cast<unsigned long long>(inputConsumes().load(std::memory_order_relaxed)));
         line += text;
         line += "; table image entries dropped for retired records " + std::to_string(totals.tableImageEntriesDropped);
@@ -2106,6 +2110,8 @@ public:
     }
 
     void Detach(VkDevice replaced) {
+        listReplayStops.store(true, std::memory_order_release);
+        while (listReplaying.load(std::memory_order_acquire)) std::this_thread::yield();
         {
             std::unique_lock jobs(pipelineMutex);
             ++framesWaiting;
@@ -2117,6 +2123,8 @@ public:
         if (device != replaced && device != VK_NULL_HANDLE) return;
         device = VK_NULL_HANDLE;
         attachedDevice.store(VK_NULL_HANDLE, std::memory_order_release);
+        listReplayStops.store(false, std::memory_order_release);
+        listReplayStarted.store(false, std::memory_order_release);
         ring.reset();
         ringAddress = 0;
         space.reset();
@@ -3223,6 +3231,7 @@ public:
         std::string reason;
         if (attachedDevice.load(std::memory_order_acquire) != context.device || dispatch.stages.size() != 1u || dispatch.stages.front().program.result == nullptr || !dispatchPrecheck(dispatch, reason)) return;
         const auto key = pipelineKey(dispatch);
+        startListReplay(context, owner);
         std::lock_guard pipelineLock(pipelineMutex);
         if (computePipelines.contains(key) || buildingPipelines.contains(key) || failedPipelines.contains(key)) return;
         if (queuePipeline(context, owner, dispatch, key, reason)) pipelinesPrebuilt.fetch_add(1, std::memory_order_relaxed);
@@ -3232,6 +3241,7 @@ private:
 
     bool pipelineReady(const Context& context, VulkanDevice& owner, const Resolve::ResolvedDraw& dispatch, std::unique_lock<std::mutex>& lock, std::string& reason) {
         const auto key = pipelineKey(dispatch);
+        startListReplay(context, owner);
         std::unique_lock pipelineLock(pipelineMutex);
         if (computePipelines.contains(key)) return true;
         if (!queuePipeline(context, owner, dispatch, key, reason)) return false;
@@ -3258,6 +3268,85 @@ private:
         if (computePipelines.contains(key)) return true;
         if (const auto failed = failedPipelines.find(key); failed != failedPipelines.end()) reason = "compute pipeline failed: " + failed->second;
         return false;
+    }
+
+    static const std::filesystem::path& pipelineListDirectory() {
+        static const std::filesystem::path directory = PipelineList::Directory();
+        return directory;
+    }
+
+    static void listPipeline(const PipelineJob& job) {
+        const auto& directory = pipelineListDirectory();
+        if (directory.empty() || PipelineList::Listed(directory, job.key)) return;
+        PipelineList::Entry entry{job.key, {}};
+        ShaderRecompiler::ShaderDiskCache::EncodeResult(*job.result, entry.result);
+        PipelineList::Store(directory, entry);
+    }
+
+    void startListReplay(const Context& context, VulkanDevice& owner) {
+        if (listReplayStarted.exchange(true, std::memory_order_acq_rel) || pipelineListDirectory().empty()) return;
+        listReplaying.store(true, std::memory_order_release);
+        std::thread([this, context, &owner] {
+            replayList(context, owner);
+            listReplaying.store(false, std::memory_order_release);
+        }).detach();
+    }
+
+    VkDescriptorSetLayout listedSetLayout(const Context& context, std::span<const std::uint64_t> triplets) {
+        std::vector<std::uint32_t> key(triplets.begin(), triplets.end());
+        std::lock_guard layoutLock(layoutMutex);
+        if (const auto found = layouts.find(key); found != layouts.end()) return found->second;
+        std::vector<VkDescriptorSetLayoutBinding> bindings;
+        for (std::size_t index = 0; index + 3u <= key.size(); index += 3u) {
+            const VkShaderStageFlags stages = (key[index + 2u] & Bindings::StageBit(ShaderRecompiler::ShaderStage::Compute)) != 0u ? VK_SHADER_STAGE_COMPUTE_BIT : 0u;
+            bindings.push_back({key[index], VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, key[index + 1u], stages, nullptr});
+        }
+        VkDescriptorSetLayoutCreateInfo info{VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO};
+        info.bindingCount = static_cast<std::uint32_t>(bindings.size());
+        info.pBindings = bindings.data();
+        VkDescriptorSetLayout layout = VK_NULL_HANDLE;
+        Graphics::Check(context.Function<PFN_vkCreateDescriptorSetLayout>("vkCreateDescriptorSetLayout")(context.device, &info, nullptr, &layout), "vkCreateDescriptorSetLayout recode pipeline list");
+        layouts.emplace(std::move(key), layout);
+        return layout;
+    }
+
+    void replayList(const Context& context, VulkanDevice& owner) {
+        const auto started = std::chrono::steady_clock::now();
+        const auto files = PipelineList::Newest(pipelineListDirectory());
+        std::uint32_t queued = 0;
+        for (const auto& file : files) {
+            auto loaded = PipelineList::Load(file);
+            if (!loaded.has_value() || loaded->key.size() < 2u || (loaded->key.size() - 2u) % 3u != 0u) continue;
+            {
+                std::lock_guard lock(pipelineMutex);
+                if (computePipelines.contains(loaded->key) || buildingPipelines.contains(loaded->key) || failedPipelines.contains(loaded->key)) continue;
+            }
+            const auto held = std::make_shared<const PipelineList::Entry>(std::move(*loaded));
+            auto result = std::make_shared<ShaderRecompiler::RecompileResult>();
+            if (!ShaderRecompiler::ShaderDiskCache::DecodeResult(held->result, *result, held)) continue;
+            const auto hash = result->spirv.ContentHash();
+            if (hash.low != held->key[0] || hash.high != held->key[1]) continue;
+            const auto* heap = Resolve::HeapDevice();
+            if (heap == nullptr || attachedDevice.load(std::memory_order_acquire) != context.device || listReplayStops.load(std::memory_order_acquire)) break;
+            try {
+                const auto main = listedSetLayout(context, std::span(held->key).subspan(2));
+                std::lock_guard lock(pipelineMutex);
+                if (computePipelines.contains(held->key) || buildingPipelines.contains(held->key) || failedPipelines.contains(held->key)) continue;
+                PipelineJob job{held->key, context, result, main, heap->Layout(), emptySetLayout(context), owner.computePipelineFlags(), owner.computeStageFlags(*result), owner.computeSubgroupSize(*result), &owner, 0u};
+                job.spirvBytes = result->spirv.size() * sizeof(std::uint32_t);
+                job.listed = true;
+                buildingPipelines.insert(job.key);
+                pipelineJobs.push_back(std::move(job));
+                listedJobs++;
+                queued++;
+                const std::size_t wanted = std::min<std::size_t>(BuildBudget::Threads(BuildBudget::Host()), pipelineJobs.size() + runningBuilds.builds);
+                while (builders.size() < wanted) builders.emplace_back([this] { buildPipelines(); });
+                jobsReady.notify_all();
+            } catch (const std::exception&) {
+                continue;
+            }
+        }
+        std::fprintf(stderr, "[recode-pipeline-list] %u of %zu listed compute pipelines queued in %.0f ms\n", queued, files.size(), static_cast<double>(elapsed(started)) / 1e6);
     }
 
     struct PipelineCounts {
@@ -3321,7 +3410,7 @@ private:
             std::optional<PipelineJob> job;
             {
                 std::unique_lock lock(pipelineMutex);
-                jobsReady.wait(lock, [&] { return !pipelineJobs.empty() && BuildBudget::Admits(BuildBudget::Host(), framesWaiting != 0u, runningBuilds, pipelineJobs.front().spirvBytes); });
+                jobsReady.wait(lock, [&] { return !pipelineJobs.empty() && BuildBudget::Admits(BuildBudget::Host(), framesWaiting != 0u || listedJobs != 0u, runningBuilds, pipelineJobs.front().spirvBytes); });
                 job.emplace(std::move(pipelineJobs.front()));
                 pipelineJobs.pop_front();
                 runningBuilds.builds++;
@@ -3339,11 +3428,16 @@ private:
             const auto built = elapsed(started);
             if (made != nullptr && Downgrades::Active() && job->result != nullptr) std::fprintf(stderr, "[recode-build] %016llx module %016llx %s %.0f ms (cache lock %.0f ms)\n", static_cast<unsigned long long>(Downgrades::ProgramHash(job->codeAddress)), static_cast<unsigned long long>(job->result->spirv.ContentHash().low), (made->feedback & VK_PIPELINE_CREATION_FEEDBACK_VALID_BIT) == 0u ? "no-feedback" : (made->feedback & VK_PIPELINE_CREATION_FEEDBACK_APPLICATION_PIPELINE_CACHE_HIT_BIT) != 0u ? "cache-hit" : "cache-miss", static_cast<double>(built) / 1e6, static_cast<double>(made->lockNanoseconds) / 1e6);
             if (job->result != nullptr) Downgrades::DumpModule(job->codeAddress, job->result->spirv.ContentHash().low, std::span<const std::uint32_t>(job->result->spirv.data(), job->result->spirv.size()));
+            if (made != nullptr && !job->listed && job->result != nullptr) listPipeline(*job);
             Downgrades::NoteBuild(job->codeAddress, built, job->result != nullptr ? job->result->spirv.size() * sizeof(std::uint32_t) : 0u, job->result != nullptr ? job->result->spirv.ContentHash().low : 0u, job->key.size() > 2u ? Downgrades::HashCode(std::as_bytes(std::span(job->key).subspan(2))) : 0u);
             {
                 std::lock_guard lock(pipelineMutex);
                 runningBuilds.builds--;
                 runningBuilds.memoryBytes -= BuildBudget::MemoryBytes(job->spirvBytes);
+                if (job->listed) {
+                    listedJobs--;
+                    if (made != nullptr) pipelinesReplayed.fetch_add(1, std::memory_order_relaxed);
+                }
                 buildingPipelines.erase(job->key);
                 buildNanoseconds += built;
                 unsavedBuildNanoseconds += made != nullptr ? built : 0u;
@@ -5598,6 +5692,11 @@ private:
     std::uint64_t unsavedBuildNanoseconds = 0;
     BuildBudget::Running runningBuilds;
     std::uint32_t framesWaiting = 0;
+    std::uint32_t listedJobs = 0;
+    std::atomic<bool> listReplayStarted{false};
+    std::atomic<bool> listReplaying{false};
+    std::atomic<bool> listReplayStops{false};
+    std::atomic<std::uint64_t> pipelinesReplayed{0};
     std::uint32_t mostBuildsAtOnce = 0;
     std::mutex pipelineMutex;
     std::mutex layoutMutex;
