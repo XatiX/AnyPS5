@@ -262,10 +262,20 @@ std::uint32_t NanSpeculationFallbacks() {
     return SuppressedCount().load(std::memory_order_acquire);
 }
 
+static bool recodeMemoryRequested() {
+    if (std::getenv("APS5_RECODE_MEMORY") != nullptr) return true;
+#if ANYPS5_UNIFIED
+    const char* route = std::getenv("APS5_RECODE_ROUTE");
+    return route == nullptr || std::strcmp(route, "0") != 0;
+#else
+    return false;
+#endif
+}
+
 bool ExactF32Arithmetic() {
     static const bool exact = [] {
         const char* text = std::getenv("APS5_FAST_F32");
-        if (text == nullptr || *text == '\0') return std::getenv("APS5_RECODE_MEMORY") == nullptr;
+        if (text == nullptr || *text == '\0') return !recodeMemoryRequested();
         return std::strcmp(text, "0") == 0;
     }();
     return exact;

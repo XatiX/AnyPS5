@@ -80,9 +80,19 @@ struct KernelArena {
     void Release(const void* pointer, size_t len) { GuestArena::GuestArenaRelease_nid_postfix(pointer, len); }
 };
 
+static bool RecodeMemoryRequested() {
+    if (std::getenv("APS5_RECODE_MEMORY") != nullptr) return true;
+#if ANYPS5_UNIFIED
+    const char* route = std::getenv("APS5_RECODE_ROUTE");
+    return route == nullptr || std::strcmp(route, "0") != 0;
+#else
+    return false;
+#endif
+}
+
 static GuestMemoryView::GuestView* SharedView() {
     static GuestMemoryView::GuestView* const view = []() -> GuestMemoryView::GuestView* {
-        const bool wanted = std::getenv("APS5_GUEST_VIEW") != nullptr || (std::getenv("APS5_RECODE_MEMORY") != nullptr && std::getenv("APS5_NO_GUEST_VIEW") == nullptr);
+        const bool wanted = std::getenv("APS5_GUEST_VIEW") != nullptr || (RecodeMemoryRequested() && std::getenv("APS5_NO_GUEST_VIEW") == nullptr);
         if (!wanted || !GuestArena::GuestArenaAvailable_nid_postfix()) return nullptr;
         std::uintptr_t base = 0;
         std::size_t bytes = 0;
