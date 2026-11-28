@@ -816,7 +816,7 @@ private:
             const std::array source{DirtyRange{copy->source, copy->bytes}};
             std::shared_ptr<Graphics::Buffer> landing;
             if (MemoryCore::Get().WithoutGpuWritten(source).empty()) {
-                static const bool ordersCopies = std::getenv("APS5_RECODE_COPIES_SETTLE") == nullptr;
+                static const bool ordersCopies = std::getenv("APS5_RECODE_COPIES_IN_MIRROR") != nullptr;
                 GuestMemory::TagGpuLockSite(GuestMemory::GpuLockSite::Label);
                 std::lock_guard lock(GuestMemory::GpuMutex());
                 auto* recorder = device.graphicsContext().recorder;
