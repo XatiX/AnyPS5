@@ -350,9 +350,10 @@ VkImageView VulkanSurface::ShapedStorageView(std::uint32_t level, StorageShape s
         reason = "atomic storage view of a format that is not 32-bit single-channel";
         return VK_NULL_HANDLE;
     }
+    const auto imageLayers = std::max(geometry.imageLayers, 1u);
     const bool arrayed = shape == StorageShape::Array || shape == StorageShape::LineArray;
-    if (shape != StorageShape::Flat && shape != StorageShape::Line) layer = 0;
-    if (layer >= std::max(geometry.imageLayers, 1u)) {
+    if (shape == StorageShape::Volume) layer = 0;
+    if (layer >= imageLayers) {
         reason = "storage view past the layers";
         return VK_NULL_HANDLE;
     }
@@ -368,7 +369,7 @@ VkImageView VulkanSurface::ShapedStorageView(std::uint32_t level, StorageShape s
     const auto packed = packedStorageView(storageFormat);
     const auto uintFormat = uintView ? uintStorageView(storageFormat) : VK_FORMAT_UNDEFINED;
     info.format = atomic ? VK_FORMAT_R32_UINT : packed != VK_FORMAT_UNDEFINED ? packed : uintFormat != VK_FORMAT_UNDEFINED ? uintFormat : storageFormat;
-    info.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, level, 1u, layer, arrayed ? std::max(geometry.imageLayers, 1u) : 1u};
+    info.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, level, 1u, layer, arrayed ? imageLayers - layer : 1u};
     VkImageView created = VK_NULL_HANDLE;
     if (context.Function<PFN_vkCreateImageView>("vkCreateImageView")(context.device, &info, nullptr, &created) != VK_SUCCESS) {
         reason = "vkCreateImageView recode storage";
